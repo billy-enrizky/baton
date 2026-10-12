@@ -9,7 +9,7 @@ export interface ThreadRow {
   title: string;
   cwd: string;
   currentProvider: ProviderId;
-  currentModel: string;
+  currentModel: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -59,14 +59,14 @@ export interface NewThread {
   title: string;
   cwd: string;
   currentProvider: ProviderId;
-  currentModel: string;
+  currentModel: string | null;
 }
 
 export interface ImportThread {
   title: string;
   cwd: string;
   currentProvider: ProviderId;
-  currentModel: string;
+  currentModel: string | null;
   nativeSessionId: string;
   rolloutPath: string | null;
   messages: ReadonlyArray<{
@@ -84,7 +84,7 @@ CREATE TABLE IF NOT EXISTS threads (
   title TEXT NOT NULL,
   cwd TEXT NOT NULL,
   current_provider TEXT NOT NULL,
-  current_model TEXT NOT NULL,
+  current_model TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -159,7 +159,7 @@ function mapThread(row: SqlRow): ThreadRow {
     title: str(row.title),
     cwd: str(row.cwd),
     currentProvider: str(row.current_provider) as ProviderId,
-    currentModel: str(row.current_model),
+    currentModel: nullableStr(row.current_model),
     createdAt: str(row.created_at),
     updatedAt: str(row.updated_at),
   };
@@ -215,19 +215,45 @@ function mapUsage(row: SqlRow): UsageRow {
   };
 }
 
+function migrateThreadModelNullable(db: DatabaseSync): void {
+  const column = db
+    .prepare(`SELECT "notnull" AS is_notnull FROM pragma_table_info('threads') WHERE name = 'current_model'`)
+    .get() as { is_notnull: number } | undefined;
+  if (!column || column.is_notnull === 0) return;
+  db.exec(`
+    CREATE TABLE threads_migrated (
+      id TEXT PRIMARY KEY,
+      title TEXT NOT NULL,
+      cwd TEXT NOT NULL,
+      current_provider TEXT NOT NULL,
+      current_model TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO threads_migrated (id, title, cwd, current_provider, current_model, created_at, updated_at)
+      SELECT id, title, cwd, current_provider,
+        CASE WHEN current_model IN ('gpt-6.1-sol', 'claude-sonnet-4-5') THEN NULL ELSE current_model END,
+        created_at, updated_at
+      FROM threads;
+    DROP TABLE threads;
+    ALTER TABLE threads_migrated RENAME TO threads;
+  `);
+}
+
 export class BatonStore {
   private constructor(private readonly db: DatabaseSync) {}
-
   static open(path: string): BatonStore {
     mkdirSync(dirname(path), { recursive: true });
     const db = new DatabaseSync(path);
     db.exec(MIGRATIONS);
+    migrateThreadModelNullable(db);
     return new BatonStore(db);
   }
 
   static memory(): BatonStore {
     const db = new DatabaseSync(":memory:");
     db.exec(MIGRATIONS);
+    migrateThreadModelNullable(db);
     return new BatonStore(db);
   }
 
@@ -359,7 +385,7 @@ export class BatonStore {
       .run(title, new Date().toISOString(), id);
   }
 
-  setThreadProvider(id: string, provider: ProviderId, model: string): void {
+  setThreadProvider(id: string, provider: ProviderId, model: string | null): void {
     this.db
       .prepare("UPDATE threads SET current_provider = ?, current_model = ?, updated_at = ? WHERE id = ?")
       .run(provider, model, new Date().toISOString(), id);

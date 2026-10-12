@@ -47,13 +47,15 @@ async function main(): Promise<void> {
     }
     case "threads": {
       const store = BatonStore.open(batonDbPath());
+      const resolved = resolveConfig({ home, cwd: command.cwd });
       const threads = store.listThreads(command.cwd);
       if (threads.length === 0) {
         console.log("no threads in this directory yet. Run baton to start one.");
         return;
       }
       for (const thread of threads) {
-        console.log(`${thread.id.slice(0, 8)}  ${thread.currentProvider}/${thread.currentModel}  ${thread.title}`);
+        const model = thread.currentModel ?? resolved[thread.currentProvider].model;
+        console.log(`${thread.id.slice(0, 8)}  ${thread.currentProvider}/${model}  ${thread.title}`);
       }
       return;
     }
@@ -66,7 +68,7 @@ async function main(): Promise<void> {
         title: command.title,
         cwd: command.cwd,
         currentProvider: provider,
-        currentModel: model,
+        currentModel: command.model ?? null,
       });
       console.log(`created thread ${thread.id.slice(0, 8)} (${provider}/${model})`);
       return;
@@ -92,7 +94,7 @@ async function main(): Promise<void> {
           title: session.title,
           cwd: session.cwd ?? command.cwd,
           currentProvider: session.provider,
-          currentModel: session.model ?? resolved[session.provider].model,
+          currentModel: session.model ?? null,
           nativeSessionId: session.nativeSessionId,
           rolloutPath: session.provider === "codex" ? session.path : null,
           messages: session.messages,
@@ -146,6 +148,7 @@ async function main(): Promise<void> {
     }
     case "usage": {
       const store = BatonStore.open(batonDbPath());
+      const resolved = resolveConfig({ home, cwd: process.cwd() });
       const threads = command.threadId
         ? [store.getThread(command.threadId)].filter((thread): thread is NonNullable<typeof thread> => thread !== null)
         : store.listThreads();
@@ -156,8 +159,9 @@ async function main(): Promise<void> {
         const totals = sumUsage(rows);
         const rate = cacheHitRate(totals);
         const rateLabel = rate === null ? "n/a" : `${(rate * 100).toFixed(0)}%`;
+        const model = thread.currentModel ?? resolved[thread.currentProvider].model;
         console.log(
-          `${thread.id.slice(0, 8)}  ${thread.currentProvider}/${thread.currentModel}  ${thread.title}  ${formatUsageLine(totals)}  hit ${rateLabel}`,
+          `${thread.id.slice(0, 8)}  ${thread.currentProvider}/${model}  ${thread.title}  ${formatUsageLine(totals)}  hit ${rateLabel}`,
         );
       }
       return;
@@ -170,16 +174,17 @@ async function main(): Promise<void> {
       if (!thread) thread = store.latestThreadInCwd(command.cwd);
       const provider: ProviderId = command.provider ?? thread?.currentProvider ?? "claude";
       if (!isProviderId(provider)) throw new Error(`unknown provider ${provider}`);
-      const model = command.model ?? thread?.currentModel ?? resolved[provider].model;
       if (!thread) {
         thread = store.createThread({
           title: "New thread",
           cwd: command.cwd,
           currentProvider: provider,
-          currentModel: model,
+          currentModel: command.model ?? null,
         });
-      } else if (thread.currentProvider !== provider || thread.currentModel !== model) {
-        store.setThreadProvider(thread.id, provider, model);
+      } else if (thread.currentProvider !== provider) {
+        store.setThreadProvider(thread.id, provider, command.model ?? null);
+      } else if (command.model !== null && command.model !== thread.currentModel) {
+        store.setThreadModel(thread.id, command.model);
       }
       const { ClaudeAdapter } = await import("./adapters/claude.ts");
       const { CodexAdapter } = await import("./adapters/codex.ts");

@@ -1,4 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { BatonStore } from "../src/store.ts";
 
 describe("BatonStore", () => {
@@ -116,5 +120,75 @@ describe("BatonStore", () => {
     expect(store.getCheckpoint(thread.id, 1)?.turn).toBe(1);
     expect(store.listUsage(thread.id)[0]?.cacheReadTokens).toBe(800);
     expect(store.listUsage()).toHaveLength(1);
+  });
+
+  it("supports null models that follow harness config", () => {
+    const store = BatonStore.memory();
+    const thread = store.createThread({
+      title: "t",
+      cwd: "/tmp/x",
+      currentProvider: "codex",
+      currentModel: null,
+    });
+    expect(store.getThread(thread.id)?.currentModel).toBeNull();
+    store.setThreadProvider(thread.id, "claude", null);
+    expect(store.getThread(thread.id)?.currentModel).toBeNull();
+    store.setThreadModel(thread.id, "claude-opus-5-5");
+    expect(store.getThread(thread.id)?.currentModel).toBe("claude-opus-5-5");
+  });
+
+  it("migrates old NOT NULL schema, resetting stale baked-in default models", () => {
+    const dir = mkdtempSync(join(tmpdir(), "baton-store-"));
+    try {
+      const path = join(dir, "state.sqlite");
+      const legacy = new DatabaseSync(path);
+      legacy.exec(`
+        CREATE TABLE threads (
+          id TEXT PRIMARY KEY,
+          title TEXT NOT NULL,
+          cwd TEXT NOT NULL,
+          current_provider TEXT NOT NULL,
+          current_model TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `);
+      const insert = legacy.prepare(
+        "INSERT INTO threads (id, title, cwd, current_provider, current_model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      );
+      insert.run("stale-id", "stale", "/tmp/x", "codex", "gpt-6.1-sol", "2026-10-12T00:00:00Z", "2026-10-12T00:00:00Z");
+      insert.run("fresh-id", "fresh", "/tmp/x", "claude", "claude-opus-5-5", "2026-10-12T00:00:00Z", "2026-10-12T00:00:00Z");
+      legacy.close();
+
+      const store = BatonStore.open(path);
+      expect(store.getThread("stale-id")?.currentModel).toBeNull();
+      expect(store.getThread("fresh-id")?.currentModel).toBe("claude-opus-5-5");
+      store.setThreadProvider("stale-id", "codex", null);
+      expect(store.getThread("stale-id")?.currentModel).toBeNull();
+      store.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps explicit model choices on reopened nullable-schema databases", () => {
+    const dir = mkdtempSync(join(tmpdir(), "baton-store-"));
+    try {
+      const path = join(dir, "state.sqlite");
+      const store = BatonStore.open(path);
+      const thread = store.createThread({
+        title: "explicit",
+        cwd: "/tmp/x",
+        currentProvider: "codex",
+        currentModel: "gpt-6.1-sol",
+      });
+      store.close();
+
+      const reopened = BatonStore.open(path);
+      expect(reopened.getThread(thread.id)?.currentModel).toBe("gpt-6.1-sol");
+      reopened.close();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

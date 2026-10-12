@@ -254,25 +254,27 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
             return true;
           }
           const next = target as ProviderId;
-          const model = args[1] ?? config[next].model;
-          store.setThreadProvider(thread.id, next, model);
+          store.setThreadProvider(thread.id, next, args[1] ?? null);
           applyProviderDefaults(next);
+          const effectiveModel = args[1] ?? config[next].model;
           const existing = store.getProviderSession(thread.id, next);
           setNotice(
             existing
-              ? `switched to ${next}/${model}, resuming native session ${existing.nativeSessionId.slice(0, 8)}`
-              : `switched to ${next}/${model}. First turn carries a context handoff.`,
+              ? `switched to ${next}/${effectiveModel}, resuming native session ${existing.nativeSessionId.slice(0, 8)}`
+              : `switched to ${next}/${effectiveModel}. First turn carries a context handoff.`,
           );
           refreshThreadState(thread.id);
           return true;
         }
         case "/model": {
-          const model = args[0];
-          if (!model) {
-            setNotice(`current model: ${thread.currentProvider}/${thread.currentModel}`);
+          const requested = args[0];
+          if (!requested) {
+            const effective = thread.currentModel ?? config[thread.currentProvider].model;
+            const source = thread.currentModel ? "thread" : "harness config";
+            setNotice(`current model: ${thread.currentProvider}/${effective} (${source})`);
             return true;
           }
-          store.setThreadModel(thread.id, model);
+          store.setThreadModel(thread.id, requested);
           refreshThreadState(thread.id);
           return true;
         }
@@ -325,7 +327,7 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
             title,
             cwd: thread.cwd,
             currentProvider: thread.currentProvider,
-            currentModel: config[thread.currentProvider].model,
+            currentModel: null,
           });
           setThread(created);
           setHistory([]);
@@ -342,7 +344,7 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
             .slice(0, 20)
             .map(
               (candidate) =>
-                `${candidate.id.slice(0, 8)}  ${candidate.currentProvider}/${candidate.currentModel}  ${candidate.title}`,
+                `${candidate.id.slice(0, 8)}  ${candidate.currentProvider}/${candidate.currentModel ?? config[candidate.currentProvider].model}  ${candidate.title}`,
             );
           setNotice(lines.join("\n") || "no threads in this directory");
           return true;
@@ -565,7 +567,7 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
             })
           }
           provider={thread.currentProvider}
-          model={thread.currentModel}
+          model={thread.currentModel ?? config[thread.currentProvider].model}
           authLabel={authLabel}
           permissionMode={permissionMode}
           suggestions={suggestions}
@@ -743,11 +745,17 @@ function Composer(props: {
   useInput((input, key) => {
     if (suggestions.length > 0) {
       if (key.upArrow) {
-        setSelectedIndex((index) => Math.max(Math.min(index, suggestions.length - 1) - 1, 0));
+        setSelectedIndex((index) => {
+          const current = Math.min(index, suggestions.length - 1);
+          return (current - 1 + suggestions.length) % suggestions.length;
+        });
         return;
       }
       if (key.downArrow) {
-        setSelectedIndex((index) => Math.min(Math.min(index, suggestions.length - 1) + 1, suggestions.length - 1));
+        setSelectedIndex((index) => {
+          const current = Math.min(index, suggestions.length - 1);
+          return (current + 1) % suggestions.length;
+        });
         return;
       }
       if (key.tab) {
@@ -785,17 +793,27 @@ function Composer(props: {
     if (input.length > 0) props.onChange(props.value + input);
   });
 
+  const maxVisible = 6;
+  const windowStart = Math.max(
+    Math.min(clampedIndex - (maxVisible - 1), suggestions.length - maxVisible),
+    0,
+  );
+  const visibleSuggestions = suggestions.slice(windowStart, windowStart + maxVisible);
+
   return (
     <Box flexDirection="column" marginTop={1}>
       {suggestions.length > 0 ? (
         <Box flexDirection="column" borderStyle="round" borderColor={COLORS.border} paddingX={1}>
-          {suggestions.slice(0, 6).map((entry, index) => (
-            <Text key={entry.command} color={index === clampedIndex ? COLORS.accent : COLORS.muted}>
-              {index === clampedIndex ? "❯ " : "  "}
+          {visibleSuggestions.map((entry, index) => (
+            <Text key={entry.command} color={windowStart + index === clampedIndex ? COLORS.accent : COLORS.muted}>
+              {windowStart + index === clampedIndex ? "❯ " : "  "}
               {entry.command.padEnd(12)} {entry.description}
             </Text>
           ))}
-          <Text dimColor>↑↓ select · tab/enter complete</Text>
+          <Text dimColor>
+            ↑↓ select (wraps) · tab/enter complete
+            {suggestions.length > maxVisible ? ` · ${suggestions.length} matches` : ""}
+          </Text>
         </Box>
       ) : null}
       <Box

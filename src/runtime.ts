@@ -51,9 +51,13 @@ export async function runTurn(
     };
   }
 
+  const config = resolveConfig({ home, cwd: thread.cwd });
+  const model = thread.currentModel ?? config[provider].model;
+  const authEnv = providerAuthEnv(config[provider], provider);
+
   const priorMessages = store.listMessages(thread.id);
   const turn = store.nextTurnNumber(thread.id);
-  store.addMessage({ threadId: thread.id, turn, role: "user", provider, model: thread.currentModel, text: userText });
+  store.addMessage({ threadId: thread.id, turn, role: "user", provider, model, text: userText });
 
   const session = store.getProviderSession(thread.id, provider);
   let prompt = userText;
@@ -63,7 +67,7 @@ export async function runTurn(
       threadTitle: thread.title,
       messages: [
         ...priorMessages,
-        { role: "user", provider, model: thread.currentModel, text: userText },
+        { role: "user", provider, model, text: userText },
       ],
       gitStatus: await gitStatusSummary(thread.cwd),
     });
@@ -74,13 +78,10 @@ export async function runTurn(
     store.renameThread(thread.id, deriveTitle(userText));
   }
 
-  const config = resolveConfig({ home, cwd: thread.cwd });
-  const authEnv = providerAuthEnv(config[provider], provider);
-
   return await new Promise<TurnOutcome>((resolve) => {
     const finish = (ok: boolean, finalText: string, error: string | null, nativeSessionId: string | null, rolloutPath: string | null) => {
       if (nativeSessionId) {
-        store.upsertProviderSession(thread.id, provider, nativeSessionId, thread.currentModel, rolloutPath);
+        store.upsertProviderSession(thread.id, provider, nativeSessionId, model, rolloutPath);
       }
       resolve({ threadId: thread.id, turn, ok, finalText, error });
       void captureCheckpoint(thread.cwd, thread.id, turn)
@@ -93,7 +94,7 @@ export async function runTurn(
         {
           threadId: thread.id,
           cwd: thread.cwd,
-          model: thread.currentModel,
+          model: model,
           prompt,
           permissionMode: options.permissionMode,
           authEnv,
@@ -107,7 +108,7 @@ export async function runTurn(
               turn,
               role: "assistant",
               provider,
-              model: thread.currentModel,
+              model: model,
               text: event.finalText,
             });
             if (event.usage) {
@@ -115,7 +116,7 @@ export async function runTurn(
                 threadId: thread.id,
                 turn,
                 provider,
-                model: thread.currentModel,
+                model: model,
                 inputTokens: event.usage.inputTokens,
                 outputTokens: event.usage.outputTokens,
                 cacheReadTokens: event.usage.cacheReadTokens,

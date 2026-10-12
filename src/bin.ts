@@ -169,23 +169,26 @@ async function main(): Promise<void> {
     case "chat": {
       const store = BatonStore.open(batonDbPath());
       const resolved = resolveConfig({ home, cwd: command.cwd });
-      let thread = command.threadId ? store.getThread(command.threadId) : null;
-      if (command.threadId && !thread) throw new Error(`no thread matches ${command.threadId}`);
-      if (!thread) thread = store.latestThreadInCwd(command.cwd);
-      const provider: ProviderId = command.provider ?? thread?.currentProvider ?? "claude";
+      const provider: ProviderId = command.provider ?? "claude";
       if (!isProviderId(provider)) throw new Error(`unknown provider ${provider}`);
-      if (!thread) {
-        thread = store.createThread({
-          title: "New thread",
-          cwd: command.cwd,
-          currentProvider: provider,
-          currentModel: command.model ?? null,
-        });
-      } else if (thread.currentProvider !== provider) {
-        store.setThreadProvider(thread.id, provider, command.model ?? null);
-      } else if (command.model !== null && command.model !== thread.currentModel) {
-        store.setThreadModel(thread.id, command.model);
+      if (command.threadId) {
+        const thread = store.getThread(command.threadId);
+        if (!thread) throw new Error(`no thread matches ${command.threadId}`);
+        if (thread.currentProvider !== provider) {
+          store.setThreadProvider(thread.id, provider, command.model ?? null);
+        } else if (command.model !== null && command.model !== thread.currentModel) {
+          store.setThreadModel(thread.id, command.model);
+        }
       }
+      const thread = command.threadId
+        ? store.getThread(command.threadId)
+        : store.draftThread({
+            title: "New thread",
+            cwd: command.cwd,
+            currentProvider: provider,
+            currentModel: command.model ?? null,
+          });
+      if (!thread) throw new Error(`no thread matches ${command.threadId}`);
       const { ClaudeAdapter } = await import("./adapters/claude.ts");
       const { CodexAdapter } = await import("./adapters/codex.ts");
       const { runChatTui } = await import("./tui/App.tsx");

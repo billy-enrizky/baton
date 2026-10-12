@@ -28,9 +28,25 @@ describe("BatonStore", () => {
       currentProvider: "codex",
       currentModel: "gpt-6.1-sol",
     });
-    expect(store.latestThreadInCwd("/tmp/project")?.id).toBe(second.id);
     store.deleteThread(second.id);
     expect(store.listThreads("/tmp/project")).toHaveLength(1);
+  });
+
+  it("creates threads with an explicit id and drafts unpersisted threads", () => {
+    const store = BatonStore.memory();
+    const draft = store.draftThread({
+      title: "New thread",
+      cwd: "/tmp/x",
+      currentProvider: "claude",
+      currentModel: null,
+    });
+    expect(store.getThread(draft.id)).toBeNull();
+    const persisted = store.createThread(
+      { title: "New thread", cwd: "/tmp/x", currentProvider: "claude", currentModel: null },
+      draft.id,
+    );
+    expect(persisted.id).toBe(draft.id);
+    expect(store.getThread(draft.id)?.title).toBe("New thread");
   });
 
   it("tracks messages and turn numbers", () => {

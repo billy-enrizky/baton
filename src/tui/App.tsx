@@ -196,21 +196,37 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
     }
   }, []);
 
+  const ensureThread = useCallback((): ThreadRow => {
+    const existing = store.getThread(thread.id);
+    if (existing) return existing;
+    const created = store.createThread(
+      {
+        title: thread.title,
+        cwd: thread.cwd,
+        currentProvider: thread.currentProvider,
+        currentModel: thread.currentModel,
+      },
+      thread.id,
+    );
+    setThread(created);
+    return created;
+  }, [store, thread]);
+
   const submitTurn = useCallback(
     async (text: string) => {
       if (runningRef.current) return;
+      const current = ensureThread();
       setRunning(true);
       setStreamingText("");
       setToolLines([]);
       setNotice(null);
       setDiffOutput(null);
-      const current = store.getThread(thread.id) ?? thread;
       setHistory((currentHistory) => [
         ...currentHistory,
         {
           id: -Date.now(),
-          threadId: thread.id,
-          turn: store.nextTurnNumber(thread.id),
+          threadId: current.id,
+          turn: store.nextTurnNumber(current.id),
           role: "user" as const,
           provider: current.currentProvider,
           model: current.currentModel,
@@ -222,12 +238,12 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
       setRunning(false);
       setStreamingText("");
       setToolLines([]);
-      refreshThreadState(thread.id);
+      refreshThreadState(current.id);
       if (!outcome.ok && outcome.error) {
         setNotice(`turn failed: ${outcome.error}`);
       }
     },
-    [adapters, emit, home, permissionMode, refreshThreadState, store, thread],
+    [adapters, emit, ensureThread, home, permissionMode, refreshThreadState, store],
   );
 
   const applyProviderDefaults = useCallback(
@@ -267,16 +283,17 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
             return true;
           }
           const next = target as ProviderId;
-          store.setThreadProvider(thread.id, next, args[1] ?? null);
+          const current = ensureThread();
+          store.setThreadProvider(current.id, next, args[1] ?? null);
           applyProviderDefaults(next);
           const effectiveModel = args[1] ?? config[next].model;
-          const existing = store.getProviderSession(thread.id, next);
+          const existing = store.getProviderSession(current.id, next);
           setNotice(
             existing
               ? `switched to ${next}/${effectiveModel}, resuming native session ${existing.nativeSessionId.slice(0, 8)}`
               : `switched to ${next}/${effectiveModel}. First turn carries a context handoff.`,
           );
-          refreshThreadState(thread.id);
+          refreshThreadState(current.id);
           return true;
         }
         case "/model": {
@@ -287,8 +304,9 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
             setNotice(`current model: ${thread.currentProvider}/${effective} (${source})`);
             return true;
           }
-          store.setThreadModel(thread.id, requested);
-          refreshThreadState(thread.id);
+          const current = ensureThread();
+          store.setThreadModel(current.id, requested);
+          refreshThreadState(current.id);
           return true;
         }
         case "/mode": {
@@ -336,19 +354,20 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
         }
         case "/new": {
           const title = args.join(" ").trim() || "New thread";
-          const created = store.createThread({
-            title,
-            cwd: thread.cwd,
-            currentProvider: thread.currentProvider,
-            currentModel: null,
-          });
-          setThread(created);
+          setThread(
+            store.draftThread({
+              title,
+              cwd: thread.cwd,
+              currentProvider: thread.currentProvider,
+              currentModel: null,
+            }),
+          );
           setHistory([]);
           setUsageRows([]);
           setBranchLabel(null);
           setDiffOutput(null);
           setScrollOffset(0);
-          setNotice(`new thread ${created.id.slice(0, 8)}`);
+          setNotice(`new thread (${title}), unsaved until you send a message`);
           return true;
         }
         case "/threads": {
@@ -424,19 +443,20 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
           return true;
       }
     },
-    [
-      applyProviderDefaults,
-      config,
-      exit,
-      home,
-      permissionMode,
-      refreshThreadState,
-      store,
-      thread,
-      totals,
-      usageRows.length,
-    ],
-  );
+     [
+       applyProviderDefaults,
+       config,
+       ensureThread,
+       exit,
+       home,
+       permissionMode,
+       refreshThreadState,
+       store,
+       thread,
+       totals,
+       usageRows.length,
+     ],
+   );
 
   const onSubmit = useCallback(
     async (text: string) => {

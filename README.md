@@ -29,7 +29,8 @@ Development: `npm run dev` (tsx), `npm run build`, `npm test`, `npm run typechec
 ## Usage
 
 ```
-baton                    # open the TUI on the latest thread in this directory
+baton                    # start the TUI on a fresh thread (unsaved until the first message)
+baton -t <id>            # open an existing thread
 baton new [title]        # create a thread
 baton threads            # list threads here
 baton import [--dry-run] # import recent claude/codex sessions as threads

@@ -54,13 +54,15 @@ afterEach(() => {
   rmSync(home, { recursive: true, force: true });
 });
 
-function renderApp(adapters: Record<ProviderId, BatonAdapter>) {
-  const thread = store.createThread({
-    title: "test thread",
-    cwd: process.cwd(),
-    currentProvider: "claude",
-    currentModel: null,
-  });
+function renderApp(adapters: Record<ProviderId, BatonAdapter>, options?: { draft?: boolean }) {
+  const thread = options?.draft
+    ? store.draftThread({ title: "test thread", cwd: process.cwd(), currentProvider: "claude", currentModel: null })
+    : store.createThread({
+        title: "test thread",
+        cwd: process.cwd(),
+        currentProvider: "claude",
+        currentModel: null,
+      });
   const instance = render(
     <BatonApp
       store={store}
@@ -111,6 +113,22 @@ describe("BatonApp message visibility", () => {
     expect(store.listMessages(thread.id)).toHaveLength(2);
     expect(store.listMessages(thread.id)[0]?.text).toBe("say hi");
     expect(store.listMessages(thread.id)[1]?.text).toBe("the reply");
+    instance.unmount();
+  });
+
+  it("persists a draft thread only when the first message is sent", async () => {
+    const { instance, thread } = renderApp(
+      { claude: new EchoAdapter("claude"), codex: new HangingAdapter("codex") },
+      { draft: true },
+    );
+    await settle();
+    expect(store.getThread(thread.id)).toBeNull();
+    type(instance, "first message");
+    instance.stdin.write("\r");
+    await settle(200);
+    expect(store.getThread(thread.id)).not.toBeNull();
+    expect(store.listMessages(thread.id)).toHaveLength(2);
+    expect(store.listMessages(thread.id)[0]?.text).toBe("first message");
     instance.unmount();
   });
 

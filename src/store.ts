@@ -261,10 +261,10 @@ export class BatonStore {
     this.db.close();
   }
 
-  createThread(input: NewThread): ThreadRow {
+  createThread(input: NewThread, id: string = randomUUID()): ThreadRow {
     const now = new Date().toISOString();
     const thread: ThreadRow = {
-      id: randomUUID(),
+      id,
       title: input.title,
       cwd: input.cwd,
       currentProvider: input.currentProvider,
@@ -357,11 +357,17 @@ export class BatonStore {
     return row ? mapThread(row) : null;
   }
 
-  latestThreadInCwd(cwd: string): ThreadRow | null {
-    const row = this.db
-      .prepare("SELECT * FROM threads WHERE cwd = ? ORDER BY updated_at DESC, rowid DESC LIMIT 1")
-      .get(cwd) as SqlRow | undefined;
-    return row ? mapThread(row) : null;
+  draftThread(input: NewThread): ThreadRow {
+    const now = new Date().toISOString();
+    return {
+      id: randomUUID(),
+      title: input.title,
+      cwd: input.cwd,
+      currentProvider: input.currentProvider,
+      currentModel: input.currentModel,
+      createdAt: now,
+      updatedAt: now,
+    };
   }
 
   deleteThread(id: string): void {

@@ -152,10 +152,11 @@ export const HELP_TEXT = `baton: one terminal CLI for every coding agent harness
 Usage: baton [command] [options]
 
 Commands:
-  baton                     start or resume the TUI chat (most recent thread in this directory)
+  baton                     start the TUI with a fresh thread (unsaved until you send a message)
   baton chat                same as bare baton
   baton new [title]         create a thread
   baton threads             list threads for this directory
+  baton -t <id>             open an existing thread in the TUI
   baton import              import recent native sessions (claude jsonl, codex rollouts) as threads
   baton checkpoints <id>    list checkpoints for a thread
   baton diff <id> [turn]    diff a checkpoint (default: latest) against the working tree

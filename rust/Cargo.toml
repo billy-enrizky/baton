@@ -1,0 +1,32 @@
+[package]
+name = "baton"
+version = "0.3.0"
+edition = "2021"
+description = "One terminal CLI for every coding agent harness. Same thread, any model, native prompt caching."
+license = "MIT"
+
+[[bin]]
+name = "baton"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "time", "sync"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+clap = { version = "4", features = ["derive"] }
+ratatui = "0.30"
+crossterm = "0.29"
+uuid = { version = "1", features = ["v4"] }
+anyhow = "1"
+dirs = "6"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+futures = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true

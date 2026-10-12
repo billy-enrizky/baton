@@ -370,6 +370,20 @@ export class BatonStore {
     };
   }
 
+  rewindThread(threadId: string, fromTurn: number): void {
+    this.db.exec("BEGIN");
+    try {
+      this.db.prepare("DELETE FROM messages WHERE thread_id = ? AND turn >= ?").run(threadId, fromTurn);
+      this.db.prepare("DELETE FROM usage WHERE thread_id = ? AND turn >= ?").run(threadId, fromTurn);
+      this.db.prepare("DELETE FROM provider_sessions WHERE thread_id = ?").run(threadId);
+      this.db.prepare("UPDATE threads SET updated_at = ? WHERE id = ?").run(new Date().toISOString(), threadId);
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   deleteThread(id: string): void {
     this.db.exec("BEGIN");
     try {

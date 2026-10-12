@@ -32,6 +32,31 @@ describe("BatonStore", () => {
     expect(store.listThreads("/tmp/project")).toHaveLength(1);
   });
 
+  it("rewinds a thread: truncates messages and usage, clears provider sessions", () => {
+    const store = BatonStore.memory();
+    const thread = store.createThread({
+      title: "t",
+      cwd: "/tmp/x",
+      currentProvider: "claude",
+      currentModel: null,
+    });
+    store.addMessage({ threadId: thread.id, turn: 1, role: "user", text: "one" });
+    store.addMessage({ threadId: thread.id, turn: 1, role: "assistant", text: "reply one" });
+    store.addMessage({ threadId: thread.id, turn: 2, role: "user", text: "two" });
+    store.addMessage({ threadId: thread.id, turn: 2, role: "assistant", text: "reply two" });
+    store.upsertProviderSession(thread.id, "claude", "native-a", null, null);
+    store.addUsage({ threadId: thread.id, turn: 1, provider: "claude", inputTokens: 1, outputTokens: 1, cacheReadTokens: 1, cacheCreationTokens: 1 });
+    store.addUsage({ threadId: thread.id, turn: 2, provider: "claude", inputTokens: 2, outputTokens: 2, cacheReadTokens: 2, cacheCreationTokens: 2 });
+
+    store.rewindThread(thread.id, 2);
+    const messages = store.listMessages(thread.id);
+    expect(messages).toHaveLength(2);
+    expect(messages.map((message) => message.text)).toEqual(["one", "reply one"]);
+    expect(store.getProviderSession(thread.id, "claude")).toBeNull();
+    expect(store.listUsage(thread.id)).toHaveLength(1);
+    expect(store.nextTurnNumber(thread.id)).toBe(2);
+  });
+
   it("creates threads with an explicit id and drafts unpersisted threads", () => {
     const store = BatonStore.memory();
     const draft = store.draftThread({

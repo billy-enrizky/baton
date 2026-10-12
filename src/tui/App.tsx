@@ -205,6 +205,19 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
       setNotice(null);
       setDiffOutput(null);
       const current = store.getThread(thread.id) ?? thread;
+      setHistory((currentHistory) => [
+        ...currentHistory,
+        {
+          id: -Date.now(),
+          threadId: thread.id,
+          turn: store.nextTurnNumber(thread.id),
+          role: "user" as const,
+          provider: current.currentProvider,
+          model: current.currentModel,
+          text,
+          createdAt: new Date().toISOString(),
+        },
+      ]);
       const outcome = await runTurn({ store, adapters, home }, current, text, emit, { permissionMode });
       setRunning(false);
       setStreamingText("");
@@ -477,10 +490,12 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
   const liveToolRows = Math.min(toolLines.length, 5);
   const liveStreamingCap = Math.max(3, Math.floor(((size.rows - composerRows - 6) * 3) / 5));
   const liveStreamingRows = streamingText.length > 0 ? Math.min(wrappedRows(streamingText, size.cols), liveStreamingCap) : 0;
-  const liveRows =
-    liveToolRows +
-    (toolLines.length > liveToolRows ? 1 : 0) +
-    (liveStreamingRows > 0 ? liveStreamingRows + 1 : 0);
+  const thinking = running && toolLines.length === 0 && streamingText.length === 0;
+  const liveRows = thinking
+    ? 1
+    : liveToolRows +
+      (toolLines.length > liveToolRows ? 1 : 0) +
+      (liveStreamingRows > 0 ? liveStreamingRows + 1 : 0);
   const statusRows = 1;
   const flexRows = Math.max(
     size.rows - statusRows - composerRows - noticeRows - approvalRows - liveRows,
@@ -532,6 +547,8 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
       )}
       {liveRows > 0 ? (
         <LiveArea
+          thinking={thinking}
+          spinnerFrame={SPINNER_FRAMES[spinnerFrame] ?? "⠋"}
           toolLines={toolLines.slice(-liveToolRows)}
           toolLinesHidden={Math.max(toolLines.length - liveToolRows, 0)}
           streamingText={streamingText}
@@ -558,7 +575,9 @@ export function BatonApp(props: BatonAppProps): React.ReactElement {
         <Composer
           running={running}
           value={input}
-          onChange={setInput}
+          onAppend={(chunk) => setInput((current) => current + chunk)}
+          onBackspace={() => setInput((current) => current.slice(0, -1))}
+          onSetValue={(value) => setInput(value)}
           onSubmit={onSubmit}
           onScroll={(delta) =>
             setScrollOffset((offset) => {
@@ -631,11 +650,20 @@ function MessageView(props: { message: ViewportMessage }): React.ReactElement {
 }
 
 function LiveArea(props: {
+  thinking: boolean;
+  spinnerFrame: string;
   toolLines: ReadonlyArray<ToolLineState>;
   toolLinesHidden: number;
   streamingText: string;
   streamingRows: number;
 }): React.ReactElement {
+  if (props.thinking) {
+    return (
+      <Box paddingLeft={1} paddingRight={1}>
+        <Text color={COLORS.accent}>{props.spinnerFrame} Thinking</Text>
+      </Box>
+    );
+  }
   const streamingLines = props.streamingText.length > 0 ? props.streamingText.split("\n") : [];
   const visibleStreaming =
     props.streamingRows > 0 ? streamingLines.slice(-props.streamingRows * 2) : [];
@@ -646,7 +674,7 @@ function LiveArea(props: {
         <Text dimColor>+{props.toolLinesHidden} earlier tool calls</Text>
       ) : null}
       {props.toolLines.map((line, index) => (
-        <ToolLineView key={index} line={line} />
+        <ToolLineView key={index} line={line} spinnerFrame={props.spinnerFrame} />
       ))}
       {props.streamingRows > 0 ? (
         <>
@@ -658,14 +686,16 @@ function LiveArea(props: {
   );
 }
 
-function ToolLineView(props: { line: ToolLineState }): React.ReactElement {
-  const color =
-    props.line.status === "running"
-      ? COLORS.accent
-      : props.line.status === "failed"
-        ? COLORS.error
-        : COLORS.success;
-  const marker = props.line.status === "running" ? "◐" : props.line.status === "failed" ? "✗" : "✓";
+function ToolLineView(props: { line: ToolLineState; spinnerFrame: string }): React.ReactElement {
+  if (props.line.status === "running") {
+    return (
+      <Text color={COLORS.accent} wrap="wrap">
+        {props.spinnerFrame} {props.line.label}
+      </Text>
+    );
+  }
+  const color = props.line.status === "failed" ? COLORS.error : COLORS.success;
+  const marker = props.line.status === "failed" ? "✗" : "✓";
   return (
     <Text color={color} wrap="wrap">
       {marker} {props.line.label}
@@ -716,7 +746,9 @@ function ApprovalBox(props: {
 function Composer(props: {
   running: boolean;
   value: string;
-  onChange: (value: string) => void;
+  onAppend: (chunk: string) => void;
+  onBackspace: () => void;
+  onSetValue: (value: string) => void;
   onSubmit: (value: string) => void | Promise<void>;
   onScroll: (delta: number) => void;
   provider: ProviderId;
@@ -728,6 +760,7 @@ function Composer(props: {
   const [selectedIndex, setSelectedIndex] = useState(0);
   const suggestions = props.suggestions;
   const clampedIndex = Math.min(selectedIndex, Math.max(suggestions.length - 1, 0));
+  const valueRef = useRef(props.value);
 
   useEffect(() => {
     setSelectedIndex(0);
@@ -737,7 +770,8 @@ function Composer(props: {
     (index: number) => {
       const entry = suggestions[index];
       if (!entry) return;
-      props.onChange(`${entry.command} `);
+      valueRef.current = `${entry.command} `;
+      props.onSetValue(valueRef.current);
     },
     [props, suggestions],
   );
@@ -763,9 +797,11 @@ function Composer(props: {
         return;
       }
       if (key.return) {
-        const exact = suggestions.find((entry) => entry.command === props.value.trim());
+        const exact = suggestions.find((entry) => entry.command === valueRef.current.trim());
         if (exact) {
-          void props.onSubmit(props.value);
+          const text = valueRef.current;
+          valueRef.current = "";
+          void props.onSubmit(text);
         } else {
           acceptSuggestion(clampedIndex);
         }
@@ -781,16 +817,22 @@ function Composer(props: {
         return;
       }
       if (key.return) {
-        void props.onSubmit(props.value);
+        const text = valueRef.current;
+        valueRef.current = "";
+        void props.onSubmit(text);
         return;
       }
     }
     if (key.backspace || key.delete) {
-      props.onChange(props.value.slice(0, -1));
+      valueRef.current = valueRef.current.slice(0, -1);
+      props.onBackspace();
       return;
     }
     if (key.ctrl || key.meta || key.escape || key.tab || key.return || key.upArrow || key.downArrow) return;
-    if (input.length > 0) props.onChange(props.value + input);
+    if (input.length > 0) {
+      valueRef.current += input;
+      props.onAppend(input);
+    }
   });
 
   const maxVisible = 6;

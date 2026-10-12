@@ -1,18 +1,30 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import type { ProviderId } from "./types.ts";
+import type { AuthMode, PermissionMode, ProviderId } from "./types.ts";
+import { readHarnessConfig } from "./harnessConfig.ts";
 
-export type AuthMode = "subscription" | "api";
-
+export type { AuthMode };
 export interface ProviderAuth {
   mode: AuthMode;
   apiKey: string | null;
+  apiKeyEnvName: string | null;
 }
 
-export interface BatonConfig {
-  claude: ProviderAuth;
-  codex: ProviderAuth;
-  defaultModels: Record<ProviderId, string>;
+export interface EffectiveProviderConfig extends ProviderAuth {
+  model: string;
+  permissionMode: PermissionMode;
+  harnessAuthMode: AuthMode | null;
+}
+
+export interface EffectiveConfig {
+  claude: EffectiveProviderConfig;
+  codex: EffectiveProviderConfig;
+}
+
+export interface BatonConfigFile {
+  claude?: { mode?: AuthMode; apiKey?: string } | null;
+  codex?: { mode?: AuthMode; apiKey?: string } | null;
+  defaultModels?: Partial<Record<ProviderId, string>> | null;
 }
 
 const API_KEY_ENV: Record<ProviderId, string> = {
@@ -25,55 +37,69 @@ export const DEFAULT_MODELS: Record<ProviderId, string> = {
   codex: "gpt-6.1-sol",
 };
 
-export function defaultConfig(env: NodeJS.ProcessEnv = process.env): BatonConfig {
-  return {
-    claude: { mode: "subscription", apiKey: env.ANTHROPIC_API_KEY?.trim() || null },
-    codex: { mode: "subscription", apiKey: env.OPENAI_API_KEY?.trim() || null },
-    defaultModels: { ...DEFAULT_MODELS },
-  };
-}
-
 export function configPath(home: string): string {
   return join(home, "config.json");
 }
 
-export function loadConfig(home: string, env: NodeJS.ProcessEnv = process.env): BatonConfig {
-  const fallback = defaultConfig(env);
+export function loadConfigFile(home: string): BatonConfigFile | null {
   const path = configPath(home);
-  if (!existsSync(path)) return fallback;
+  if (!existsSync(path)) return null;
   try {
-    const parsed = JSON.parse(readFileSync(path, "utf8")) as {
-      claude?: { mode?: unknown; apiKey?: unknown };
-      codex?: { mode?: unknown; apiKey?: unknown };
-      defaultModels?: { claude?: unknown; codex?: unknown };
-    };
-    return {
-      claude: mergeProviderAuth(parsed.claude, fallback.claude),
-      codex: mergeProviderAuth(parsed.codex, fallback.codex),
-      defaultModels: {
-        claude: typeof parsed.defaultModels?.claude === "string" ? parsed.defaultModels.claude : fallback.defaultModels.claude,
-        codex: typeof parsed.defaultModels?.codex === "string" ? parsed.defaultModels.codex : fallback.defaultModels.codex,
-      },
-    };
+    const parsed = JSON.parse(readFileSync(path, "utf8")) as BatonConfigFile;
+    if (typeof parsed !== "object" || parsed === null) return null;
+    return parsed;
   } catch {
-    return fallback;
+    return null;
   }
 }
 
-function mergeProviderAuth(
-  stored: { mode?: unknown; apiKey?: unknown } | undefined,
-  fallback: ProviderAuth,
-): ProviderAuth {
-  if (!stored) return fallback;
-  const mode = stored.mode === "api" || stored.mode === "subscription" ? stored.mode : fallback.mode;
-  const apiKey =
-    typeof stored.apiKey === "string" && stored.apiKey.trim().length > 0 ? stored.apiKey.trim() : fallback.apiKey;
-  return { mode, apiKey };
+export function saveConfigFile(home: string, file: BatonConfigFile): void {
+  mkdirSync(home, { recursive: true });
+  writeFileSync(configPath(home), `${JSON.stringify(file, null, 2)}\n`, "utf8");
 }
 
-export function saveConfig(home: string, config: BatonConfig): void {
-  mkdirSync(home, { recursive: true });
-  writeFileSync(configPath(home), `${JSON.stringify(config, null, 2)}\n`, "utf8");
+export function resolveProviderConfig(
+  provider: ProviderId,
+  input: { home: string; cwd: string; env?: NodeJS.ProcessEnv; claudeDir?: string; codexHome?: string },
+): EffectiveProviderConfig {
+  const env = input.env ?? process.env;
+  const file = loadConfigFile(input.home);
+  const harness = readHarnessConfig(provider, {
+    env,
+    projectRoot: input.cwd,
+    claudeDir: input.claudeDir,
+    codexHome: input.codexHome,
+  });
+  const apiKeyEnvName = harness.apiKeyEnvName ?? API_KEY_ENV[provider];
+  const fileProvider = file?.[provider] ?? null;
+  const fileModel = file?.defaultModels?.[provider] ?? null;
+  const mode = fileProvider?.mode ?? harness.authMode ?? "subscription";
+  const apiKey =
+    fileProvider?.apiKey?.trim() ||
+    harness.apiKey?.trim() ||
+    env[apiKeyEnvName]?.trim() ||
+    null;
+  return {
+    mode,
+    apiKey,
+    apiKeyEnvName,
+    model: fileModel ?? harness.model ?? DEFAULT_MODELS[provider],
+    permissionMode: harness.permissionMode ?? "default",
+    harnessAuthMode: harness.authMode,
+  };
+}
+
+export function resolveConfig(input: {
+  home: string;
+  cwd: string;
+  env?: NodeJS.ProcessEnv;
+  claudeDir?: string;
+  codexHome?: string;
+}): EffectiveConfig {
+  return {
+    claude: resolveProviderConfig("claude", input),
+    codex: resolveProviderConfig("codex", input),
+  };
 }
 
 export function providerAuthEnv(
@@ -82,9 +108,10 @@ export function providerAuthEnv(
   env: NodeJS.ProcessEnv = process.env,
 ): Record<string, string> {
   if (auth.mode !== "api") return {};
-  const apiKey = auth.apiKey?.trim() || env[API_KEY_ENV[provider]]?.trim();
+  const envName = auth.apiKeyEnvName ?? API_KEY_ENV[provider];
+  const apiKey = auth.apiKey?.trim() || env[envName]?.trim();
   if (!apiKey) return {};
-  return { [API_KEY_ENV[provider]]: apiKey };
+  return { [envName]: apiKey };
 }
 
 export function authSignature(envAdditions: Record<string, string>): string {
@@ -93,8 +120,9 @@ export function authSignature(envAdditions: Record<string, string>): string {
   return entries.join(";");
 }
 
-export function describeAuth(auth: ProviderAuth, provider: ProviderId, env: NodeJS.ProcessEnv = process.env): string {
+export function describeAuth(auth: ProviderAuth, env: NodeJS.ProcessEnv = process.env): string {
   if (auth.mode === "subscription") return "subscription (harness login)";
-  const hasKey = Boolean(auth.apiKey?.trim() || env[API_KEY_ENV[provider]]?.trim());
-  return hasKey ? "api (key configured)" : "api (MISSING KEY)";
+  const envName = auth.apiKeyEnvName ?? "API key";
+  const hasKey = Boolean(auth.apiKey?.trim() || env[envName]?.trim());
+  return hasKey ? `api (${envName})` : `api (MISSING ${envName})`;
 }

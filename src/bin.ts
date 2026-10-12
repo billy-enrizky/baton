@@ -3,7 +3,12 @@ import { parseCli, HELP_TEXT } from "./cli.ts";
 import { BatonStore } from "./store.ts";
 import { batonHome, batonDbPath, claudeProjectsDir, codexSessionsDir } from "./paths.ts";
 import { scanClaudeSessions, scanCodexSessions } from "./scanner.ts";
-import { loadConfig, saveConfig, describeAuth } from "./config.ts";
+import {
+  describeAuth,
+  loadConfigFile,
+  resolveConfig,
+  saveConfigFile,
+} from "./config.ts";
 import { isProviderId, type ProviderId } from "./types.ts";
 import { diffCheckpointAgainstWorktree, restoreCheckpoint } from "./checkpoints.ts";
 import { cacheHitRate, formatUsageLine, sumUsage } from "./usage.ts";
@@ -22,21 +27,22 @@ async function main(): Promise<void> {
       console.log(VERSION);
       return;
     case "auth": {
-      const config = loadConfig(home);
+      const resolved = resolveConfig({ home, cwd: process.cwd() });
       if (!command.set) {
-        console.log(`claude: ${describeAuth(config.claude, "claude")}`);
-        console.log(`codex:  ${describeAuth(config.codex, "codex")}`);
+        console.log(`claude: ${describeAuth(resolved.claude)}`);
+        console.log(`codex:  ${describeAuth(resolved.codex)}`);
         return;
       }
       const { provider, mode } = command.set;
-      if (mode === "api" && !config[provider].apiKey) {
+      if (mode === "api" && !resolved[provider].apiKey) {
         throw new Error(
-          `no API key configured for ${provider}. Set ${provider === "claude" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"} in the environment or ${home}/config.json first.`,
+          `no API key configured for ${provider}. Set ${resolved[provider].apiKeyEnvName} in the environment, the harness config, or ${home}/config.json first.`,
         );
       }
-      config[provider].mode = mode;
-      saveConfig(home, config);
-      console.log(`${provider} billing: ${describeAuth(config[provider], provider)}`);
+      const file = loadConfigFile(home) ?? {};
+      file[provider] = { ...(file[provider] ?? {}), mode };
+      saveConfigFile(home, file);
+      console.log(`${provider} billing set to ${mode}`);
       return;
     }
     case "threads": {
@@ -53,9 +59,9 @@ async function main(): Promise<void> {
     }
     case "new": {
       const store = BatonStore.open(batonDbPath());
-      const config = loadConfig(home);
+      const resolved = resolveConfig({ home, cwd: command.cwd });
       const provider: ProviderId = command.provider ?? "claude";
-      const model = command.model ?? config.defaultModels[provider];
+      const model = command.model ?? resolved[provider].model;
       const thread = store.createThread({
         title: command.title,
         cwd: command.cwd,
@@ -67,7 +73,7 @@ async function main(): Promise<void> {
     }
     case "import": {
       const store = BatonStore.open(batonDbPath());
-      const config = loadConfig(home);
+      const resolved = resolveConfig({ home, cwd: command.cwd });
       const claudeSessions = scanClaudeSessions(command.claudeHome ?? claudeProjectsDir(), command.limit);
       const codexSessions = scanCodexSessions(command.codexHome ?? codexSessionsDir(), command.limit);
       let imported = 0;
@@ -86,7 +92,7 @@ async function main(): Promise<void> {
           title: session.title,
           cwd: session.cwd ?? command.cwd,
           currentProvider: session.provider,
-          currentModel: session.model ?? config.defaultModels[session.provider],
+          currentModel: session.model ?? resolved[session.provider].model,
           nativeSessionId: session.nativeSessionId,
           rolloutPath: session.provider === "codex" ? session.path : null,
           messages: session.messages,
@@ -158,13 +164,13 @@ async function main(): Promise<void> {
     }
     case "chat": {
       const store = BatonStore.open(batonDbPath());
-      const config = loadConfig(home);
+      const resolved = resolveConfig({ home, cwd: command.cwd });
       let thread = command.threadId ? store.getThread(command.threadId) : null;
       if (command.threadId && !thread) throw new Error(`no thread matches ${command.threadId}`);
       if (!thread) thread = store.latestThreadInCwd(command.cwd);
       const provider: ProviderId = command.provider ?? thread?.currentProvider ?? "claude";
       if (!isProviderId(provider)) throw new Error(`unknown provider ${provider}`);
-      const model = command.model ?? thread?.currentModel ?? config.defaultModels[provider];
+      const model = command.model ?? thread?.currentModel ?? resolved[provider].model;
       if (!thread) {
         thread = store.createThread({
           title: "New thread",

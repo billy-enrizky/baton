@@ -3,7 +3,7 @@ import type { BatonAdapter, TurnEventEmitter } from "./adapters/types.ts";
 import type { BatonStore, MessageRow, ThreadRow } from "./store.ts";
 import { buildHandoff, gitStatusSummary, wrapPromptWithHandoff } from "./handoff.ts";
 import { captureCheckpoint } from "./checkpoints.ts";
-import { loadConfig, providerAuthEnv } from "./config.ts";
+import { providerAuthEnv, resolveConfig } from "./config.ts";
 
 export interface BatonRuntimeDeps {
   store: BatonStore;
@@ -74,7 +74,7 @@ export async function runTurn(
     store.renameThread(thread.id, deriveTitle(userText));
   }
 
-  const config = loadConfig(home);
+  const config = resolveConfig({ home, cwd: thread.cwd });
   const authEnv = providerAuthEnv(config[provider], provider);
 
   return await new Promise<TurnOutcome>((resolve) => {

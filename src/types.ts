@@ -1,5 +1,7 @@
 export type ProviderId = "claude" | "codex";
 
+export type AuthMode = "subscription" | "api";
+
 export const PROVIDER_IDS: readonly ProviderId[] = ["claude", "codex"];
 
 export function isProviderId(value: string): value is ProviderId {

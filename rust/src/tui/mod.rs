@@ -90,7 +90,10 @@ enum Overlay {
     Approval { summary: String, respond: tokio::sync::oneshot::Sender<ApprovalDecision> },
     RewindPicker { selected: usize },
     CodeConfirm { turn: i64, git_ref: String },
+    SwitchPicker { selected: usize },
 }
+
+const PROVIDERS: [ProviderId; 2] = [ProviderId::Claude, ProviderId::Codex];
 
 pub struct TuiState {
     store: Arc<Mutex<BatonStore>>,
@@ -352,6 +355,25 @@ fn handle_key(
                 }
             }
         }
+        Overlay::SwitchPicker { mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = (selected + PROVIDERS.len() - 1) % PROVIDERS.len();
+                state.overlay = Overlay::SwitchPicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % PROVIDERS.len();
+                state.overlay = Overlay::SwitchPicker { selected };
+            }
+            KeyCode::Enter => {
+                if let Some(provider) = PROVIDERS.get(selected).copied() {
+                    perform_switch(state, store, provider, None);
+                }
+            }
+            _ => {
+                state.overlay = Overlay::SwitchPicker { selected };
+            }
+        },
         Overlay::CodeConfirm { turn, git_ref } => match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let cwd = std::path::PathBuf::from(&state.thread.cwd);
@@ -551,43 +573,8 @@ fn handle_command(
                 _ => None,
             };
             match provider {
-                None => state.notice = Some("usage: /switch <claude|codex> [model]".into()),
-                Some(provider) => {
-                    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
-                    let default_model = match provider {
-                        ProviderId::Claude => resolved.claude.model.clone(),
-                        ProviderId::Codex => resolved.codex.model.clone(),
-                    };
-                    let model = args.get(1).cloned().unwrap_or(default_model);
-                    let display_model = model.clone();
-                    let result = {
-                        let guard = store.lock().unwrap();
-                        ensure_persisted(&guard, &mut state.thread)
-                            .and_then(|()| guard.set_thread_provider(&state.thread.id, provider, if args.len() > 1 { Some(model) } else { None }))
-                    };
-                    match result {
-                        Ok(()) => {
-                            state.permission_mode = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd))
-                                .for_provider(provider)
-                                .permission_mode;
-                            let existing = store
-                                .lock()
-                                .unwrap()
-                                .get_provider_session(&state.thread.id, provider)
-                                .unwrap_or(None);
-                            state.notice = Some(match existing {
-                                Some(session) => format!(
-                                    "switched to {provider}/{display_model}, resuming native session {}",
-                                    &session.native_session_id[..8.min(session.native_session_id.len())]
-                                ),
-                                None => format!(
-                                    "switched to {provider}/{display_model}. First turn carries a context handoff."
-                                ),
-                            });
-                        }
-                        Err(error) => state.notice = Some(format!("switch failed: {error}")),
-                    }
-                }
+                None => state.overlay = Overlay::SwitchPicker { selected: 0 },
+                Some(provider) => perform_switch(state, store, provider, args.get(1).cloned()),
             }
         }
         "/model" => {
@@ -854,6 +841,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             .min(8)
             + 4,
         Overlay::CodeConfirm { .. } => 4,
+        Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
     };
     let live_tool_rows = state.tool_lines.len().min(5);
     let streaming_cap = ((area.height as usize).saturating_sub(composer_rows + 6) * 3 / 5).max(3);
@@ -887,6 +875,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         Overlay::Approval { summary, .. } => draw_approval(frame, chunks[2], summary),
         Overlay::RewindPicker { selected } => draw_rewind_picker(frame, chunks[2], state, *selected),
         Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[2], *turn),
+        Overlay::SwitchPicker { selected } => draw_switch_picker(frame, chunks[2], state, *selected),
         Overlay::None => {}
     }
     if let Some(notice) = &state.notice {
@@ -895,6 +884,72 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     }
     draw_composer(frame, state, chunks[4], &suggestions);
     draw_status(frame, state, chunks[5], spinner_frame);
+}
+
+fn perform_switch(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    provider: ProviderId,
+    model: Option<String>,
+) {
+    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let default_model = match provider {
+        ProviderId::Claude => resolved.claude.model.clone(),
+        ProviderId::Codex => resolved.codex.model.clone(),
+    };
+    let display_model = model.clone().unwrap_or(default_model);
+    let result = {
+        let guard = store.lock().unwrap();
+        ensure_persisted(&guard, &mut state.thread)
+            .and_then(|()| guard.set_thread_provider(&state.thread.id, provider, model))
+    };
+    match result {
+        Ok(()) => {
+            state.permission_mode = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd))
+                .for_provider(provider)
+                .permission_mode;
+            let existing = store
+                .lock()
+                .unwrap()
+                .get_provider_session(&state.thread.id, provider)
+                .unwrap_or(None);
+            state.notice = Some(match existing {
+                Some(session) => format!(
+                    "switched to {provider}/{display_model}, resuming native session {}",
+                    &session.native_session_id[..8.min(session.native_session_id.len())]
+                ),
+                None => format!("switched to {provider}/{display_model}. First turn carries a context handoff."),
+            });
+        }
+        Err(error) => state.notice = Some(format!("switch failed: {error}")),
+    }
+}
+
+fn draw_switch_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
+    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "switch harness · enter select · esc cancel",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, provider) in PROVIDERS.iter().enumerate() {
+        let provider_config = resolved.for_provider(*provider);
+        let style = if index == selected {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let marker = if *provider == state.thread.current_provider { "●" } else { " " };
+        lines.push(Line::styled(
+            format!(
+                "❯ {marker} {provider} · {} · {}",
+                provider_config.model,
+                describe_auth(provider_config)
+            ),
+            style,
+        ));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {

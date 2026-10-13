@@ -14,6 +14,7 @@ use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
 use crate::config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
+use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
 use crate::types::{ApprovalDecision, PermissionMode, ProviderId};
 use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
@@ -68,6 +69,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/checkpoints", "list checkpoints for this thread"),
     ("/diff", "diff a checkpoint against the working tree"),
     ("/rewind", "rewind to a previous message"),
+    ("/settings", "configure the current harness's settings"),
+    ("/mcp", "manage MCP servers and sync across harnesses"),
+    ("/skills", "list skills across harnesses"),
     ("/clear", "clear panels and notices"),
     ("/quit", "exit baton"),
 ];
@@ -92,6 +96,9 @@ enum Overlay {
     CodeConfirm { turn: i64, git_ref: String },
     SwitchPicker { selected: usize },
     ModelPicker { provider: ProviderId, models: Vec<String>, selected: usize },
+    SettingsPicker { provider: ProviderId, categories: Vec<(String, Vec<String>)>, category_index: usize, value_index: usize },
+    McpPicker { selected: usize },
+    SkillsPicker { selected: usize, skills: Vec<(String, String)> },
 }
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -392,7 +399,11 @@ fn handle_key(
             }
         },
         Overlay::ModelPicker { provider, models, mut selected } => match key.code {
-            KeyCode::Esc => {}
+            KeyCode::Esc | KeyCode::Left => {
+                if key.code == KeyCode::Left {
+                    state.overlay = Overlay::SwitchPicker { selected: 0 };
+                }
+            }
             KeyCode::Up => {
                 if !models.is_empty() {
                     selected = (selected + models.len() - 1) % models.len();
@@ -412,6 +423,110 @@ fn handle_key(
             }
             _ => {
                 state.overlay = Overlay::ModelPicker { provider, models, selected };
+            }
+        },
+        Overlay::SettingsPicker { provider, categories, mut category_index, mut value_index } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Left => {
+                state.overlay = Overlay::SwitchPicker { selected: 0 };
+            }
+            KeyCode::Up => {
+                if !categories.is_empty() {
+                    category_index = (category_index + categories.len() - 1) % categories.len();
+                    value_index = 0;
+                }
+                state.overlay = Overlay::SettingsPicker { provider, categories, category_index, value_index };
+            }
+            KeyCode::Down => {
+                if !categories.is_empty() {
+                    category_index = (category_index + 1) % categories.len();
+                    value_index = 0;
+                }
+                state.overlay = Overlay::SettingsPicker { provider, categories, category_index, value_index };
+            }
+            KeyCode::Right | KeyCode::Tab => {
+                if let Some((_, values)) = categories.get(category_index) {
+                    if !values.is_empty() {
+                        value_index = (value_index + 1) % values.len();
+                    }
+                }
+                state.overlay = Overlay::SettingsPicker { provider, categories, category_index, value_index };
+            }
+            KeyCode::Enter => {
+                if let Some((label, values)) = categories.get(category_index) {
+                    if let Some(value) = values.get(value_index) {
+                        state.notice = Some(format!("{provider} {label}: {value}"));
+                    }
+                }
+            }
+            _ => {
+                state.overlay = Overlay::SettingsPicker { provider, categories, category_index, value_index };
+            }
+        },
+        Overlay::McpPicker { mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = (selected + 4 - 1) % 4;
+                state.overlay = Overlay::McpPicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % 4;
+                state.overlay = Overlay::McpPicker { selected };
+            }
+            KeyCode::Enter => {
+                match selected {
+                    0 => {
+                        let registry = sync::load_mcp_registry(&state.home);
+                        let lines: Vec<String> = if registry.servers.is_empty() {
+                            vec!["no MCP servers configured in baton".to_string()]
+                        } else {
+                            registry.servers.iter().map(|(name, server)| {
+                                format!("  {name}: {} {}", server.command, server.args.join(" "))
+                            }).collect()
+                        };
+                        state.notice = Some(format!("MCP servers:\n{}", lines.join("\n")));
+                    }
+                    1 => {
+                        state.notice = Some("usage: /mcp add <name> <command> [args...] (typed command)".into());
+                    }
+                    2 => {
+                        state.notice = Some("usage: /mcp remove <name> (typed command)".into());
+                    }
+                    3 => {
+                        let registry = sync::load_mcp_registry(&state.home);
+                        match sync::sync_mcp_to_all(&registry) {
+                            Ok(results) => {
+                                let lines: Vec<String> = results.iter().map(|(harness, names)| {
+                                    format!("  {harness}: {} synced", names.len())
+                                }).collect();
+                                state.notice = Some(format!("MCP sync complete\n{}", lines.join("\n")));
+                            }
+                            Err(error) => state.notice = Some(format!("sync failed: {error}")),
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                state.overlay = Overlay::McpPicker { selected };
+            }
+        },
+        Overlay::SkillsPicker { selected, skills } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                if !skills.is_empty() {
+                    let new_selected = (selected + skills.len() - 1) % skills.len();
+                    state.overlay = Overlay::SkillsPicker { selected: new_selected, skills };
+                }
+            }
+            KeyCode::Down => {
+                if !skills.is_empty() {
+                    let new_selected = (selected + 1) % skills.len();
+                    state.overlay = Overlay::SkillsPicker { selected: new_selected, skills };
+                }
+            }
+            _ => {
+                state.overlay = Overlay::SkillsPicker { selected, skills };
             }
         },
         Overlay::CodeConfirm { turn, git_ref } => match key.code {
@@ -604,6 +719,36 @@ fn handle_command(
         "/clear" => {
             state.diff_output = None;
             state.notice = None;
+        }
+        "/settings" => {
+            let categories: Vec<(String, Vec<String>)> = sync::settings_for_provider(state.thread.current_provider)
+                .into_iter()
+                .map(|(label, values)| (label.to_string(), values.into_iter().map(str::to_string).collect()))
+                .collect();
+            state.overlay = Overlay::SettingsPicker {
+                provider: state.thread.current_provider,
+                categories,
+                category_index: 0,
+                value_index: 0,
+            };
+        }
+        "/mcp" => {
+            if let Some(action) = args.first().map(String::as_str) {
+                handle_mcp_command(state, action, &args[1..]);
+            } else {
+                state.overlay = Overlay::McpPicker { selected: 0 };
+            }
+        }
+        "/skills" => {
+            let skills: Vec<(String, String)> = sync::scan_skills()
+                .into_iter()
+                .map(|skill| (skill.name, skill.source))
+                .collect();
+            if skills.is_empty() {
+                state.notice = Some("no skills found in ~/.claude/skills or ~/.codex/skills".into());
+            } else {
+                state.overlay = Overlay::SkillsPicker { selected: 0, skills };
+            }
         }
         "/switch" => {
             let target = args.first().map(String::as_str);
@@ -877,6 +1022,11 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         Overlay::CodeConfirm { .. } => 4,
         Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
         Overlay::ModelPicker { models, .. } => models.len().min(8) + 4,
+        Overlay::SettingsPicker { categories, category_index, .. } => {
+            categories.get(*category_index).map(|(_, values): &(String, Vec<String>)| values.len()).unwrap_or(0).min(6) + categories.len().min(4) + 4
+        },
+        Overlay::McpPicker { .. } => 8,
+        Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
     };
     let live_tool_rows = state.tool_lines.len().min(5);
     let streaming_cap = ((area.height as usize).saturating_sub(composer_rows + 6) * 3 / 5).max(3);
@@ -914,6 +1064,13 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         Overlay::ModelPicker { provider, models, selected } => {
             draw_model_picker(frame, chunks[2], state, *provider, models, *selected)
         }
+        Overlay::SettingsPicker { provider, categories, category_index, value_index } => {
+            draw_settings_picker(frame, chunks[2], *provider, categories, *category_index, *value_index)
+        }
+        Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[2], *selected),
+        Overlay::SkillsPicker { selected, skills } => {
+            draw_skills_picker(frame, chunks[2], skills, *selected)
+        }
         Overlay::None => {}
     }
     if let Some(notice) = &state.notice {
@@ -922,6 +1079,71 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     }
     draw_composer(frame, state, chunks[4], &suggestions);
     draw_status(frame, state, chunks[5], spinner_frame);
+}
+
+fn handle_mcp_command(state: &mut TuiState, action: &str, args: &[String]) {
+    let mut registry = sync::load_mcp_registry(&state.home);
+    match action {
+        "list" => {
+            if registry.servers.is_empty() {
+                state.notice = Some("no MCP servers configured. Use /mcp add <name> <command> [args...]".into());
+            } else {
+                let lines: Vec<String> = registry
+                    .servers
+                    .iter()
+                    .map(|(name, server)| format!("  {name}: {} {}", server.command, server.args.join(" ")))
+                    .collect();
+                state.notice = Some(format!("MCP servers:\n{}", lines.join("\n")));
+            }
+        }
+        "add" => {
+            if args.len() < 2 {
+                state.notice = Some("usage: /mcp add <name> <command> [args...]".into());
+                return;
+            }
+            let name = args[0].clone();
+            let command = args[1].clone();
+            let server_args: Vec<String> = args[2..].to_vec();
+            registry.servers.insert(
+                name.clone(),
+                sync::McpServerConfig {
+                    command,
+                    args: server_args,
+                    env: Default::default(),
+                },
+            );
+            match sync::save_mcp_registry(&state.home, &registry) {
+                Ok(()) => state.notice = Some(format!("added MCP server {name}. Run /mcp sync to push to all harnesses")),
+                Err(error) => state.notice = Some(format!("cannot save: {error}")),
+            }
+        }
+        "remove" => {
+            match args.first() {
+                Some(name) => {
+                    if registry.servers.remove(name).is_some() {
+                        match sync::save_mcp_registry(&state.home, &registry) {
+                            Ok(()) => state.notice = Some(format!("removed MCP server {name}")),
+                            Err(error) => state.notice = Some(format!("cannot save: {error}")),
+                        }
+                    } else {
+                        state.notice = Some(format!("no MCP server named {name}"));
+                    }
+                }
+                None => state.notice = Some("usage: /mcp remove <name>".into()),
+            }
+        }
+        "sync" => match sync::sync_mcp_to_all(&registry) {
+            Ok(results) => {
+                let lines: Vec<String> = results
+                    .iter()
+                    .map(|(harness, names)| format!("  {harness}: {} servers synced", names.len()))
+                    .collect();
+                state.notice = Some(format!("MCP sync complete\n{}", lines.join("\n")));
+            }
+            Err(error) => state.notice = Some(format!("sync failed: {error}")),
+        }
+        other => state.notice = Some(format!("unknown /mcp action {other}. Use list, add, remove, or sync")),
+    }
 }
 
 fn perform_switch(
@@ -1009,6 +1231,72 @@ fn draw_model_picker(
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ {marker} {model}"), style));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_settings_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    provider: ProviderId,
+    categories: &[(String, Vec<String>)],
+    category_index: usize,
+    value_index: usize,
+) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!("{provider} settings · ←back · ↑↓ category · →/tab value · enter apply"),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (label, values)) in categories.iter().enumerate() {
+        let style = if index == category_index {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let current_value = values.get(value_index).map(|value| value.as_str()).unwrap_or("?");
+        lines.push(Line::styled(
+            format!("❯ {label}: {current_value}"),
+            style,
+        ));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_mcp_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
+    let actions = ["list servers", "add server (typed)", "remove server (typed)", "sync to all harnesses"];
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "MCP servers · enter select · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, action) in actions.iter().enumerate() {
+        let style = if index == selected {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(format!("❯ {action}"), style));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_skills_picker(frame: &mut ratatui::Frame, area: Rect, skills: &[(String, String)], selected: usize) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!("skills ({}) · esc close", skills.len()),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (name, source)) in skills.iter().take(8).enumerate() {
+        let style = if index == selected {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(format!("❯ {name} ({source})"), style));
+    }
+    if skills.len() > 8 {
+        lines.push(Line::styled(format!("... and {} more", skills.len() - 8), Style::default().fg(COLORS.muted)));
     }
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);

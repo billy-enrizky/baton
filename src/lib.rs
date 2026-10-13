@@ -9,6 +9,7 @@ pub mod paths;
 pub mod runtime;
 pub mod scanner;
 pub mod store;
+pub mod sync;
 pub mod tui;
 pub mod types;
 pub mod usage;

@@ -389,6 +389,15 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Default { provider } => {
+            let parsed = ProviderId::parse(&provider)
+                .ok_or_else(|| anyhow::anyhow!("unknown provider {provider}, expected claude, codex, cursor, grok, opencode, or antigravity"))?;
+            let mut file = load_config_file(&home).unwrap_or_default();
+            file.default_provider = Some(parsed.as_str().to_string());
+            save_config_file(&home, &file)?;
+            println!("default provider set to {provider}");
+            Ok(())
+        }
         cli::Commands::Login { provider } => {
             let provider = ProviderId::parse(&provider)
                 .ok_or_else(|| anyhow::anyhow!("unknown provider {provider}, expected claude, codex, cursor, grok, opencode, or antigravity"))?;
@@ -566,6 +575,9 @@ fn build_all_adapters(
 }
 
 fn default_provider_from_configs(home: &PathBuf, cwd: &PathBuf) -> ProviderId {
+    if let Some(provider) = config::get_default_provider(home) {
+        return provider;
+    }
     let resolved = resolve_config(home, cwd);
     for provider in ProviderId::all() {
         let config = resolved.for_provider(*provider);

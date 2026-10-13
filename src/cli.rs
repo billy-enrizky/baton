@@ -88,4 +88,8 @@ pub enum Commands {
     Login {
         provider: String,
     },
+    /// Set the default provider (used by exec and new threads)
+    Default {
+        provider: String,
+    },
 }

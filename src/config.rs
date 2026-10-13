@@ -20,6 +20,8 @@ pub struct BatonConfigFile {
     pub providers: BTreeMap<String, ProviderAuthFile>,
     #[serde(default, rename = "defaultModels")]
     pub default_models: Option<BTreeMap<String, String>>,
+    #[serde(default, rename = "defaultProvider")]
+    pub default_provider: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -113,6 +115,13 @@ pub fn resolve_provider_config(
         model: file_model.or(harness.model).unwrap_or(fallback_model),
         permission_mode: harness.permission_mode.unwrap_or(PermissionMode::Default),
     }
+}
+
+pub fn get_default_provider(home: &Path) -> Option<ProviderId> {
+    let file = load_config_file(home)?;
+    file.default_provider
+        .as_deref()
+        .and_then(ProviderId::parse)
 }
 
 pub fn resolve_config(home: &Path, cwd: &Path) -> EffectiveConfig {

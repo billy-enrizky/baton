@@ -156,13 +156,14 @@ fn resolve_config_precedence() {
     std::fs::create_dir_all(&codex_home).unwrap();
     std::fs::write(codex_home.join("config.toml"), "model = \"gpt-5.6-luna\"").unwrap();
 
+    let mut providers = std::collections::BTreeMap::new();
+    providers.insert(
+        "claude".to_string(),
+        baton::config::ProviderAuthFile { mode: Some(AuthMode::Api), api_key: Some("sk-ant-file".into()) },
+    );
     save_config_file(
         home.path(),
-        &baton::config::BatonConfigFile {
-            claude: Some(baton::config::ProviderAuthFile { mode: Some(AuthMode::Api), api_key: Some("sk-ant-file".into()) }),
-            codex: None,
-            default_models: None,
-        },
+        &baton::config::BatonConfigFile { providers, default_models: None },
     )
     .unwrap();
     assert!(load_config_file(home.path()).is_some());
@@ -173,11 +174,17 @@ fn resolve_config_precedence() {
         Some(&claude_dir),
         Some(&codex_home),
     );
-    assert_eq!(resolved.claude.model, "claude-opus-5-5");
-    assert_eq!(resolved.claude.permission_mode, baton::types::PermissionMode::AcceptEdits);
-    assert_eq!(resolved.claude.mode, AuthMode::Api);
-    assert_eq!(resolved.claude.api_key.as_deref(), Some("sk-ant-file"));
-    assert_eq!(resolved.codex.model, "gpt-5.6-luna");
+    assert_eq!(resolved.for_provider(baton::types::ProviderId::Claude).model, "claude-opus-5-5");
+    assert_eq!(
+        resolved.for_provider(baton::types::ProviderId::Claude).permission_mode,
+        baton::types::PermissionMode::AcceptEdits
+    );
+    assert_eq!(resolved.for_provider(baton::types::ProviderId::Claude).mode, AuthMode::Api);
+    assert_eq!(
+        resolved.for_provider(baton::types::ProviderId::Claude).api_key.as_deref(),
+        Some("sk-ant-file")
+    );
+    assert_eq!(resolved.for_provider(baton::types::ProviderId::Codex).model, "gpt-5.6-luna");
 }
 
 #[test]

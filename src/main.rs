@@ -5,7 +5,7 @@ use clap::Parser;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use adapters::{child_halves, ClaudeAdapter, CodexAdapter};
+use adapters::{child_halves, AcpAdapter, ClaudeAdapter, CodexAdapter, OpenCodeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use runtime::{run_engine, SharedAdapter};
 use store::{BatonStore, ImportedMessage, NewThread};
@@ -43,10 +43,7 @@ fn main_result() -> Result<()> {
                 let model = thread
                     .current_model
                     .clone()
-                    .unwrap_or_else(|| match thread.current_provider {
-                        ProviderId::Claude => resolved.claude.model.clone(),
-                        ProviderId::Codex => resolved.codex.model.clone(),
-                    });
+                    .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
                 println!(
                     "{}  {}/{}  {}",
                     &thread.id[..8],
@@ -65,10 +62,10 @@ fn main_result() -> Result<()> {
                 .as_deref()
                 .and_then(ProviderId::parse)
                 .unwrap_or(ProviderId::Claude);
-            let model = cli.model.clone().or(match provider {
-                ProviderId::Claude => Some(resolved.claude.model.clone()),
-                ProviderId::Codex => Some(resolved.codex.model.clone()),
-            });
+            let model = cli
+                .model
+                .clone()
+                .or_else(|| Some(resolved.for_provider(provider).model.clone()));
             let thread_title = if title.is_empty() {
                 "New thread".to_string()
             } else {
@@ -124,10 +121,7 @@ fn main_result() -> Result<()> {
                     );
                     continue;
                 }
-                let model = session.model.clone().or(match session.provider {
-                    ProviderId::Claude => Some(resolved.claude.model.clone()),
-                    ProviderId::Codex => Some(resolved.codex.model.clone()),
-                });
+                let model = session.model.clone().or(Some(resolved.for_provider(session.provider).model.clone()));
                 let messages: Vec<ImportedMessage> = session
                     .messages
                     .iter()
@@ -241,10 +235,7 @@ fn main_result() -> Result<()> {
                 let model = thread
                     .current_model
                     .clone()
-                    .unwrap_or_else(|| match thread.current_provider {
-                        ProviderId::Claude => resolved.claude.model.clone(),
-                        ProviderId::Codex => resolved.codex.model.clone(),
-                    });
+                    .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
                 println!(
                     "{}  {}/{}  {}  {}  hit {}",
                     &thread.id[..8],
@@ -257,22 +248,49 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Login { provider } => {
+            let provider = ProviderId::parse(&provider)
+                .ok_or_else(|| anyhow::anyhow!("unknown provider {provider}, expected claude, codex, cursor, grok, opencode, or antigravity"))?;
+            let command: Vec<&str> = match provider {
+                ProviderId::Codex => vec!["codex", "login"],
+                ProviderId::Claude => vec!["claude", "auth", "login"],
+                ProviderId::Cursor => vec!["agent", "login"],
+                ProviderId::Grok => vec!["grok", "login"],
+                ProviderId::OpenCode => vec!["opencode", "auth", "login"],
+                ProviderId::Antigravity => {
+                    println!("Antigravity has no CLI login.");
+                    println!("1. Install Antigravity and enable it in its settings.");
+                    println!("2. Sign in with Google when prompted.");
+                    println!("For API-rate billing set GEMINI_API_KEY and run: baton auth antigravity api");
+                    return Ok(());
+                }
+            };
+            println!("running: {}", command.join(" "));
+            let status = std::process::Command::new(command[0])
+                .args(&command[1..])
+                .status()?;
+            if !status.success() {
+                anyhow::bail!("{} failed with {status}", command.join(" "));
+            }
+            if provider == ProviderId::Cursor {
+                println!("cursor login complete (if the agent command was not found, install Cursor CLI and try `cursor-agent login`)");
+            }
+            Ok(())
+        }
         cli::Commands::Auth { provider, mode } => {
             let resolved = resolve_config(&home, &cwd);
             match (provider, mode) {
                 (None, _) => {
-                    println!("claude: {}", describe_auth(&resolved.claude));
-                    println!("codex:  {}", describe_auth(&resolved.codex));
+                    for provider in ProviderId::all() {
+                        println!("{:<12} {}", provider, describe_auth(resolved.for_provider(*provider)));
+                    }
                 }
                 (Some(provider), Some(mode)) => {
                     let provider = ProviderId::parse(&provider)
                         .ok_or_else(|| anyhow::anyhow!("unknown provider {provider}, expected claude or codex"))?;
                     let mode = config::AuthMode::parse(&mode)
                         .ok_or_else(|| anyhow::anyhow!("unknown auth mode {mode}, expected subscription or api"))?;
-                    let provider_config = match provider {
-                        ProviderId::Claude => &resolved.claude,
-                        ProviderId::Codex => &resolved.codex,
-                    };
+                    let provider_config = resolved.for_provider(provider);
                     if mode == config::AuthMode::Api && provider_config.api_key.is_none() {
                         anyhow::bail!(
                             "no API key configured for {provider}. Set {} in the environment, the harness config, or {}/config.json first.",
@@ -281,21 +299,17 @@ fn main_result() -> Result<()> {
                         );
                     }
                     let mut file = load_config_file(&home).unwrap_or_default();
-                    let entry = match provider {
-                        ProviderId::Claude => file.claude.get_or_insert_with(Default::default),
-                        ProviderId::Codex => file.codex.get_or_insert_with(Default::default),
-                    };
-                    entry.mode = Some(mode);
+                    file.providers
+                        .entry(provider.as_str().to_string())
+                        .or_default()
+                        .mode = Some(mode);
                     save_config_file(&home, &file)?;
                     println!("{provider} billing set to {}", mode.as_str());
                 }
                 (Some(provider), None) => {
-                    let resolved_provider = match ProviderId::parse(&provider) {
-                        Some(ProviderId::Claude) => &resolved.claude,
-                        Some(ProviderId::Codex) => &resolved.codex,
-                        None => anyhow::bail!("unknown provider {provider}"),
-                    };
-                    println!("{provider}: {}", describe_auth(resolved_provider));
+                    let parsed = ProviderId::parse(&provider)
+                        .ok_or_else(|| anyhow::anyhow!("unknown provider {provider}, expected claude, codex, cursor, grok, opencode, or antigravity"))?;
+                    println!("{provider}: {}", describe_auth(resolved.for_provider(parsed)));
                 }
             }
             Ok(())
@@ -330,10 +344,10 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf) -> Result<()> {
                 .as_deref()
                 .and_then(ProviderId::parse)
                 .unwrap_or(ProviderId::Claude);
-            let model = cli.model.clone().or(match provider {
-                ProviderId::Claude => Some(resolved.claude.model.clone()),
-                ProviderId::Codex => Some(resolved.codex.model.clone()),
-            });
+            let model = cli
+                .model
+                .clone()
+                .or_else(|| Some(resolved.for_provider(provider).model.clone()));
             guard_draft_thread(&store, provider, model, cwd)?
         }
     };
@@ -343,12 +357,12 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf) -> Result<()> {
         .build()?;
 
     let (adapters, interrupt_handles) = tokio_runtime.block_on(async {
-        let codex_spawner = {
-            let cwd = cwd.clone();
+        let cwd_for_codex = cwd.clone();
+        let codex_spawner = Arc::new(
             move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
                 let mut command = tokio::process::Command::new("codex");
                 command.args(["app-server"]);
-                command.current_dir(&cwd);
+                command.current_dir(&cwd_for_codex);
                 command.stdin(std::process::Stdio::piped());
                 command.stdout(std::process::Stdio::piped());
                 command.stderr(std::process::Stdio::null());
@@ -356,16 +370,102 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf) -> Result<()> {
                     command.env(key, value);
                 }
                 child_halves(command.spawn()?)
-            }
-        };
-        let codex: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(
-            CodexAdapter::new(Arc::new(codex_spawner)),
-        )));
+            },
+        );
+        let cwd_for_grok = cwd.clone();
+        let grok_spawner = Arc::new(
+            move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
+                let mut command = tokio::process::Command::new("grok");
+                command.args(["agent", "stdio"]);
+                command.current_dir(&cwd_for_grok);
+                command.env("GROK_OAUTH2_REFERRER", "baton");
+                command.stdin(std::process::Stdio::piped());
+                command.stdout(std::process::Stdio::piped());
+                command.stderr(std::process::Stdio::null());
+                for (key, value) in auth_env {
+                    command.env(key, value);
+                }
+                child_halves(command.spawn()?)
+            },
+        );
+        let cwd_for_antigravity = cwd.clone();
+        let antigravity_home = home.join("antigravity");
+        let antigravity_spawner = Arc::new(
+            move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
+                std::fs::create_dir_all(&antigravity_home)?;
+                let mut command = tokio::process::Command::new("antigravity");
+                command.current_dir(&cwd_for_antigravity);
+                command.env("AGY_ACP_FORCE_FILE_STORAGE", "1");
+                command.env("GEMINI_HOME", &antigravity_home);
+                if !auth_env.iter().any(|(key, _)| key == "GEMINI_API_KEY" || key == "GOOGLE_API_KEY") {
+                    command.env_remove("GEMINI_API_KEY");
+                    command.env_remove("GOOGLE_API_KEY");
+                }
+                command.stdin(std::process::Stdio::piped());
+                command.stdout(std::process::Stdio::piped());
+                command.stderr(std::process::Stdio::null());
+                for (key, value) in auth_env {
+                    command.env(key, value);
+                }
+                child_halves(command.spawn()?)
+            },
+        );
+        let cwd_for_cursor = cwd.clone();
+        let cursor_spawner = Arc::new(
+            move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
+                let mut command = tokio::process::Command::new("cursor-agent");
+                command.current_dir(&cwd_for_cursor);
+                command.stdin(std::process::Stdio::piped());
+                command.stdout(std::process::Stdio::piped());
+                command.stderr(std::process::Stdio::null());
+                for (key, value) in auth_env {
+                    command.env(key, value);
+                }
+                child_halves(command.spawn()?)
+            },
+        );
+        let opencode_spawner = Arc::new(
+            move |_auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::opencode::OpenCodeChild> {
+                let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+                let port = listener.local_addr()?.port();
+                drop(listener);
+                let password = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
+                let mut command = tokio::process::Command::new("opencode");
+                command.args(["serve", "--hostname=127.0.0.1", "--port", &port.to_string()]);
+                command.env("OPENCODE_PASSWORD", &password);
+                command.env("OPENCODE_SERVER_PASSWORD", &password);
+                command.env("OPENCODE_CONFIG_CONTENT", "{}");
+                command.stdin(std::process::Stdio::null());
+                command.stdout(std::process::Stdio::piped());
+                command.stderr(std::process::Stdio::null());
+                let child = command.spawn()?;
+                Ok(baton::adapters::opencode::OpenCodeChild { port, password, child })
+            },
+        );
+
         let claude: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new())));
+        let codex: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(codex_spawner))));
+        let grok: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(
+            ProviderId::Grok,
+            grok_spawner,
+        ))));
+        let antigravity: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(
+            ProviderId::Antigravity,
+            antigravity_spawner,
+        ))));
+        let cursor: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(
+            ProviderId::Cursor,
+            cursor_spawner,
+        ))));
+        let opencode: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(OpenCodeAdapter::new(
+            opencode_spawner,
+        ))));
+        let adapters = vec![claude, codex, cursor, grok, opencode, antigravity];
         let mut handles = Vec::new();
-        handles.push(claude.lock().await.interrupt_handle());
-        handles.push(codex.lock().await.interrupt_handle());
-        (vec![claude, codex], handles)
+        for adapter in &adapters {
+            handles.push(adapter.lock().await.interrupt_handle());
+        }
+        (adapters, handles)
     });
 
     let (engine_command_sender, engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();

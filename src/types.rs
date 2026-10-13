@@ -1,9 +1,13 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub enum ProviderId {
     Claude,
     Codex,
+    Cursor,
+    Grok,
+    OpenCode,
+    Antigravity,
 }
 
 impl ProviderId {
@@ -11,6 +15,10 @@ impl ProviderId {
         match self {
             ProviderId::Claude => "claude",
             ProviderId::Codex => "codex",
+            ProviderId::Cursor => "cursor",
+            ProviderId::Grok => "grok",
+            ProviderId::OpenCode => "opencode",
+            ProviderId::Antigravity => "antigravity",
         }
     }
 
@@ -18,8 +26,23 @@ impl ProviderId {
         match value {
             "claude" => Some(ProviderId::Claude),
             "codex" => Some(ProviderId::Codex),
+            "cursor" => Some(ProviderId::Cursor),
+            "grok" => Some(ProviderId::Grok),
+            "opencode" => Some(ProviderId::OpenCode),
+            "antigravity" => Some(ProviderId::Antigravity),
             _ => None,
         }
+    }
+
+    pub fn all() -> &'static [ProviderId] {
+        &[
+            ProviderId::Claude,
+            ProviderId::Codex,
+            ProviderId::Cursor,
+            ProviderId::Grok,
+            ProviderId::OpenCode,
+            ProviderId::Antigravity,
+        ]
     }
 }
 

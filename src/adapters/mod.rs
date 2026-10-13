@@ -167,8 +167,12 @@ pub trait BatonAdapter: Send {
     async fn dispose(&mut self) -> Result<()>;
 }
 
+pub mod acp;
 pub mod claude;
 pub mod codex;
+pub mod opencode;
 
+pub use acp::AcpAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
+pub use opencode::OpenCodeAdapter;

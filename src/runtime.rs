@@ -107,10 +107,7 @@ async fn execute_turn(
     };
 
     let config = resolve_config(home, std::path::Path::new(&cwd));
-    let provider_config = match provider {
-        ProviderId::Claude => &config.claude,
-        ProviderId::Codex => &config.codex,
-    };
+    let provider_config = config.for_provider(provider);
     let model = thread_model.clone().unwrap_or_else(|| provider_config.model.clone());
     let auth_env = provider_auth_env(provider_config);
 

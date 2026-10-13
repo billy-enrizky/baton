@@ -24,6 +24,8 @@ dirs = "6"
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 futures = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

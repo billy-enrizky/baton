@@ -16,8 +16,8 @@ pub struct ProviderAuthFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BatonConfigFile {
-    pub claude: Option<ProviderAuthFile>,
-    pub codex: Option<ProviderAuthFile>,
+    #[serde(default, flatten)]
+    pub providers: BTreeMap<String, ProviderAuthFile>,
     #[serde(default, rename = "defaultModels")]
     pub default_models: Option<BTreeMap<String, String>>,
 }
@@ -33,8 +33,7 @@ pub struct EffectiveProviderConfig {
 
 #[derive(Debug, Clone)]
 pub struct EffectiveConfig {
-    pub claude: EffectiveProviderConfig,
-    pub codex: EffectiveProviderConfig,
+    pub providers: BTreeMap<ProviderId, EffectiveProviderConfig>,
 }
 
 pub fn default_models() -> BTreeMap<String, String> {
@@ -44,12 +43,7 @@ pub fn default_models() -> BTreeMap<String, String> {
     ])
 }
 
-fn api_key_env(provider: ProviderId) -> &'static str {
-    match provider {
-        ProviderId::Claude => "ANTHROPIC_API_KEY",
-        ProviderId::Codex => "OPENAI_API_KEY",
-    }
-}
+
 
 pub fn config_path(home: &Path) -> PathBuf {
     home.join("config.json")
@@ -82,21 +76,26 @@ pub fn resolve_provider_config(
     let env_key_name = harness
         .api_key_env_name
         .clone()
-        .unwrap_or_else(|| api_key_env(provider).to_string());
-    let file_provider = match provider {
-        ProviderId::Claude => file.as_ref().and_then(|file| file.claude.clone()),
-        ProviderId::Codex => file.as_ref().and_then(|file| file.codex.clone()),
-    };
+        .unwrap_or_else(|| crate::models::api_key_env(provider).to_string());
+    let file_provider = file
+        .as_ref()
+        .and_then(|file| file.providers.get(provider.as_str()))
+        .cloned();
     let file_model = file
         .as_ref()
         .and_then(|file| file.default_models.as_ref())
         .and_then(|models| models.get(provider.as_str()))
         .cloned();
 
+    let ambient_key = std::env::var(&env_key_name)
+        .ok()
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
     let mode = file_provider
         .as_ref()
         .and_then(|auth| auth.mode)
         .or(harness.auth_mode)
+        .or_else(|| if ambient_key { Some(AuthMode::Api) } else { None })
         .unwrap_or(AuthMode::Subscription);
 
     let api_key = file_provider
@@ -105,10 +104,7 @@ pub fn resolve_provider_config(
         .or(harness.api_key)
         .or_else(|| std::env::var(&env_key_name).ok().filter(|key| !key.trim().is_empty()));
 
-    let fallback_model = default_models()
-        .get(provider.as_str())
-        .cloned()
-        .unwrap_or_default();
+    let fallback_model = crate::models::default_model(provider).to_string();
 
     EffectiveProviderConfig {
         mode,
@@ -129,18 +125,21 @@ pub fn resolve_config_in(
     claude_dir: Option<&Path>,
     codex_home: Option<&Path>,
 ) -> EffectiveConfig {
-    EffectiveConfig {
-        claude: resolve_provider_config(ProviderId::Claude, home, cwd, claude_dir, codex_home),
-        codex: resolve_provider_config(ProviderId::Codex, home, cwd, claude_dir, codex_home),
+    let mut providers = BTreeMap::new();
+    for provider in ProviderId::all() {
+        providers.insert(
+            *provider,
+            resolve_provider_config(*provider, home, cwd, claude_dir, codex_home),
+        );
     }
+    EffectiveConfig { providers }
 }
 
 impl EffectiveConfig {
     pub fn for_provider(&self, provider: ProviderId) -> &EffectiveProviderConfig {
-        match provider {
-            ProviderId::Claude => &self.claude,
-            ProviderId::Codex => &self.codex,
-        }
+        self.providers
+            .get(&provider)
+            .unwrap_or_else(|| panic!("missing config for {provider}"))
     }
 }
 

@@ -91,9 +91,17 @@ enum Overlay {
     RewindPicker { selected: usize },
     CodeConfirm { turn: i64, git_ref: String },
     SwitchPicker { selected: usize },
+    ModelPicker { provider: ProviderId, models: Vec<String>, selected: usize },
 }
 
-const PROVIDERS: [ProviderId; 2] = [ProviderId::Claude, ProviderId::Codex];
+const PROVIDERS: [ProviderId; 6] = [
+    ProviderId::Claude,
+    ProviderId::Codex,
+    ProviderId::Cursor,
+    ProviderId::Grok,
+    ProviderId::OpenCode,
+    ProviderId::Antigravity,
+];
 
 pub struct TuiState {
     store: Arc<Mutex<BatonStore>>,
@@ -367,11 +375,43 @@ fn handle_key(
             }
             KeyCode::Enter => {
                 if let Some(provider) = PROVIDERS.get(selected).copied() {
-                    perform_switch(state, store, provider, None);
+                    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+                    let default_model = resolved.for_provider(provider).model.clone();
+                    let mut models: Vec<String> = crate::models::catalog(provider)
+                        .iter()
+                        .map(|model| model.to_string())
+                        .collect();
+                    if !models.contains(&default_model) {
+                        models.insert(0, default_model);
+                    }
+                    state.overlay = Overlay::ModelPicker { provider, models, selected: 0 };
                 }
             }
             _ => {
                 state.overlay = Overlay::SwitchPicker { selected };
+            }
+        },
+        Overlay::ModelPicker { provider, models, mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                if !models.is_empty() {
+                    selected = (selected + models.len() - 1) % models.len();
+                }
+                state.overlay = Overlay::ModelPicker { provider, models, selected };
+            }
+            KeyCode::Down => {
+                if !models.is_empty() {
+                    selected = (selected + 1) % models.len();
+                }
+                state.overlay = Overlay::ModelPicker { provider, models, selected };
+            }
+            KeyCode::Enter => {
+                if let Some(model) = models.get(selected).cloned() {
+                    perform_switch(state, store, provider, Some(model));
+                }
+            }
+            _ => {
+                state.overlay = Overlay::ModelPicker { provider, models, selected };
             }
         },
         Overlay::CodeConfirm { turn, git_ref } => match key.code {
@@ -585,10 +625,7 @@ fn handle_command(
                         .thread
                         .current_model
                         .clone()
-                        .unwrap_or_else(|| match state.thread.current_provider {
-                            ProviderId::Claude => resolved.claude.model.clone(),
-                            ProviderId::Codex => resolved.codex.model.clone(),
-                        });
+                        .unwrap_or_else(|| resolved.for_provider(state.thread.current_provider).model.clone());
                     let source = if state.thread.current_model.is_some() { "thread" } else { "harness config" };
                     state.notice = Some(format!(
                         "current model: {}/{} ({source})",
@@ -626,9 +663,12 @@ fn handle_command(
             match (args.first().map(String::as_str), args.get(1).map(String::as_str)) {
                 (None, _) => {
                     state.notice = Some(format!(
-                        "claude: {} | codex: {}",
-                        describe_auth(&resolved.claude),
-                        describe_auth(&resolved.codex)
+                        "{}",
+                        ProviderId::all()
+                            .iter()
+                            .map(|provider| format!("{}: {}", provider, describe_auth(resolved.for_provider(*provider))))
+                            .collect::<Vec<_>>()
+                            .join(" | ")
                     ));
                 }
                 (Some(provider), Some(mode)) => {
@@ -646,10 +686,7 @@ fn handle_command(
                             return;
                         }
                     };
-                    let provider_config = match provider {
-                        ProviderId::Claude => &resolved.claude,
-                        ProviderId::Codex => &resolved.codex,
-                    };
+                    let provider_config = resolved.for_provider(provider);
                     if mode == crate::config::AuthMode::Api && provider_config.api_key.is_none() {
                         state.notice = Some(format!(
                             "no API key for {provider}. Set {} in the environment, the harness config, or config.json.",
@@ -658,13 +695,10 @@ fn handle_command(
                         return;
                     }
                     let mut file = load_config_file(&state.home).unwrap_or_default();
-                    {
-                        let entry = match provider {
-                            ProviderId::Claude => file.claude.get_or_insert_with(Default::default),
-                            ProviderId::Codex => file.codex.get_or_insert_with(Default::default),
-                        };
-                        entry.mode = Some(mode);
-                    }
+                    file.providers
+                        .entry(provider.as_str().to_string())
+                        .or_default()
+                        .mode = Some(mode);
                     if let Err(error) = save_config_file(&state.home, &file) {
                         state.notice = Some(format!("cannot save config: {error}"));
                         return;
@@ -672,12 +706,12 @@ fn handle_command(
                     state.notice = Some(format!("{provider} billing set to {}", mode.as_str()));
                 }
                 (Some(provider), None) => {
-                    let label = match ProviderId::parse(provider) {
-                        Some(ProviderId::Claude) => describe_auth(&resolved.claude),
-                        Some(ProviderId::Codex) => describe_auth(&resolved.codex),
-                        None => "unknown provider".into(),
-                    };
-                    state.notice = Some(label);
+                    match ProviderId::parse(provider) {
+                        Some(parsed) => {
+                            state.notice = Some(describe_auth(resolved.for_provider(parsed)));
+                        }
+                        None => state.notice = Some("unknown provider".into()),
+                    }
                 }
             }
         }
@@ -708,10 +742,10 @@ fn handle_command(
                     .into_iter()
                     .take(20)
                     .map(|thread| {
-                        let model = thread.current_model.clone().unwrap_or_else(|| match thread.current_provider {
-                            ProviderId::Claude => resolved.claude.model.clone(),
-                            ProviderId::Codex => resolved.codex.model.clone(),
-                        });
+                        let model = thread
+                            .current_model
+                            .clone()
+                            .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
                         format!("{}  {}/{}  {}", &thread.id[..8], thread.current_provider, model, thread.title)
                     })
                     .collect::<Vec<_>>()
@@ -842,6 +876,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             + 4,
         Overlay::CodeConfirm { .. } => 4,
         Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
+        Overlay::ModelPicker { models, .. } => models.len().min(8) + 4,
     };
     let live_tool_rows = state.tool_lines.len().min(5);
     let streaming_cap = ((area.height as usize).saturating_sub(composer_rows + 6) * 3 / 5).max(3);
@@ -876,6 +911,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         Overlay::RewindPicker { selected } => draw_rewind_picker(frame, chunks[2], state, *selected),
         Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[2], *turn),
         Overlay::SwitchPicker { selected } => draw_switch_picker(frame, chunks[2], state, *selected),
+        Overlay::ModelPicker { provider, models, selected } => {
+            draw_model_picker(frame, chunks[2], state, *provider, models, *selected)
+        }
         Overlay::None => {}
     }
     if let Some(notice) = &state.notice {
@@ -893,10 +931,7 @@ fn perform_switch(
     model: Option<String>,
 ) {
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
-    let default_model = match provider {
-        ProviderId::Claude => resolved.claude.model.clone(),
-        ProviderId::Codex => resolved.codex.model.clone(),
-    };
+    let default_model = resolved.for_provider(provider).model.clone();
     let display_model = model.clone().unwrap_or(default_model);
     let result = {
         let guard = store.lock().unwrap();
@@ -947,6 +982,33 @@ fn draw_switch_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
             ),
             style,
         ));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_model_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    provider: ProviderId,
+    models: &[String],
+    selected: usize,
+) {
+    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let default_model = resolved.for_provider(provider).model.clone();
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!("{provider} models · enter select · esc cancel"),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, model) in models.iter().take(8).enumerate() {
+        let marker = if *model == default_model { "●" } else { " " };
+        let style = if index == selected {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(format!("❯ {marker} {model}"), style));
     }
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1138,10 +1200,7 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
     };
     rows.push(display);
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
-    let provider_config = match state.thread.current_provider {
-        ProviderId::Claude => &resolved.claude,
-        ProviderId::Codex => &resolved.codex,
-    };
+    let provider_config = resolved.for_provider(state.thread.current_provider);
     let effective_model = state
         .thread
         .current_model

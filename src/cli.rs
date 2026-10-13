@@ -48,4 +48,5 @@ pub enum Commands {
     Restore { thread_id: String, turn: i64 },
     Usage { thread_id: Option<String> },
     Auth { provider: Option<String>, mode: Option<String> },
+    Login { provider: String },
 }

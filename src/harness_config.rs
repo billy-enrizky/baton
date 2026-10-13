@@ -209,6 +209,9 @@ pub fn read_harness_config(
             codex_home.unwrap_or(&crate::paths::codex_global_home()),
             project_root,
         ),
+        ProviderId::Cursor | ProviderId::Grok | ProviderId::OpenCode | ProviderId::Antigravity => {
+            HarnessProviderConfig::default()
+        }
     }
 }
 

@@ -308,12 +308,23 @@ fn viewport_windowing() {
             has_usage: false,
         })
         .collect();
+    // Each message is 3 rows (margin + label + text) = 12 total rows
+    // Budget 6 rows, offset 0 (bottom): shows m3, m4
     let windowed = window_messages(&items, 6, 80, 0);
     assert_eq!(windowed.visible.len(), 2);
     assert_eq!(windowed.visible[1].id, 4);
     assert_eq!(windowed.hidden_above, 2);
+    assert_eq!(windowed.hidden_below, 0);
 
-    let scrolled = window_messages(&items, 6, 80, 2);
+    // Offset 6 lines from bottom = top 6 rows: shows m1, m2
+    let scrolled = window_messages(&items, 6, 80, 6);
     assert_eq!(scrolled.visible[0].id, 1);
+    assert_eq!(scrolled.visible.last().unwrap().id, 2);
     assert_eq!(scrolled.hidden_below, 2);
+
+    // Offset 3 lines from bottom: viewport covers rows 3-8, showing m2, m3
+    let partial = window_messages(&items, 6, 80, 3);
+    assert!(partial.visible.len() >= 2);
+    assert_eq!(partial.visible.first().unwrap().id, 2);
+    assert_eq!(partial.visible.last().unwrap().id, 3);
 }

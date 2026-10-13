@@ -163,7 +163,7 @@ fn resolve_config_precedence() {
     );
     save_config_file(
         home.path(),
-        &baton::config::BatonConfigFile { providers, default_models: None },
+        &baton::config::BatonConfigFile { providers, default_models: None, default_provider: None },
     )
     .unwrap();
     assert!(load_config_file(home.path()).is_some());

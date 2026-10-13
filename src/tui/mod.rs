@@ -288,6 +288,7 @@ fn apply_engine_event(
                         state.thread = fresh;
                     }
                 }
+                state.scroll_offset = 0;
                 if !ok {
                     state.notice = Some(format!("turn failed: {}", error.unwrap_or_else(|| "unknown error".into())));
                 }
@@ -836,7 +837,7 @@ fn handle_composer_key(
                 state.prompt_history_index = Some(index);
                 state.input = state.prompt_history[index].clone();
             } else {
-                state.scroll_offset += 1;
+                state.scroll_offset += 3;
             }
         }
         KeyCode::Down => {
@@ -849,14 +850,17 @@ fn handle_composer_key(
                     state.input.clear();
                 }
             } else {
-                state.scroll_offset = state.scroll_offset.saturating_sub(1);
+                state.scroll_offset = state.scroll_offset.saturating_sub(3);
             }
         }
         KeyCode::PageUp => {
-            state.scroll_offset += 10;
+            state.scroll_offset += 20;
         }
         KeyCode::PageDown => {
-            state.scroll_offset = state.scroll_offset.saturating_sub(10);
+            state.scroll_offset = state.scroll_offset.saturating_sub(20);
+        }
+        KeyCode::End => {
+            state.scroll_offset = 0;
         }
         KeyCode::Esc => {
             if state.running {
@@ -1869,7 +1873,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     if scroll_offset > 0 {
         lines.push(Line::styled(
             format!(
-                "↑ {} older messages · PageUp/PageDown scroll",
+                "↑ {} older · ↓/End to bottom",
                 windowed.hidden_above
             ),
             Style::default().fg(COLORS.muted),

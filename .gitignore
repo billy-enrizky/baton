@@ -1,6 +1,8 @@
-node_modules/
-dist/
+# Cargo
+/target/
+
+# Local notes (never commit)
+local_docs/
+
 *.log
 .DS_Store
-local_docs/
-rust/target/

@@ -4,6 +4,7 @@ pub mod cli;
 pub mod config;
 pub mod handoff;
 pub mod harness_config;
+pub mod memory;
 pub mod models;
 pub mod paths;
 pub mod runtime;

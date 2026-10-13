@@ -69,6 +69,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/checkpoints", "list checkpoints for this thread"),
     ("/diff", "diff a checkpoint against the working tree"),
     ("/rewind", "rewind to a previous message"),
+    ("/compact", "compact the conversation to free context"),
+    ("/context", "show context usage"),
+    ("/init", "create a CLAUDE.md memory file"),
+    ("/export", "export the conversation"),
     ("/settings", "configure the current harness's settings"),
     ("/mcp", "manage MCP servers and sync across harnesses"),
     ("/skills", "list skills across harnesses"),
@@ -99,6 +103,10 @@ enum Overlay {
     SettingsPicker { provider: ProviderId, categories: Vec<(String, Vec<String>)>, category_index: usize, value_index: usize },
     McpPicker { selected: usize },
     SkillsPicker { selected: usize, skills: Vec<(String, String)> },
+    ModePicker { selected: usize },
+    AuthPicker { selected: usize },
+    ThreadPicker { selected: usize, threads: Vec<(String, String)> },
+    CheckpointPicker { selected: usize, checkpoints: Vec<(i64, String)> },
 }
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -112,6 +120,8 @@ const PROVIDERS: [ProviderId; 6] = [
 
 pub struct TuiState {
     store: Arc<Mutex<BatonStore>>,
+    prompt_history: Vec<String>,
+    prompt_history_index: Option<usize>,
     home: std::path::PathBuf,
     thread: ThreadRow,
     history: Vec<MessageRow>,
@@ -148,6 +158,8 @@ pub fn run_tui(
 
     let mut state = TuiState {
         store: store.clone(),
+        prompt_history: Vec::new(),
+        prompt_history_index: None,
         home,
         thread,
         history,
@@ -529,6 +541,140 @@ fn handle_key(
                 state.overlay = Overlay::SkillsPicker { selected, skills };
             }
         },
+        Overlay::ModePicker { mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = (selected + 3) % 4;
+                state.overlay = Overlay::ModePicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % 4;
+                state.overlay = Overlay::ModePicker { selected };
+            }
+            KeyCode::Enter => {
+                let modes = [PermissionMode::Default, PermissionMode::AcceptEdits, PermissionMode::BypassPermissions, PermissionMode::Plan];
+                if let Some(mode) = modes.get(selected) {
+                    state.permission_mode = *mode;
+                    state.notice = Some(format!("permission mode: {mode}"));
+                }
+            }
+            _ => {
+                state.overlay = Overlay::ModePicker { selected };
+            }
+        },
+        Overlay::AuthPicker { mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = (selected + PROVIDERS.len() * 2 - 1) % (PROVIDERS.len() * 2);
+                state.overlay = Overlay::AuthPicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % (PROVIDERS.len() * 2);
+                state.overlay = Overlay::AuthPicker { selected };
+            }
+            KeyCode::Enter => {
+                let provider_index = selected / 2;
+                let is_api = selected % 2 == 1;
+                if let Some(provider) = PROVIDERS.get(provider_index).copied() {
+                    let mode = if is_api { crate::config::AuthMode::Api } else { crate::config::AuthMode::Subscription };
+                    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+                    let provider_config = resolved.for_provider(provider);
+                    if mode == crate::config::AuthMode::Api && provider_config.api_key.is_none() {
+                        state.notice = Some(format!(
+                            "no API key for {provider}. Set {} in the environment, the harness config, or config.json.",
+                            provider_config.api_key_env_name
+                        ));
+                        return;
+                    }
+                    let mut file = load_config_file(&state.home).unwrap_or_default();
+                    file.providers.entry(provider.as_str().to_string()).or_default().mode = Some(mode);
+                    if let Err(error) = save_config_file(&state.home, &file) {
+                        state.notice = Some(format!("cannot save config: {error}"));
+                        return;
+                    }
+                    state.notice = Some(format!("{provider} billing set to {}", mode.as_str()));
+                }
+            }
+            _ => {
+                state.overlay = Overlay::AuthPicker { selected };
+            }
+        },
+        Overlay::ThreadPicker { selected, threads } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                if !threads.is_empty() {
+                    let new_selected = (selected + threads.len() - 1) % threads.len();
+                    state.overlay = Overlay::ThreadPicker { selected: new_selected, threads };
+                }
+            }
+            KeyCode::Down => {
+                if !threads.is_empty() {
+                    let new_selected = (selected + 1) % threads.len();
+                    state.overlay = Overlay::ThreadPicker { selected: new_selected, threads };
+                }
+            }
+            KeyCode::Enter => {
+                if let Some((thread_id, _)) = threads.get(selected) {
+                    let found = {
+                        let guard = store.lock().unwrap();
+                        guard.list_threads(None).unwrap_or_default().into_iter()
+                            .find(|thread| thread.id.starts_with(thread_id.as_str()))
+                    };
+                    if let Some(thread) = found {
+                        state.thread = thread.clone();
+                        let guard = store.lock().unwrap();
+                        state.history = guard.list_messages(&thread.id).unwrap_or_default();
+                        state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
+                        state.diff_output = None;
+                        state.scroll_offset = 0;
+                        state.notice = Some(format!("opened {}", thread.title));
+                    }
+                }
+            }
+            _ => {
+                state.overlay = Overlay::ThreadPicker { selected, threads };
+            }
+        },
+        Overlay::CheckpointPicker { selected, checkpoints } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                if !checkpoints.is_empty() {
+                    let new_selected = (selected + checkpoints.len() - 1) % checkpoints.len();
+                    state.overlay = Overlay::CheckpointPicker { selected: new_selected, checkpoints };
+                }
+            }
+            KeyCode::Down => {
+                if !checkpoints.is_empty() {
+                    let new_selected = (selected + 1) % checkpoints.len();
+                    state.overlay = Overlay::CheckpointPicker { selected: new_selected, checkpoints };
+                }
+            }
+            KeyCode::Enter => {
+                if let Some((turn, _)) = checkpoints.get(selected) {
+                    let cwd = std::path::PathBuf::from(&state.thread.cwd);
+                    let result = {
+                        let guard = store.lock().unwrap();
+                        guard.get_checkpoint(&state.thread.id, *turn).unwrap_or(None)
+                    };
+                    if let Some(checkpoint) = result {
+                        match crate::checkpoints::diff_checkpoint_against_worktree(&cwd, &checkpoint.git_ref) {
+                            Ok(diff) => {
+                                let lines: Vec<&str> = diff.lines().take(200).collect();
+                                let mut text = lines.join("\n");
+                                if diff.lines().count() > 200 {
+                                    text.push_str("\n[...truncated]");
+                                }
+                                state.diff_output = Some(text);
+                            }
+                            Err(error) => state.notice = Some(format!("diff failed: {error}")),
+                        }
+                    }
+                }
+            }
+            _ => {
+                state.overlay = Overlay::CheckpointPicker { selected, checkpoints };
+            }
+        },
         Overlay::CodeConfirm { turn, git_ref } => match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
                 let cwd = std::path::PathBuf::from(&state.thread.cwd);
@@ -639,10 +785,26 @@ fn handle_composer_key(
             state.esc_primed = false;
         }
         KeyCode::Up => {
-            state.scroll_offset += 1;
+            if state.input.is_empty() && !state.prompt_history.is_empty() {
+                let index = state.prompt_history_index.map(|index| index.saturating_sub(1)).unwrap_or(state.prompt_history.len() - 1);
+                state.prompt_history_index = Some(index);
+                state.input = state.prompt_history[index].clone();
+            } else {
+                state.scroll_offset += 1;
+            }
         }
         KeyCode::Down => {
-            state.scroll_offset = state.scroll_offset.saturating_sub(1);
+            if let Some(index) = state.prompt_history_index {
+                if index + 1 < state.prompt_history.len() {
+                    state.prompt_history_index = Some(index + 1);
+                    state.input = state.prompt_history[index + 1].clone();
+                } else {
+                    state.prompt_history_index = None;
+                    state.input.clear();
+                }
+            } else {
+                state.scroll_offset = state.scroll_offset.saturating_sub(1);
+            }
         }
         KeyCode::PageUp => {
             state.scroll_offset += 10;
@@ -683,6 +845,8 @@ fn submit(
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     text: String,
 ) {
+    state.prompt_history.push(text.clone());
+    state.prompt_history_index = None;
     let result = {
         let guard = store.lock().unwrap();
         ensure_persisted(&guard, &mut state.thread)
@@ -719,6 +883,71 @@ fn handle_command(
         "/clear" => {
             state.diff_output = None;
             state.notice = None;
+        }
+        "/compact" => {
+            let messages: Vec<(String, String)> = state
+                .history
+                .iter()
+                .map(|message| (message.role.clone(), message.text.clone()))
+                .collect();
+            if messages.len() < 4 {
+                state.notice = Some("not enough conversation to compact".into());
+            } else {
+                let summary = crate::memory::build_compact_summary(&messages, 8000);
+                let thread_id = state.thread.id.clone();
+                let next_turn = store.lock().unwrap().next_turn_number(&thread_id).unwrap_or(1);
+                {
+                    let mut guard = store.lock().unwrap();
+                    let _ = guard.rewind_thread(&thread_id, 1);
+                    let _ = guard.add_message(&thread_id, next_turn, "user", None, None, "compact");
+                    let _ = guard.add_message(&thread_id, next_turn, "assistant", None, None, &summary);
+                }
+                state.history = store.lock().unwrap().list_messages(&thread_id).unwrap_or_default();
+                state.scroll_offset = 0;
+                state.notice = Some(format!("compacted {} messages", messages.len()));
+            }
+        }
+        "/context" => {
+            let messages: Vec<&crate::store::MessageRow> = state.history.iter().collect();
+            let total_chars: usize = messages.iter().map(|message| message.text.len()).sum();
+            let streaming_chars = state.streaming_text.len();
+            let usage_rows = store.lock().unwrap().list_usage(Some(&state.thread.id)).unwrap_or_default();
+            let usage_line = if usage_rows.is_empty() {
+                "no token usage recorded".to_string()
+            } else {
+                format_usage_line(&sum_usage(&usage_rows))
+            };
+            state.notice = Some(format!(
+                "context: {} messages, {:.1}k chars history, {:.1}k chars streaming\ntokens: {usage_line}",
+                messages.len(),
+                total_chars as f64 / 1000.0,
+                streaming_chars as f64 / 1000.0
+            ));
+        }
+        "/init" => {
+            match crate::memory::init_memory_file(std::path::Path::new(&state.thread.cwd)) {
+                Ok(result) => state.notice = Some(result),
+                Err(error) => state.notice = Some(format!("cannot create memory file: {error}")),
+            }
+        }
+        "/export" => {
+            let lines: Vec<String> = state
+                .history
+                .iter()
+                .map(|message| {
+                    let speaker = if message.role == "user" { "you" } else { message.provider.as_deref().unwrap_or("assistant") };
+                    format!("[{speaker}]\n{}", message.text)
+                })
+                .collect();
+            if lines.is_empty() {
+                state.notice = Some("nothing to export".into());
+            } else {
+                let export_path = std::env::temp_dir().join(format!("baton-export-{}.md", state.thread.id[..8].to_string()));
+                match std::fs::write(&export_path, lines.join("\n\n---\n\n")) {
+                    Ok(()) => state.notice = Some(format!("exported to {}", export_path.display())),
+                    Err(error) => state.notice = Some(format!("export failed: {error}")),
+                }
+            }
         }
         "/settings" => {
             let categories: Vec<(String, Vec<String>)> = sync::settings_for_provider(state.thread.current_provider)
@@ -790,31 +1019,18 @@ fn handle_command(
             }
         }
         "/mode" => {
-            match args.first().map(String::as_str).and_then(PermissionMode::parse) {
-                Some(mode) => {
-                    state.permission_mode = mode;
-                    state.notice = Some(format!("permission mode: {mode}"));
-                }
-                None => {
-                    state.notice = Some(format!(
-                        "usage: /mode <default|acceptEdits|bypassPermissions|plan> (current: {})",
-                        state.permission_mode
-                    ));
-                }
+            if let Some(mode) = args.first().map(String::as_str).and_then(PermissionMode::parse) {
+                state.permission_mode = mode;
+                state.notice = Some(format!("permission mode: {mode}"));
+            } else {
+                state.overlay = Overlay::ModePicker { selected: 0 };
             }
         }
         "/auth" => {
             let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
             match (args.first().map(String::as_str), args.get(1).map(String::as_str)) {
                 (None, _) => {
-                    state.notice = Some(format!(
-                        "{}",
-                        ProviderId::all()
-                            .iter()
-                            .map(|provider| format!("{}: {}", provider, describe_auth(resolved.for_provider(*provider))))
-                            .collect::<Vec<_>>()
-                            .join(" | ")
-                    ));
+                    state.overlay = Overlay::AuthPicker { selected: 0 };
                 }
                 (Some(provider), Some(mode)) => {
                     let provider = match ProviderId::parse(provider) {
@@ -878,56 +1094,60 @@ fn handle_command(
             state.notice = Some("new thread, unsaved until you send a message".into());
         }
         "/threads" => {
-            let lines = {
+            let threads: Vec<(String, String)> = {
                 let guard = store.lock().unwrap();
-                let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
                 guard
                     .list_threads(Some(state.thread.cwd.as_str()))
                     .unwrap_or_default()
                     .into_iter()
                     .take(20)
-                    .map(|thread| {
-                        let model = thread
-                            .current_model
-                            .clone()
-                            .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
-                        format!("{}  {}/{}  {}", &thread.id[..8], thread.current_provider, model, thread.title)
-                    })
-                    .collect::<Vec<_>>()
+                    .map(|thread| (thread.id[..8].to_string(), thread.title))
+                    .collect()
             };
-            state.notice = Some(if lines.is_empty() {
-                "no threads in this directory".into()
+            if threads.is_empty() {
+                state.notice = Some("no threads in this directory".into());
             } else {
-                lines.join("\n")
-            });
+                state.overlay = Overlay::ThreadPicker { selected: 0, threads };
+            }
         }
         "/open" => {
-            let prefix = match args.first() {
-                Some(prefix) => prefix.clone(),
-                None => {
-                    state.notice = Some("usage: /open <threadId>".into());
-                    return;
-                }
-            };
-            let found = {
-                let guard = store.lock().unwrap();
-                guard
-                    .list_threads(None)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .find(|thread| thread.id.starts_with(&prefix))
-            };
-            match found {
-                Some(thread) => {
-                    state.thread = thread.clone();
+            if let Some(prefix) = args.first() {
+                let found = {
                     let guard = store.lock().unwrap();
-                    state.history = guard.list_messages(&thread.id).unwrap_or_default();
-                    state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
-                    state.diff_output = None;
-                    state.scroll_offset = 0;
-                    state.notice = Some(format!("opened {}", thread.title));
+                    guard
+                        .list_threads(None)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|thread| thread.id.starts_with(prefix.as_str()))
+                };
+                match found {
+                    Some(thread) => {
+                        state.thread = thread.clone();
+                        let guard = store.lock().unwrap();
+                        state.history = guard.list_messages(&thread.id).unwrap_or_default();
+                        state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
+                        state.diff_output = None;
+                        state.scroll_offset = 0;
+                        state.notice = Some(format!("opened {}", thread.title));
+                    }
+                    None => state.notice = Some(format!("no thread matches \"{prefix}\"")),
                 }
-                None => state.notice = Some(format!("no thread matches \"{prefix}\"")),
+            } else {
+                let threads: Vec<(String, String)> = {
+                    let guard = store.lock().unwrap();
+                    guard
+                        .list_threads(None)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .take(20)
+                        .map(|thread| (thread.id[..8].to_string(), thread.title))
+                        .collect()
+                };
+                if threads.is_empty() {
+                    state.notice = Some("no threads".into());
+                } else {
+                    state.overlay = Overlay::ThreadPicker { selected: 0, threads };
+                }
             }
         }
         "/usage" => {
@@ -943,22 +1163,39 @@ fn handle_command(
             state.notice = Some(lines.unwrap_or_else(|| "no usage yet".into()));
         }
         "/checkpoints" => {
-            let lines = {
+            let checkpoints: Vec<(i64, String)> = {
                 let guard = store.lock().unwrap();
                 guard
                     .list_checkpoints(&state.thread.id)
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|checkpoint| format!("turn {:>3}  {}", checkpoint.turn, checkpoint.git_ref))
-                    .collect::<Vec<_>>()
+                    .map(|checkpoint| (checkpoint.turn, checkpoint.git_ref))
+                    .collect()
             };
-            state.notice = Some(if lines.is_empty() {
-                "no checkpoints yet".into()
+            if checkpoints.is_empty() {
+                state.notice = Some("no checkpoints yet".into());
             } else {
-                lines.join("\n")
-            });
+                state.overlay = Overlay::CheckpointPicker { selected: checkpoints.len().saturating_sub(1), checkpoints };
+            }
         }
         "/diff" => {
+            if args.is_empty() {
+                let checkpoints: Vec<(i64, String)> = {
+                    let guard = store.lock().unwrap();
+                    guard
+                        .list_checkpoints(&state.thread.id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|checkpoint| (checkpoint.turn, checkpoint.git_ref))
+                        .collect()
+                };
+                if checkpoints.is_empty() {
+                    state.notice = Some("no checkpoints yet".into());
+                } else {
+                    state.overlay = Overlay::CheckpointPicker { selected: checkpoints.len().saturating_sub(1), checkpoints };
+                }
+                return;
+            }
             let result = (|| -> anyhow::Result<String> {
                 let guard = store.lock().unwrap();
                 let checkpoints = guard.list_checkpoints(&state.thread.id)?;
@@ -1027,6 +1264,10 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         },
         Overlay::McpPicker { .. } => 8,
         Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
+        Overlay::ModePicker { .. } => 7,
+        Overlay::AuthPicker { .. } => 9,
+        Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
+        Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
     };
     let live_tool_rows = state.tool_lines.len().min(5);
     let streaming_cap = ((area.height as usize).saturating_sub(composer_rows + 6) * 3 / 5).max(3);
@@ -1070,6 +1311,14 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[2], *selected),
         Overlay::SkillsPicker { selected, skills } => {
             draw_skills_picker(frame, chunks[2], skills, *selected)
+        }
+        Overlay::ModePicker { selected } => draw_mode_picker(frame, chunks[2], state, *selected),
+        Overlay::AuthPicker { selected } => draw_auth_picker(frame, chunks[2], state, *selected),
+        Overlay::ThreadPicker { selected, threads } => {
+            draw_thread_picker(frame, chunks[2], threads, *selected)
+        }
+        Overlay::CheckpointPicker { selected, checkpoints } => {
+            draw_checkpoint_picker(frame, chunks[2], checkpoints, *selected)
         }
         Overlay::None => {}
     }
@@ -1302,6 +1551,85 @@ fn draw_skills_picker(frame: &mut ratatui::Frame, area: Rect, skills: &[(String,
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn draw_mode_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
+    let modes = ["default", "acceptEdits", "bypassPermissions", "plan"];
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "permission mode · enter select · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, mode) in modes.iter().enumerate() {
+        let is_current = state.permission_mode.as_str() == *mode;
+        let marker = if is_current { "●" } else { " " };
+        let style = if index == selected {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(format!("❯ {marker} {mode}"), style));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
+    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "billing mode · enter select · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, provider) in PROVIDERS.iter().enumerate() {
+        let config = resolved.for_provider(*provider);
+        for (mode_index, mode) in [0usize, 1usize].iter().zip(["subscription", "api"]) {
+            let flat_index = index * 2 + mode_index;
+            let is_api = *mode_index == 1;
+            let is_current = (config.mode == crate::config::AuthMode::Api) == is_api;
+            let marker = if is_current { "●" } else { " " };
+            let style = if flat_index == selected {
+                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLORS.muted)
+            };
+            lines.push(Line::styled(format!("❯ {marker} {provider} {mode}"), style));
+        }
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_thread_picker(frame: &mut ratatui::Frame, area: Rect, threads: &[(String, String)], selected: usize) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "threads · enter open · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (thread_id, title)) in threads.iter().take(8).enumerate() {
+        let style = if index == selected {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(format!("❯ {thread_id}  {title}"), style));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_checkpoint_picker(frame: &mut ratatui::Frame, area: Rect, checkpoints: &[(i64, String)], selected: usize) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "checkpoints · enter diff · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (turn, _)) in checkpoints.iter().take(8).enumerate() {
+        let style = if index == selected {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(format!("❯ turn {turn}"), style));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     if let Some(diff) = &state.diff_output {
         let lines: Vec<Line> = std::iter::once(Line::styled("diff · /clear to close", Style::default().fg(COLORS.muted)))
@@ -1351,7 +1679,9 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
         })
         .collect();
     let scroll_offset = state.scroll_offset.min(items.len().saturating_sub(1));
-    let windowed = window_messages(&items, area.height.saturating_sub(1) as usize, area.width as usize, scroll_offset);
+    let budget = area.height.saturating_sub(1) as usize;
+    let windowed = window_messages(&items, budget, area.width as usize, scroll_offset);
+    let _ = budget;
 
     let mut lines: Vec<Line> = Vec::new();
     if scroll_offset > 0 {
@@ -1406,7 +1736,20 @@ fn draw_live(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_f
         lines.push(line);
     }
     if !state.streaming_text.is_empty() {
-        lines.push(Line::styled(state.streaming_text.clone(), Style::default().fg(COLORS.text)));
+        let all_lines: Vec<&str> = state.streaming_text.lines().collect();
+        let tool_row_count = lines.len();
+        let available = (area.height as usize).saturating_sub(tool_row_count);
+        if all_lines.len() > available && available > 0 {
+            lines.push(Line::styled("…", Style::default().fg(COLORS.muted)));
+            let start = all_lines.len().saturating_sub(available.saturating_sub(1));
+            for line in &all_lines[start..] {
+                lines.push(Line::styled(*line, Style::default().fg(COLORS.text)));
+            }
+        } else {
+            for line in &all_lines {
+                lines.push(Line::styled(*line, Style::default().fg(COLORS.text)));
+            }
+        }
     }
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }

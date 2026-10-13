@@ -438,7 +438,6 @@ impl BatonAdapter for AcpAdapter {
                                     usage = Some(parse_usage(result_usage));
                                 }
                             }
-                            break Ok(());
                         }
                         Ok(Err(error)) => break Err(anyhow::anyhow!("acp error: {error}")),
                         Err(_) => break Err(anyhow::anyhow!("acp connection closed")),

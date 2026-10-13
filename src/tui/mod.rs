@@ -155,12 +155,12 @@ pub fn run_tui(
     engine_command_sender: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     engine_event_receiver: std::sync::mpsc::Receiver<EngineEvent>,
     turn_event_receiver: std::sync::mpsc::Receiver<TurnEvent>,
+    initial_prompt: Option<String>,
+    initial_permission_mode: PermissionMode,
 ) -> Result<()> {
     let history = store.lock().unwrap().list_messages(&thread.id)?;
     let branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
-    let permission_mode = resolve_config(&home, std::path::Path::new(&thread.cwd))
-        .for_provider(thread.current_provider)
-        .permission_mode;
+    let permission_mode = initial_permission_mode;
 
     let custom_commands = discover_custom_commands(&thread.cwd);
     let mut state = TuiState {
@@ -189,6 +189,24 @@ pub fn run_tui(
         quit: false,
         suggestion_index: 0,
     };
+
+    if let Some(prompt) = initial_prompt {
+        state.prompt_history.push(prompt.clone());
+        let thread_id = state.thread.id.clone();
+        let result = {
+            let mut guard = store.lock().unwrap();
+            ensure_persisted(&guard, &mut state.thread)
+        };
+        if result.is_ok() {
+            let _ = engine_command_sender.send(EngineCommand::Submit {
+                thread_id,
+                text: prompt,
+                permission_mode: state.permission_mode,
+            });
+            state.running = true;
+            state.turn_started = Some(Instant::now());
+        }
+    }
 
     terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();

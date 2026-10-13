@@ -8,6 +8,10 @@ use clap::{Parser, Subcommand};
     disable_help_subcommand = true
 )]
 pub struct Cli {
+    /// Initial prompt (starts the TUI with this submitted)
+    #[arg(value_name = "PROMPT")]
+    pub prompt: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 
@@ -22,6 +26,18 @@ pub struct Cli {
 
     #[arg(short = 'm', long, global = true)]
     pub model: Option<String>,
+
+    /// Skip all permission checks (bypass permissions)
+    #[arg(long, global = true, alias = "dangerously-skip-permissions")]
+    pub yolo: bool,
+
+    /// Auto-accept file edits, ask for shell commands
+    #[arg(long, global = true)]
+    pub full_auto: bool,
+
+    /// Plan mode (read-only, proposes plans)
+    #[arg(long, global = true)]
+    pub plan: bool,
 
     #[arg(long, global = true)]
     pub claude_home: Option<String>,
@@ -38,15 +54,38 @@ pub struct Cli {
 
 #[derive(Subcommand, Clone)]
 pub enum Commands {
+    /// Run a prompt non-interactively and print the result
+    Exec {
+        prompt: Vec<String>,
+    },
+    /// Update baton to the latest version
+    Update,
     Chat,
     #[command(visible_alias = "list")]
     Threads,
-    New { title: Vec<String> },
+    New {
+        title: Vec<String>,
+    },
     Import,
-    Checkpoints { thread_id: String },
-    Diff { thread_id: String, turn: Option<i64> },
-    Restore { thread_id: String, turn: i64 },
-    Usage { thread_id: Option<String> },
-    Auth { provider: Option<String>, mode: Option<String> },
-    Login { provider: String },
+    Checkpoints {
+        thread_id: String,
+    },
+    Diff {
+        thread_id: String,
+        turn: Option<i64>,
+    },
+    Restore {
+        thread_id: String,
+        turn: i64,
+    },
+    Usage {
+        thread_id: Option<String>,
+    },
+    Auth {
+        provider: Option<String>,
+        mode: Option<String>,
+    },
+    Login {
+        provider: String,
+    },
 }

@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex};
 
 use adapters::{child_halves, AcpAdapter, ClaudeAdapter, CodexAdapter, OpenCodeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
-use runtime::{run_engine, SharedAdapter};
+use runtime::{run_engine, EngineCommand, EngineEvent, SharedAdapter};
 use store::{BatonStore, ImportedMessage, NewThread};
-use types::ProviderId;
+use types::{PermissionMode, ProviderId};
+use adapters::TurnEvent;
 use usage::{cache_hit_rate, format_usage_line, sum_usage};
 
 fn main() {
@@ -28,9 +29,163 @@ fn main_result() -> Result<()> {
         .unwrap_or(std::env::current_dir()?);
     let home = paths::baton_home();
     let command = cli.command.clone().unwrap_or(cli::Commands::Chat);
+    let cli_prompt = cli.prompt.clone();
+
+    let permission_mode = if cli.yolo {
+        PermissionMode::BypassPermissions
+    } else if cli.full_auto {
+        PermissionMode::AcceptEdits
+    } else if cli.plan {
+        PermissionMode::Plan
+    } else {
+        PermissionMode::Default
+    };
 
     match command {
-        cli::Commands::Chat => run_chat(cli, &home, &cwd),
+        cli::Commands::Exec { prompt } => {
+            let prompt = prompt.join(" ");
+            if prompt.is_empty() {
+                anyhow::bail!("usage: baton exec <prompt>");
+            }
+            let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
+            let resolved = resolve_config(&home, &cwd);
+            let provider = cli
+                .provider
+                .as_deref()
+                .and_then(ProviderId::parse)
+                .unwrap_or(ProviderId::Claude);
+            let model = cli
+                .model
+                .clone()
+                .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
+            let thread = store.lock().unwrap().draft_thread(crate::store::NewThread {
+                title: baton::handoff::derive_title(&prompt),
+                cwd: cwd.to_string_lossy().to_string(),
+                current_provider: provider,
+                current_model: Some(model),
+            });
+            {
+                let guard = store.lock().unwrap();
+                let persisted = guard.create_thread_with_id(
+                    crate::store::NewThread {
+                        title: thread.title.clone(),
+                        cwd: thread.cwd.clone(),
+                        current_provider: thread.current_provider,
+                        current_model: thread.current_model.clone(),
+                    },
+                    thread.id.clone(),
+                )?;
+                drop(guard);
+                let _ = persisted;
+            }
+
+            let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let (adapters, interrupt_handles) = tokio_runtime.block_on(async {
+                let codex_spawner = {
+                    let cwd = cwd.clone();
+                    move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
+                        let mut command = tokio::process::Command::new("codex");
+                        command.args(["app-server"]);
+                        command.current_dir(&cwd);
+                        command.stdin(std::process::Stdio::piped());
+                        command.stdout(std::process::Stdio::piped());
+                        command.stderr(std::process::Stdio::null());
+                        for (key, value) in auth_env {
+                            command.env(key, value);
+                        }
+                        child_halves(command.spawn()?)
+                    }
+                };
+                let codex: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(Arc::new(codex_spawner))))); let claude: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new())));
+                let mut handles = Vec::new();
+                handles.push(claude.lock().await.interrupt_handle());
+                handles.push(codex.lock().await.interrupt_handle());
+                (vec![claude, codex], handles)
+            });
+
+            let (engine_command_sender, engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (engine_event_sender, engine_event_receiver) = std::sync::mpsc::channel();
+            let (turn_event_sender, turn_event_receiver) = std::sync::mpsc::channel();
+
+            let runtime_home = home.clone();
+            let engine_store = store.clone();
+            let engine_task = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime");
+                let _ = rt.block_on(run_engine(
+                    engine_store,
+                    runtime_home,
+                    adapters,
+                    interrupt_handles,
+                    engine_command_receiver,
+                    engine_event_sender,
+                    turn_event_sender,
+                ));
+            });
+
+            let _ = engine_command_sender.send(EngineCommand::Submit {
+                thread_id: thread.id.clone(),
+                text: prompt,
+                permission_mode,
+            });
+
+            let mut result_text = String::new();
+            let mut result_ok = false;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    eprintln!("exec timed out after 300s");
+                    std::process::exit(1);
+                }
+                match engine_event_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
+                    Ok(EngineEvent::TurnFinished { ok, error, .. }) => {
+                        result_ok = ok;
+                        if !ok {
+                            if let Some(error) = error {
+                                eprintln!("turn failed: {error}");
+                            }
+                        }
+                        break;
+                    }
+                    Ok(EngineEvent::Turn(TurnEvent::TurnCompleted { final_text, .. })) => {
+                        result_text = final_text;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
+            }
+            let _ = engine_command_sender.send(EngineCommand::Quit);
+            let _ = engine_task.join();
+
+            if !result_text.is_empty() {
+                println!("{result_text}");
+            }
+            if !result_ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        cli::Commands::Update => {
+            println!("updating baton...");
+            let status = std::process::Command::new("cargo")
+                .args(["install", "--path", "--force"])
+                .current_dir(&cwd)
+                .status();
+            match status {
+                Ok(status) if status.success() => println!("baton updated"),
+                _ => {
+                    println!("cargo install not available in this context.");
+                    println!("to update: cargo install --git https://github.com/billy-enrizky/baton --force");
+                    println!("or from source: cargo install --path /path/to/baton --force");
+                }
+            }
+            return Ok(());
+        }
+        cli::Commands::Chat => run_chat(cli, &home, &cwd, permission_mode, cli_prompt),
         cli::Commands::Threads => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let resolved = resolve_config(&home, &cwd);
@@ -329,7 +484,7 @@ fn resolve_thread(store: &BatonStore, thread_id: &str) -> Result<store::ThreadRo
         .ok_or_else(|| anyhow::anyhow!("no thread matches {thread_id}"))
 }
 
-fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf) -> Result<()> {
+fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_mode: PermissionMode, initial_prompt: Option<String>) -> Result<()> {
     let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
     let resolved = resolve_config(home, cwd);
 
@@ -497,6 +652,8 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf) -> Result<()> {
         engine_command_sender,
         engine_event_receiver,
         turn_event_receiver,
+        initial_prompt,
+        permission_mode,
     );
 
     let _ = engine_task.join();

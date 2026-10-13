@@ -2023,16 +2023,30 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
     let mut rows: Vec<Line> = Vec::new();
     if !suggestions.is_empty() {
         let clamped = state.suggestion_index.min(suggestions.len() - 1);
-        for (index, (command, description)) in suggestions.iter().take(6).enumerate() {
-            let style = if index == clamped {
-                Style::default().fg(COLORS.accent)
+        let visible_count = 6.min(suggestions.len());
+
+        // Scroll the window to keep the selection visible
+        let start = if clamped < visible_count {
+            0
+        } else {
+            clamped - visible_count + 1
+        }
+        .min(suggestions.len().saturating_sub(visible_count));
+
+        let end = (start + visible_count).min(suggestions.len());
+
+        for (index, (command, description)) in suggestions[start..end].iter().enumerate() {
+            let actual_index = start + index;
+            let style = if actual_index == clamped {
+                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(COLORS.muted)
             };
-            rows.push(Line::styled(format!("❯ {command:<12} {description}"), style));
+            rows.push(Line::styled(format!("❯ {command:<14} {description}"), style));
         }
+        let position = format!("{}/{}", clamped + 1, suggestions.len());
         rows.push(Line::styled(
-            "↑↓ select (wraps) · tab/enter complete",
+            format!("↑↓ select ({position}) · tab/enter complete · esc dismiss"),
             Style::default().fg(COLORS.muted),
         ));
         rows.push(Line::from(""));
@@ -2069,7 +2083,7 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
         ..area
     };
     frame.render_widget(
-        Paragraph::new(rows).wrap(Wrap { trim: false }).block(block),
+        Paragraph::new(rows).block(block),
         composer_area,
     );
 }
@@ -2099,12 +2113,9 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner
         Line::styled(format!("{location} · {}", state.thread.title), Style::default().fg(COLORS.muted))
     };
 
-    let usage_rows = {
-        let store = state.store_rows();
-        store
-            .map(|rows| sum_usage(&rows))
-    };
-    let (cache_badge, cache_color, total_input) = match usage_rows {
+    let usage_rows = state.store_rows();
+    let totals = usage_rows.map(|rows| sum_usage(&rows));
+    let (cache_badge, cache_color, total_input) = match totals {
         Some(totals) => {
             let rate = cache_hit_rate(&totals.total_usage());
             let badge = match rate {
@@ -2117,11 +2128,7 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner
                 Some(rate) if rate >= 0.4 => COLORS.warning,
                 Some(_) => COLORS.error,
             };
-            (
-                badge,
-                color,
-                totals.input_tokens + totals.cache_read_tokens + totals.cache_creation_tokens,
-            )
+            (badge, color, totals.input_tokens + totals.cache_read_tokens + totals.cache_creation_tokens)
         }
         None => ("cache n/a".to_string(), COLORS.muted, 0),
     };

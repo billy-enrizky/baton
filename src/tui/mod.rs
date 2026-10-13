@@ -69,6 +69,9 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/checkpoints", "list checkpoints for this thread"),
     ("/diff", "diff a checkpoint against the working tree"),
     ("/rewind", "rewind to a previous message"),
+    ("/goal", "set a multi-turn objective the agent works toward"),
+    ("/find", "search the conversation"),
+    ("/multi", "send the same prompt to multiple providers"),
     ("/compact", "compact the conversation to free context"),
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),
@@ -122,6 +125,9 @@ pub struct TuiState {
     store: Arc<Mutex<BatonStore>>,
     prompt_history: Vec<String>,
     prompt_history_index: Option<usize>,
+    queued_messages: Vec<String>,
+    goal: Option<String>,
+    custom_commands: Vec<(String, String)>,
     home: std::path::PathBuf,
     thread: ThreadRow,
     history: Vec<MessageRow>,
@@ -156,10 +162,14 @@ pub fn run_tui(
         .for_provider(thread.current_provider)
         .permission_mode;
 
+    let custom_commands = discover_custom_commands(&thread.cwd);
     let mut state = TuiState {
         store: store.clone(),
         prompt_history: Vec::new(),
         prompt_history_index: None,
+        queued_messages: Vec::new(),
+        goal: None,
+        custom_commands,
         home,
         thread,
         history,
@@ -192,7 +202,7 @@ pub fn run_tui(
             apply_turn_event(&mut state, event);
         }
         while let Ok(event) = engine_event_receiver.try_recv() {
-            apply_engine_event(&mut state, &store, event);
+            apply_engine_event(&mut state, &store, event, &engine_command_sender);
         }
         if crossterm::event::poll(Duration::from_millis(32))? {
             if let Event::Key(key) = crossterm::event::read()? {
@@ -215,7 +225,12 @@ pub fn run_tui(
     Ok(())
 }
 
-fn apply_engine_event(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, event: EngineEvent) {
+fn apply_engine_event(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    event: EngineEvent,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+) {
     match event {
         EngineEvent::UserEcho { thread_id, turn, text, provider, model } => {
             if thread_id == state.thread.id {
@@ -257,6 +272,13 @@ fn apply_engine_event(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, even
                 }
                 if !ok {
                     state.notice = Some(format!("turn failed: {}", error.unwrap_or_else(|| "unknown error".into())));
+                }
+                if let Some(next) = state.queued_messages.first().cloned() {
+                    state.queued_messages.remove(0);
+                    let remaining = state.queued_messages.len();
+                    let preview: String = next.chars().take(60).collect();
+                    state.notice = Some(format!("sending queued message ({remaining} remaining): {preview}"));
+                    submit(state, store, engine_command_sender, next);
                 }
             }
         }
@@ -775,6 +797,12 @@ fn handle_composer_key(
             state.esc_primed = false;
             if text.starts_with('/') {
                 handle_command(state, store, engine_command_sender, &text);
+            } else if state.running {
+                state.queued_messages.push(text.clone());
+                state.notice = Some(format!(
+                    "queued ({} waiting) · sends after current turn · ctrl+c to interrupt instead",
+                    state.queued_messages.len()
+                ));
             } else {
                 submit(state, store, engine_command_sender, text);
             }
@@ -847,6 +875,11 @@ fn submit(
 ) {
     state.prompt_history.push(text.clone());
     state.prompt_history_index = None;
+    let text = if let Some(goal) = &state.goal {
+        format!("[goal: {goal}]\n{text}")
+    } else {
+        text
+    };
     let result = {
         let guard = store.lock().unwrap();
         ensure_persisted(&guard, &mut state.thread)
@@ -863,7 +896,7 @@ fn submit(
 fn handle_command(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
-    _engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     raw: &str,
 ) {
     let mut parts = raw.split_whitespace();
@@ -883,6 +916,104 @@ fn handle_command(
         "/clear" => {
             state.diff_output = None;
             state.notice = None;
+        }
+        "/goal" => {
+            if let Some(action) = args.first().map(String::as_str) {
+                match action {
+                    "clear" => {
+                        state.goal = None;
+                        state.notice = Some("goal cleared".into());
+                    }
+                    "pause" => {
+                        state.notice = Some("goal paused (will not inject into next turns)".into());
+                    }
+                    "resume" => {
+                        state.notice = Some("goal resumed".into());
+                    }
+                    _ => {
+                        state.goal = Some(args.join(" "));
+                        state.notice = Some(format!("goal set: {}", args.join(" ")));
+                    }
+                }
+            } else if let Some(goal) = &state.goal {
+                state.notice = Some(format!("current goal: {goal}"));
+            } else {
+                state.notice = Some("usage: /goal <done criteria> · /goal clear".into());
+            }
+        }
+        "/find" => {
+            let query = args.join(" ");
+            if query.is_empty() {
+                state.notice = Some("usage: /find <text>".into());
+                return;
+            }
+            let query_lower = query.to_lowercase();
+            let matches: Vec<String> = state
+                .history
+                .iter()
+                .filter(|message| message.text.to_lowercase().contains(&query_lower))
+                .map(|message| {
+                    let speaker = if message.role == "user" { "you" } else { "agent" };
+                    let context = message
+                        .text
+                        .lines()
+                        .find(|line| line.to_lowercase().contains(&query_lower))
+                        .unwrap_or("");
+                    let start = context.to_lowercase().find(&query_lower).unwrap_or(0);
+                    let begin = start.saturating_sub(30);
+                    let end = (start + query_lower.len() + 50).min(context.len());
+                    format!("  [{speaker}] ...{}...", &context[begin..end])
+                })
+                .collect();
+            state.notice = Some(if matches.is_empty() {
+                format!("no matches for \"{query}\"")
+            } else {
+                format!("found {} matches:\n{}", matches.len(), matches.join("\n"))
+            });
+        }
+        "/multi" => {
+            if args.len() < 2 {
+                state.notice = Some("usage: /multi <provider1> <provider2> ... <prompt>".into());
+                return;
+            }
+            let prompt = args.last().cloned().unwrap_or_default();
+            let providers: Vec<&str> = args[..args.len() - 1].iter().map(String::as_str).collect();
+            let valid_providers: Vec<ProviderId> = providers
+                .iter()
+                .filter_map(|provider| ProviderId::parse(provider))
+                .collect();
+            if valid_providers.is_empty() {
+                state.notice = Some("no valid providers. Use claude, codex, cursor, grok, opencode, or antigravity".into());
+                return;
+            }
+            state.notice = Some(format!(
+                "sending to {} providers in parallel: {}",
+                valid_providers.len(),
+                valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
+            ));
+            let mut threads = Vec::new();
+            for provider in valid_providers {
+                let thread = {
+                    let guard = store.lock().unwrap();
+                    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+                    let model = resolved.for_provider(provider).model.clone();
+                    guard.draft_thread(crate::store::NewThread {
+                        title: format!("[multi] {prompt}"),
+                        cwd: state.thread.cwd.clone(),
+                        current_provider: provider,
+                        current_model: Some(model),
+                    })
+                };
+                threads.push(thread);
+            }
+            for thread in threads {
+                let thread_id = thread.id.clone();
+                let _ = engine_command_sender.send(EngineCommand::Submit {
+                    thread_id,
+                    text: prompt.clone(),
+                    permission_mode: state.permission_mode,
+                });
+            }
         }
         "/compact" => {
             let messages: Vec<(String, String)> = state
@@ -1233,7 +1364,16 @@ fn handle_command(
                 state.notice = Some("nothing to rewind to yet".into());
             }
         }
-        other => state.notice = Some(format!("unknown command {other}. Try /help.")),
+        other => {
+            if let Some((_, template)) = state.custom_commands.iter().find(|(name, _)| name == other) {
+                let expanded = template
+                    .replace("{{args}}", &args.join(" "))
+                    .replace("{{cwd}}", &state.thread.cwd);
+                submit(state, store, engine_command_sender, expanded);
+            } else {
+                state.notice = Some(format!("unknown command {other}. Try /help."));
+            }
+        }
     }
 }
 
@@ -1328,6 +1468,30 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     }
     draw_composer(frame, state, chunks[4], &suggestions);
     draw_status(frame, state, chunks[5], spinner_frame);
+}
+
+fn discover_custom_commands(cwd: &str) -> Vec<(String, String)> {
+    let mut commands = Vec::new();
+    let dirs = [
+        std::path::PathBuf::from(cwd).join(".baton").join("commands"),
+        std::path::PathBuf::from(cwd).join(".claude").join("commands"),
+    ];
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+                    if let (Some(name), Ok(contents)) = (
+                        path.file_stem().and_then(|name| name.to_str()),
+                        std::fs::read_to_string(&path),
+                    ) {
+                        commands.push((format!("/{name}"), contents.trim().to_string()));
+                    }
+                }
+            }
+        }
+    }
+    commands
 }
 
 fn handle_mcp_command(state: &mut TuiState, action: &str, args: &[String]) {

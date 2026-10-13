@@ -832,34 +832,18 @@ fn handle_composer_key(
             state.esc_primed = false;
         }
         KeyCode::Up => {
-            if state.input.is_empty() && !state.prompt_history.is_empty() {
-                let index = state.prompt_history_index.map(|index| index.saturating_sub(1)).unwrap_or(state.prompt_history.len() - 1);
-                state.prompt_history_index = Some(index);
-                state.input = state.prompt_history[index].clone();
-            } else {
-                state.scroll_offset += 3;
-            }
+            state.scroll_offset += 1;
         }
         KeyCode::Down => {
-            if let Some(index) = state.prompt_history_index {
-                if index + 1 < state.prompt_history.len() {
-                    state.prompt_history_index = Some(index + 1);
-                    state.input = state.prompt_history[index + 1].clone();
-                } else {
-                    state.prompt_history_index = None;
-                    state.input.clear();
-                }
-            } else {
-                state.scroll_offset = state.scroll_offset.saturating_sub(3);
-            }
+            state.scroll_offset = state.scroll_offset.saturating_sub(1);
         }
         KeyCode::PageUp => {
-            state.scroll_offset += 20;
+            state.scroll_offset += 10;
         }
         KeyCode::PageDown => {
-            state.scroll_offset = state.scroll_offset.saturating_sub(20);
+            state.scroll_offset = state.scroll_offset.saturating_sub(10);
         }
-        KeyCode::End => {
+        KeyCode::End | KeyCode::Home => {
             state.scroll_offset = 0;
         }
         KeyCode::Esc => {
@@ -1830,7 +1814,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
                 Line::styled(line.to_string(), style)
             }))
             .collect();
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        frame.render_widget(Paragraph::new(lines), area);
         return;
     }
 
@@ -1853,48 +1837,91 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
         return;
     }
 
-    let items: Vec<ViewportItem> = state
-        .history
-        .iter()
-        .map(|message| ViewportItem {
-            id: message.id,
-            role: message.role.clone(),
-            text: message.text.clone(),
-            has_label: message.role == "assistant",
-            has_usage: false,
-        })
-        .collect();
-    let scroll_offset = state.scroll_offset.min(items.len().saturating_sub(1));
-    let budget = area.height.saturating_sub(1) as usize;
-    let windowed = window_messages(&items, budget, area.width as usize, scroll_offset);
-    let _ = budget;
+    // Pre-wrap all text at the actual terminal width so line counts are exact
+    let width = area.width as usize;
+    let wrap = |text: &str| -> Vec<String> {
+        text.split('\n')
+            .flat_map(|line| {
+                if line.is_empty() {
+                    vec![String::new()]
+                } else {
+                    let mut wrapped = Vec::new();
+                    let mut current = String::new();
+                    for ch in line.chars() {
+                        if current.chars().count() >= width.saturating_sub(2) {
+                            wrapped.push(current.clone());
+                            current.clear();
+                        }
+                        current.push(ch);
+                    }
+                    if !current.is_empty() || wrapped.is_empty() {
+                        wrapped.push(current);
+                    }
+                    wrapped
+                }
+            })
+            .collect()
+    };
 
-    let mut lines: Vec<Line> = Vec::new();
+    // Build all terminal lines (each element = exactly 1 rendered row)
+    let mut all_lines: Vec<Line> = Vec::new();
+    for message in &state.history {
+        if message.role == "user" {
+            for line in wrap(&message.text) {
+                all_lines.push(Line::styled(line, Style::default().fg(COLORS.text).bg(COLORS.user_bg)));
+            }
+        } else {
+            all_lines.push(Line::styled(
+                format!(
+                    "{} · {}",
+                    message.provider.as_deref().unwrap_or("?"),
+                    message.model.as_deref().unwrap_or("?")
+                ),
+                Style::default().fg(COLORS.muted),
+            ));
+            for line in wrap(&message.text) {
+                all_lines.push(Line::styled(line, Style::default().fg(COLORS.text)));
+            }
+        }
+        all_lines.push(Line::from(vec![Span::raw(" ")]));
+    }
+
+    let total = all_lines.len();
+    let viewport = area.height as usize;
+
+    if total <= viewport {
+        // Everything fits - render all, no scrolling
+        frame.render_widget(Paragraph::new(all_lines), area);
+        return;
+    }
+
+    // Content is taller than viewport - compute which lines to show
+    let scroll_offset = state.scroll_offset.min(total.saturating_sub(1));
+    let visible: Vec<Line> = if scroll_offset == 0 {
+        // Bottom-sticky: show the LAST viewport lines
+        all_lines[total.saturating_sub(viewport)..].to_vec()
+    } else {
+        // Scrolled up by scroll_offset lines from the bottom
+        let end = total.saturating_sub(scroll_offset);
+        let start = end.saturating_sub(viewport);
+        all_lines[start..end].to_vec()
+    };
+
+    // Add scroll indicator as the first line if scrolled
+    let mut render_lines = Vec::new();
     if scroll_offset > 0 {
-        lines.push(Line::styled(
-            format!(
-                "↑ {} older · ↓/End to bottom",
-                windowed.hidden_above
-            ),
+        render_lines.push(Line::styled(
+            format!("↑ {} lines above · ↓ or End for bottom", scroll_offset),
             Style::default().fg(COLORS.muted),
         ));
+        // One less line for content since we used one for the indicator
+        let content = visible[1.min(visible.len())..].to_vec();
+        render_lines.extend(content);
+    } else {
+        render_lines = visible;
     }
-    for item in windowed.visible {
-        let message = state.history.iter().find(|message| message.id == item.id);
-        if item.role == "user" {
-            lines.push(Line::styled(item.text.clone(), Style::default().fg(COLORS.text).bg(COLORS.user_bg)));
-        } else {
-            if let Some(message) = message {
-                lines.push(Line::styled(
-                    format!("{} · {}", message.provider.as_deref().unwrap_or("?"), message.model.as_deref().unwrap_or("?")),
-                    Style::default().fg(COLORS.muted),
-                ));
-            }
-            lines.push(Line::styled(item.text.clone(), Style::default().fg(COLORS.text)));
-        }
-        lines.push(Line::from(vec![Span::raw(" ")]));
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+
+    frame.render_widget(Paragraph::new(render_lines), area);
 }
 
 fn draw_live(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize, thinking: bool) {

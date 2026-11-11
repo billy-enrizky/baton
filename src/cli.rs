@@ -105,6 +105,10 @@ pub enum Commands {
     Status {
         thread_id: Option<String>,
     },
+    /// List durable turn phases for a thread
+    Turns {
+        thread_id: Option<String>,
+    },
     /// List or clear durable queued follow-ups
     Queue {
         thread_id: Option<String>,

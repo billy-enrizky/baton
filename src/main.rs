@@ -478,6 +478,47 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Turns { thread_id } => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
+                Some(thread_id) => resolve_thread(&store, thread_id)?,
+                None => store
+                    .list_threads(Some(cwd.to_string_lossy().as_ref()))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
+            };
+            let turns = store.list_turn_records(&thread.id)?;
+            if turns.is_empty() {
+                println!("no turn records");
+            } else {
+                for turn in turns {
+                    let ended = turn.ended_at.as_deref().unwrap_or("open");
+                    let provider_turn = turn
+                        .provider_turn_id
+                        .as_deref()
+                        .map(|id| format!(" provider-turn={id}"))
+                        .unwrap_or_default();
+                    let error = turn
+                        .error
+                        .as_deref()
+                        .map(|error| format!(" error={error}"))
+                        .unwrap_or_default();
+                    println!(
+                        "turn {} {} {}/{} started={} ended={}{}{}",
+                        turn.turn,
+                        turn.phase.as_str(),
+                        turn.provider,
+                        turn.model.as_deref().unwrap_or("-"),
+                        turn.started_at,
+                        ended,
+                        provider_turn,
+                        error
+                    );
+                }
+            }
+            Ok(())
+        }
         cli::Commands::Queue { thread_id, clear } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {

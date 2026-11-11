@@ -313,6 +313,7 @@ fn main_result() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&values)?);
                 return Ok(());
             }
+            let mut has_open = false;
             for thread in threads {
                 let model = thread
                     .current_model
@@ -320,10 +321,20 @@ fn main_result() -> Result<()> {
                     .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
                 let turns = store.list_turn_records(&thread.id)?;
                 let turn_count = turns.len();
-                let phase = turns
-                    .into_iter()
-                    .last()
-                    .map(|turn| turn.phase.as_str().to_string())
+                let latest_phase = turns.into_iter().last().map(|turn| turn.phase);
+                if latest_phase
+                    .map(|phase| {
+                        matches!(
+                            phase,
+                            TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+                        )
+                    })
+                    .unwrap_or(false)
+                {
+                    has_open = true;
+                }
+                let phase = latest_phase
+                    .map(|phase| phase.as_str().to_string())
                     .unwrap_or_else(|| "idle".to_string());
                 let queued = store.list_queued_messages(&thread.id)?.len();
                 println!(
@@ -336,6 +347,9 @@ fn main_result() -> Result<()> {
                     queued,
                     thread.title
                 );
+            }
+            if has_open {
+                println!("note: one or more turns are open; use `baton status <id>` to inspect them");
             }
             Ok(())
         }

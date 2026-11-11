@@ -254,6 +254,7 @@ fn main_result() -> Result<()> {
                     let phase = latest_phase
                         .map(|phase| phase.as_str().to_string())
                         .unwrap_or_else(|| "idle".to_string());
+                    let queued = store.list_queued_messages(&thread.id)?;
                     values.push(serde_json::json!({
                         "thread_id": thread.id,
                         "title": thread.title,
@@ -269,7 +270,8 @@ fn main_result() -> Result<()> {
                         } else {
                             None
                         },
-                        "queue_count": store.list_queued_messages(&thread.id)?.len(),
+                        "queue_count": queued.len(),
+                        "queue": queued,
                     }));
                 }
                 println!("{}", serde_json::to_string_pretty(&values)?);

@@ -614,6 +614,7 @@ fn main_result() -> Result<()> {
             if turns.is_empty() {
                 println!("no turn records");
             } else {
+                println!("turns: {}", turns.len());
                 for turn in turns {
                     let ended = turn.ended_at.as_deref().unwrap_or("open");
                     let provider_turn = turn

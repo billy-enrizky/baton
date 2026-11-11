@@ -684,6 +684,7 @@ fn main_result() -> Result<()> {
             if queued.is_empty() {
                 println!("queue: empty");
             } else {
+                println!("queue: {} waiting", queued.len());
                 for (index, message) in queued.iter().enumerate() {
                     let preview: String = message
                         .lines()

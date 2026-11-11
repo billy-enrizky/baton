@@ -659,9 +659,152 @@ async fn codex_interrupt_sends_turn_id_and_reports_interruption() {
     let result = tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap();
     assert!(result.is_err(), "an interrupted turn must not return Ok");
     let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
-    let failure = events.iter().find_map(|event| match event {
-        baton::adapters::TurnEvent::TurnFailed { error } => Some(error.clone()),
+    let interrupted = events.iter().find_map(|event| match event {
+        baton::adapters::TurnEvent::TurnInterrupted { reason } => reason.clone(),
         _ => None,
     });
-    assert_eq!(failure.as_deref(), Some("interrupted by user"));
+    assert_eq!(interrupted.as_deref(), Some("interrupted by user"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, baton::adapters::TurnEvent::TurnFailed { .. })),
+        "an interruption is not a generic failure"
+    );
+}
+
+
+async fn fake_server_steer(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    observed: std::sync::mpsc::Sender<Value>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = frame.get("id").cloned();
+        match method.as_str() {
+            "initialize" => send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await,
+            "thread/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "thread": { "id": "native-steer", "path": null } }
+                    }),
+                )
+                .await;
+            }
+            "turn/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "turn": { "id": "turn-steer", "status": "inProgress" } }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "item/agentMessage/delta",
+                        "params": { "threadId": "native-steer", "delta": "working" }
+                    }),
+                )
+                .await;
+            }
+            "turn/steer" => {
+                let params = frame.get("params").cloned().unwrap_or(Value::Null);
+                let _ = observed.send(params);
+                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": { "turnId": "turn-steer" } })).await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "native-steer",
+                            "turn": {
+                                "id": "turn-steer",
+                                "status": "completed",
+                                "items": [ { "type": "agentMessage", "text": "steered" } ]
+                            }
+                        }
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_steer_injects_into_the_active_turn() {
+    let (observed_sender, observed_receiver) = std::sync::mpsc::channel::<Value>();
+    let spawner = Arc::new(move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+        let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+        tokio::spawn(fake_server_steer(server_read, server_write, observed_sender.clone()));
+        Ok(halves)
+    });
+    let mut adapter = CodexAdapter::new(spawner);
+    let steer = adapter.steer_handle().expect("codex exposes steering");
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let turn = tokio::spawn(async move {
+        adapter
+            .start_turn(
+                baton::adapters::TurnStartInput {
+                    thread_id: "baton-thread".into(),
+                    cwd: "/work".into(),
+                    model: "m".into(),
+                    prompt: "hello".into(),
+                    permission_mode: PermissionMode::Default,
+                    auth_env: vec![],
+                },
+                None,
+                event_sender,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(event_receiver.try_recv(), Ok(baton::adapters::TurnEvent::TextDelta { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn is running");
+
+    assert!(steer("change direction".into()), "steer is accepted while the turn runs");
+    let params = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(params) = observed_receiver.try_recv() {
+                break params;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("steer frame reaches the server");
+    assert_eq!(params["threadId"], "native-steer");
+    assert_eq!(params["expectedTurnId"], "turn-steer");
+    assert_eq!(params["input"][0]["text"], "change direction");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap();
+    assert!(result.is_ok());
+    assert!(!steer("too late".into()), "steering after the turn ends is rejected");
 }

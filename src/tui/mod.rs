@@ -16,7 +16,7 @@ use crate::handoff::git_branch_label;
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
-use crate::types::{ApprovalDecision, PermissionMode, ProviderId};
+use crate::types::{ApprovalDecision, PermissionMode, ProviderId, TurnPhase};
 use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 
 pub mod viewport;
@@ -139,6 +139,7 @@ pub struct TuiState {
     prompt_history_index: Option<usize>,
     queued_messages: Vec<String>,
     goal: Option<String>,
+    goal_paused: bool,
     custom_commands: Vec<(String, String)>,
     home: std::path::PathBuf,
     thread: ThreadRow,
@@ -172,12 +173,19 @@ pub fn run_tui(
     engine_event_receiver: std::sync::mpsc::Receiver<EngineEvent>,
     turn_event_receiver: std::sync::mpsc::Receiver<TurnEvent>,
     initial_prompt: Option<String>,
-    initial_permission_mode: PermissionMode,
+    permission_override: Option<PermissionMode>,
 ) -> Result<()> {
     let history = store.lock().unwrap().list_messages(&thread.id)?;
     let prompt_history = store.lock().unwrap().list_prompt_history(&thread.cwd).unwrap_or_default();
     let branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
-    let permission_mode = initial_permission_mode;
+    let permission_mode = permission_override.unwrap_or(thread.permission_mode);
+    let goal = thread.goal.clone();
+    let goal_paused = thread.goal_paused;
+    let reconciled = store
+        .lock()
+        .unwrap()
+        .reconcile_running_turns(Some(thread.cwd.as_str()))
+        .unwrap_or_default();
 
     let custom_commands = discover_custom_commands(&thread.cwd);
     let mut state = TuiState {
@@ -185,7 +193,8 @@ pub fn run_tui(
         prompt_history,
         prompt_history_index: None,
         queued_messages: Vec::new(),
-        goal: None,
+        goal,
+        goal_paused,
         custom_commands,
         home,
         thread,
@@ -211,6 +220,17 @@ pub fn run_tui(
         input_origin: std::cell::Cell::new((0, 0)),
     };
 
+    if !reconciled.is_empty() {
+        let turns = reconciled
+            .iter()
+            .map(|row| row.turn.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        state.notice = Some(format!(
+            "previous turn(s) {turns} did not finish and were marked unverified"
+        ));
+    }
+
     if let Some(prompt) = initial_prompt {
         state.prompt_history.push(prompt.clone());
         let thread_id = state.thread.id.clone();
@@ -219,6 +239,15 @@ pub fn run_tui(
             ensure_persisted(&guard, &mut state.thread)
         };
         if result.is_ok() {
+            {
+                let guard = store.lock().unwrap();
+                let _ = guard.set_thread_permission_mode(&thread_id, state.permission_mode);
+                let _ = guard.set_thread_goal(
+                    &thread_id,
+                    state.goal.as_deref(),
+                    state.goal_paused,
+                );
+            }
             let _ = engine_command_sender.send(EngineCommand::Submit {
                 thread_id,
                 text: prompt,
@@ -259,6 +288,9 @@ pub fn run_tui(
             match crossterm::event::read()? {
                 Event::Key(key) => {
                     if key.kind == KeyEventKind::Press {
+                        if std::env::var_os("BATON_DEBUG_KEYS").is_some() {
+                            eprintln!("baton key: {:?} {:?}", key.code, key.modifiers);
+                        }
                         handle_key(&mut state, &store, &engine_command_sender, key);
                     }
                 }
@@ -342,7 +374,7 @@ fn apply_engine_event(
                 state.diff_output = None;
             }
         }
-        EngineEvent::TurnFinished { thread_id, ok, error } => {
+        EngineEvent::TurnFinished { thread_id, ok, error, phase } => {
             if thread_id == state.thread.id {
                 state.running = false;
                 state.streaming_text.clear();
@@ -356,15 +388,37 @@ fn apply_engine_event(
                 }
                 state.scroll_offset = 0;
                 if !ok {
-                    state.notice = Some(format!("turn failed: {}", error.unwrap_or_else(|| "unknown error".into())));
+                    let detail = error.unwrap_or_else(|| "unknown error".into());
+                    state.notice = Some(match phase {
+                        TurnPhase::Interrupted => "turn interrupted".to_string(),
+                        TurnPhase::Unverified => format!("turn unverified: {detail}"),
+                        _ => format!("turn failed: {detail}"),
+                    });
                 }
-                if let Some(next) = state.queued_messages.first().cloned() {
-                    state.queued_messages.remove(0);
-                    let remaining = state.queued_messages.len();
-                    let preview: String = next.chars().take(60).collect();
-                    state.notice = Some(format!("sending queued message ({remaining} remaining): {preview}"));
-                    submit(state, store, engine_command_sender, next);
+                // Only advance the queue after a clean turn. A failure or an
+                // interrupt should not automatically fire the next prompt.
+                if ok {
+                    if let Some(next) = state.queued_messages.first().cloned() {
+                        state.queued_messages.remove(0);
+                        let remaining = state.queued_messages.len();
+                        let preview: String = next.chars().take(60).collect();
+                        state.notice = Some(format!("sending queued message ({remaining} remaining): {preview}"));
+                        submit(state, store, engine_command_sender, next);
+                    }
+                } else if !state.queued_messages.is_empty() {
+                    let waiting = state.queued_messages.len();
+                    let prefix = state.notice.take().unwrap_or_default();
+                    state.notice = Some(format!("{prefix} · {waiting} queued message(s) kept; press enter to send"));
                 }
+            }
+        }
+        EngineEvent::SteerRejected { thread_id, text } => {
+            if thread_id == state.thread.id {
+                state.queued_messages.push(text);
+                state.notice = Some(format!(
+                    "this provider cannot steer the live turn; queued ({} waiting)",
+                    state.queued_messages.len()
+                ));
             }
         }
         EngineEvent::Turn(_) => {}
@@ -412,7 +466,9 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
             state.overlay = Overlay::Approval { summary, respond };
         }
         TurnEvent::Usage { .. } => {}
-        TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. } => {}
+        TurnEvent::TurnCompleted { .. }
+        | TurnEvent::TurnInterrupted { .. }
+        | TurnEvent::TurnFailed { .. } => {}
     }
 }
 
@@ -687,7 +743,7 @@ fn handle_key(
             KeyCode::Enter => {
                 let modes = [PermissionMode::Default, PermissionMode::AcceptEdits, PermissionMode::BypassPermissions, PermissionMode::Plan];
                 if let Some(mode) = modes.get(selected) {
-                    state.permission_mode = *mode;
+                    state.apply_permission_mode(store, *mode);
                     state.notice = Some(format!("permission mode: {mode}"));
                 }
             }
@@ -754,6 +810,9 @@ fn handle_key(
                             .find(|thread| thread.id.starts_with(thread_id.as_str()))
                     };
                     if let Some(thread) = found {
+                        state.permission_mode = thread.permission_mode;
+                        state.goal = thread.goal.clone();
+                        state.goal_paused = thread.goal_paused;
                         state.thread = thread.clone();
                         let guard = store.lock().unwrap();
                         state.history = guard.list_messages(&thread.id).unwrap_or_default();
@@ -921,11 +980,11 @@ fn handle_composer_key(
             if text.starts_with('/') {
                 handle_command(state, store, engine_command_sender, &text);
             } else if state.running {
-                state.queued_messages.push(text.clone());
-                state.notice = Some(format!(
-                    "queued ({} waiting) · sends after current turn · ctrl+c to interrupt instead",
-                    state.queued_messages.len()
-                ));
+                let _ = engine_command_sender.send(EngineCommand::Steer {
+                    thread_id: state.thread.id.clone(),
+                    text: text.clone(),
+                });
+                state.notice = Some("steering the current turn...".into());
             } else {
                 submit(state, store, engine_command_sender, text);
             }
@@ -1051,7 +1110,11 @@ fn submit(
         state.notice = Some(format!("cannot record prompt: {error}"));
     }
     let text = if let Some(goal) = &state.goal {
-        format!("[goal: {goal}]\n{text}")
+        if state.goal_paused {
+            text
+        } else {
+            format!("[goal: {goal}]\n{text}")
+        }
     } else {
         text
     };
@@ -1065,6 +1128,7 @@ fn submit(
     }
     let thread_id = state.thread.id.clone();
     let permission_mode = state.permission_mode;
+    state.persist_thread_state(store);
     let _ = engine_command_sender.send(EngineCommand::Submit { thread_id, text, permission_mode });
 }
 
@@ -1098,24 +1162,38 @@ fn handle_command(
             if let Some(action) = args.first().map(String::as_str) {
                 match action {
                     "clear" => {
-                        state.goal = None;
+                        state.set_goal_state(store, None, false);
                         state.notice = Some("goal cleared".into());
                     }
                     "pause" => {
-                        state.notice = Some("goal paused (will not inject into next turns)".into());
+                        if state.goal.is_none() {
+                            state.notice = Some("no goal to pause; set one with /goal <criteria>".into());
+                        } else {
+                            let goal = state.goal.clone();
+                            state.set_goal_state(store, goal, true);
+                            state.notice = Some("goal paused (not injected into new turns)".into());
+                        }
                     }
                     "resume" => {
-                        state.notice = Some("goal resumed".into());
+                        if state.goal.is_none() {
+                            state.notice = Some("no goal to resume; set one with /goal <criteria>".into());
+                        } else {
+                            let goal = state.goal.clone();
+                            state.set_goal_state(store, goal, false);
+                            state.notice = Some("goal resumed".into());
+                        }
                     }
                     _ => {
-                        state.goal = Some(args.join(" "));
-                        state.notice = Some(format!("goal set: {}", args.join(" ")));
+                        let goal = args.join(" ");
+                        state.set_goal_state(store, Some(goal.clone()), false);
+                        state.notice = Some(format!("goal set: {goal}"));
                     }
                 }
             } else if let Some(goal) = &state.goal {
-                state.notice = Some(format!("current goal: {goal}"));
+                let suffix = if state.goal_paused { " (paused)" } else { "" };
+                state.notice = Some(format!("current goal{suffix}: {goal}"));
             } else {
-                state.notice = Some("usage: /goal <done criteria> · /goal clear".into());
+                state.notice = Some("usage: /goal <done criteria> · /goal pause|resume|clear".into());
             }
         }
         "/find" => {
@@ -1345,7 +1423,7 @@ fn handle_command(
         }
         "/mode" => {
             if let Some(mode) = args.first().map(String::as_str).and_then(PermissionMode::parse) {
-                state.permission_mode = mode;
+                state.apply_permission_mode(store, mode);
                 state.notice = Some(format!("permission mode: {mode}"));
             } else {
                 state.overlay = Overlay::ModePicker { selected: 0 };
@@ -1412,7 +1490,12 @@ fn handle_command(
                     current_model: None,
                 })
             };
+            state.thread.permission_mode = state.permission_mode;
             state.history.clear();
+            state.goal = None;
+            state.goal_paused = false;
+            state.thread.goal = None;
+            state.thread.goal_paused = false;
             state.branch_label = None;
             state.diff_output = None;
             state.scroll_offset = 0;
@@ -2394,6 +2477,38 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
 }
 
 impl TuiState {
+    fn persist_thread_state(&self, store: &Arc<Mutex<BatonStore>>) {
+        let guard = store.lock().unwrap();
+        if guard.get_thread(&self.thread.id).ok().flatten().is_none() {
+            return;
+        }
+        let _ = guard.set_thread_permission_mode(&self.thread.id, self.permission_mode);
+        let _ = guard.set_thread_goal(
+            &self.thread.id,
+            self.goal.as_deref(),
+            self.goal_paused,
+        );
+    }
+
+    fn apply_permission_mode(&mut self, store: &Arc<Mutex<BatonStore>>, mode: PermissionMode) {
+        self.permission_mode = mode;
+        self.thread.permission_mode = mode;
+        self.persist_thread_state(store);
+    }
+
+    fn set_goal_state(
+        &mut self,
+        store: &Arc<Mutex<BatonStore>>,
+        goal: Option<String>,
+        paused: bool,
+    ) {
+        self.goal = goal;
+        self.goal_paused = paused;
+        self.thread.goal = self.goal.clone();
+        self.thread.goal_paused = paused;
+        self.persist_thread_state(store);
+    }
+
     fn set_input(&mut self, text: String) {
         self.input_cursor = text.chars().count();
         self.input = text;
@@ -2502,6 +2617,7 @@ mod tests {
             prompt_history_index: None,
             queued_messages: Vec::new(),
             goal: None,
+            goal_paused: false,
             custom_commands: Vec::new(),
             home: home.to_path_buf(),
             thread,
@@ -2933,6 +3049,137 @@ mod tests {
             Some((9, 13)),
             "the second line maps to the absolute char range"
         );
+    }
+
+    #[test]
+    fn a_message_while_running_steers_instead_of_queueing() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.running = true;
+        state.set_input("change direction".into());
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        match engine_command_receiver.try_recv().expect("steer command") {
+            EngineCommand::Steer { thread_id, text } => {
+                assert_eq!(thread_id, state.thread.id);
+                assert_eq!(text, "change direction");
+            }
+            _ => panic!("expected a steer command"),
+        }
+        assert!(state.queued_messages.is_empty(), "a steer is not a queued turn");
+    }
+
+    #[test]
+    fn rejected_steering_falls_back_to_the_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::SteerRejected {
+                thread_id,
+                text: "follow up".into(),
+            },
+            &engine_command_sender,
+        );
+        assert_eq!(state.queued_messages, vec!["follow up".to_string()]);
+        assert!(state.notice.as_deref().unwrap_or("").contains("queued"));
+    }
+
+    #[test]
+    fn permission_mode_and_goal_persist_and_paused_goals_are_not_injected() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/mode plan");
+        let saved = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(saved.permission_mode, PermissionMode::Plan, "mode persists on the thread");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/goal ship the fix");
+        let saved = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(saved.goal.as_deref(), Some("ship the fix"));
+        assert!(!saved.goal_paused);
+
+        handle_command(&mut state, &store, &engine_command_sender, "/goal pause");
+        let saved = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert!(saved.goal_paused, "pause is durable, not just a notice");
+        submit(&mut state, &store, &engine_command_sender, "while paused".into());
+        match engine_command_receiver.try_recv().expect("submit") {
+            EngineCommand::Submit { text, permission_mode, .. } => {
+                assert_eq!(text, "while paused", "a paused goal must not be injected");
+                assert_eq!(permission_mode, PermissionMode::Plan);
+            }
+            _ => panic!("expected submit"),
+        }
+
+        handle_command(&mut state, &store, &engine_command_sender, "/goal resume");
+        submit(&mut state, &store, &engine_command_sender, "after resume".into());
+        match engine_command_receiver.try_recv().expect("submit") {
+            EngineCommand::Submit { text, .. } => {
+                assert_eq!(text, "[goal: ship the fix]\nafter resume");
+            }
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn opening_a_thread_restores_its_mode_and_goal() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "other".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        {
+            let guard = store.lock().unwrap();
+            guard.set_thread_permission_mode(&other.id, PermissionMode::BypassPermissions).unwrap();
+            guard
+                .set_thread_goal(&other.id, Some("other goal"), true)
+                .unwrap();
+        }
+        state.overlay = Overlay::ThreadPicker {
+            selected: 0,
+            threads: vec![(other.id.clone(), other.title.clone())],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert_eq!(state.thread.id, other.id);
+        assert_eq!(state.permission_mode, PermissionMode::BypassPermissions);
+        assert_eq!(state.goal.as_deref(), Some("other goal"));
+        assert!(state.goal_paused);
     }
 
     #[test]

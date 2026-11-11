@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{BatonAdapter, LineReader, LineWriter, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, LineReader, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -82,6 +82,12 @@ enum ApprovalKind {
     Command,
     FileChange,
     Permissions,
+}
+
+fn steer_debug(message: &str) {
+    if std::env::var_os("BATON_DEBUG_STEER").is_some() {
+        eprintln!("baton steer: {message}");
+    }
 }
 
 fn approval_kind(method: &str) -> Option<ApprovalKind> {
@@ -234,6 +240,7 @@ impl CodexAdapter {
     }
 
     async fn ensure_runtime(&mut self, auth_env: &[(String, String)]) -> Result<Arc<CodexRuntime>> {
+        steer_debug(&format!("ensure adapter={:x} slot={:x}", self as *const Self as usize, Arc::as_ptr(&self.runtime) as usize));
         let signature = auth_signature(auth_env);
         let need_spawn = self.auth_signature.lock().unwrap().as_deref() != Some(signature.as_str());
         if need_spawn {
@@ -255,6 +262,7 @@ impl CodexAdapter {
             });
             spawn_reader(runtime.clone());
             *slot = Some(runtime.clone());
+            steer_debug(&format!("runtime spawned adapter={:x} slot={:x} runtime={:p}", self as *const Self as usize, Arc::as_ptr(&self.runtime) as usize, Arc::as_ptr(&runtime)));
             self.notification_receiver = Some(notification_receiver);
             *self.auth_signature.lock().unwrap() = Some(signature);
         }
@@ -441,6 +449,72 @@ impl BatonAdapter for CodexAdapter {
         })
     }
 
+    fn steer_handle(&self) -> Option<SteerHandle> {
+        let runtime = self.runtime.clone();
+        let adapter_ptr = self as *const Self as usize;
+        let slot_ptr = Arc::as_ptr(&runtime) as usize;
+        steer_debug(&format!("handle adapter={adapter_ptr:x} slot={slot_ptr:x}"));
+        let next_id = self.next_id.clone();
+        Some(Arc::new(move |text: String| -> bool {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                steer_debug("no tokio runtime");
+                return false;
+            };
+            let runtime = match runtime.try_lock() {
+                Ok(slot) => slot.clone(),
+                Err(_) => {
+                    steer_debug("runtime slot busy");
+                    return false;
+                }
+            };
+            let runtime = match runtime {
+                Some(runtime) => runtime,
+                None => {
+                    steer_debug(&format!("runtime not spawned adapter={adapter_ptr:x} slot={slot_ptr:x}"));
+                    return false;
+                }
+            };
+            steer_debug(&format!("runtime found adapter={adapter_ptr:x} runtime={:p}", Arc::as_ptr(&runtime)));
+            let thread_id = match runtime.active_thread.try_lock() {
+                Ok(value) => value.clone(),
+                Err(_) => {
+                    steer_debug("active thread busy");
+                    return false;
+                }
+            };
+            let turn_id = match runtime.active_turn.try_lock() {
+                Ok(value) => value.clone(),
+                Err(_) => {
+                    steer_debug("active turn busy");
+                    return false;
+                }
+            };
+            let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) else {
+                steer_debug("no active thread or turn");
+                return false;
+            };
+            let id = next_id.fetch_add(1, Ordering::SeqCst);
+            steer_debug("accepted");
+            handle.spawn(async move {
+                let frame = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "turn/steer",
+                    "params": {
+                        "threadId": thread_id,
+                        "expectedTurnId": turn_id,
+                        "input": [ { "type": "text", "text": text } ]
+                    }
+                });
+                if let Ok(serialized) = serde_json::to_string(&frame) {
+                    let mut writer = runtime.writer.lock().await;
+                    let _ = writer.write_line(&serialized).await;
+                }
+            });
+            true
+        }))
+    }
+
     async fn start_turn(
         &mut self,
         input: TurnStartInput,
@@ -571,8 +645,11 @@ impl BatonAdapter for CodexAdapter {
                                 break Ok(());
                             }
                             "interrupted" => {
-                                let message = error.unwrap_or_else(|| "turn interrupted".to_string());
-                                let _ = emit.send(TurnEvent::TurnFailed { error: message.clone() });
+                                let reason = error;
+                                let message = reason
+                                    .clone()
+                                    .unwrap_or_else(|| "turn interrupted".to_string());
+                                let _ = emit.send(TurnEvent::TurnInterrupted { reason });
                                 break Err(anyhow::anyhow!(message));
                             }
                             "failed" => {

@@ -2,18 +2,19 @@ use anyhow::Result;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::adapters::{BatonAdapter, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::checkpoints::capture_checkpoint;
 use crate::config::{provider_auth_env, resolve_config};
 use crate::handoff::{build_handoff, derive_title, git_status_summary, wrap_prompt_with_handoff, HandoffMessage};
 use crate::store::{BatonStore, NewThread, ThreadRow};
-use crate::types::{PermissionMode, ProviderId, TurnUsage};
+use crate::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
 
 pub type SharedStore = Arc<Mutex<BatonStore>>;
 pub type SharedAdapter = Arc<tokio::sync::Mutex<Box<dyn BatonAdapter>>>;
 
 pub enum EngineCommand {
     Submit { thread_id: String, text: String, permission_mode: PermissionMode },
+    Steer { thread_id: String, text: String },
     Interrupt,
     Quit,
 }
@@ -22,7 +23,8 @@ pub enum EngineEvent {
     UserEcho { thread_id: String, turn: i64, text: String, provider: ProviderId, model: Option<String> },
     TurnStarted { thread_id: String },
     Turn(TurnEvent),
-    TurnFinished { thread_id: String, ok: bool, error: Option<String> },
+    SteerRejected { thread_id: String, text: String },
+    TurnFinished { thread_id: String, ok: bool, error: Option<String>, phase: TurnPhase },
 }
 
 struct TurnOutcome {
@@ -30,6 +32,65 @@ struct TurnOutcome {
     usage: Option<TurnUsage>,
     native_session_id: Option<String>,
     rollout_path: Option<String>,
+}
+
+/// Durable state for one turn. Early returns, panics in the provider task, or
+/// a closed stream still leave a terminal phase instead of a silent gap.
+struct TurnLedger {
+    store: SharedStore,
+    thread_id: String,
+    turn: i64,
+    settled: bool,
+}
+
+impl TurnLedger {
+    fn start(
+        store: &SharedStore,
+        thread_id: &str,
+        turn: i64,
+        provider: ProviderId,
+        model: &str,
+    ) -> Result<TurnLedger> {
+        store
+            .lock()
+            .unwrap()
+            .start_turn_record(thread_id, turn, provider, Some(model))?;
+        Ok(TurnLedger {
+            store: store.clone(),
+            thread_id: thread_id.to_string(),
+            turn,
+            settled: false,
+        })
+    }
+
+    fn settle(&mut self, phase: TurnPhase, error: Option<&str>) {
+        if self.settled {
+            return;
+        }
+        if let Ok(store) = self.store.lock() {
+            let _ = store.finish_turn_record(&self.thread_id, self.turn, phase, error);
+        }
+        self.settled = true;
+    }
+}
+
+impl Drop for TurnLedger {
+    fn drop(&mut self) {
+        if !self.settled {
+            self.settle(
+                TurnPhase::Failed,
+                Some("turn ended without a terminal state"),
+            );
+        }
+    }
+}
+
+fn phase_for_error(error: &str) -> TurnPhase {
+    if error.to_ascii_lowercase().contains("interrupt") {
+        TurnPhase::Interrupted
+    } else {
+        TurnPhase::Failed
+    }
 }
 
 /// One tool invocation of a turn, kept for the conversation history.
@@ -101,6 +162,7 @@ pub async fn run_engine(
     home: std::path::PathBuf,
     adapters: Vec<SharedAdapter>,
     interrupt_handles: Vec<Arc<dyn Fn() + Send + Sync>>,
+    steer_handles: Vec<(ProviderId, SteerHandle)>,
     mut command_receiver: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: TurnEventSender,
@@ -112,6 +174,62 @@ pub async fn run_engine(
                     let _ = adapter.lock().await.dispose().await;
                 }
                 break;
+            }
+            EngineCommand::Steer { thread_id, text } => {
+                let provider = store
+                    .lock()
+                    .unwrap()
+                    .get_thread(&thread_id)
+                    .ok()
+                    .flatten()
+                    .map(|thread| thread.current_provider);
+                let accepted = provider
+                    .and_then(|provider| {
+                        steer_handles
+                            .iter()
+                            .find(|(candidate, _)| *candidate == provider)
+                            .map(|(_, handle)| handle(text.clone()))
+                    })
+                    .unwrap_or(false);
+                if accepted {
+                    let (provider, model, turn) = {
+                        let store = store.lock().unwrap();
+                        let thread = store.get_thread(&thread_id).ok().flatten();
+                        let turn = store.next_turn_number(&thread_id).unwrap_or(1).saturating_sub(1);
+                        thread
+                            .map(|thread| {
+                                let model = thread
+                                    .current_model
+                                    .clone()
+                                    .unwrap_or_else(|| crate::models::default_model(thread.current_provider).to_string());
+                                (thread.current_provider, model, turn)
+                            })
+                            .unwrap_or((ProviderId::Codex, String::new(), turn))
+                    };
+                    {
+                        let store = store.lock().unwrap();
+                        let _ = store.add_message(
+                            &thread_id,
+                            turn,
+                            "user",
+                            Some(provider.as_str()),
+                            Some(&model),
+                            &text,
+                        );
+                    }
+                    let _ = engine_event_sender.send(EngineEvent::UserEcho {
+                        thread_id,
+                        turn,
+                        text,
+                        provider,
+                        model: Some(model),
+                    });
+                } else {
+                    let _ = engine_event_sender.send(EngineEvent::SteerRejected {
+                        thread_id,
+                        text,
+                    });
+                }
             }
             EngineCommand::Interrupt => {
                 for handle in &interrupt_handles {
@@ -145,15 +263,35 @@ async fn run_turn(
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: TurnEventSender,
 ) {
+    let expected_turn = store
+        .lock()
+        .unwrap()
+        .next_turn_number(&thread_id)
+        .unwrap_or(0);
     let result = execute_turn(&store, &home, &adapters, &thread_id, &text, permission_mode, &engine_event_sender, &turn_event_sender).await;
-    let (ok, error) = match result {
-        Ok(()) => (true, None),
-        Err(error) => (false, Some(error.to_string())),
+    let record = if expected_turn > 0 {
+        store
+            .lock()
+            .unwrap()
+            .get_turn_record(&thread_id, expected_turn)
+            .unwrap_or(None)
+    } else {
+        None
     };
+    let phase = record
+        .as_ref()
+        .map(|record| record.phase)
+        .unwrap_or(TurnPhase::Unverified);
+    let error = record
+        .as_ref()
+        .and_then(|record| record.error.clone())
+        .or_else(|| result.as_ref().err().map(ToString::to_string));
+    let ok = matches!(phase, TurnPhase::Completed);
     let _ = engine_event_sender.send(EngineEvent::TurnFinished {
         thread_id,
         ok,
         error,
+        phase,
     });
 }
 
@@ -188,6 +326,8 @@ async fn execute_turn(
         let session = store.get_provider_session(thread_id, provider)?;
         (prior, turn, session)
     };
+
+    let mut turn_ledger = TurnLedger::start(store, thread_id, turn, provider, &model)?;
 
     let _ = engine_event_sender.send(EngineEvent::UserEcho {
         thread_id: thread_id.to_string(),
@@ -259,9 +399,11 @@ async fn execute_turn(
     let tui_sender = turn_event_sender.clone();
     let outcome_slot: Arc<Mutex<Option<TurnOutcome>>> = Arc::new(Mutex::new(None));
     let failure_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let interrupted_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let tools_slot: Arc<Mutex<Vec<ToolRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let outcome_for_thread = outcome_slot.clone();
     let failure_for_thread = failure_slot.clone();
+    let interrupted_for_thread = interrupted_slot.clone();
     let tools_for_thread = tools_slot.clone();
     let forwarder = std::thread::spawn(move || {
         for event in event_receiver {
@@ -273,6 +415,12 @@ async fn execute_turn(
                         native_session_id: native_session_id.clone(),
                         rollout_path: rollout_path.clone(),
                     });
+                    let _ = tui_sender.send(event);
+                    break;
+                }
+                TurnEvent::TurnInterrupted { reason } => {
+                    *interrupted_for_thread.lock().unwrap() =
+                        Some(reason.clone().unwrap_or_else(|| "turn interrupted".into()));
                     let _ = tui_sender.send(event);
                     break;
                 }
@@ -301,11 +449,23 @@ async fn execute_turn(
 
     let tool_records = tools_slot.lock().unwrap().drain(..).collect::<Vec<_>>();
     if !tool_records.is_empty() {
-        let store = store.lock().unwrap();
-        persist_tool_records(&store, thread_id, turn, provider, &tool_records)?;
+        let result = {
+            let store = store.lock().unwrap();
+            persist_tool_records(&store, thread_id, turn, provider, &tool_records)
+        };
+        if let Err(error) = result {
+            turn_ledger.settle(TurnPhase::Failed, Some(&error.to_string()));
+            return Err(error);
+        }
+    }
+
+    if let Some(reason) = interrupted_slot.lock().unwrap().take() {
+        turn_ledger.settle(TurnPhase::Interrupted, Some(&reason));
+        return Err(anyhow::anyhow!(reason));
     }
 
     if let Some(error) = failure_slot.lock().unwrap().take() {
+        turn_ledger.settle(phase_for_error(&error), Some(&error));
         return Err(anyhow::anyhow!("{error}"));
     }
 
@@ -315,10 +475,17 @@ async fn execute_turn(
     let outcome = match outcome_slot.lock().unwrap().take() {
         Some(outcome) => outcome,
         None => {
-            let message = match adapter_result {
-                Ok(()) => "provider ended without a result".to_string(),
-                Err(error) => format!("provider turn failed: {error}"),
+            let (phase, message) = match adapter_result {
+                Ok(()) => (
+                    TurnPhase::Unverified,
+                    "provider ended without a result".to_string(),
+                ),
+                Err(error) => (
+                    TurnPhase::Failed,
+                    format!("provider turn failed: {error}"),
+                ),
             };
+            turn_ledger.settle(phase, Some(&message));
             return Err(anyhow::anyhow!(message));
         }
     };
@@ -351,6 +518,7 @@ async fn execute_turn(
             }
         }
     }
+    turn_ledger.settle(TurnPhase::Completed, None);
     // Non-TUI consumers (baton exec) read the final text from the engine
     // event channel; the TUI ignores EngineEvent::Turn.
     let _ = engine_event_sender.send(EngineEvent::Turn(TurnEvent::TurnCompleted {
@@ -395,10 +563,20 @@ pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()
 mod tests {
     use super::*;
 
-    struct SilentAdapter;
+    #[derive(Clone, Copy)]
+    enum AdapterMode {
+        Silent,
+        Complete,
+        Fail,
+        Interrupt,
+    }
+
+    struct ScriptAdapter {
+        mode: AdapterMode,
+    }
 
     #[async_trait::async_trait]
-    impl BatonAdapter for SilentAdapter {
+    impl BatonAdapter for ScriptAdapter {
         fn id(&self) -> ProviderId {
             ProviderId::Codex
         }
@@ -413,7 +591,27 @@ mod tests {
             _session: Option<crate::types::NativeSessionRef>,
             emit: TurnEventSender,
         ) -> Result<()> {
-            drop(emit);
+            match self.mode {
+                AdapterMode::Silent => drop(emit),
+                AdapterMode::Complete => {
+                    let _ = emit.send(TurnEvent::TurnCompleted {
+                        final_text: "done".into(),
+                        usage: None,
+                        native_session_id: Some("native-1".into()),
+                        rollout_path: None,
+                    });
+                }
+                AdapterMode::Fail => {
+                    let _ = emit.send(TurnEvent::TurnFailed {
+                        error: "provider died".into(),
+                    });
+                }
+                AdapterMode::Interrupt => {
+                    let _ = emit.send(TurnEvent::TurnInterrupted {
+                        reason: Some("stopped by user".into()),
+                    });
+                }
+            }
             Ok(())
         }
 
@@ -422,8 +620,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_turn_without_a_terminal_event_is_an_error() {
+    async fn run_scripted_turn(mode: AdapterMode) -> (SharedStore, String, Result<()>) {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let cwd = home.path().to_string_lossy().to_string();
@@ -438,11 +635,10 @@ mod tests {
             })
             .unwrap();
         let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
-            Box::new(SilentAdapter) as Box<dyn BatonAdapter>
+            Box::new(ScriptAdapter { mode }) as Box<dyn BatonAdapter>
         ))];
         let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
         let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
-
         let result = execute_turn(
             &store,
             &home.path().to_path_buf(),
@@ -454,14 +650,200 @@ mod tests {
             &turn_sender,
         )
         .await;
+        (store, thread.id, result)
+    }
 
+    struct IdleAdapter;
+
+    #[async_trait::async_trait]
+    impl BatonAdapter for IdleAdapter {
+        fn id(&self) -> ProviderId {
+            ProviderId::Codex
+        }
+
+        fn interrupt_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+            Arc::new(|| {})
+        }
+
+        async fn start_turn(
+            &mut self,
+            _input: TurnStartInput,
+            _session: Option<crate::types::NativeSessionRef>,
+            _emit: TurnEventSender,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn dispose(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn engine_accepts_steering_and_rejects_it_without_a_handle() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "t".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
+            Box::new(IdleAdapter) as Box<dyn BatonAdapter>
+        ))];
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_handle = accepted.clone();
+        let steer: SteerHandle = Arc::new(move |text: String| {
+            accepted_handle.store(text == "try this", Ordering::SeqCst);
+            true
+        });
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store.clone(),
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            Vec::new(),
+            vec![(ProviderId::Codex, steer)],
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        command_sender
+            .send(EngineCommand::Steer {
+                thread_id: thread.id.clone(),
+                text: "try this".into(),
+            })
+            .unwrap();
+
+        let echo = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(EngineEvent::UserEcho { text, .. }) = event_receiver.try_recv() {
+                    break text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("steer is accepted");
+        assert_eq!(echo, "try this");
+        assert!(accepted.load(Ordering::SeqCst));
+
+        let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
+        assert_eq!(messages.len(), 1, "steering text is persisted in the conversation");
+        assert_eq!(messages[0].text, "try this");
+
+        // A provider without a steer handle falls back to the queue event.
+        let (command_sender2, command_receiver2) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender2, event_receiver2) = std::sync::mpsc::channel();
+        let (turn_sender2, _turn_receiver2) = std::sync::mpsc::channel();
+        let adapters2: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
+            Box::new(IdleAdapter) as Box<dyn BatonAdapter>
+        ))];
+        let engine2 = tokio::spawn(run_engine(
+            store.clone(),
+            std::path::PathBuf::from("/tmp"),
+            adapters2,
+            Vec::new(),
+            Vec::new(),
+            command_receiver2,
+            event_sender2,
+            turn_sender2,
+        ));
+        command_sender2
+            .send(EngineCommand::Steer {
+                thread_id: thread.id.clone(),
+                text: "queue me".into(),
+            })
+            .unwrap();
+        let rejected = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(EngineEvent::SteerRejected { text, .. }) = event_receiver2.try_recv() {
+                    break text;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("missing handle rejects steering");
+        assert_eq!(rejected, "queue me");
+
+        command_sender.send(EngineCommand::Quit).unwrap();
+        command_sender2.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine2).await;
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_a_terminal_event_is_unverified() {
+        let (store, thread_id, result) = run_scripted_turn(AdapterMode::Silent).await;
         let error = result.expect_err("a silent adapter must fail the turn");
         assert!(error.to_string().contains("without a result"), "{error}");
-        let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
+        let messages = store.lock().unwrap().list_messages(&thread_id).unwrap();
         assert!(
             !messages.iter().any(|message| message.role == "assistant"),
             "no empty assistant reply may be stored"
         );
+        let turn = store
+            .lock()
+            .unwrap()
+            .get_turn_record(&thread_id, 1)
+            .unwrap()
+            .expect("turn record");
+        assert_eq!(turn.phase, TurnPhase::Unverified);
+    }
+
+    #[tokio::test]
+    async fn a_completed_turn_is_recorded() {
+        let (store, thread_id, result) = run_scripted_turn(AdapterMode::Complete).await;
+        result.expect("turn completes");
+        let turn = store
+            .lock()
+            .unwrap()
+            .get_turn_record(&thread_id, 1)
+            .unwrap()
+            .expect("turn record");
+        assert_eq!(turn.phase, TurnPhase::Completed);
+        assert!(turn.ended_at.is_some());
+        let messages = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        assert!(messages.iter().any(|message| message.role == "assistant" && message.text == "done"));
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_turn_is_recorded_as_interrupted() {
+        let (store, thread_id, result) = run_scripted_turn(AdapterMode::Interrupt).await;
+        let error = result.expect_err("interrupted turn");
+        assert_eq!(error.to_string(), "stopped by user");
+        let turn = store
+            .lock()
+            .unwrap()
+            .get_turn_record(&thread_id, 1)
+            .unwrap()
+            .expect("turn record");
+        assert_eq!(turn.phase, TurnPhase::Interrupted);
+        assert_eq!(turn.error.as_deref(), Some("stopped by user"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_is_recorded() {
+        let (store, thread_id, result) = run_scripted_turn(AdapterMode::Fail).await;
+        let error = result.expect_err("turn fails");
+        assert_eq!(error.to_string(), "provider died");
+        let turn = store
+            .lock()
+            .unwrap()
+            .get_turn_record(&thread_id, 1)
+            .unwrap()
+            .expect("turn record");
+        assert_eq!(turn.phase, TurnPhase::Failed);
+        assert_eq!(turn.error.as_deref(), Some("provider died"));
     }
 
     #[test]

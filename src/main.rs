@@ -10,7 +10,7 @@ use adapters::{child_halves, BatonAdapter, AcpAdapter, ClaudeAdapter, CodexAdapt
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use runtime::{run_engine, EngineCommand, EngineEvent, SharedAdapter};
 use store::{BatonStore, ImportedMessage, NewThread};
-use types::{PermissionMode, ProviderId};
+use types::{PermissionMode, ProviderId, TurnPhase};
 use adapters::TurnEvent;
 use usage::{cache_hit_rate, format_usage_line, sum_usage};
 
@@ -32,15 +32,16 @@ fn main_result() -> Result<()> {
     let command = cli.command.clone().unwrap_or(cli::Commands::Chat);
     let cli_prompt = cli.prompt.clone();
 
-    let permission_mode = if cli.yolo {
-        PermissionMode::BypassPermissions
+    let permission_override = if cli.yolo {
+        Some(PermissionMode::BypassPermissions)
     } else if cli.full_auto {
-        PermissionMode::AcceptEdits
+        Some(PermissionMode::AcceptEdits)
     } else if cli.plan {
-        PermissionMode::Plan
+        Some(PermissionMode::Plan)
     } else {
-        PermissionMode::Default
+        None
     };
+    let permission_mode = permission_override.unwrap_or(PermissionMode::Default);
 
     match command {
         cli::Commands::Exec { prompt } => {
@@ -108,6 +109,7 @@ fn main_result() -> Result<()> {
                     runtime_home,
                     adapters,
                     interrupt_handles,
+                    Vec::new(),
                     engine_command_receiver,
                     engine_event_sender,
                     turn_event_sender,
@@ -159,11 +161,16 @@ fn main_result() -> Result<()> {
                     }
                 }
                 match engine_event_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(EngineEvent::TurnFinished { ok, error, .. }) => {
+                    Ok(EngineEvent::TurnFinished { ok, error, phase, .. }) => {
                         result_ok = Some(ok);
                         if !ok {
                             if let Some(error) = error {
-                                eprintln!("turn failed: {error}");
+                                let label = match phase {
+                                    TurnPhase::Interrupted => "turn interrupted",
+                                    TurnPhase::Unverified => "turn unverified",
+                                    _ => "turn failed",
+                                };
+                                eprintln!("{label}: {error}");
                             }
                         }
                         break;
@@ -215,7 +222,7 @@ fn main_result() -> Result<()> {
             }
             return Ok(());
         }
-        cli::Commands::Chat => run_chat(cli, &home, &cwd, permission_mode, cli_prompt),
+        cli::Commands::Chat => run_chat(cli, &home, &cwd, permission_override, cli_prompt),
         cli::Commands::Threads => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let resolved = resolve_config(&home, &cwd);
@@ -697,7 +704,7 @@ fn resolve_thread(store: &BatonStore, thread_id: &str) -> Result<store::ThreadRo
         .ok_or_else(|| anyhow::anyhow!("no thread matches {thread_id}"))
 }
 
-fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_mode: PermissionMode, initial_prompt: Option<String>) -> Result<()> {
+fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: Option<PermissionMode>, initial_prompt: Option<String>) -> Result<()> {
     let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
     let resolved = resolve_config(home, cwd);
 
@@ -724,7 +731,7 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_mode: Permi
         .enable_all()
         .build()?;
 
-    let (adapters, interrupt_handles) = tokio_runtime.block_on(async {
+    let (adapters, interrupt_handles, steer_handles) = tokio_runtime.block_on(async {
         let cwd_for_codex = cwd.clone();
         let codex_spawner = Arc::new(
             move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
@@ -832,10 +839,15 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_mode: Permi
         ))));
         let adapters = vec![claude, codex, cursor, grok, opencode, antigravity];
         let mut handles = Vec::new();
+        let mut steer_handles = Vec::new();
         for adapter in &adapters {
-            handles.push(adapter.lock().await.interrupt_handle());
+            let adapter = adapter.lock().await;
+            handles.push(adapter.interrupt_handle());
+            if let Some(handle) = adapter.steer_handle() {
+                steer_handles.push((adapter.id(), handle));
+            }
         }
-        (adapters, handles)
+        (adapters, handles, steer_handles)
     });
 
     let (engine_command_sender, engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -854,6 +866,7 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_mode: Permi
             runtime_home,
             adapters,
             interrupt_handles,
+            steer_handles,
             engine_command_receiver,
             engine_event_sender,
             turn_event_sender,
@@ -868,7 +881,7 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_mode: Permi
         engine_event_receiver,
         turn_event_receiver,
         initial_prompt,
-        permission_mode,
+        permission_override,
     );
 
     let _ = engine_task.join();

@@ -134,6 +134,7 @@ impl BatonAdapter for ClaudeAdapter {
         let mut final_text = String::new();
         let mut usage: Option<TurnUsage> = None;
         let mut saw_stream_events = false;
+        let mut interrupted = false;
         let mut result: Result<()> = Ok(());
         // Claude starts a tool with `tool_use.id` and finishes it with a
         // `tool_result.tool_use_id`. Keep the label so both events match.
@@ -153,6 +154,7 @@ impl BatonAdapter for ClaudeAdapter {
                         }
                     }
                 } => {
+                    interrupted = true;
                     result = Err(anyhow::anyhow!("interrupted"));
                     break;
                 }
@@ -320,7 +322,13 @@ impl BatonAdapter for ClaudeAdapter {
                 Ok(())
             }
             Err(error) => {
-                let _ = emit.send(TurnEvent::TurnFailed { error: error.to_string() });
+                if interrupted {
+                    let _ = emit.send(TurnEvent::TurnInterrupted {
+                        reason: Some(error.to_string()),
+                    });
+                } else {
+                    let _ = emit.send(TurnEvent::TurnFailed { error: error.to_string() });
+                }
                 Err(error)
             }
         }

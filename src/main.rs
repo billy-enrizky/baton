@@ -371,17 +371,22 @@ fn main_result() -> Result<()> {
             } else {
                 title.join(" ")
             };
-            let thread = store.create_thread(NewThread {
+            let mut thread = store.create_thread(NewThread {
                 title: thread_title,
                 cwd: cwd.to_string_lossy().to_string(),
                 current_provider: provider,
                 current_model: cli.model.clone(),
             })?;
+            if let Some(mode) = permission_override {
+                store.set_thread_permission_mode(&thread.id, mode)?;
+                thread.permission_mode = mode;
+            }
             println!(
-                "created thread {} ({}/{})",
+                "created thread {} ({}/{}) mode {}",
                 &thread.id[..8],
                 provider,
-                model.unwrap_or_default()
+                model.unwrap_or_default(),
+                thread.permission_mode
             );
             Ok(())
         }

@@ -228,7 +228,8 @@ fn handle_event(
             if let Some(call_id) = data.get("callID").and_then(Value::as_str) {
                 tool_names.insert(call_id.to_string(), name.clone());
             }
-            let _ = emit.send(TurnEvent::ToolStarted { tool: name, detail: None });
+            let id = data.get("callID").and_then(Value::as_str).map(str::to_string);
+            let _ = emit.send(TurnEvent::ToolStarted { id, tool: name, detail: None });
             false
         }
         // The called frame carries the authoritative tool name for the call.
@@ -251,7 +252,9 @@ fn handle_event(
                 .and_then(|call_id| tool_names.get(call_id))
                 .cloned()
                 .unwrap_or(fallback);
+            let id = data.get("callID").and_then(Value::as_str).map(str::to_string);
             let _ = emit.send(TurnEvent::ToolCompleted {
+                id,
                 tool: name,
                 detail: None,
                 exit_code: Some(if event_type.ends_with("failed") { 1 } else { 0 }),

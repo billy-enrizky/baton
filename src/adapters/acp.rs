@@ -209,13 +209,18 @@ fn handle_session_update(update: &Value, emit: &TurnEventSender, final_text: &mu
             match status {
                 "completed" | "failed" => {
                     let _ = emit.send(TurnEvent::ToolCompleted {
+                        id: (!tool_call_id.is_empty()).then_some(tool_call_id.clone()),
                         tool: title,
                         detail: Some(tool_call_id),
                         exit_code: if status == "failed" { Some(1) } else { Some(0) },
                     });
                 }
                 _ => {
-                    let _ = emit.send(TurnEvent::ToolStarted { tool: title, detail: Some(tool_call_id) });
+                    let _ = emit.send(TurnEvent::ToolStarted {
+                        id: (!tool_call_id.is_empty()).then_some(tool_call_id.clone()),
+                        tool: title,
+                        detail: Some(tool_call_id),
+                    });
                 }
             }
         }

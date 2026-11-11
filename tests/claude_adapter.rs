@@ -206,13 +206,13 @@ async fn claude_adapter_pairs_tool_use_with_tool_result() {
 
     let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
     let started = events.iter().find_map(|event| match event {
-        baton::adapters::TurnEvent::ToolStarted { tool, detail } => Some((tool.clone(), detail.clone())),
+        baton::adapters::TurnEvent::ToolStarted { tool, detail, .. } => Some((tool.clone(), detail.clone())),
         _ => None,
     });
     assert_eq!(started, Some(("Bash".to_string(), Some("ls".to_string()))));
 
     let completed = events.iter().find_map(|event| match event {
-        baton::adapters::TurnEvent::ToolCompleted { tool, detail, exit_code } => {
+        baton::adapters::TurnEvent::ToolCompleted { tool, detail, exit_code, .. } => {
             Some((tool.clone(), detail.clone(), *exit_code))
         }
         _ => None,

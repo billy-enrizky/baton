@@ -34,6 +34,7 @@ struct TurnOutcome {
 
 /// One tool invocation of a turn, kept for the conversation history.
 struct ToolRecord {
+    id: Option<String>,
     label: String,
     /// None while running, Some(false) when it failed.
     ok: Option<bool>,
@@ -43,22 +44,34 @@ struct ToolRecord {
 /// a completion settles the most recent still-running record with that label.
 fn record_tool_event(records: &mut Vec<ToolRecord>, event: &TurnEvent) {
     match event {
-        TurnEvent::ToolStarted { tool, detail } => {
+        TurnEvent::ToolStarted { id, tool, detail } => {
             let label = match detail {
                 Some(detail) => format!("{tool} {detail}"),
                 None => tool.clone(),
             };
-            records.push(ToolRecord { label, ok: None });
+            records.push(ToolRecord { id: id.clone(), label, ok: None });
         }
-        TurnEvent::ToolCompleted { tool, detail, exit_code } => {
+        TurnEvent::ToolCompleted { id, tool, detail, exit_code } => {
             let label = match detail {
                 Some(detail) => format!("{tool} {detail}"),
                 None => tool.clone(),
             };
             let failed = exit_code.map(|code| code != 0).unwrap_or(false);
-            match records.iter_mut().rev().find(|record| record.ok.is_none() && record.label == label) {
+            // Prefer the provider's call id. Two identical commands running at
+            // once must not settle each other's row.
+            let matched = match id.as_deref() {
+                Some(id) => records
+                    .iter_mut()
+                    .rev()
+                    .find(|record| record.ok.is_none() && record.id.as_deref() == Some(id)),
+                None => records
+                    .iter_mut()
+                    .rev()
+                    .find(|record| record.ok.is_none() && record.label == label),
+            };
+            match matched {
                 Some(record) => record.ok = Some(!failed),
-                None => records.push(ToolRecord { label, ok: Some(!failed) }),
+                None => records.push(ToolRecord { id: id.clone(), label, ok: Some(!failed) }),
             }
         }
         _ => {}
@@ -454,14 +467,16 @@ mod tests {
     #[test]
     fn tool_events_pair_into_ordered_records() {
         let mut records = Vec::new();
-        record_tool_event(&mut records, &TurnEvent::ToolStarted { tool: "shell".into(), detail: Some("cargo test".into()) });
-        record_tool_event(&mut records, &TurnEvent::ToolStarted { tool: "edit".into(), detail: Some("src/lib.rs".into()) });
+        record_tool_event(&mut records, &TurnEvent::ToolStarted { id: Some("c1".into()), tool: "shell".into(), detail: Some("cargo test".into()) });
+        record_tool_event(&mut records, &TurnEvent::ToolStarted { id: Some("c2".into()), tool: "edit".into(), detail: Some("src/lib.rs".into()) });
         record_tool_event(&mut records, &TurnEvent::ToolCompleted {
+            id: Some("c1".into()),
             tool: "shell".into(),
             detail: Some("cargo test".into()),
             exit_code: Some(101),
         });
         record_tool_event(&mut records, &TurnEvent::ToolCompleted {
+            id: Some("c2".into()),
             tool: "edit".into(),
             detail: Some("src/lib.rs".into()),
             exit_code: None,
@@ -473,10 +488,43 @@ mod tests {
         assert_eq!(records[1].ok, Some(true));
 
         // a completion with no running match becomes its own record
-        record_tool_event(&mut records, &TurnEvent::ToolCompleted { tool: "shell".into(), detail: Some("ls".into()), exit_code: Some(0) });
+        record_tool_event(&mut records, &TurnEvent::ToolCompleted { id: Some("c3".into()), tool: "shell".into(), detail: Some("ls".into()), exit_code: Some(0) });
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].label, "shell ls");
         assert_eq!(records[2].ok, Some(true));
+    }
+
+    #[test]
+    fn identical_tool_labels_pair_by_call_id() {
+        let mut records = Vec::new();
+        record_tool_event(
+            &mut records,
+            &TurnEvent::ToolStarted {
+                id: Some("call-1".into()),
+                tool: "shell".into(),
+                detail: Some("ls".into()),
+            },
+        );
+        record_tool_event(
+            &mut records,
+            &TurnEvent::ToolStarted {
+                id: Some("call-2".into()),
+                tool: "shell".into(),
+                detail: Some("ls".into()),
+            },
+        );
+        record_tool_event(
+            &mut records,
+            &TurnEvent::ToolCompleted {
+                id: Some("call-2".into()),
+                tool: "shell".into(),
+                detail: Some("ls".into()),
+                exit_code: Some(1),
+            },
+        );
+
+        assert_eq!(records[0].ok, None, "the first call is still running");
+        assert_eq!(records[1].ok, Some(false), "the second call settled by id");
     }
 
     #[test]
@@ -491,8 +539,8 @@ mod tests {
             })
             .unwrap();
         let records = vec![
-            ToolRecord { label: "shell cargo test".into(), ok: Some(false) },
-            ToolRecord { label: "edit src/lib.rs".into(), ok: Some(true) },
+            ToolRecord { id: None, label: "shell cargo test".into(), ok: Some(false) },
+            ToolRecord { id: None, label: "edit src/lib.rs".into(), ok: Some(true) },
         ];
         persist_tool_records(&store, &thread.id, 1, ProviderId::Codex, &records).unwrap();
         store.add_message(&thread.id, 1, "assistant", Some("codex"), None, "done").unwrap();

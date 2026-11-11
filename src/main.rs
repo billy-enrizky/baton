@@ -142,13 +142,13 @@ fn main_result() -> Result<()> {
                                 saw_output = true;
                             }
                         }
-                        TurnEvent::ToolStarted { tool, detail } if show_progress => {
+                        TurnEvent::ToolStarted { tool, detail, .. } if show_progress => {
                             match detail {
                                 Some(detail) => eprintln!("· {tool} {detail}"),
                                 None => eprintln!("· {tool}"),
                             }
                         }
-                        TurnEvent::ToolCompleted { tool, detail, exit_code } if show_progress => {
+                        TurnEvent::ToolCompleted { tool, detail, exit_code, .. } if show_progress => {
                             let marker = if exit_code.unwrap_or(0) == 0 { "✓" } else { "✗" };
                             match detail {
                                 Some(detail) => eprintln!("{marker} {tool} {detail}"),

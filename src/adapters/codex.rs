@@ -355,12 +355,14 @@ impl CodexAdapter {
                     }
                     "commandExecution" => {
                         let command = item.get("command").and_then(Value::as_str).unwrap_or("").to_string();
+                        let call_id = item.get("id").and_then(Value::as_str).map(str::to_string);
                         if !completed {
-                            let _ = emit.send(TurnEvent::ToolStarted { tool: "shell".into(), detail: Some(command) });
+                            let _ = emit.send(TurnEvent::ToolStarted { id: call_id, tool: "shell".into(), detail: Some(command) });
                         } else {
                             let status = item.get("status").and_then(Value::as_str).unwrap_or("");
                             if status == "completed" || status == "failed" {
                                 let _ = emit.send(TurnEvent::ToolCompleted {
+                                    id: call_id,
                                     tool: "shell".into(),
                                     detail: Some(command),
                                     exit_code: item.get("exitCode").and_then(Value::as_i64),
@@ -380,10 +382,11 @@ impl CodexAdapter {
                                     .join(", ")
                             })
                             .unwrap_or_default();
+                        let call_id = item.get("id").and_then(Value::as_str).map(str::to_string);
                         if !completed {
-                            let _ = emit.send(TurnEvent::ToolStarted { tool: "edit".into(), detail: Some(paths) });
+                            let _ = emit.send(TurnEvent::ToolStarted { id: call_id, tool: "edit".into(), detail: Some(paths) });
                         } else {
-                            let _ = emit.send(TurnEvent::ToolCompleted { tool: "edit".into(), detail: Some(paths), exit_code: None });
+                            let _ = emit.send(TurnEvent::ToolCompleted { id: call_id, tool: "edit".into(), detail: Some(paths), exit_code: None });
                         }
                     }
                     _ => {}

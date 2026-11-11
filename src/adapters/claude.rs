@@ -194,12 +194,15 @@ impl BatonAdapter for ClaudeAdapter {
                                 } else if block_type == "tool_use" {
                                     let tool = block.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
                                     let detail = block.get("input").and_then(tool_input_summary);
-                                    if let Some(id) = block.get("id").and_then(Value::as_str) {
-                                        if !id.is_empty() {
-                                            tool_calls.insert(id.to_string(), (tool.clone(), detail.clone()));
-                                        }
+                                    let call_id = block
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .filter(|id| !id.is_empty())
+                                        .map(str::to_string);
+                                    if let Some(id) = call_id.as_ref() {
+                                        tool_calls.insert(id.clone(), (tool.clone(), detail.clone()));
                                     }
-                                    let _ = emit.send(TurnEvent::ToolStarted { tool, detail });
+                                    let _ = emit.send(TurnEvent::ToolStarted { id: call_id, tool, detail });
                                 }
                             }
                         }
@@ -222,6 +225,7 @@ impl BatonAdapter for ClaudeAdapter {
                                 let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                                 if let Some((tool, detail)) = tool_calls.remove(id) {
                                     let _ = emit.send(TurnEvent::ToolCompleted {
+                                        id: (!id.is_empty()).then_some(id.to_string()),
                                         tool,
                                         detail,
                                         exit_code: Some(if is_error { 1 } else { 0 }),

@@ -87,6 +87,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
 
 #[derive(Debug, Clone, PartialEq)]
 struct ToolLine {
+    id: Option<String>,
     label: String,
     status: ToolStatus,
 }
@@ -376,23 +377,35 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
             state.streaming_text.push_str(&text);
         }
         TurnEvent::AssistantText { .. } => {}
-        TurnEvent::ToolStarted { tool, detail } => {
+        TurnEvent::ToolStarted { id, tool, detail } => {
             let label = match detail {
                 Some(detail) => format!("{tool} {detail}"),
                 None => tool,
             };
-            state.tool_lines.push(ToolLine { label, status: ToolStatus::Running });
+            state.tool_lines.push(ToolLine { id, label, status: ToolStatus::Running });
         }
-        TurnEvent::ToolCompleted { tool, detail, exit_code } => {
+        TurnEvent::ToolCompleted { id, tool, detail, exit_code } => {
             let label = match detail {
                 Some(detail) => format!("{tool} {detail}"),
                 None => tool,
             };
             let status = if exit_code.unwrap_or(0) != 0 { ToolStatus::Failed } else { ToolStatus::Done };
-            if let Some(line) = state.tool_lines.iter_mut().rev().find(|line| line.status == ToolStatus::Running) {
+            let matched = match id.as_deref() {
+                Some(id) => state
+                    .tool_lines
+                    .iter_mut()
+                    .rev()
+                    .find(|line| line.status == ToolStatus::Running && line.id.as_deref() == Some(id)),
+                None => state
+                    .tool_lines
+                    .iter_mut()
+                    .rev()
+                    .find(|line| line.status == ToolStatus::Running),
+            };
+            if let Some(line) = matched {
                 line.status = status;
             } else {
-                state.tool_lines.push(ToolLine { label, status });
+                state.tool_lines.push(ToolLine { id, label, status });
             }
         }
         TurnEvent::ApprovalRequest { summary, respond, .. } => {
@@ -990,9 +1003,6 @@ fn handle_composer_key(
         }
         KeyCode::PageDown => {
             state.scroll_offset = state.scroll_offset.saturating_sub(10);
-        }
-        KeyCode::End | KeyCode::Home => {
-            state.scroll_offset = 0;
         }
         KeyCode::Esc => {
             if state.running {
@@ -2703,7 +2713,7 @@ mod tests {
         let thinking_row = lines.iter().position(|line| line.contains("Thinking")).expect("thinking spinner in transcript");
         assert!(thinking_row > user_row, "thinking renders after the user message, not above the composer");
 
-        state.tool_lines.push(ToolLine { label: "shell cargo test".into(), status: ToolStatus::Running });
+        state.tool_lines.push(ToolLine { id: None, label: "shell cargo test".into(), status: ToolStatus::Running });
         state.streaming_text = "partial answer".into();
         let lines = buffer_lines(&render_state(&state, 100, 30));
         let user_row = lines.iter().position(|line| line.contains("message 01")).expect("user message rendered");

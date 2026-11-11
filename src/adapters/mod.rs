@@ -20,8 +20,8 @@ pub struct TurnStartInput {
 pub enum TurnEvent {
     TextDelta { text: String },
     AssistantText { text: String },
-    ToolStarted { tool: String, detail: Option<String> },
-    ToolCompleted { tool: String, detail: Option<String>, exit_code: Option<i64> },
+    ToolStarted { id: Option<String>, tool: String, detail: Option<String> },
+    ToolCompleted { id: Option<String>, tool: String, detail: Option<String>, exit_code: Option<i64> },
     ApprovalRequest {
         id: String,
         kind: String,

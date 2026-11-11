@@ -63,6 +63,15 @@ pub fn render(status: &ThreadStatus) -> String {
             if let Some(error) = &turn.error {
                 lines.push(format!("error: {error}"));
             }
+            if matches!(
+                turn.phase,
+                TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+            ) {
+                lines.push(
+                    "note: this turn is still open; if no baton process is running it is stale and will be marked unverified on the next open"
+                        .to_string(),
+                );
+            }
         }
         None => lines.push("turn: none".to_string()),
     }
@@ -120,6 +129,17 @@ mod tests {
         assert!(text.contains("  - follow up"));
         assert!(text.contains("  - second"));
         assert!(text.contains("usage: in 1.0k, out 100, cache 50%"));
+    }
+
+    #[test]
+    fn warns_that_an_open_turn_may_be_stale() {
+        let mut value = status();
+        value.latest_turn.as_mut().unwrap().phase = TurnPhase::Running;
+        value.latest_turn.as_mut().unwrap().ended_at = None;
+        let text = render(&value);
+        assert!(text.contains("turn: 3 running"));
+        assert!(text.contains("still open"));
+        assert!(text.contains("marked unverified"));
     }
 
     #[test]

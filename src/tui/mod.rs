@@ -143,7 +143,7 @@ enum Overlay {
     RewindPicker { selected: usize },
     CodeConfirm { turn: i64, git_ref: String },
     SwitchPicker { selected: usize },
-    ModelPicker { provider: ProviderId, models: Vec<String>, selected: usize },
+    ModelPicker { provider: ProviderId, models: Vec<String>, selected: usize, filter: String },
     SettingsPicker { provider: ProviderId, categories: Vec<(String, Vec<String>)>, category_index: usize, value_index: usize },
     McpPicker { selected: usize },
     SkillsPicker { selected: usize, skills: Vec<(String, String)> },
@@ -490,14 +490,23 @@ fn apply_engine_event(
             if let Overlay::ModelPicker {
                 models: current,
                 selected,
+                filter,
                 ..
             } = &mut state.overlay
             {
-                let previous = current.get(*selected).cloned();
-                *selected = previous
-                    .and_then(|model| live.iter().position(|candidate| candidate == &model))
-                    .unwrap_or(0);
+                let previous = model_filter_indices(current, filter)
+                    .get(*selected)
+                    .and_then(|index| current.get(*index))
+                    .cloned();
                 *current = live;
+                let filtered = model_filter_indices(current, filter);
+                *selected = previous
+                    .and_then(|model| {
+                        filtered
+                            .iter()
+                            .position(|index| current[*index] == model)
+                    })
+                    .unwrap_or(0);
             }
             state.notice = Some(format!("loaded {count} live model(s) for {provider}"));
         }
@@ -593,6 +602,24 @@ fn char_to_byte(text: &str, index: usize) -> usize {
         .nth(index)
         .map(|(byte, _)| byte)
         .unwrap_or(text.len())
+}
+
+fn model_filter_indices(models: &[String], filter: &str) -> Vec<usize> {
+    let needle = filter.as_bytes();
+    if needle.is_empty() {
+        return (0..models.len()).collect();
+    }
+    models
+        .iter()
+        .enumerate()
+        .filter(|(_, model)| {
+            model
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 fn suggestions_for(input: &str) -> Vec<&'static (&'static str, &'static str)> {
@@ -724,50 +751,82 @@ fn handle_key(
                         thread_id: state.thread.id.clone(),
                         provider,
                     });
-                    state.overlay = Overlay::ModelPicker { provider, models, selected: 0 };
+                    state.overlay = Overlay::ModelPicker {
+                        provider,
+                        models,
+                        selected: 0,
+                        filter: String::new(),
+                    };
                 }
             }
             _ => {
                 state.overlay = Overlay::SwitchPicker { selected };
             }
         },
-        Overlay::ModelPicker { provider, models, mut selected } => match key.code {
-            KeyCode::Esc | KeyCode::Left => {
-                if key.code == KeyCode::Left {
+        Overlay::ModelPicker {
+            provider,
+            models,
+            mut selected,
+            mut filter,
+        } => {
+            let filtered = model_filter_indices(&models, &filter);
+            match key.code {
+                KeyCode::Esc => {
+                    if filter.is_empty() {
+                        return;
+                    }
+                    filter.clear();
+                    selected = 0;
+                }
+                KeyCode::Left => {
                     state.overlay = Overlay::SwitchPicker { selected: 0 };
+                    return;
                 }
-            }
-            KeyCode::Up => {
-                if !models.is_empty() {
-                    selected = (selected + models.len() - 1) % models.len();
+                KeyCode::Backspace => {
+                    filter.pop();
+                    selected = 0;
                 }
-                state.overlay = Overlay::ModelPicker { provider, models, selected };
-            }
-            KeyCode::Down => {
-                if !models.is_empty() {
-                    selected = (selected + 1) % models.len();
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    filter.push(character);
+                    selected = 0;
                 }
-                state.overlay = Overlay::ModelPicker { provider, models, selected };
-            }
-            KeyCode::PageUp => {
-                selected = selected.saturating_sub(10);
-                state.overlay = Overlay::ModelPicker { provider, models, selected };
-            }
-            KeyCode::PageDown => {
-                if !models.is_empty() {
-                    selected = (selected + 10).min(models.len() - 1);
+                KeyCode::Up => {
+                    if !filtered.is_empty() {
+                        selected = (selected + filtered.len() - 1) % filtered.len();
+                    }
                 }
-                state.overlay = Overlay::ModelPicker { provider, models, selected };
-            }
-            KeyCode::Enter => {
-                if let Some(model) = models.get(selected).cloned() {
-                    perform_switch(state, store, provider, Some(model));
+                KeyCode::Down => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 1) % filtered.len();
+                    }
                 }
+                KeyCode::PageUp => {
+                    selected = selected.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 10).min(filtered.len() - 1);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(index) = filtered.get(selected) {
+                        if let Some(model) = models.get(*index).cloned() {
+                            perform_switch(state, store, provider, Some(model));
+                            return;
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {
-                state.overlay = Overlay::ModelPicker { provider, models, selected };
-            }
-        },
+            state.overlay = Overlay::ModelPicker {
+                provider,
+                models,
+                selected,
+                filter,
+            };
+        }
         Overlay::SettingsPicker { provider, categories, mut category_index, mut value_index } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Left => {
@@ -2329,7 +2388,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::CodeConfirm { .. } => 4,
             Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
-            Overlay::ModelPicker { models, .. } => models.len().min(8) + 4,
+            Overlay::ModelPicker { models, filter, .. } => {
+                model_filter_indices(models, filter).len().min(8) + 4
+            }
             Overlay::SettingsPicker {
                 categories,
                 category_index,
@@ -2376,7 +2437,16 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 provider,
                 models,
                 selected,
-            } => draw_model_picker(frame, chunks[1], state, *provider, models, *selected),
+                filter,
+            } => draw_model_picker(
+                frame,
+                chunks[1],
+                state,
+                *provider,
+                models,
+                *selected,
+                filter,
+            ),
             Overlay::SettingsPicker {
                 provider,
                 categories,
@@ -2579,6 +2649,7 @@ fn draw_model_picker(
     provider: ProviderId,
     models: &[String],
     selected: usize,
+    filter: &str,
 ) {
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
     let selected_model = if state.thread.current_provider == provider {
@@ -2590,25 +2661,36 @@ fn draw_model_picker(
     } else {
         resolved.for_provider(provider).model.clone()
     };
-    let visible = models.len().min(8);
-    let start = if visible == 0 || models.len() <= visible {
+    let filtered = model_filter_indices(models, filter);
+    let visible = filtered.len().min(8);
+    let start = if visible == 0 || filtered.len() <= visible {
         0
     } else {
         selected
             .saturating_sub(visible / 2)
-            .min(models.len() - visible)
+            .min(filtered.len() - visible)
     };
-    let end = (start + visible).min(models.len());
+    let end = (start + visible).min(filtered.len());
+    let filter_label = if filter.is_empty() {
+        "type to filter".to_string()
+    } else {
+        format!("filter \"{filter}\"")
+    };
+    let position = if filtered.is_empty() {
+        0
+    } else {
+        selected.min(filtered.len() - 1) + 1
+    };
     let mut lines: Vec<Line> = vec![Line::styled(
         format!(
-            "{provider} models · {}/{} · enter select · esc cancel",
-            selected.saturating_add(1).min(models.len().max(1)),
-            models.len()
+            "{provider} models · {position}/{} · {filter_label} · enter · esc",
+            filtered.len()
         ),
         Style::default().fg(COLORS.muted),
     )];
-    for (offset, model) in models[start..end].iter().enumerate() {
+    for (offset, model_index) in filtered[start..end].iter().enumerate() {
         let index = start + offset;
+        let model = &models[*model_index];
         let marker = if *model == selected_model { "●" } else { " " };
         let style = if index == selected {
             Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
@@ -3491,11 +3573,41 @@ mod tests {
             provider: ProviderId::Codex,
             models: (0..20).map(|index| format!("model-{index:02}")).collect(),
             selected: 15,
+            filter: String::new(),
         };
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(text.contains("16/20"), "position header: {text}");
         assert!(text.contains("model-15"), "selected model: {text}");
         assert!(!text.contains("model-00"), "first row should be outside the window");
+    }
+
+    #[test]
+    fn model_picker_can_filter_a_live_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::ModelPicker {
+            provider: ProviderId::Codex,
+            models: vec!["alpha-model".into(), "beta-model".into(), "gamma-model".into()],
+            selected: 0,
+            filter: String::new(),
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('b')));
+        let text = buffer_lines(&render_state(&state, 80, 30)).join("\n");
+        assert!(text.contains("beta-model"), "filtered row: {text}");
+        assert!(!text.contains("alpha-model"), "non-match hidden: {text}");
+        assert!(text.contains("filter \"b\""), "filter visible: {text}");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.thread.current_provider, ProviderId::Codex);
+        assert_eq!(state.thread.current_model.as_deref(), Some("beta-model"));
     }
 
     #[test]
@@ -3507,6 +3619,7 @@ mod tests {
             provider: ProviderId::Codex,
             models: vec!["selected-model".into()],
             selected: 0,
+            filter: String::new(),
         };
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let thread_id = state.thread.id.clone();

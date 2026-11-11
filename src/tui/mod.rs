@@ -125,6 +125,7 @@ struct ReviewState {
 }
 
 struct ApprovalState {
+    thread_id: String,
     summary: String,
     respond: tokio::sync::oneshot::Sender<ApprovalDecision>,
 }
@@ -317,9 +318,7 @@ pub fn run_tui(
     let mut spinner_frame = 0usize;
     while !state.quit {
         while let Ok((event_thread, event)) = turn_event_receiver.try_recv() {
-            if event_thread == state.thread.id {
-                apply_turn_event(&mut state, event);
-            }
+            apply_turn_event_for_thread(&mut state, event_thread, event);
         }
         while let Ok(event) = engine_event_receiver.try_recv() {
             apply_engine_event(&mut state, &store, event, &engine_command_sender);
@@ -406,61 +405,63 @@ fn apply_engine_event(
             }
         }
         EngineEvent::TurnStarted { thread_id } => {
-            if thread_id == state.thread.id {
-                state.running = true;
-                state.streaming_text.clear();
-                state.tool_lines.clear();
-                state.approvals.clear();
-                state.notice = None;
-                state.diff_output = None;
+            state.approvals.retain(|approval| approval.thread_id != thread_id);
+            if thread_id != state.thread.id {
+                return;
             }
+            state.running = true;
+            state.streaming_text.clear();
+            state.tool_lines.clear();
+            state.notice = None;
+            state.diff_output = None;
         }
         EngineEvent::TurnFinished { thread_id, ok, error, phase } => {
-            if thread_id == state.thread.id {
-                state.running = false;
-                state.streaming_text.clear();
-                state.tool_lines.clear();
-                state.approvals.clear();
-                {
-                    let guard = store.lock().unwrap();
-                    state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
-                    if let Some(fresh) = guard.get_thread(&state.thread.id).unwrap_or(None) {
-                        state.thread = fresh;
-                    }
+            state.approvals.retain(|approval| approval.thread_id != thread_id);
+            if thread_id != state.thread.id {
+                return;
+            }
+            state.running = false;
+            state.streaming_text.clear();
+            state.tool_lines.clear();
+            {
+                let guard = store.lock().unwrap();
+                state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
+                if let Some(fresh) = guard.get_thread(&state.thread.id).unwrap_or(None) {
+                    state.thread = fresh;
                 }
-                state.scroll_offset = 0;
-                if !ok {
-                    let detail = error.unwrap_or_else(|| "unknown error".into());
-                    state.notice = Some(match phase {
-                        TurnPhase::Interrupted => "turn interrupted".to_string(),
-                        TurnPhase::Unverified => format!("turn unverified: {detail}"),
-                        _ => format!("turn failed: {detail}"),
-                    });
-                }
-                // Only advance the queue after a clean turn. A failure or an
-                // interrupt should not automatically fire the next prompt.
-                if ok {
-                    let next = store
+            }
+            state.scroll_offset = 0;
+            if !ok {
+                let detail = error.unwrap_or_else(|| "unknown error".into());
+                state.notice = Some(match phase {
+                    TurnPhase::Interrupted => "turn interrupted".to_string(),
+                    TurnPhase::Unverified => format!("turn unverified: {detail}"),
+                    _ => format!("turn failed: {detail}"),
+                });
+            }
+            // Only advance the queue after a clean turn. A failure or an
+            // interrupt should not automatically fire the next prompt.
+            if ok {
+                let next = store
+                    .lock()
+                    .unwrap()
+                    .pop_queued_message(&state.thread.id)
+                    .unwrap_or(None);
+                if let Some(next) = next {
+                    state.queued_messages = store
                         .lock()
                         .unwrap()
-                        .pop_queued_message(&state.thread.id)
-                        .unwrap_or(None);
-                    if let Some(next) = next {
-                        state.queued_messages = store
-                            .lock()
-                            .unwrap()
-                            .list_queued_messages(&state.thread.id)
-                            .unwrap_or_default();
-                        let remaining = state.queued_messages.len();
-                        let preview: String = next.chars().take(60).collect();
-                        state.notice = Some(format!("sending queued message ({remaining} remaining): {preview}"));
-                        submit(state, store, engine_command_sender, next);
-                    }
-                } else if !state.queued_messages.is_empty() {
-                    let waiting = state.queued_messages.len();
-                    let prefix = state.notice.take().unwrap_or_default();
-                    state.notice = Some(format!("{prefix} · {waiting} queued message(s) kept; press enter to send"));
+                        .list_queued_messages(&state.thread.id)
+                        .unwrap_or_default();
+                    let remaining = state.queued_messages.len();
+                    let preview: String = next.chars().take(60).collect();
+                    state.notice = Some(format!("sending queued message ({remaining} remaining): {preview}"));
+                    submit(state, store, engine_command_sender, next);
                 }
+            } else if !state.queued_messages.is_empty() {
+                let waiting = state.queued_messages.len();
+                let prefix = state.notice.take().unwrap_or_default();
+                state.notice = Some(format!("{prefix} · {waiting} queued message(s) kept; press enter to send"));
             }
         }
         EngineEvent::ModelsLoaded { thread_id, provider, models, error } => {
@@ -582,13 +583,27 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                 state.tool_lines.push(ToolLine { id, label, status });
             }
         }
-        TurnEvent::ApprovalRequest { summary, respond, .. } => {
-            state.approvals.push(ApprovalState { summary, respond });
-        }
         TurnEvent::Usage { .. } => {}
+        // Approval requests need their thread id, so the run loop routes them
+        // through apply_turn_event_for_thread before calling this function.
+        TurnEvent::ApprovalRequest { .. } => {}
         TurnEvent::TurnCompleted { .. }
         | TurnEvent::TurnInterrupted { .. }
         | TurnEvent::TurnFailed { .. } => {}
+    }
+}
+
+fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: TurnEvent) {
+    match event {
+        TurnEvent::ApprovalRequest {
+            summary, respond, ..
+        } => state.approvals.push(ApprovalState {
+            thread_id,
+            summary,
+            respond,
+        }),
+        event if thread_id == state.thread.id => apply_turn_event(state, event),
+        _ => {}
     }
 }
 
@@ -2425,7 +2440,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
 
     draw_transcript(frame, state, chunks[0], spinner_frame);
     if let Some(approval) = state.approvals.last() {
-        draw_approval(frame, chunks[1], &approval.summary);
+        draw_approval(frame, chunks[1], state, approval);
     } else {
         match &state.overlay {
             Overlay::RewindPicker { selected } => {
@@ -3018,13 +3033,26 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
     frame.render_widget(Paragraph::new(render_lines), area);
 }
 
-fn draw_approval(frame: &mut ratatui::Frame, area: Rect, summary: &str) {
+fn draw_approval(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    approval: &ApprovalState,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.warning))
         .border_style(Style::default().fg(COLORS.border));
+    let target = if approval.thread_id == state.thread.id {
+        String::new()
+    } else {
+        format!(" for thread {} ", &approval.thread_id[..approval.thread_id.len().min(8)])
+    };
     let lines = vec![
-        Line::styled(format!("approval needed: {summary}"), Style::default().fg(COLORS.warning)),
+        Line::styled(
+            format!("approval needed{target}: {}", approval.summary),
+            Style::default().fg(COLORS.warning),
+        ),
         Line::styled("[y] allow once · [a] allow for session · [n] deny", Style::default().fg(COLORS.muted)),
     ];
     frame.render_widget(
@@ -3490,8 +3518,10 @@ mod tests {
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let (first_sender, mut first_receiver) = tokio::sync::oneshot::channel();
         let (second_sender, mut second_receiver) = tokio::sync::oneshot::channel();
-        apply_turn_event(
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
             &mut state,
+            thread_id.clone(),
             TurnEvent::ApprovalRequest {
                 id: "first".into(),
                 kind: "permissions".into(),
@@ -3499,8 +3529,9 @@ mod tests {
                 respond: first_sender,
             },
         );
-        apply_turn_event(
+        apply_turn_event_for_thread(
             &mut state,
+            thread_id,
             TurnEvent::ApprovalRequest {
                 id: "second".into(),
                 kind: "permissions".into(),
@@ -3532,6 +3563,64 @@ mod tests {
     }
 
     #[test]
+    fn child_approvals_are_cleared_by_the_child_turn_only() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let current_id = state.thread.id.clone();
+        let child_id = "child-thread".to_string();
+        let (current_sender, _current_receiver) = tokio::sync::oneshot::channel();
+        let (child_sender, _child_receiver) = tokio::sync::oneshot::channel();
+        apply_turn_event_for_thread(
+            &mut state,
+            current_id.clone(),
+            TurnEvent::ApprovalRequest {
+                id: "current".into(),
+                kind: "permissions".into(),
+                summary: "current request".into(),
+                respond: current_sender,
+            },
+        );
+        apply_turn_event_for_thread(
+            &mut state,
+            child_id.clone(),
+            TurnEvent::ApprovalRequest {
+                id: "child".into(),
+                kind: "permissions".into(),
+                summary: "child request".into(),
+                respond: child_sender,
+            },
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: child_id,
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+        assert_eq!(state.approvals.len(), 1);
+        assert_eq!(state.approvals[0].thread_id, current_id);
+        let current_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: current_id,
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+        assert!(state.approvals.is_empty());
+    }
+
+    #[test]
     fn an_approval_can_be_answered_while_review_is_open() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -3541,8 +3630,10 @@ mod tests {
         handle_command(&mut state, &store, &engine_command_sender, "/review");
         assert!(state.review.is_some());
         let (sender, mut receiver) = tokio::sync::oneshot::channel();
-        apply_turn_event(
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
             &mut state,
+            thread_id,
             TurnEvent::ApprovalRequest {
                 id: "review-approval".into(),
                 kind: "permissions".into(),

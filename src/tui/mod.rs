@@ -1511,6 +1511,7 @@ fn handle_command(
                     !turn.phase.is_terminal()
                 })
                 .unwrap_or(false);
+            let latest_error = latest.as_ref().and_then(|turn| turn.error.clone());
             text.push_str(&format!(
                 "\nturns: {}\nturn: {}\nqueue: {} waiting",
                 turn_count,
@@ -1519,6 +1520,10 @@ fn handle_command(
                     .unwrap_or_else(|| "none".into()),
                 state.queued_messages.len()
             ));
+            if let Some(error) = latest_error {
+                let preview: String = error.chars().take(160).collect();
+                text.push_str(&format!("\nerror: {preview}"));
+            }
             if open_turn {
                 text.push_str("\nnote: open turn may be stale; /turns shows history");
             }
@@ -3712,6 +3717,7 @@ mod tests {
         assert!(notice.contains("goal: ship (paused)"));
         assert!(notice.contains("turns: 1"));
         assert!(notice.contains("turn: 1 failed"));
+        assert!(notice.contains("error: boom"));
         assert!(notice.contains("queue: 1 waiting"));
     }
 

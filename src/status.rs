@@ -58,6 +58,7 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
         })
     });
     serde_json::json!({
+        "schema_version": 1,
         "thread_id": status.thread_id,
         "title": status.title,
         "provider": status.provider.as_str(),
@@ -174,6 +175,7 @@ mod tests {
     #[test]
     fn json_exposes_the_same_state() {
         let value = to_json(&status());
+        assert_eq!(value["schema_version"], 1);
         assert_eq!(value["thread_id"], "thread-1");
         assert_eq!(value["permission_mode"], "plan");
         assert_eq!(value["latest_turn"]["phase"], "failed");

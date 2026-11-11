@@ -1,4 +1,4 @@
-use baton::{adapters, checkpoints, cli, config, paths, resume, runtime, scanner, store, tui, types, usage};
+use baton::{adapters, checkpoints, cli, config, paths, resume, runtime, scanner, status, store, tui, types, usage};
 
 use anyhow::Result;
 use clap::Parser;
@@ -476,6 +476,54 @@ fn main_result() -> Result<()> {
             if provider == ProviderId::Cursor {
                 println!("cursor login complete (if the agent command was not found, install Cursor CLI and try `cursor-agent login`)");
             }
+            Ok(())
+        }
+        cli::Commands::Status { thread_id } => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
+                Some(thread_id) => resolve_thread(&store, thread_id)?,
+                None => store
+                    .list_threads(Some(cwd.to_string_lossy().as_ref()))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
+            };
+            let resolved = resolve_config(&home, Path::new(&thread.cwd));
+            let model = thread
+                .current_model
+                .clone()
+                .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
+            let latest_turn = store
+                .list_turn_records(&thread.id)?
+                .into_iter()
+                .last()
+                .map(|turn| status::TurnStatus {
+                    turn: turn.turn,
+                    phase: turn.phase,
+                    started_at: turn.started_at,
+                    ended_at: turn.ended_at,
+                    error: turn.error,
+                    provider_turn_id: turn.provider_turn_id,
+                });
+            let usage_rows = store.list_usage(Some(&thread.id))?;
+            let usage = if usage_rows.is_empty() {
+                None
+            } else {
+                Some(format_usage_line(&sum_usage(&usage_rows)))
+            };
+            let report = status::ThreadStatus {
+                thread_id: thread.id.clone(),
+                title: thread.title.clone(),
+                provider: thread.current_provider,
+                model,
+                permission_mode: thread.permission_mode,
+                goal: thread.goal.clone(),
+                goal_paused: thread.goal_paused,
+                latest_turn,
+                queued: store.list_queued_messages(&thread.id)?,
+                usage,
+            };
+            println!("{}", status::render(&report));
             Ok(())
         }
         cli::Commands::Resume { fork, print } => {

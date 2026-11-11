@@ -101,4 +101,8 @@ pub enum Commands {
         #[arg(long)]
         print: bool,
     },
+    /// Show thread phase, goal, queue, and usage
+    Status {
+        thread_id: Option<String>,
+    },
 }

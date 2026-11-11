@@ -9,6 +9,7 @@ pub mod models;
 pub mod paths;
 pub mod resume;
 pub mod runtime;
+pub mod status;
 pub mod scanner;
 pub mod store;
 pub mod sync;

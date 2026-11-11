@@ -1794,7 +1794,7 @@ fn handle_command(
             let threads: Vec<(String, String)> = {
                 let guard = store.lock().unwrap();
                 guard
-                    .list_threads(Some(state.thread.cwd.as_str()))
+                    .list_threads_for_path(std::path::Path::new(&state.thread.cwd))
                     .unwrap_or_default()
                     .into_iter()
                     .take(20)

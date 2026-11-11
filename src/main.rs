@@ -1,7 +1,8 @@
-use baton::{adapters, checkpoints, cli, config, paths, runtime, scanner, store, tui, types, usage};
+use baton::{adapters, checkpoints, cli, config, paths, resume, runtime, scanner, store, tui, types, usage};
 
 use anyhow::Result;
 use clap::Parser;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -120,16 +121,46 @@ fn main_result() -> Result<()> {
             });
 
             let mut result_text = String::new();
-            let mut result_ok = false;
+            let mut streamed_text = String::new();
+            let mut result_ok: Option<bool> = None;
+            let mut timed_out = false;
+            let mut saw_output = false;
+            let show_progress = std::io::stderr().is_terminal();
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             loop {
                 if std::time::Instant::now() > deadline {
-                    eprintln!("exec timed out after 300s");
-                    std::process::exit(1);
+                    timed_out = true;
+                    break;
+                }
+                while let Ok(event) = turn_event_receiver.try_recv() {
+                    match event {
+                        TurnEvent::TextDelta { text } => {
+                            if !text.is_empty() {
+                                print!("{text}");
+                                let _ = std::io::stdout().flush();
+                                streamed_text.push_str(&text);
+                                saw_output = true;
+                            }
+                        }
+                        TurnEvent::ToolStarted { tool, detail } if show_progress => {
+                            match detail {
+                                Some(detail) => eprintln!("· {tool} {detail}"),
+                                None => eprintln!("· {tool}"),
+                            }
+                        }
+                        TurnEvent::ToolCompleted { tool, detail, exit_code } if show_progress => {
+                            let marker = if exit_code.unwrap_or(0) == 0 { "✓" } else { "✗" };
+                            match detail {
+                                Some(detail) => eprintln!("{marker} {tool} {detail}"),
+                                None => eprintln!("{marker} {tool}"),
+                            }
+                        }
+                        _ => {}
+                    }
                 }
                 match engine_event_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(EngineEvent::TurnFinished { ok, error, .. }) => {
-                        result_ok = ok;
+                        result_ok = Some(ok);
                         if !ok {
                             if let Some(error) = error {
                                 eprintln!("turn failed: {error}");
@@ -147,10 +178,23 @@ fn main_result() -> Result<()> {
             let _ = engine_command_sender.send(EngineCommand::Quit);
             let _ = engine_task.join();
 
-            if !result_text.is_empty() {
+            // Providers that do not emit deltas only deliver final text here.
+            // If deltas were streamed, do not print the same answer twice.
+            if streamed_text.is_empty() && !result_text.is_empty() {
                 println!("{result_text}");
+                saw_output = true;
+            } else if !streamed_text.is_empty() {
+                println!();
             }
-            if !result_ok {
+            if timed_out {
+                eprintln!("exec timed out after 300s");
+                std::process::exit(1);
+            }
+            let result_ok = result_ok.unwrap_or(false);
+            if result_ok && !saw_output {
+                eprintln!("no output from provider");
+            }
+            if !result_ok || !saw_output {
                 std::process::exit(1);
             }
             return Ok(());
@@ -424,6 +468,60 @@ fn main_result() -> Result<()> {
             }
             if provider == ProviderId::Cursor {
                 println!("cursor login complete (if the agent command was not found, install Cursor CLI and try `cursor-agent login`)");
+            }
+            Ok(())
+        }
+        cli::Commands::Resume { fork, print } => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let thread = match &cli.thread {
+                Some(thread_id) => resolve_thread(&store, thread_id)?,
+                None => store
+                    .list_threads(Some(cwd.to_string_lossy().as_ref()))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
+            };
+            let provider = match cli.provider.as_deref() {
+                Some(value) => ProviderId::parse(value)
+                    .ok_or_else(|| anyhow::anyhow!("unknown provider {value}"))?,
+                None => thread.current_provider,
+            };
+            let session = match store.get_provider_session(&thread.id, provider)? {
+                Some(session) => session,
+                None => {
+                    let available = store
+                        .list_provider_sessions(&thread.id)?
+                        .into_iter()
+                        .map(|session| session.provider.to_string())
+                        .collect::<Vec<_>>();
+                    let suffix = if available.is_empty() {
+                        "it has no native sessions yet".to_string()
+                    } else {
+                        format!("available sessions: {}", available.join(", "))
+                    };
+                    anyhow::bail!(
+                        "thread {} has no {} session; {suffix}",
+                        &thread.id[..8.min(thread.id.len())],
+                        provider
+                    );
+                }
+            };
+            let command = resume::build(provider, &session.native_session_id, fork)?;
+            if print {
+                println!("{}", command.shell_line());
+                return Ok(());
+            }
+            let resolved = resolve_config(&home, Path::new(&thread.cwd));
+            let mut process = std::process::Command::new(&command.program);
+            process.args(&command.args).current_dir(&thread.cwd);
+            for (key, value) in config::provider_auth_env(resolved.for_provider(provider)) {
+                process.env(key, value);
+            }
+            let status = process
+                .status()
+                .map_err(|error| anyhow::anyhow!("cannot run {}: {error}", command.program))?;
+            if !status.success() {
+                anyhow::bail!("{} exited with {status}", command.program);
             }
             Ok(())
         }

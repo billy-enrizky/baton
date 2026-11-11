@@ -92,4 +92,13 @@ pub enum Commands {
     Default {
         provider: String,
     },
+    /// Open this thread in the provider's native CLI
+    Resume {
+        /// Fork the native session instead of resuming it in place
+        #[arg(long)]
+        fork: bool,
+        /// Print the command instead of running it
+        #[arg(long)]
+        print: bool,
+    },
 }

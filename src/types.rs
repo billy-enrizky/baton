@@ -180,3 +180,39 @@ pub struct NativeSessionRef {
     pub native_session_id: String,
     pub rollout_path: Option<String>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TurnPhase;
+
+    #[test]
+    fn only_terminal_phases_report_terminal() {
+        for phase in [TurnPhase::Queued, TurnPhase::Running, TurnPhase::Settling] {
+            assert!(!phase.is_terminal(), "{} must stay open", phase.as_str());
+        }
+        for phase in [
+            TurnPhase::Completed,
+            TurnPhase::Failed,
+            TurnPhase::Interrupted,
+            TurnPhase::Unverified,
+        ] {
+            assert!(phase.is_terminal(), "{} must be terminal", phase.as_str());
+        }
+    }
+
+    #[test]
+    fn phase_strings_round_trip() {
+        for phase in [
+            TurnPhase::Queued,
+            TurnPhase::Running,
+            TurnPhase::Settling,
+            TurnPhase::Completed,
+            TurnPhase::Failed,
+            TurnPhase::Interrupted,
+            TurnPhase::Unverified,
+        ] {
+            assert_eq!(TurnPhase::parse(phase.as_str()), Some(phase));
+        }
+        assert_eq!(TurnPhase::parse("unknown"), None);
+    }
+}

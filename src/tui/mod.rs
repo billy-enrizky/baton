@@ -98,6 +98,15 @@ enum ToolStatus {
     Failed,
 }
 
+#[derive(Debug, Clone)]
+struct InputRow {
+    screen_y: u16,
+    screen_x_start: u16,
+    char_start: usize,
+    line_len: usize,
+    scroll: usize,
+}
+
 enum Overlay {
     None,
     Approval { summary: String, respond: tokio::sync::oneshot::Sender<ApprovalDecision> },
@@ -134,6 +143,8 @@ pub struct TuiState {
     thread: ThreadRow,
     history: Vec<MessageRow>,
     input: String,
+    input_cursor: usize,
+    input_layout: std::cell::RefCell<Vec<InputRow>>,
     running: bool,
     streaming_text: String,
     tool_lines: Vec<ToolLine>,
@@ -179,6 +190,8 @@ pub fn run_tui(
         thread,
         history,
         input: String::new(),
+        input_cursor: 0,
+        input_layout: std::cell::RefCell::new(Vec::new()),
         running: false,
         streaming_text: String::new(),
         tool_lines: Vec::new(),
@@ -222,6 +235,14 @@ pub fn run_tui(
         crossterm::cursor::Hide,
         crossterm::event::EnableMouseCapture
     )?;
+    // Let terminals report Shift+Enter distinctly from Enter. Unsupported
+    // terminals ignore this and keep the Alt+Enter fallback.
+    let _ = execute!(
+        std::io::stdout(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    );
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -249,6 +270,10 @@ pub fn run_tui(
     }
 
     terminal::disable_raw_mode()?;
+    let _ = execute!(
+        terminal.backend_mut(),
+        crossterm::event::PopKeyboardEnhancementFlags
+    );
     execute!(
         terminal.backend_mut(),
         crossterm::cursor::Show,
@@ -263,25 +288,22 @@ pub fn run_tui(
 /// extends an orange-highlighted range, and clicks outside the input clear it.
 fn handle_mouse(state: &mut TuiState, mouse: crossterm::event::MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
-    let (origin_x, origin_y) = state.input_origin.get();
-    let char_index = |column: u16, input: &str| input.chars().take(column.saturating_sub(origin_x) as usize).count();
+    let index = input_index_at(state, mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if mouse.row == origin_y {
-                let index = char_index(mouse.column, &state.input);
+            if let Some(index) = index {
                 state.selection_anchor = Some(index);
                 state.selection = Some((index, index));
+                state.input_cursor = index;
             } else {
                 state.selection_anchor = None;
                 state.selection = None;
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let Some(anchor) = state.selection_anchor {
-                if mouse.row == origin_y {
-                    let index = char_index(mouse.column, &state.input);
-                    state.selection = Some((anchor.min(index), anchor.max(index)));
-                }
+            if let (Some(anchor), Some(index)) = (state.selection_anchor, index) {
+                state.selection = Some((anchor.min(index), anchor.max(index)));
+                state.input_cursor = index;
             }
         }
         _ => {}
@@ -379,6 +401,20 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
         TurnEvent::Usage { .. } => {}
         TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. } => {}
     }
+}
+
+fn input_index_at(state: &TuiState, column: u16, row: u16) -> Option<usize> {
+    let layout = state.input_layout.borrow();
+    let line = layout.iter().find(|line| line.screen_y == row)?;
+    let column = column.saturating_sub(line.screen_x_start) as usize;
+    Some((line.char_start + line.scroll + column).min(line.char_start + line.line_len))
+}
+
+fn char_to_byte(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
 }
 
 fn suggestions_for(input: &str) -> Vec<&'static (&'static str, &'static str)> {
@@ -793,7 +829,7 @@ fn apply_rewind(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, turn: i64,
                 }
             }
             state.scroll_offset = 0;
-            state.input = text;
+            state.set_input(text);
             state.notice = Some(format!("rewound to before turn {turn}; message restored to composer"));
         }
         Err(error) => {
@@ -810,6 +846,18 @@ fn handle_composer_key(
 ) {
     let suggestions = suggestions_for(&state.input);
     let clamped = state.suggestion_index.min(suggestions.len().saturating_sub(1));
+    let force_newline = (key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
+        || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL));
+    if force_newline {
+        state.insert_input_char('\n');
+        state.suggestion_index = 0;
+        state.esc_primed = false;
+        state.prompt_history_index = None;
+        return;
+    }
 
     if !suggestions.is_empty() {
         match key.code {
@@ -827,7 +875,7 @@ fn handle_composer_key(
             }
             KeyCode::Tab => {
                 if let Some((command, _)) = suggestions.get(clamped) {
-                    state.input = format!("{command} ");
+                    state.set_input(format!("{command} "));
                     state.suggestion_index = 0;
                 }
                 return;
@@ -836,10 +884,10 @@ fn handle_composer_key(
                 let typed = state.input.trim().to_string();
                 if let Some((command, _)) = suggestions.iter().find(|(command, _)| *command == typed) {
                     let command = command.to_string();
-                    state.input.clear();
+                    state.set_input(String::new());
                     handle_command(state, store, engine_command_sender, &command);
                 } else if let Some((command, _)) = suggestions.get(clamped) {
-                    state.input = format!("{command} ");
+                    state.set_input(format!("{command} "));
                     state.suggestion_index = 0;
                 }
                 return;
@@ -854,11 +902,9 @@ fn handle_composer_key(
             if text.is_empty() {
                 return;
             }
-            state.input.clear();
+            state.set_input(String::new());
             state.suggestion_index = 0;
             state.esc_primed = false;
-            state.selection = None;
-            state.selection_anchor = None;
             if text.starts_with('/') {
                 handle_command(state, store, engine_command_sender, &text);
             } else if state.running {
@@ -872,12 +918,41 @@ fn handle_composer_key(
             }
         }
         KeyCode::Backspace => {
-            state.input.pop();
+            state.backspace_input();
             state.suggestion_index = 0;
             state.esc_primed = false;
             state.selection = None;
             state.selection_anchor = None;
             state.prompt_history_index = None;
+        }
+        KeyCode::Delete => {
+            state.delete_input();
+            state.suggestion_index = 0;
+            state.esc_primed = false;
+            state.prompt_history_index = None;
+        }
+        KeyCode::Left => {
+            state.input_cursor = state.input_cursor.saturating_sub(1);
+            state.selection = None;
+            state.selection_anchor = None;
+        }
+        KeyCode::Right => {
+            let length = state.input.chars().count();
+            state.input_cursor = (state.input_cursor + 1).min(length);
+            state.selection = None;
+            state.selection_anchor = None;
+        }
+        KeyCode::Home => {
+            let (start, _) = state.cursor_line_bounds();
+            state.input_cursor = start;
+            state.selection = None;
+            state.selection_anchor = None;
+        }
+        KeyCode::End => {
+            let (_, end) = state.cursor_line_bounds();
+            state.input_cursor = end;
+            state.selection = None;
+            state.selection_anchor = None;
         }
         // Claude Code style recall: with an empty input (or while already
         // recalling), Up walks back through this project's prompt history
@@ -889,24 +964,20 @@ fn handle_composer_key(
                     Some(0) => 0,
                     Some(index) => index - 1,
                 };
-                state.input = state.prompt_history[next].clone();
+                state.set_input(state.prompt_history[next].clone());
                 state.prompt_history_index = Some(next);
-                state.selection = None;
-                state.selection_anchor = None;
                 state.esc_primed = false;
             }
         }
         KeyCode::Down if state.prompt_history_index.is_some() => {
             let index = state.prompt_history_index.unwrap() + 1;
             if index >= state.prompt_history.len() {
-                state.input.clear();
+                state.set_input(String::new());
                 state.prompt_history_index = None;
             } else {
-                state.input = state.prompt_history[index].clone();
+                state.set_input(state.prompt_history[index].clone());
                 state.prompt_history_index = Some(index);
             }
-            state.selection = None;
-            state.selection_anchor = None;
         }
         KeyCode::Up => {
             state.scroll_offset += 1;
@@ -935,14 +1006,14 @@ fn handle_composer_key(
                     state.esc_primed = true;
                 }
             } else {
-                state.input.clear();
+                state.set_input(String::new());
                 state.prompt_history_index = None;
                 state.notice = Some("composer cleared".into());
             }
         }
-        KeyCode::Char(char) => {
+        KeyCode::Char(character) => {
             if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
-                state.input.push(char);
+                state.insert_input_char(character);
                 state.suggestion_index = 0;
                 state.esc_primed = false;
                 state.selection = None;
@@ -999,13 +1070,15 @@ fn handle_command(
     match command {
         "/quit" | "/exit" => state.quit = true,
         "/help" => {
-            state.notice = Some(
-                SLASH_COMMANDS
-                    .iter()
-                    .map(|(name, description)| format!("{name:<14} {description}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+            let mut help = SLASH_COMMANDS
+                .iter()
+                .map(|(name, description)| format!("{name:<14} {description}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            help.push_str(
+                "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll",
             );
+            state.notice = Some(help);
         }
         "/clear" => {
             state.diff_output = None;
@@ -1491,7 +1564,13 @@ fn handle_command(
 fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     let area = frame.area();
     let suggestions = suggestions_for(&state.input);
-    let composer_rows = 4 + if suggestions.is_empty() { 0 } else { suggestions.len().min(6) + 2 };
+    let composer_rows = 4u16
+        + state.visible_input_lines().saturating_sub(1) as u16
+        + if suggestions.is_empty() {
+            0
+        } else {
+            (suggestions.len().min(6) + 2) as u16
+        };
     let notice_rows = state
         .notice
         .as_ref()
@@ -2145,30 +2224,88 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
         rows.push(Line::from(""));
     }
     let input_row_index = rows.len();
-    let display: Vec<Span> = if state.input.is_empty() {
-        vec![Span::styled("Ask anything...", Style::default().fg(COLORS.muted))]
+    let input_width = area.width.saturating_sub(2).max(10) as usize;
+    let chars: Vec<char> = state.input.chars().collect();
+    let line_count = state.input.split('\n').count().max(1);
+    let (cursor_line, cursor_column) = state.cursor_line_column();
+    let visible_count = line_count.min(8);
+    let first_line = if line_count > visible_count {
+        cursor_line
+            .saturating_sub(visible_count.saturating_sub(1))
+            .min(line_count - visible_count)
     } else {
-        match state.selection {
-            Some((start, end)) if end > start => {
-                let chars: Vec<char> = state.input.chars().collect();
-                let (start, end) = (start.min(chars.len()), end.min(chars.len()));
-                if end > start {
-                    let selected = chars[start..end].iter().collect::<String>();
-                    vec![
-                        Span::styled(chars[..start].iter().collect::<String>(), Style::default().fg(COLORS.text)),
-                        Span::styled(selected, Style::default().fg(Color::Black).bg(COLORS.accent)),
-                        Span::styled(chars[end..].iter().collect::<String>(), Style::default().fg(COLORS.text)),
-                    ]
-                } else {
-                    vec![Span::styled(state.input.clone(), Style::default().fg(COLORS.text))]
+        0
+    };
+    let mut layout: Vec<InputRow> = Vec::new();
+    let mut line_char_start = 0usize;
+    for line_index in 0..line_count {
+        let line_end = chars[line_char_start..]
+            .iter()
+            .position(|character| *character == '\n')
+            .map(|offset| line_char_start + offset)
+            .unwrap_or(chars.len());
+        if line_index >= first_line && line_index < first_line + visible_count {
+            let line_len = line_end - line_char_start;
+            let scroll = if line_index == cursor_line {
+                cursor_column.saturating_sub(input_width.saturating_sub(1))
+            } else {
+                0
+            };
+            let start = line_char_start + scroll.min(line_len);
+            let end = (start + input_width).min(line_end);
+            let mut spans: Vec<Span> = Vec::new();
+            if state.input.is_empty() && line_index == 0 {
+                spans.push(Span::styled(
+                    "Ask anything...",
+                    Style::default().fg(COLORS.muted),
+                ));
+            } else {
+                for absolute in start..end {
+                    let mut style = Style::default().fg(COLORS.text);
+                    if let Some((selection_start, selection_end)) = state.selection {
+                        if selection_end > selection_start
+                            && absolute >= selection_start
+                            && absolute < selection_end
+                        {
+                            style = style.fg(Color::Black).bg(COLORS.accent);
+                        }
+                    }
+                    if absolute == state.input_cursor && state.selection.is_none() {
+                        style = style.fg(Color::Black).bg(COLORS.accent);
+                    }
+                    spans.push(Span::styled(chars[absolute].to_string(), style));
+                }
+                if state.input_cursor == line_end
+                    && line_index == cursor_line
+                    && state.selection.is_none()
+                {
+                    spans.push(Span::styled(
+                        " ",
+                        Style::default().fg(Color::Black).bg(COLORS.accent),
+                    ));
                 }
             }
-            _ => vec![Span::styled(state.input.clone(), Style::default().fg(COLORS.text))],
+            if spans.is_empty() {
+                spans.push(Span::raw(""));
+            }
+            rows.push(Line::from(spans));
+            layout.push(InputRow {
+                screen_y: area.y + 1 + (input_row_index + (line_index - first_line)) as u16,
+                screen_x_start: area.x + 1,
+                char_start: line_char_start,
+                line_len,
+                scroll,
+            });
         }
-    };
-    // Screen position of the input text, for mapping mouse columns to chars.
-    state.input_origin.set((area.x + 1, area.y + 1 + input_row_index as u16));
-    rows.push(Line::from(display));
+        if line_end >= chars.len() {
+            break;
+        }
+        line_char_start = line_end + 1;
+    }
+    if let Some(first) = layout.first() {
+        state.input_origin.set((first.screen_x_start, first.screen_y));
+    }
+    state.input_layout.replace(layout);
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
     let provider_config = resolved.for_provider(state.thread.current_provider);
     let effective_model = state
@@ -2247,6 +2384,71 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
 }
 
 impl TuiState {
+    fn set_input(&mut self, text: String) {
+        self.input_cursor = text.chars().count();
+        self.input = text;
+        self.selection = None;
+        self.selection_anchor = None;
+    }
+
+    fn insert_input_char(&mut self, character: char) {
+        let byte = char_to_byte(&self.input, self.input_cursor);
+        self.input.insert(byte, character);
+        self.input_cursor += 1;
+    }
+
+    fn backspace_input(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let start = char_to_byte(&self.input, self.input_cursor - 1);
+        let end = char_to_byte(&self.input, self.input_cursor);
+        self.input.replace_range(start..end, "");
+        self.input_cursor -= 1;
+    }
+
+    fn delete_input(&mut self) {
+        let chars = self.input.chars().count();
+        if self.input_cursor >= chars {
+            return;
+        }
+        let start = char_to_byte(&self.input, self.input_cursor);
+        let end = char_to_byte(&self.input, self.input_cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn cursor_line_bounds(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.input_cursor.min(chars.len());
+        let start = chars[..cursor]
+            .iter()
+            .rposition(|character| *character == '\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let end = chars[cursor..]
+            .iter()
+            .position(|character| *character == '\n')
+            .map(|index| cursor + index)
+            .unwrap_or(chars.len());
+        (start, end)
+    }
+
+    fn cursor_line_column(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.input_cursor.min(chars.len());
+        let line = chars[..cursor].iter().filter(|character| **character == '\n').count();
+        let column = chars[..cursor]
+            .iter()
+            .rposition(|character| *character == '\n')
+            .map(|index| cursor - index - 1)
+            .unwrap_or(cursor);
+        (line, column)
+    }
+
+    fn visible_input_lines(&self) -> usize {
+        self.input.split('\n').count().clamp(1, 8)
+    }
+
     fn store_rows(&self) -> Option<Vec<crate::store::UsageRow>> {
         self.store.lock().unwrap().list_usage(Some(&self.thread.id)).ok()
     }
@@ -2295,6 +2497,8 @@ mod tests {
             thread,
             history,
             input: String::new(),
+            input_cursor: 0,
+            input_layout: std::cell::RefCell::new(Vec::new()),
             running: false,
                 streaming_text: String::new(),
             tool_lines: Vec::new(),
@@ -2615,6 +2819,110 @@ mod tests {
             let thread = store.lock().unwrap().get_thread(thread_id).unwrap();
             assert!(thread.is_some(), "parallel thread {thread_id} must be persisted before submit");
         }
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_instead_of_submitting() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode, modifiers: KeyModifiers| KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        state.set_input("first".into());
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        state.set_input(format!("{}second", state.input));
+        assert_eq!(state.input, "first\nsecond");
+        assert!(
+            engine_command_receiver.try_recv().is_err(),
+            "shift+enter must not submit"
+        );
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(state.input, "", "plain enter still submits");
+        let command = engine_command_receiver.try_recv().expect("submit command");
+        match command {
+            EngineCommand::Submit { text, .. } => assert_eq!(text, "first\nsecond"),
+            _ => panic!("expected a submit command"),
+        }
+    }
+
+    #[test]
+    fn composer_cursor_moves_and_edits_mid_string() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        state.set_input("abc".into());
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Left));
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('X')));
+        assert_eq!(state.input, "abXc");
+        assert_eq!(state.input_cursor, 3);
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Home));
+        assert_eq!(state.input_cursor, 0);
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Delete));
+        assert_eq!(state.input, "bXc");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::End));
+        assert_eq!(state.input_cursor, 3);
+    }
+
+    #[test]
+    fn multiline_composer_renders_every_line_and_maps_mouse_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.set_input("line one\nline two".into());
+
+        let buffer = render_state(&state, 100, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains("line one"));
+        assert!(text.contains("line two"));
+
+        let layout = state.input_layout.borrow().clone();
+        assert_eq!(layout.len(), 2, "both logical lines register a mouse row");
+        let second = &layout[1];
+        let mouse = |kind: crossterm::event::MouseEventKind, column: u16, row: u16| {
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            }
+        };
+        handle_mouse(
+            &mut state,
+            mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                second.screen_x_start,
+                second.screen_y,
+            ),
+        );
+        handle_mouse(
+            &mut state,
+            mouse(
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                second.screen_x_start + 4,
+                second.screen_y,
+            ),
+        );
+        assert_eq!(
+            state.selection,
+            Some((9, 13)),
+            "the second line maps to the absolute char range"
+        );
     }
 
     #[test]

@@ -226,7 +226,7 @@ fn main_result() -> Result<()> {
         cli::Commands::Threads => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let resolved = resolve_config(&home, &cwd);
-            let threads = store.list_threads(Some(cwd.to_string_lossy().as_ref()))?;
+            let threads = store.list_threads_for_path(&cwd)?;
             if threads.is_empty() {
                 println!("no threads in this directory yet. Run baton to start one.");
                 return Ok(());
@@ -483,7 +483,7 @@ fn main_result() -> Result<()> {
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
-                    .list_threads(Some(cwd.to_string_lossy().as_ref()))?
+                    .list_threads_for_path(&cwd)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
@@ -543,7 +543,7 @@ fn main_result() -> Result<()> {
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
-                    .list_threads(Some(cwd.to_string_lossy().as_ref()))?
+                    .list_threads_for_path(&cwd)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
@@ -586,7 +586,7 @@ fn main_result() -> Result<()> {
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
-                    .list_threads(Some(cwd.to_string_lossy().as_ref()))?
+                    .list_threads_for_path(&cwd)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
@@ -638,7 +638,7 @@ fn main_result() -> Result<()> {
             let thread = match &cli.thread {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
-                    .list_threads(Some(cwd.to_string_lossy().as_ref()))?
+                    .list_threads_for_path(&cwd)?
                     .into_iter()
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,

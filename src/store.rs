@@ -313,6 +313,35 @@ impl BatonStore {
         }
     }
 
+    /// Lists threads for a directory, accepting both the caller's path and its
+    /// canonical form. A symlinked invocation path must not hide threads that
+    /// were created through the real project path, or vice versa.
+    pub fn list_threads_for_path(&self, cwd: &Path) -> Result<Vec<ThreadRow>> {
+        let mut candidates = vec![cwd.to_path_buf()];
+        if let Ok(canonical) = cwd.canonicalize() {
+            if canonical != cwd {
+                candidates.push(canonical);
+            }
+        }
+        if let Ok(target) = cwd.read_link() {
+            let target = if target.is_absolute() {
+                target
+            } else {
+                cwd.parent().unwrap_or(Path::new(".")).join(target)
+            };
+            if !candidates.contains(&target) {
+                candidates.push(target);
+            }
+        }
+        for candidate in candidates {
+            let rows = self.list_threads(Some(candidate.to_string_lossy().as_ref()))?;
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+        Ok(Vec::new())
+    }
+
     pub fn list_threads(&self, cwd: Option<&str>) -> Result<Vec<ThreadRow>> {
         let mut statement = match cwd {
             Some(_cwd) => self.db.prepare(&format!(

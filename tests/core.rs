@@ -147,6 +147,28 @@ fn store_turn_records_and_reconcile() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn store_thread_lookup_accepts_symlinked_project_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "linked".into(),
+            cwd: real.to_string_lossy().to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    let found = store.list_threads_for_path(&link).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, thread.id);
+}
+
 #[test]
 fn store_queue_is_fifo_and_cleared_on_rewind() {
     let store = BatonStore::memory().unwrap();

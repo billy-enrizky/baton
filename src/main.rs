@@ -603,7 +603,17 @@ fn main_result() -> Result<()> {
             };
             if clear {
                 store.clear_queued_messages(&thread.id)?;
-                println!("queue cleared");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "thread_id": thread.id,
+                            "cleared": true,
+                        }))?
+                    );
+                } else {
+                    println!("queue cleared");
+                }
                 return Ok(());
             }
             let queued = store.list_queued_messages(&thread.id)?;

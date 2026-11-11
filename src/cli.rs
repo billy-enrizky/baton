@@ -124,5 +124,8 @@ pub enum Commands {
         /// Remove every queued message
         #[arg(long)]
         clear: bool,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
     },
 }

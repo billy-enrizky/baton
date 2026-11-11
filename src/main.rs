@@ -538,7 +538,7 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
-        cli::Commands::Queue { thread_id, clear } => {
+        cli::Commands::Queue { thread_id, clear, json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
@@ -554,6 +554,17 @@ fn main_result() -> Result<()> {
                 return Ok(());
             }
             let queued = store.list_queued_messages(&thread.id)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "thread_id": thread.id,
+                        "count": queued.len(),
+                        "messages": queued,
+                    }))?
+                );
+                return Ok(());
+            }
             if queued.is_empty() {
                 println!("queue: empty");
             } else {

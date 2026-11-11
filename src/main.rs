@@ -250,6 +250,8 @@ fn main_result() -> Result<()> {
                         "provider": thread.current_provider.as_str(),
                         "model": model,
                         "permission_mode": thread.permission_mode.as_str(),
+                        "goal": thread.goal,
+                        "goal_paused": thread.goal_paused,
                         "phase": phase,
                         "queue_count": store.list_queued_messages(&thread.id)?.len(),
                     }));

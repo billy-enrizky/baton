@@ -202,7 +202,7 @@ pub fn run_tui(
     thread: ThreadRow,
     engine_command_sender: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     engine_event_receiver: std::sync::mpsc::Receiver<EngineEvent>,
-    turn_event_receiver: std::sync::mpsc::Receiver<TurnEvent>,
+    turn_event_receiver: std::sync::mpsc::Receiver<(String, TurnEvent)>,
     initial_prompt: Option<String>,
     permission_override: Option<PermissionMode>,
 ) -> Result<()> {
@@ -316,8 +316,10 @@ pub fn run_tui(
 
     let mut spinner_frame = 0usize;
     while !state.quit {
-        while let Ok(event) = turn_event_receiver.try_recv() {
-            apply_turn_event(&mut state, event);
+        while let Ok((event_thread, event)) = turn_event_receiver.try_recv() {
+            if event_thread == state.thread.id {
+                apply_turn_event(&mut state, event);
+            }
         }
         while let Ok(event) = engine_event_receiver.try_recv() {
             apply_engine_event(&mut state, &store, event, &engine_command_sender);

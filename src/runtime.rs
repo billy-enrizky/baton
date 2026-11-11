@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnStartInput};
 use crate::checkpoints::capture_checkpoint;
 use crate::config::{provider_auth_env, resolve_config};
 use crate::handoff::{build_handoff, derive_title, git_status_summary, wrap_prompt_with_handoff, HandoffMessage};
@@ -12,6 +12,7 @@ use crate::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
 
 pub type SharedStore = Arc<Mutex<BatonStore>>;
 pub type SharedAdapter = Arc<tokio::sync::Mutex<Box<dyn BatonAdapter>>>;
+pub type ThreadTurnEventSender = std::sync::mpsc::Sender<(String, TurnEvent)>;
 
 pub enum EngineCommand {
     Submit { thread_id: String, text: String, permission_mode: PermissionMode },
@@ -179,7 +180,7 @@ pub async fn run_engine(
     steer_handles: Vec<(ProviderId, SteerHandle)>,
     mut command_receiver: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
-    turn_event_sender: TurnEventSender,
+    turn_event_sender: ThreadTurnEventSender,
 ) -> Result<()> {
     let active_threads: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     while let Some(command) = command_receiver.recv().await {
@@ -320,7 +321,7 @@ async fn run_turn(
     text: String,
     permission_mode: PermissionMode,
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
-    turn_event_sender: TurnEventSender,
+    turn_event_sender: ThreadTurnEventSender,
     active_threads: Arc<Mutex<HashSet<String>>>,
 ) {
     let expected_turn = store
@@ -402,7 +403,7 @@ async fn execute_turn(
     text: &str,
     permission_mode: PermissionMode,
     engine_event_sender: &std::sync::mpsc::Sender<EngineEvent>,
-    turn_event_sender: &TurnEventSender,
+    turn_event_sender: &ThreadTurnEventSender,
 ) -> Result<()> {
     let (provider, cwd, thread_title, thread_model) = {
         let store = store.lock().unwrap();
@@ -496,6 +497,7 @@ async fn execute_turn(
 
     let (event_sender, event_receiver) = std::sync::mpsc::channel::<TurnEvent>();
     let tui_sender = turn_event_sender.clone();
+    let event_thread_id = thread_id.to_string();
     let outcome_slot: Arc<Mutex<Option<TurnOutcome>>> = Arc::new(Mutex::new(None));
     let failure_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let interrupted_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -514,23 +516,23 @@ async fn execute_turn(
                         native_session_id: native_session_id.clone(),
                         rollout_path: rollout_path.clone(),
                     });
-                    let _ = tui_sender.send(event);
+                    let _ = tui_sender.send((event_thread_id.clone(), event));
                     break;
                 }
                 TurnEvent::TurnInterrupted { reason } => {
                     *interrupted_for_thread.lock().unwrap() =
                         Some(reason.clone().unwrap_or_else(|| "turn interrupted".into()));
-                    let _ = tui_sender.send(event);
+                    let _ = tui_sender.send((event_thread_id.clone(), event));
                     break;
                 }
                 TurnEvent::TurnFailed { error } => {
                     *failure_for_thread.lock().unwrap() = Some(error.clone());
-                    let _ = tui_sender.send(event);
+                    let _ = tui_sender.send((event_thread_id.clone(), event));
                     break;
                 }
                 _ => {
                     record_tool_event(&mut tools_for_thread.lock().unwrap(), &event);
-                    let _ = tui_sender.send(event);
+                    let _ = tui_sender.send((event_thread_id.clone(), event));
                 }
             }
         }
@@ -661,6 +663,7 @@ pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapters::TurnEventSender;
 
     #[derive(Clone, Copy)]
     enum AdapterMode {
@@ -948,6 +951,121 @@ mod tests {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
         assert!(!codex_interrupted.load(Ordering::SeqCst));
         assert!(claude_interrupted.load(Ordering::SeqCst));
+    }
+
+    struct TaggedAdapter {
+        provider: ProviderId,
+        reply: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl BatonAdapter for TaggedAdapter {
+        fn id(&self) -> ProviderId {
+            self.provider
+        }
+
+        fn interrupt_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+            Arc::new(|| {})
+        }
+
+        async fn start_turn(
+            &mut self,
+            _input: TurnStartInput,
+            _session: Option<crate::types::NativeSessionRef>,
+            emit: TurnEventSender,
+        ) -> Result<()> {
+            let _ = emit.send(TurnEvent::TextDelta {
+                text: self.reply.to_string(),
+            });
+            let _ = emit.send(TurnEvent::TurnCompleted {
+                final_text: self.reply.to_string(),
+                usage: None,
+                native_session_id: None,
+                rollout_path: None,
+            });
+            Ok(())
+        }
+
+        async fn dispose(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_turn_events_keep_their_thread_id() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let codex_thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "codex".into(),
+                cwd: "/tmp/codex".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let claude_thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "claude".into(),
+                cwd: "/tmp/claude".into(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        let adapters: Vec<SharedAdapter> = vec![
+            Arc::new(tokio::sync::Mutex::new(
+                Box::new(TaggedAdapter {
+                    provider: ProviderId::Codex,
+                    reply: "codex-reply",
+                }) as Box<dyn BatonAdapter>,
+            )),
+            Arc::new(tokio::sync::Mutex::new(
+                Box::new(TaggedAdapter {
+                    provider: ProviderId::Claude,
+                    reply: "claude-reply",
+                }) as Box<dyn BatonAdapter>,
+            )),
+        ];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store,
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        for thread_id in [&codex_thread.id, &claude_thread.id] {
+            command_sender
+                .send(EngineCommand::Submit {
+                    thread_id: thread_id.clone(),
+                    text: "hello".into(),
+                    permission_mode: PermissionMode::Default,
+                })
+                .unwrap();
+        }
+        let mut completed = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && completed.len() < 2 {
+            if let Ok((thread_id, TurnEvent::TurnCompleted { final_text, .. })) =
+                turn_receiver.try_recv()
+            {
+                completed.push((thread_id, final_text));
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        assert_eq!(completed.len(), 2);
+        assert!(completed.contains(&(codex_thread.id.clone(), "codex-reply".to_string())));
+        assert!(completed.contains(&(claude_thread.id.clone(), "claude-reply".to_string())));
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
     }
 
     #[tokio::test]

@@ -142,7 +142,10 @@ fn main_result() -> Result<()> {
                     timed_out = true;
                     break;
                 }
-                while let Ok(event) = turn_event_receiver.try_recv() {
+                while let Ok((event_thread, event)) = turn_event_receiver.try_recv() {
+                    if event_thread != thread.id {
+                        continue;
+                    }
                     match event {
                         TurnEvent::TextDelta { text } => {
                             if !text.is_empty() {

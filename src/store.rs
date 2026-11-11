@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::types::{ProviderId, TurnUsage};
+use crate::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
 
 #[derive(Debug, Clone)]
 pub struct ThreadRow {
@@ -12,8 +12,24 @@ pub struct ThreadRow {
     pub cwd: String,
     pub current_provider: ProviderId,
     pub current_model: Option<String>,
+    pub permission_mode: PermissionMode,
+    pub goal: Option<String>,
+    pub goal_paused: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnRow {
+    pub thread_id: String,
+    pub turn: i64,
+    pub provider: ProviderId,
+    pub model: Option<String>,
+    pub phase: TurnPhase,
+    pub error: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,8 +94,23 @@ CREATE TABLE IF NOT EXISTS threads (
   cwd TEXT NOT NULL,
   current_provider TEXT NOT NULL,
   current_model TEXT,
+  permission_mode TEXT NOT NULL DEFAULT 'default',
+  goal TEXT,
+  goal_paused INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS turns (
+  thread_id TEXT NOT NULL,
+  turn INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT,
+  phase TEXT NOT NULL,
+  error TEXT,
+  provider_turn_id TEXT,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  PRIMARY KEY (thread_id, turn)
 );
 CREATE TABLE IF NOT EXISTS provider_sessions (
   thread_id TEXT NOT NULL,
@@ -131,6 +162,31 @@ CREATE TABLE IF NOT EXISTS usage (
 CREATE INDEX IF NOT EXISTS usage_thread_idx ON usage (thread_id, id);
 "#;
 
+fn ensure_column(db: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let exists = db
+        .query_row(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
+            params![table, column],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        db.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_thread_columns(db: &Connection) -> Result<()> {
+    ensure_column(db, "threads", "permission_mode", "TEXT NOT NULL DEFAULT 'default'")?;
+    ensure_column(db, "threads", "goal", "TEXT")?;
+    ensure_column(db, "threads", "goal_paused", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
+
 fn migrate_thread_model_nullable(db: &Connection) -> Result<()> {
     let not_null: Option<i64> = db
         .query_row(
@@ -149,13 +205,16 @@ fn migrate_thread_model_nullable(db: &Connection) -> Result<()> {
                   cwd TEXT NOT NULL,
                   current_provider TEXT NOT NULL,
                   current_model TEXT,
+                  permission_mode TEXT NOT NULL DEFAULT 'default',
+                  goal TEXT,
+                  goal_paused INTEGER NOT NULL DEFAULT 0,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
-                INSERT INTO threads_migrated (id, title, cwd, current_provider, current_model, created_at, updated_at)
+                INSERT INTO threads_migrated (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, created_at, updated_at)
                   SELECT id, title, cwd, current_provider,
                     CASE WHEN current_model IN ('gpt-6.1-sol', 'claude-sonnet-4-5') THEN NULL ELSE current_model END,
-                    created_at, updated_at
+                    'default', NULL, 0, created_at, updated_at
                   FROM threads;
                 DROP TABLE threads;
                 ALTER TABLE threads_migrated RENAME TO threads;
@@ -169,18 +228,22 @@ fn migrate_thread_model_nullable(db: &Connection) -> Result<()> {
 
 fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
     let provider: String = row.get(3)?;
+    let permission_mode: String = row.get(7)?;
     Ok(ThreadRow {
         id: row.get(0)?,
         title: row.get(1)?,
         cwd: row.get(2)?,
         current_provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
         current_model: row.get(4)?,
+        permission_mode: PermissionMode::parse(&permission_mode).unwrap_or(PermissionMode::Default),
+        goal: row.get(8)?,
+        goal_paused: row.get::<_, i64>(9)? != 0,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
     })
 }
 
-const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at";
+const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused";
 
 /// Per-project prompt history cap, Claude Code style.
 pub const PROMPT_HISTORY_LIMIT: i64 = 100;
@@ -193,6 +256,7 @@ impl BatonStore {
         let db = Connection::open(path)?;
         db.execute_batch(MIGRATIONS)?;
         migrate_thread_model_nullable(&db)?;
+        ensure_thread_columns(&db)?;
         Ok(BatonStore { db })
     }
 
@@ -209,7 +273,7 @@ impl BatonStore {
     pub fn create_thread_with_id(&self, input: NewThread, id: String) -> Result<ThreadRow> {
         let now = now_iso();
         self.db.execute(
-            "INSERT INTO threads (id, title, cwd, current_provider, current_model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'default', NULL, 0, ?, ?)",
             params![id, input.title, input.cwd, input.current_provider.as_str(), input.current_model, now, now],
         )?;
         Ok(ThreadRow {
@@ -218,6 +282,9 @@ impl BatonStore {
             cwd: input.cwd,
             current_provider: input.current_provider,
             current_model: input.current_model,
+            permission_mode: PermissionMode::Default,
+            goal: None,
+            goal_paused: false,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -231,6 +298,9 @@ impl BatonStore {
             cwd: input.cwd,
             current_provider: input.current_provider,
             current_model: input.current_model,
+            permission_mode: PermissionMode::Default,
+            goal: None,
+            goal_paused: false,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -283,6 +353,22 @@ impl BatonStore {
         self.db.execute(
             "UPDATE threads SET current_model = ?, updated_at = ? WHERE id = ?",
             params![model, now_iso(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_permission_mode(&self, id: &str, mode: PermissionMode) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET permission_mode = ?, updated_at = ? WHERE id = ?",
+            params![mode.as_str(), now_iso(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_goal(&self, id: &str, goal: Option<&str>, paused: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET goal = ?, goal_paused = ?, updated_at = ? WHERE id = ?",
+            params![goal, if paused { 1 } else { 0 }, now_iso(), id],
         )?;
         Ok(())
     }
@@ -398,16 +484,21 @@ impl BatonStore {
     pub fn find_thread_by_native_session(&self, provider: ProviderId, native_session_id: &str) -> Result<Option<ThreadRow>> {
         self.db
             .query_row(
-                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
+                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
                 params![provider.as_str(), native_session_id],
                 |row| {
                     let provider: String = row.get(3)?;
+                    let permission_mode: String = row.get(7)?;
                     Ok(ThreadRow {
                         id: row.get(0)?,
                         title: row.get(1)?,
                         cwd: row.get(2)?,
                         current_provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
                         current_model: row.get(4)?,
+                        permission_mode: PermissionMode::parse(&permission_mode)
+                            .unwrap_or(PermissionMode::Default),
+                        goal: row.get(8)?,
+                        goal_paused: row.get::<_, i64>(9)? != 0,
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
                     })
@@ -427,6 +518,124 @@ impl BatonStore {
             )
             .unwrap_or(0);
         Ok(max_turn + 1)
+    }
+
+    fn map_turn(row: &rusqlite::Row) -> rusqlite::Result<TurnRow> {
+        let provider: String = row.get(2)?;
+        let phase: String = row.get(4)?;
+        Ok(TurnRow {
+            thread_id: row.get(0)?,
+            turn: row.get(1)?,
+            provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
+            model: row.get(3)?,
+            phase: TurnPhase::parse(&phase).unwrap_or(TurnPhase::Unverified),
+            error: row.get(5)?,
+            provider_turn_id: row.get(6)?,
+            started_at: row.get(7)?,
+            ended_at: row.get(8)?,
+        })
+    }
+
+    /// Starts or restarts the durable record for one turn.
+    pub fn start_turn_record(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        provider: ProviderId,
+        model: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute(
+            r#"INSERT INTO turns (thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at)
+               VALUES (?, ?, ?, ?, 'running', NULL, NULL, ?, NULL)
+               ON CONFLICT (thread_id, turn) DO UPDATE SET
+                 provider = excluded.provider,
+                 model = excluded.model,
+                 phase = 'running',
+                 error = NULL,
+                 provider_turn_id = NULL,
+                 started_at = excluded.started_at,
+                 ended_at = NULL"#,
+            params![thread_id, turn, provider.as_str(), model, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_turn_record(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        phase: TurnPhase,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute(
+            "UPDATE turns SET phase = ?, error = ?, ended_at = ? WHERE thread_id = ? AND turn = ?",
+            params![phase.as_str(), error, now_iso(), thread_id, turn],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_turn_provider_id(&self, thread_id: &str, turn: i64, provider_turn_id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE turns SET provider_turn_id = ? WHERE thread_id = ? AND turn = ?",
+            params![provider_turn_id, thread_id, turn],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_turn_record(&self, thread_id: &str, turn: i64) -> Result<Option<TurnRow>> {
+        self.db
+            .query_row(
+                "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at FROM turns WHERE thread_id = ? AND turn = ?",
+                params![thread_id, turn],
+                Self::map_turn,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_turn_records(&self, thread_id: &str) -> Result<Vec<TurnRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at FROM turns WHERE thread_id = ? ORDER BY turn",
+        )?;
+        let rows = statement
+            .query_map(params![thread_id], Self::map_turn)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// A process that starts after a crash must not show a running turn as
+    /// live. Mark unfinished turns in this project as unverified.
+    pub fn reconcile_running_turns(&self, cwd: Option<&str>) -> Result<Vec<TurnRow>> {
+        let rows = match cwd {
+            Some(cwd) => {
+                let mut statement = self.db.prepare(
+                    "SELECT tu.thread_id, tu.turn, tu.provider, tu.model, tu.phase, tu.error, tu.provider_turn_id, tu.started_at, tu.ended_at
+                     FROM turns tu JOIN threads t ON t.id = tu.thread_id
+                     WHERE t.cwd = ? AND tu.phase IN ('queued', 'running', 'settling') ORDER BY tu.started_at",
+                )?;
+                let rows = statement
+                    .query_map(params![cwd], Self::map_turn)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+            None => {
+                let mut statement = self.db.prepare(
+                    "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at
+                     FROM turns WHERE phase IN ('queued', 'running', 'settling') ORDER BY started_at",
+                )?;
+                let rows = statement
+                    .query_map([], Self::map_turn)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+        };
+        for row in &rows {
+            self.db.execute(
+                "UPDATE turns SET phase = 'unverified', error = COALESCE(error, 'baton exited before the turn settled'), ended_at = ? WHERE thread_id = ? AND turn = ?",
+                params![now_iso(), row.thread_id, row.turn],
+            )?;
+        }
+        Ok(rows)
     }
 
     pub fn add_message(
@@ -572,6 +781,10 @@ impl BatonStore {
         )?;
         tx.execute(
             "DELETE FROM usage WHERE thread_id = ? AND turn >= ?",
+            params![thread_id, from_turn],
+        )?;
+        tx.execute(
+            "DELETE FROM turns WHERE thread_id = ? AND turn >= ?",
             params![thread_id, from_turn],
         )?;
         tx.execute("DELETE FROM provider_sessions WHERE thread_id = ?", params![thread_id])?;

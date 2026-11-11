@@ -1,6 +1,6 @@
 use baton::handoff::{build_handoff, wrap_prompt_with_handoff, HandoffMessage};
 use baton::store::{BatonStore, ImportedMessage, NewThread};
-use baton::types::{ProviderId, TurnUsage};
+use baton::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
 use baton::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 use baton::scanner::{parse_claude_transcript, parse_codex_transcript};
 use std::io::Write;
@@ -99,6 +99,10 @@ fn store_rewind_truncates_and_clears_sessions() {
         .add_usage(&thread.id, 2, ProviderId::Claude, None, &TurnUsage { input_tokens: 2, output_tokens: 2, cache_read_tokens: 2, cache_creation_tokens: 2, cost_usd: None })
         .unwrap();
 
+    store.start_turn_record(&thread.id, 1, ProviderId::Claude, None).unwrap();
+    store.finish_turn_record(&thread.id, 1, TurnPhase::Completed, None).unwrap();
+    store.start_turn_record(&thread.id, 2, ProviderId::Claude, None).unwrap();
+
     store.rewind_thread(&thread.id, 2).unwrap();
     let messages = store.list_messages(&thread.id).unwrap();
     assert_eq!(messages.len(), 2);
@@ -106,6 +110,66 @@ fn store_rewind_truncates_and_clears_sessions() {
     assert!(store.get_provider_session(&thread.id, ProviderId::Claude).unwrap().is_none());
     assert_eq!(store.list_usage(Some(&thread.id)).unwrap().len(), 1);
     assert_eq!(store.next_turn_number(&thread.id).unwrap(), 2);
+    assert_eq!(store.list_turn_records(&thread.id).unwrap().len(), 1, "rewind removes turn records at or after the cutoff");
+}
+
+#[test]
+fn store_turn_records_and_reconcile() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "t".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: Some("m".into()),
+        })
+        .unwrap();
+    store.start_turn_record(&thread.id, 1, ProviderId::Codex, Some("m")).unwrap();
+    store.finish_turn_record(&thread.id, 1, TurnPhase::Completed, None).unwrap();
+    store.start_turn_record(&thread.id, 2, ProviderId::Codex, Some("m")).unwrap();
+
+    let running = store.get_turn_record(&thread.id, 2).unwrap().unwrap();
+    assert_eq!(running.phase, TurnPhase::Running);
+    assert!(running.ended_at.is_none());
+
+    let reconciled = store.reconcile_running_turns(Some("/tmp/project")).unwrap();
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(reconciled[0].turn, 2);
+
+    let turns = store.list_turn_records(&thread.id).unwrap();
+    assert_eq!(turns[0].phase, TurnPhase::Completed);
+    assert_eq!(turns[1].phase, TurnPhase::Unverified);
+    assert!(turns[1].ended_at.is_some());
+    assert_eq!(
+        store.reconcile_running_turns(Some("/tmp/project")).unwrap().len(),
+        0,
+        "reconcile is idempotent"
+    );
+}
+
+#[test]
+fn store_thread_mode_and_goal_persist() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "t".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    assert_eq!(thread.permission_mode, PermissionMode::Default);
+    assert_eq!(thread.goal, None);
+    assert!(!thread.goal_paused);
+
+    store.set_thread_permission_mode(&thread.id, PermissionMode::Plan).unwrap();
+    store
+        .set_thread_goal(&thread.id, Some("ship the fix"), true)
+        .unwrap();
+    let updated = store.get_thread(&thread.id).unwrap().unwrap();
+    assert_eq!(updated.permission_mode, PermissionMode::Plan);
+    assert_eq!(updated.goal.as_deref(), Some("ship the fix"));
+    assert!(updated.goal_paused);
 }
 
 #[test]
@@ -143,7 +207,11 @@ fn store_migration_resets_stale_defaults() {
             .unwrap();
     }
     let store = BatonStore::open(&path).unwrap();
-    assert_eq!(store.get_thread("stale-id").unwrap().unwrap().current_model, None);
+    let stale = store.get_thread("stale-id").unwrap().unwrap();
+    assert_eq!(stale.current_model, None);
+    assert_eq!(stale.permission_mode, PermissionMode::Default);
+    assert_eq!(stale.goal, None);
+    assert!(!stale.goal_paused);
     assert_eq!(
         store.get_thread("fresh-id").unwrap().unwrap().current_model.as_deref(),
         Some("claude-opus-5-5")

@@ -112,6 +112,54 @@ impl AuthMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnPhase {
+    Queued,
+    Running,
+    Settling,
+    Completed,
+    Failed,
+    Interrupted,
+    Unverified,
+}
+
+impl TurnPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TurnPhase::Queued => "queued",
+            TurnPhase::Running => "running",
+            TurnPhase::Settling => "settling",
+            TurnPhase::Completed => "completed",
+            TurnPhase::Failed => "failed",
+            TurnPhase::Interrupted => "interrupted",
+            TurnPhase::Unverified => "unverified",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<TurnPhase> {
+        match value {
+            "queued" => Some(TurnPhase::Queued),
+            "running" => Some(TurnPhase::Running),
+            "settling" => Some(TurnPhase::Settling),
+            "completed" => Some(TurnPhase::Completed),
+            "failed" => Some(TurnPhase::Failed),
+            "interrupted" => Some(TurnPhase::Interrupted),
+            "unverified" => Some(TurnPhase::Unverified),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TurnPhase::Completed
+                | TurnPhase::Failed
+                | TurnPhase::Interrupted
+                | TurnPhase::Unverified
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Accept,
     AcceptAlways,

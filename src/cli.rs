@@ -100,6 +100,9 @@ pub enum Commands {
         /// Print the command instead of running it
         #[arg(long)]
         print: bool,
+        /// Resume even if the thread has an open turn
+        #[arg(long)]
+        force: bool,
     },
     /// Show thread phase, goal, queue, and usage
     Status {

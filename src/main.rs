@@ -599,7 +599,7 @@ fn main_result() -> Result<()> {
             println!("{}", status::render(&report));
             Ok(())
         }
-        cli::Commands::Resume { fork, print } => {
+        cli::Commands::Resume { fork, print, force } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match &cli.thread {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
@@ -609,6 +609,24 @@ fn main_result() -> Result<()> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
             };
+            if !force {
+                if let Some(turn) = store
+                    .list_turn_records(&thread.id)?
+                    .into_iter()
+                    .last()
+                    .filter(|turn| {
+                        matches!(
+                            turn.phase,
+                            TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+                        )
+                    })
+                {
+                    anyhow::bail!(
+                        "thread has an open {} turn; wait for it, use `baton status`, or pass --force to launch the native CLI anyway",
+                        turn.phase.as_str()
+                    );
+                }
+            }
             let provider = match cli.provider.as_deref() {
                 Some(value) => ProviderId::parse(value)
                     .ok_or_else(|| anyhow::anyhow!("unknown provider {value}"))?,

@@ -62,7 +62,7 @@ baton diff <id> [turn]   # checkpoint diff against the working tree
 baton restore <id> <turn>
 ```
 
-In the TUI: `/help /status /switch /model /mode /auth /new /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /queue /turns /clear /quit`. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn, press twice to exit. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably.
+In the TUI: `/help /status /switch /model /mode /auth /new /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /queue /turns /copy /clear /quit`. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn, press twice to exit. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably.
 
 ## MCP
 

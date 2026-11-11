@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod checkpoints;
+pub mod clipboard;
 pub mod cli;
 pub mod config;
 pub mod handoff;

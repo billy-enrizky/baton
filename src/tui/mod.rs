@@ -88,6 +88,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/settings", "configure the current harness's settings"),
     ("/mcp", "manage MCP servers and sync across harnesses"),
     ("/skills", "list skills across harnesses"),
+    ("/copy", "copy the latest assistant reply to the clipboard"),
     ("/clear", "clear panels and notices"),
     ("/quit", "exit baton"),
 ];
@@ -1799,6 +1800,34 @@ fn handle_command(
             } else {
                 format!("found {} matches:\n{}", matches.len(), matches.join("\n"))
             });
+        }
+        "/copy" => {
+            let index = args
+                .first()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            let reply = state
+                .history
+                .iter()
+                .rev()
+                .filter(|message| message.role == "assistant")
+                .nth(index - 1);
+            match reply {
+                Some(reply) => match crate::clipboard::copy(&reply.text) {
+                    Ok(()) => {
+                        state.notice = Some(format!(
+                            "copied assistant reply {} ({} chars)",
+                            index,
+                            reply.text.chars().count()
+                        ));
+                    }
+                    Err(error) => state.notice = Some(format!("cannot copy reply: {error}")),
+                },
+                None => {
+                    state.notice = Some(format!("no assistant reply at position {index}"));
+                }
+            }
         }
         "/multi" => {
             if args.len() < 2 {
@@ -3720,12 +3749,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 27);
+        assert_eq!(suggestions.len(), 28);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/27"), "position indicator must reflect the selection");
+        assert!(text.contains("11/28"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -4300,6 +4329,43 @@ mod tests {
                 "parallel threads inherit the active mode"
             );
         }
+    }
+
+    #[test]
+    fn copy_command_selects_the_requested_assistant_reply() {
+        std::env::set_var("BATON_CLIPBOARD_COMMAND", "cat");
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        state.history = vec![
+            MessageRow {
+                id: 1,
+                thread_id: thread_id.clone(),
+                turn: 1,
+                role: "assistant".into(),
+                provider: None,
+                model: None,
+                text: "older reply".into(),
+                created_at: String::new(),
+            },
+            MessageRow {
+                id: 2,
+                thread_id,
+                turn: 2,
+                role: "assistant".into(),
+                provider: None,
+                model: None,
+                text: "newer reply".into(),
+                created_at: String::new(),
+            },
+        ];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/copy 2");
+        assert!(state.notice.as_deref().unwrap_or("").contains("copied assistant reply 2"));
+        handle_command(&mut state, &store, &engine_command_sender, "/copy 3");
+        assert!(state.notice.as_deref().unwrap_or("").contains("no assistant reply at position 3"));
+        std::env::remove_var("BATON_CLIPBOARD_COMMAND");
     }
 
     #[test]

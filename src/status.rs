@@ -35,6 +35,32 @@ fn preview(text: &str) -> String {
     out
 }
 
+pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
+    let latest_turn = status.latest_turn.as_ref().map(|turn| {
+        serde_json::json!({
+            "turn": turn.turn,
+            "phase": turn.phase.as_str(),
+            "started_at": turn.started_at,
+            "ended_at": turn.ended_at,
+            "error": turn.error,
+            "provider_turn_id": turn.provider_turn_id,
+        })
+    });
+    serde_json::json!({
+        "thread_id": status.thread_id,
+        "title": status.title,
+        "provider": status.provider.as_str(),
+        "model": status.model,
+        "permission_mode": status.permission_mode.as_str(),
+        "goal": status.goal,
+        "goal_paused": status.goal_paused,
+        "latest_turn": latest_turn,
+        "queue": status.queued,
+        "queue_count": status.queued.len(),
+        "usage": status.usage,
+    })
+}
+
 pub fn render(status: &ThreadStatus) -> String {
     let mut lines = Vec::new();
     lines.push(format!("thread: {}  {}", status.thread_id, status.title));
@@ -129,6 +155,16 @@ mod tests {
         assert!(text.contains("  - follow up"));
         assert!(text.contains("  - second"));
         assert!(text.contains("usage: in 1.0k, out 100, cache 50%"));
+    }
+
+    #[test]
+    fn json_exposes_the_same_state() {
+        let value = to_json(&status());
+        assert_eq!(value["thread_id"], "thread-1");
+        assert_eq!(value["permission_mode"], "plan");
+        assert_eq!(value["latest_turn"]["phase"], "failed");
+        assert_eq!(value["queue_count"], 2);
+        assert_eq!(value["queue"][0], "follow up");
     }
 
     #[test]

@@ -551,7 +551,7 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
-        cli::Commands::Status { thread_id } => {
+        cli::Commands::Status { thread_id, json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
@@ -596,7 +596,11 @@ fn main_result() -> Result<()> {
                 queued: store.list_queued_messages(&thread.id)?,
                 usage,
             };
-            println!("{}", status::render(&report));
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status::to_json(&report))?);
+            } else {
+                println!("{}", status::render(&report));
+            }
             Ok(())
         }
         cli::Commands::Resume { fork, print, force } => {

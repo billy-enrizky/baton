@@ -107,6 +107,9 @@ pub enum Commands {
     /// Show thread phase, goal, queue, and usage
     Status {
         thread_id: Option<String>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
     },
     /// List durable turn phases for a thread
     Turns {

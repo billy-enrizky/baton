@@ -36,6 +36,21 @@ fn preview(text: &str) -> String {
 }
 
 pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
+    let open_turn = status
+        .latest_turn
+        .as_ref()
+        .map(|turn| {
+            matches!(
+                turn.phase,
+                TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+            )
+        })
+        .unwrap_or(false);
+    let stale_hint = if open_turn {
+        Some("if no baton process is attached, this turn is stale and will be marked unverified on the next open")
+    } else {
+        None
+    };
     let latest_turn = status.latest_turn.as_ref().map(|turn| {
         serde_json::json!({
             "turn": turn.turn,
@@ -58,6 +73,8 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
         "queue": status.queued,
         "queue_count": status.queued.len(),
         "usage": status.usage,
+        "open_turn": open_turn,
+        "stale_hint": stale_hint,
     })
 }
 
@@ -165,6 +182,8 @@ mod tests {
         assert_eq!(value["latest_turn"]["phase"], "failed");
         assert_eq!(value["queue_count"], 2);
         assert_eq!(value["queue"][0], "follow up");
+        assert_eq!(value["open_turn"], false);
+        assert_eq!(value["stale_hint"], serde_json::Value::Null);
     }
 
     #[test]
@@ -176,6 +195,9 @@ mod tests {
         assert!(text.contains("turn: 3 running"));
         assert!(text.contains("still open"));
         assert!(text.contains("marked unverified"));
+        let json = to_json(&value);
+        assert_eq!(json["open_turn"], true);
+        assert!(json["stale_hint"].as_str().unwrap().contains("stale"));
     }
 
     #[test]

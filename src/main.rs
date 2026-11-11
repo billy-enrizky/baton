@@ -586,7 +586,10 @@ fn main_result() -> Result<()> {
                     let error = turn
                         .error
                         .as_deref()
-                        .map(|error| format!(" error={error}"))
+                        .map(|error| {
+                            let preview: String = error.chars().take(160).collect();
+                            format!(" error={preview}")
+                        })
                         .unwrap_or_default();
                     println!(
                         "turn {} {} {}/{} started={} ended={}{}{}",

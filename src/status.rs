@@ -104,7 +104,7 @@ pub fn render(status: &ThreadStatus) -> String {
                 lines.push(format!("provider turn: {provider_turn_id}"));
             }
             if let Some(error) = &turn.error {
-                lines.push(format!("error: {error}"));
+                lines.push(format!("error: {}", preview(error)));
             }
             if matches!(
                 turn.phase,

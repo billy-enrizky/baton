@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{BatonAdapter, LineReader, LineWriter, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, LineReader, LineWriter, ModelListInput, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
 
@@ -152,6 +152,48 @@ fn pick_permission_option(options: &[Value], decision: Option<ApprovalDecision>)
             .map(str::to_string)
     };
     find(wanted_kind).or_else(|| find(fallback_kind))
+}
+
+fn collect_model_values(value: &Value, models: &mut Vec<String>) {
+    if let Some(model) = value
+        .get("value")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    {
+        if !models.iter().any(|known| known == model) {
+            models.push(model.to_string());
+        }
+        return;
+    }
+    if let Some(options) = value.get("options").and_then(Value::as_array) {
+        for option in options {
+            collect_model_values(option, models);
+        }
+    }
+}
+
+fn model_options(setup: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+    let Some(options) = setup.get("configOptions").and_then(Value::as_array) else {
+        return models;
+    };
+    for option in options {
+        let category = option.get("category").and_then(Value::as_str).unwrap_or("");
+        let id = option.get("id").and_then(Value::as_str).unwrap_or("");
+        let name = option.get("name").and_then(Value::as_str).unwrap_or("");
+        let is_model = category == "model"
+            || id.eq_ignore_ascii_case("model")
+            || name.to_ascii_lowercase().contains("model");
+        if !is_model || option.get("type").and_then(Value::as_str) != Some("select") {
+            continue;
+        }
+        if let Some(values) = option.get("options").and_then(Value::as_array) {
+            for value in values {
+                collect_model_values(value, &mut models);
+            }
+        }
+    }
+    models
 }
 
 fn parse_usage(usage: &Value) -> TurnUsage {
@@ -348,6 +390,19 @@ impl BatonAdapter for AcpAdapter {
                 });
             }
         })
+    }
+
+    async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        self.ensure_initialized(&runtime).await?;
+        let created = self
+            .request(
+                &runtime,
+                "session/new",
+                json!({ "cwd": input.cwd, "mcpServers": [] }),
+            )
+            .await?;
+        Ok(model_options(&created))
     }
 
     async fn start_turn(

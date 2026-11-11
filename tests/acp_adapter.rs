@@ -1,4 +1,4 @@
-use baton::adapters::{duplex_halves, BatonAdapter, TransportHalves};
+use baton::adapters::{duplex_halves, BatonAdapter, ModelListInput, TransportHalves};
 use baton::adapters::acp::AcpAdapter;
 use baton::types::{ApprovalDecision, PermissionMode, ProviderId};
 use serde_json::{json, Value};
@@ -117,6 +117,98 @@ async fn fake_acp_agent(read: tokio::io::DuplexStream, mut write: tokio::io::Dup
             _ => {}
         }
     }
+}
+
+async fn fake_acp_models(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "protocolVersion": 2 }
+                    }),
+                )
+                .await;
+            }
+            "session/new" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "sessionId": "acp-models-1",
+                            "configOptions": [
+                                {
+                                    "id": "model",
+                                    "name": "Model",
+                                    "category": "model",
+                                    "type": "select",
+                                    "currentValue": "grok-4.7",
+                                    "options": [
+                                        { "value": "grok-4.7", "name": "Grok 4.7" },
+                                        {
+                                            "group": "legacy",
+                                            "name": "Legacy",
+                                            "options": [
+                                                { "value": "grok-4.5", "name": "Grok 4.5" }
+                                            ]
+                                        }
+                                    ]
+                                },
+                                {
+                                    "id": "mode",
+                                    "name": "Mode",
+                                    "type": "select",
+                                    "currentValue": "ask",
+                                    "options": [ { "value": "ask", "name": "Ask" } ]
+                                }
+                            ]
+                        }
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_adapter_lists_session_model_options() {
+    let spawner = Arc::new(move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+        let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+        tokio::spawn(fake_acp_models(server_read, server_write));
+        Ok(halves)
+    });
+    let mut adapter = AcpAdapter::new(ProviderId::Grok, spawner);
+    let models = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.list_models(ModelListInput {
+            cwd: "/work".into(),
+            auth_env: vec![],
+        }),
+    )
+    .await
+    .expect("model list completes")
+    .expect("model list succeeds");
+    assert_eq!(models, vec!["grok-4.7", "grok-4.5"]);
+    adapter.dispose().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

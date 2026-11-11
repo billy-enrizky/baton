@@ -22,6 +22,7 @@ pub struct ThreadStatus {
     pub goal: Option<String>,
     pub goal_paused: bool,
     pub latest_turn: Option<TurnStatus>,
+    pub turn_count: usize,
     pub queued: Vec<String>,
     pub usage: Option<String>,
 }
@@ -70,6 +71,7 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
         "goal": status.goal,
         "goal_paused": status.goal_paused,
         "latest_turn": latest_turn,
+        "turn_count": status.turn_count,
         "queue": status.queued,
         "queue_count": status.queued.len(),
         "usage": status.usage,
@@ -90,6 +92,7 @@ pub fn render(status: &ThreadStatus) -> String {
         }
         None => lines.push("goal: none".to_string()),
     }
+    lines.push(format!("turns: {}", status.turn_count));
     match &status.latest_turn {
         Some(turn) => {
             let ended = turn.ended_at.as_deref().unwrap_or("running");
@@ -153,6 +156,7 @@ mod tests {
                 error: Some("provider died".into()),
                 provider_turn_id: Some("provider-turn-3".into()),
             }),
+            turn_count: 3,
             queued: vec!["follow up".into(), "second\nline".into()],
             usage: Some("in 1.0k, out 100, cache 50%".into()),
         }
@@ -165,6 +169,7 @@ mod tests {
         assert!(text.contains("provider: codex/model-1"));
         assert!(text.contains("mode: plan"));
         assert!(text.contains("goal: ship the fix (paused)"));
+        assert!(text.contains("turns: 3"));
         assert!(text.contains("turn: 3 failed (started 2026-11-11T00:00:00Z, ended 2026-11-11T00:00:05Z)"));
         assert!(text.contains("provider turn: provider-turn-3"));
         assert!(text.contains("error: provider died"));
@@ -180,6 +185,7 @@ mod tests {
         assert_eq!(value["thread_id"], "thread-1");
         assert_eq!(value["permission_mode"], "plan");
         assert_eq!(value["latest_turn"]["phase"], "failed");
+        assert_eq!(value["turn_count"], 3);
         assert_eq!(value["queue_count"], 2);
         assert_eq!(value["queue"][0], "follow up");
         assert_eq!(value["open_turn"], false);

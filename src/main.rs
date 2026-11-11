@@ -711,8 +711,9 @@ fn main_result() -> Result<()> {
                 .current_model
                 .clone()
                 .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
-            let latest_turn = store
-                .list_turn_records(&thread.id)?
+            let turn_records = store.list_turn_records(&thread.id)?;
+            let turn_count = turn_records.len();
+            let latest_turn = turn_records
                 .into_iter()
                 .last()
                 .map(|turn| status::TurnStatus {
@@ -738,6 +739,7 @@ fn main_result() -> Result<()> {
                 goal: thread.goal.clone(),
                 goal_paused: thread.goal_paused,
                 latest_turn,
+                turn_count,
                 queued: store.list_queued_messages(&thread.id)?,
                 usage,
             };

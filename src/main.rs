@@ -627,6 +627,7 @@ fn main_result() -> Result<()> {
             if turns.is_empty() {
                 println!("no turn records");
             } else {
+                println!("thread: {} {}", &thread.id[..8.min(thread.id.len())], thread.title);
                 println!("turns: {}", turns.len());
                 let mut has_open = false;
                 for turn in turns {
@@ -702,6 +703,7 @@ fn main_result() -> Result<()> {
                 );
                 return Ok(());
             }
+            println!("thread: {} {}", &thread.id[..8.min(thread.id.len())], thread.title);
             if queued.is_empty() {
                 println!("queue: empty");
             } else {

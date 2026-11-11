@@ -77,6 +77,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/multi", "send the same prompt to multiple providers"),
     ("/queue", "show or clear queued follow-ups"),
     ("/turns", "list durable turn phases"),
+    ("/status", "show this thread's phase, goal, and queue"),
     ("/compact", "compact the conversation to free context"),
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),
@@ -1474,6 +1475,38 @@ fn handle_command(
                 valid_providers.len(),
                 valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
             ));
+        }
+        "/status" => {
+            let latest = store
+                .lock()
+                .unwrap()
+                .list_turn_records(&state.thread.id)
+                .unwrap_or_default()
+                .into_iter()
+                .last();
+            let mut text = format!(
+                "thread: {} {}\nprovider: {}/{}\nmode: {}",
+                &state.thread.id[..8.min(state.thread.id.len())],
+                state.thread.title,
+                state.thread.current_provider,
+                state.thread.current_model.as_deref().unwrap_or("-"),
+                state.permission_mode
+            );
+            match &state.goal {
+                Some(goal) => {
+                    let suffix = if state.goal_paused { " (paused)" } else { "" };
+                    text.push_str(&format!("\ngoal: {goal}{suffix}"));
+                }
+                None => text.push_str("\ngoal: none"),
+            }
+            text.push_str(&format!(
+                "\nturn: {}\nqueue: {} waiting",
+                latest
+                    .map(|turn| format!("{} {}", turn.turn, turn.phase.as_str()))
+                    .unwrap_or_else(|| "none".into()),
+                state.queued_messages.len()
+            ));
+            state.notice = Some(text);
         }
         "/turns" => {
             let turns = store
@@ -3055,12 +3088,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 26);
+        assert_eq!(suggestions.len(), 27);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/26"), "position indicator must reflect the selection");
+        assert!(text.contains("11/27"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -3627,6 +3660,29 @@ mod tests {
             vec!["second".to_string()]
         );
         assert!(state.notice.as_deref().unwrap_or("").contains("already running"));
+    }
+
+    #[test]
+    fn status_command_summarizes_phase_goal_and_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.apply_permission_mode(&store, PermissionMode::Plan);
+        state.set_goal_state(&store, Some("ship".into()), true);
+        enqueue_message(&mut state, &store, "later".into());
+        {
+            let guard = store.lock().unwrap();
+            guard.start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m")).unwrap();
+            guard.finish_turn_record(&state.thread.id, 1, TurnPhase::Failed, Some("boom")).unwrap();
+        }
+        handle_command(&mut state, &store, &engine_command_sender, "/status");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("provider: claude"));
+        assert!(notice.contains("mode: plan"));
+        assert!(notice.contains("goal: ship (paused)"));
+        assert!(notice.contains("turn: 1 failed"));
+        assert!(notice.contains("queue: 1 waiting"));
     }
 
     #[test]

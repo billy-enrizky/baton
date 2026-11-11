@@ -43,7 +43,15 @@ async fn fake_server_full_turn(read: tokio::io::DuplexStream, mut write: tokio::
                 .await;
             }
             "turn/start" => {
-                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "turn": { "id": "turn-1", "status": "inProgress" } }
+                    }),
+                )
+                .await;
                 send(
                     &mut write,
                     json!({
@@ -51,7 +59,11 @@ async fn fake_server_full_turn(read: tokio::io::DuplexStream, mut write: tokio::
                         "method": "thread/tokenUsage/updated",
                         "params": {
                             "threadId": "native-t1",
-                            "tokenUsage": { "inputTokens": 50, "cachedInputTokens": 500, "cacheWriteInputTokens": 100, "outputTokens": 20 }
+                            "turnId": "turn-1",
+                            "tokenUsage": {
+                                "last": { "inputTokens": 50, "cachedInputTokens": 500, "cacheWriteInputTokens": 100, "outputTokens": 20 },
+                                "total": { "inputTokens": 999, "cachedInputTokens": 999, "cacheWriteInputTokens": 999, "outputTokens": 999 }
+                            }
                         }
                     }),
                 )
@@ -72,7 +84,11 @@ async fn fake_server_full_turn(read: tokio::io::DuplexStream, mut write: tokio::
                         "method": "turn/completed",
                         "params": {
                             "threadId": "native-t1",
-                            "turn": { "items": [ { "type": "agentMessage", "text": "hello there" } ] }
+                            "turn": {
+                                "id": "turn-1",
+                                "status": "completed",
+                                "items": [ { "type": "agentMessage", "text": "hello there" } ]
+                            }
                         }
                     }),
                 )
@@ -119,13 +135,24 @@ async fn fake_server_resume_with_approval(read: tokio::io::DuplexStream, mut wri
                 }
             }
             "turn/start" => {
-                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "turn": { "id": "turn-approval", "status": "inProgress" } }
+                    }),
+                )
+                .await;
                 send(
                     &mut write,
                     json!({
                         "jsonrpc": "2.0",
                         "method": "turn/completed",
-                        "params": { "threadId": "native-existing", "turn": { "items": [] } }
+                        "params": {
+                            "threadId": "native-existing",
+                            "turn": { "id": "turn-approval", "status": "completed", "items": [] }
+                        }
                     }),
                 )
                 .await;
@@ -222,7 +249,15 @@ async fn fake_server_gated_streaming(
                 .await;
             }
             "turn/start" => {
-                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "turn": { "id": "turn-stream", "status": "inProgress" } }
+                    }),
+                )
+                .await;
                 send(
                     &mut write,
                     json!({
@@ -251,7 +286,11 @@ async fn fake_server_gated_streaming(
                         "method": "turn/completed",
                         "params": {
                             "threadId": "native-stream",
-                            "turn": { "items": [ { "type": "agentMessage", "text": "streamed live" } ] }
+                            "turn": {
+                                "id": "turn-stream",
+                                "status": "completed",
+                                "items": [ { "type": "agentMessage", "text": "streamed live" } ]
+                            }
                         }
                     }),
                 )
@@ -378,4 +417,251 @@ async fn codex_adapter_resumes_sessions_and_maps_approvals() {
 
     tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap();
     let _ = ProviderId::Codex;
+}
+
+
+async fn fake_server_failed_turn(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = frame.get("id").cloned();
+        match method.as_str() {
+            "initialize" => send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await,
+            "thread/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "thread": { "id": "native-fail", "path": null } }
+                    }),
+                )
+                .await;
+            }
+            "turn/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "turn": { "id": "turn-fail", "status": "inProgress" } }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "native-fail",
+                            "turn": {
+                                "id": "turn-fail",
+                                "status": "failed",
+                                "error": { "message": "model exploded" },
+                                "items": []
+                            }
+                        }
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_adapter_reports_failed_turn_status() {
+    let spawner = Arc::new(move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+        let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+        tokio::spawn(fake_server_failed_turn(server_read, server_write));
+        Ok(halves)
+    });
+    let mut adapter = CodexAdapter::new(spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_turn(
+            baton::adapters::TurnStartInput {
+                thread_id: "baton-thread".into(),
+                cwd: "/work".into(),
+                model: "m".into(),
+                prompt: "hello".into(),
+                permission_mode: PermissionMode::Default,
+                auth_env: vec![],
+            },
+            None,
+            event_sender,
+        ),
+    )
+    .await
+    .expect("turn returns within 10s");
+    assert!(result.is_err(), "a failed turn must not return Ok");
+
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    let failure = events.iter().find_map(|event| match event {
+        baton::adapters::TurnEvent::TurnFailed { error } => Some(error.clone()),
+        _ => None,
+    });
+    assert_eq!(failure.as_deref(), Some("model exploded"));
+    assert!(
+        !events.iter().any(|event| matches!(event, baton::adapters::TurnEvent::TurnCompleted { .. })),
+        "a failed turn must not emit TurnCompleted"
+    );
+}
+
+async fn fake_server_interrupt(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    observed: std::sync::mpsc::Sender<Value>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("").to_string();
+        let id = frame.get("id").cloned();
+        match method.as_str() {
+            "initialize" => send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await,
+            "thread/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "thread": { "id": "native-int", "path": null } }
+                    }),
+                )
+                .await;
+            }
+            "turn/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "turn": { "id": "turn-int", "status": "inProgress" } }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "item/agentMessage/delta",
+                        "params": { "threadId": "native-int", "delta": "working" }
+                    }),
+                )
+                .await;
+            }
+            "turn/interrupt" => {
+                let params = frame.get("params").cloned().unwrap_or(Value::Null);
+                let _ = observed.send(params);
+                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "native-int",
+                            "turn": {
+                                "id": "turn-int",
+                                "status": "interrupted",
+                                "error": { "message": "interrupted by user" },
+                                "items": []
+                            }
+                        }
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_interrupt_sends_turn_id_and_reports_interruption() {
+    let (observed_sender, observed_receiver) = std::sync::mpsc::channel::<Value>();
+    let spawner = Arc::new(move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+        let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+        tokio::spawn(fake_server_interrupt(server_read, server_write, observed_sender.clone()));
+        Ok(halves)
+    });
+    let mut adapter = CodexAdapter::new(spawner);
+    let interrupt = adapter.interrupt_handle();
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let turn = tokio::spawn(async move {
+        adapter
+            .start_turn(
+                baton::adapters::TurnStartInput {
+                    thread_id: "baton-thread".into(),
+                    cwd: "/work".into(),
+                    model: "m".into(),
+                    prompt: "hello".into(),
+                    permission_mode: PermissionMode::Default,
+                    auth_env: vec![],
+                },
+                None,
+                event_sender,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(event_receiver.try_recv(), Ok(baton::adapters::TurnEvent::TextDelta { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn is running");
+
+    interrupt();
+
+    let params = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(params) = observed_receiver.try_recv() {
+                break params;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("interrupt request reaches the server");
+    assert_eq!(params.get("threadId").and_then(Value::as_str), Some("native-int"));
+    assert_eq!(
+        params.get("turnId").and_then(Value::as_str),
+        Some("turn-int"),
+        "turn/interrupt requires the active turn id"
+    );
+
+    let result = tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap();
+    assert!(result.is_err(), "an interrupted turn must not return Ok");
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    let failure = events.iter().find_map(|event| match event {
+        baton::adapters::TurnEvent::TurnFailed { error } => Some(error.clone()),
+        _ => None,
+    });
+    assert_eq!(failure.as_deref(), Some("interrupted by user"));
 }

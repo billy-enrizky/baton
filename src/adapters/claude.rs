@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -134,6 +135,9 @@ impl BatonAdapter for ClaudeAdapter {
         let mut usage: Option<TurnUsage> = None;
         let mut saw_stream_events = false;
         let mut result: Result<()> = Ok(());
+        // Claude starts a tool with `tool_use.id` and finishes it with a
+        // `tool_result.tool_use_id`. Keep the label so both events match.
+        let mut tool_calls: HashMap<String, (String, Option<String>)> = HashMap::new();
 
         loop {
             let line = tokio::select! {
@@ -190,6 +194,11 @@ impl BatonAdapter for ClaudeAdapter {
                                 } else if block_type == "tool_use" {
                                     let tool = block.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
                                     let detail = block.get("input").and_then(tool_input_summary);
+                                    if let Some(id) = block.get("id").and_then(Value::as_str) {
+                                        if !id.is_empty() {
+                                            tool_calls.insert(id.to_string(), (tool.clone(), detail.clone()));
+                                        }
+                                    }
                                     let _ = emit.send(TurnEvent::ToolStarted { tool, detail });
                                 }
                             }
@@ -198,6 +207,26 @@ impl BatonAdapter for ClaudeAdapter {
                             usage = Some(parse_usage(inner_usage));
                             if let Some(usage) = usage {
                                 let _ = emit.send(TurnEvent::Usage { usage });
+                            }
+                        }
+                    }
+                }
+                "user" => {
+                    if let Some(inner) = message.get("message") {
+                        if let Some(content) = inner.get("content").and_then(Value::as_array) {
+                            for block in content {
+                                if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                                    continue;
+                                }
+                                let id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
+                                let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
+                                if let Some((tool, detail)) = tool_calls.remove(id) {
+                                    let _ = emit.send(TurnEvent::ToolCompleted {
+                                        tool,
+                                        detail,
+                                        exit_code: Some(if is_error { 1 } else { 0 }),
+                                    });
+                                }
                             }
                         }
                     }

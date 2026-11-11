@@ -126,3 +126,100 @@ async fn claude_adapter_streams_deltas_before_turn_completion() {
     assert_eq!(completed.0, "streamed live");
     assert_eq!(completed.1.as_deref(), Some("claude-session-1"));
 }
+
+
+async fn fake_claude_tool_result(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    line.clear();
+    if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+        return;
+    }
+    send(
+        &mut write,
+        json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    { "type": "text", "text": "checking" },
+                    { "type": "tool_use", "id": "tool-1", "name": "Bash", "input": { "command": "ls" } }
+                ],
+                "usage": { "input_tokens": 10, "output_tokens": 2 }
+            }
+        }),
+    )
+    .await;
+    send(
+        &mut write,
+        json!({
+            "type": "user",
+            "message": {
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "tool-1", "is_error": false, "content": "done" }
+                ]
+            }
+        }),
+    )
+    .await;
+    send(
+        &mut write,
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "checked",
+            "session_id": "claude-session-2",
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        }),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_adapter_pairs_tool_use_with_tool_result() {
+    let spawner: baton::adapters::claude::ClaudeSpawner =
+        Arc::new(move |_input: &baton::adapters::TurnStartInput, _session: Option<&baton::types::NativeSessionRef>| {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_claude_tool_result(server_read, server_write));
+            Ok(halves)
+        });
+    let mut adapter = ClaudeAdapter::new(spawner);
+
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_turn(
+            baton::adapters::TurnStartInput {
+                thread_id: "baton-thread".into(),
+                cwd: "/work".into(),
+                model: "claude-sonnet-4-5".into(),
+                prompt: "hello".into(),
+                permission_mode: PermissionMode::Default,
+                auth_env: vec![],
+            },
+            None,
+            event_sender,
+        ),
+    )
+    .await
+    .expect("turn completes within 10s")
+    .expect("turn should complete");
+
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    let started = events.iter().find_map(|event| match event {
+        baton::adapters::TurnEvent::ToolStarted { tool, detail } => Some((tool.clone(), detail.clone())),
+        _ => None,
+    });
+    assert_eq!(started, Some(("Bash".to_string(), Some("ls".to_string()))));
+
+    let completed = events.iter().find_map(|event| match event {
+        baton::adapters::TurnEvent::ToolCompleted { tool, detail, exit_code } => {
+            Some((tool.clone(), detail.clone(), *exit_code))
+        }
+        _ => None,
+    });
+    assert_eq!(
+        completed,
+        Some(("Bash".to_string(), Some("ls".to_string()), Some(0))),
+        "tool_result completes the matching tool_use with the same label"
+    );
+}

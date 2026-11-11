@@ -284,7 +284,6 @@ async fn execute_turn(
         let mut adapter = adapter.lock().await;
         adapter.start_turn(input, session_ref, event_sender).await
     };
-    let _ = adapter_result;
     let _ = forwarder.join();
 
     let tool_records = tools_slot.lock().unwrap().drain(..).collect::<Vec<_>>();
@@ -297,7 +296,21 @@ async fn execute_turn(
         return Err(anyhow::anyhow!("{error}"));
     }
 
-    if let Some(outcome) = outcome_slot.lock().unwrap().take() {
+    // A provider that closes its stream without a terminal event is not a
+    // successful turn. Surface it as an error instead of storing an empty
+    // assistant reply and telling every caller the turn worked.
+    let outcome = match outcome_slot.lock().unwrap().take() {
+        Some(outcome) => outcome,
+        None => {
+            let message = match adapter_result {
+                Ok(()) => "provider ended without a result".to_string(),
+                Err(error) => format!("provider turn failed: {error}"),
+            };
+            return Err(anyhow::anyhow!(message));
+        }
+    };
+
+    {
         {
             let store = store.lock().unwrap();
             store.add_message(thread_id, turn, "assistant", Some(provider.as_str()), Some(&model), &outcome.final_text)?;
@@ -324,15 +337,15 @@ async fn execute_turn(
                 }
             }
         }
-        // Non-TUI consumers (baton exec) read the final text from the engine
-        // event channel; the TUI ignores EngineEvent::Turn.
-        let _ = engine_event_sender.send(EngineEvent::Turn(TurnEvent::TurnCompleted {
-            final_text: outcome.final_text,
-            usage: outcome.usage,
-            native_session_id: outcome.native_session_id,
-            rollout_path: outcome.rollout_path,
-        }));
     }
+    // Non-TUI consumers (baton exec) read the final text from the engine
+    // event channel; the TUI ignores EngineEvent::Turn.
+    let _ = engine_event_sender.send(EngineEvent::Turn(TurnEvent::TurnCompleted {
+        final_text: outcome.final_text,
+        usage: outcome.usage,
+        native_session_id: outcome.native_session_id,
+        rollout_path: outcome.rollout_path,
+    }));
     Ok(())
 }
 
@@ -368,6 +381,75 @@ pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SilentAdapter;
+
+    #[async_trait::async_trait]
+    impl BatonAdapter for SilentAdapter {
+        fn id(&self) -> ProviderId {
+            ProviderId::Codex
+        }
+
+        fn interrupt_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+            Arc::new(|| {})
+        }
+
+        async fn start_turn(
+            &mut self,
+            _input: TurnStartInput,
+            _session: Option<crate::types::NativeSessionRef>,
+            emit: TurnEventSender,
+        ) -> Result<()> {
+            drop(emit);
+            Ok(())
+        }
+
+        async fn dispose(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_without_a_terminal_event_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let cwd = home.path().to_string_lossy().to_string();
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "t".into(),
+                cwd: cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
+            Box::new(SilentAdapter) as Box<dyn BatonAdapter>
+        ))];
+        let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+
+        let result = execute_turn(
+            &store,
+            &home.path().to_path_buf(),
+            &adapters,
+            &thread.id,
+            "hello",
+            PermissionMode::Default,
+            &engine_sender,
+            &turn_sender,
+        )
+        .await;
+
+        let error = result.expect_err("a silent adapter must fail the turn");
+        assert!(error.to_string().contains("without a result"), "{error}");
+        let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
+        assert!(
+            !messages.iter().any(|message| message.role == "assistant"),
+            "no empty assistant reply may be stored"
+        );
+    }
 
     #[test]
     fn tool_events_pair_into_ordered_records() {

@@ -43,7 +43,12 @@ API-rate billing: set the provider's key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 ```
 baton                    # fresh thread in the TUI (unsaved until the first message)
 baton -t <id>            # open an existing thread
-baton threads            # list threads here
+baton threads [--json]   # list threads with phase and queue count
+baton status [-t id] [--json]  # phase, goal, queue, usage
+baton turns [-t id] [--json]   # full durable turn history
+baton queue [-t id] [--clear] [--json]  # inspect or clear queued follow-ups
+baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
+baton exec -p <provider> "prompt"  # one non-interactive turn
 baton import [--dry-run] # import recent native sessions as threads
 baton usage              # token usage and cache hit rates
 baton auth [provider] [subscription|api]
@@ -51,7 +56,7 @@ baton diff <id> [turn]   # checkpoint diff against the working tree
 baton restore <id> <turn>
 ```
 
-In the TUI: `/help /switch /model /mode /auth /new /threads /open /usage /checkpoints /diff /rewind /clear /quit`. Approvals answer with y/a/n. Ctrl+C interrupts a running turn, press twice to exit.
+In the TUI: `/help /status /switch /model /mode /auth /new /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /queue /turns /clear /quit`. Approvals answer with y/a/n. Ctrl+C interrupts a running turn, press twice to exit. While a turn is running, a new composer message is sent as a steer on Codex and Claude; other providers queue it durably.
 
 ## How context and caching work
 
@@ -59,7 +64,7 @@ Each provider keeps its own native session per baton thread. On every turn only 
 
 ## Storage
 
-`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, checkpoints, usage) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything.
+`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, durable turns, queued follow-ups, checkpoints, usage) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything.
 
 ## Development
 

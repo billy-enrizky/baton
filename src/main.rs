@@ -202,7 +202,20 @@ fn main_result() -> Result<()> {
                 println!();
             }
             if timed_out {
-                eprintln!("exec timed out after 300s");
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "thread_id": thread.id,
+                            "ok": false,
+                            "phase": "unverified",
+                            "error": "exec timed out after 300s",
+                            "text": "",
+                        }))?
+                    );
+                } else {
+                    eprintln!("exec timed out after 300s");
+                }
                 std::process::exit(1);
             }
             let result_ok = result_ok.unwrap_or(false);

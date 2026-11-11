@@ -1094,6 +1094,28 @@ fn format_review_notes(turn: i64, notes: &[ReviewNote]) -> String {
     text.trim_end().to_string()
 }
 
+fn previous_file_row(rows: &[diff_render::DiffRowRef], selected: usize) -> Option<usize> {
+    let current_path = rows.get(selected)?.path.as_str();
+    let change = rows[..selected]
+        .iter()
+        .rposition(|row| row.path != current_path)?;
+    let path = rows[change].path.as_str();
+    let mut start = change;
+    while start > 0 && rows[start - 1].path == path {
+        start -= 1;
+    }
+    Some(start)
+}
+
+fn next_file_row(rows: &[diff_render::DiffRowRef], selected: usize) -> Option<usize> {
+    let current_path = rows.get(selected)?.path.as_str();
+    rows.iter()
+        .enumerate()
+        .skip(selected + 1)
+        .find(|(_, row)| row.path != current_path)
+        .map(|(index, _)| index)
+}
+
 fn handle_review_key(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -1168,8 +1190,22 @@ fn handle_review_key(
             }
         }
         KeyCode::Char('n') => {
-            if !review.rows.is_empty() {
-                review.note_input = Some(String::new());
+            if let Some(row) = review.rows.get(review.selected) {
+                if row.added || row.removed {
+                    review.note_input = Some(String::new());
+                } else {
+                    state.notice = Some("notes anchor added or removed lines only".into());
+                }
+            }
+        }
+        KeyCode::Char('[') => {
+            if let Some(index) = previous_file_row(&review.rows, review.selected) {
+                review.selected = index;
+            }
+        }
+        KeyCode::Char(']') => {
+            if let Some(index) = next_file_row(&review.rows, review.selected) {
+                review.selected = index;
             }
         }
         KeyCode::Char('d') => {
@@ -2021,8 +2057,9 @@ fn handle_command(
             };
             match message {
                 Some(message) => {
-                    let rows = diff_render::changed_rows(&message.text);
-                    if rows.is_empty() {
+                    let rows = diff_render::review_rows(&message.text);
+                    let changed_count = rows.iter().filter(|row| row.added || row.removed).count();
+                    if changed_count == 0 {
                         state.notice = Some("this turn has no changed lines to review".into());
                     } else {
                         let fingerprint = diff_render::fingerprint(&message.text);
@@ -2046,11 +2083,15 @@ fn handle_command(
                             ),
                             Err(error) => (Vec::new(), Some(error)),
                         };
+                        let selected = rows
+                            .iter()
+                            .position(|row| row.added || row.removed)
+                            .unwrap_or(0);
                         state.review = Some(ReviewState {
                             turn: message.turn,
                             fingerprint,
                             rows,
-                            selected: 0,
+                            selected,
                             notes,
                             note_input: None,
                         });
@@ -2143,9 +2184,9 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::styled(
         format!(
-            "review turn {} · {} changed lines · ↑↓ move · n note · d delete · s send · esc close",
+            "review turn {} · {} changed lines · ↑↓ move · [ ] file · n note · d delete · s send · esc close",
             review.turn,
-            review.rows.len()
+            review.rows.iter().filter(|row| row.added || row.removed).count()
         ),
         Style::default().fg(COLORS.muted),
     ));
@@ -2165,9 +2206,10 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
     for index in start..end {
         let row = &review.rows[index];
         let selected = index == review.selected;
-        let noted = review.notes.iter().any(|note| {
-            note.path == row.path && note.line == row.line_number && note.added == row.added
-        });
+        let noted = (row.added || row.removed)
+            && review.notes.iter().any(|note| {
+                note.path == row.path && note.line == row.line_number && note.added == row.added
+            });
         let path_label = format!("{}:{}", row.path, row.line_number);
         let max_path = (inner.width as usize).saturating_sub(12).max(12);
         let path_label = if path_label.chars().count() > max_path {
@@ -2185,15 +2227,17 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
         };
         let marker = if selected { "›" } else { " " };
         let note_marker = if noted { "•" } else { " " };
-        let sign = if row.added { "+" } else { "-" };
+        let (sign, row_color) = if row.added {
+            ("+", COLORS.success)
+        } else if row.removed {
+            ("-", COLORS.error)
+        } else {
+            (" ", COLORS.muted)
+        };
         let used = path_label.chars().count() + 4;
         let text_width = (inner.width as usize).saturating_sub(used).max(1);
         let text: String = row.text.chars().take(text_width).collect();
-        let mut style = Style::default().fg(if row.added {
-            COLORS.success
-        } else {
-            COLORS.error
-        });
+        let mut style = Style::default().fg(row_color);
         if selected {
             style = style.bg(COLORS.user_bg).add_modifier(Modifier::BOLD);
         }
@@ -3906,8 +3950,9 @@ mod tests {
         let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &engine_command_sender, "/review");
         let review = state.review.as_ref().expect("review opens");
-        assert_eq!(review.rows.len(), 3, "only changed lines are anchors");
-        assert_eq!(review.rows[0].text, "old line");
+        assert_eq!(review.rows.len(), 4, "review keeps context and changed rows");
+        assert_eq!(review.rows.iter().filter(|row| row.added || row.removed).count(), 3);
+        assert_eq!(review.rows[review.selected].text, "old line", "selection starts on the first change");
 
         let key = |code: KeyCode| KeyEvent {
             code,
@@ -3954,6 +3999,59 @@ mod tests {
                 .is_empty(),
             "sending marks notes delivered so reopen cannot resend them"
         );
+    }
+
+    #[test]
+    fn review_notes_stay_anchored_to_changed_lines() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        assert!(!state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].added);
+        assert!(!state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].removed);
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        assert!(state.review.as_ref().unwrap().note_input.is_none());
+        assert!(state.notice.as_deref().unwrap_or("").contains("added or removed"));
+    }
+
+    #[test]
+    fn review_file_navigation_jumps_between_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![MessageRow {
+            id: 91,
+            thread_id: state.thread.id.clone(),
+            turn: 1,
+            role: "diff".into(),
+            provider: None,
+            model: None,
+            text: "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old a\n+new a\ndiff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-old b\n+new b\n".into(),
+            created_at: String::new(),
+        }];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let review = state.review.as_ref().unwrap();
+        assert_eq!(review.rows[review.selected].path, "src/a.rs");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char(']')));
+        assert_eq!(state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].path, "src/b.rs");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('[')));
+        assert_eq!(state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].path, "src/a.rs");
     }
 
     #[test]

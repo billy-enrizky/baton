@@ -178,16 +178,13 @@ pub fn fingerprint(diff: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// The changed rows of a diff, without context or hunk headers. Review mode
-/// uses these as stable anchors for notes.
-pub fn changed_rows(diff: &str) -> Vec<DiffRowRef> {
+/// Every line inside a hunk, including context. Review mode uses these for
+/// display while notes remain anchored to added or removed rows.
+pub fn review_rows(diff: &str) -> Vec<DiffRowRef> {
     let mut rows = Vec::new();
     for file in parse_unified_diff(diff) {
         for hunk in file.hunks {
             for row in hunk.rows {
-                if matches!(row.kind, DiffLineKind::Context) {
-                    continue;
-                }
                 rows.push(DiffRowRef {
                     path: file.path.clone(),
                     line_number: row.line_number,
@@ -341,8 +338,11 @@ mod tests {
     }
 
     #[test]
-    fn changed_rows_expose_file_line_and_side() {
-        let rows = changed_rows(SAMPLE);
+    fn review_rows_expose_file_line_and_side() {
+        let rows: Vec<_> = review_rows(SAMPLE)
+            .into_iter()
+            .filter(|row| row.added || row.removed)
+            .collect();
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].path, "notes.txt");
         assert_eq!(rows[0].line_number, 2);

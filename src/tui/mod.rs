@@ -75,6 +75,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/goal", "set a multi-turn objective the agent works toward"),
     ("/find", "search the conversation"),
     ("/multi", "send the same prompt to multiple providers"),
+    ("/queue", "show or clear queued follow-ups"),
     ("/compact", "compact the conversation to free context"),
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),
@@ -1472,6 +1473,29 @@ fn handle_command(
                 valid_providers.len(),
                 valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
             ));
+        }
+        "/queue" => {
+            if args.first().map(String::as_str) == Some("clear") {
+                state.queued_messages.clear();
+                match store.lock().unwrap().clear_queued_messages(&state.thread.id) {
+                    Ok(()) => state.notice = Some("queue cleared".into()),
+                    Err(error) => state.notice = Some(format!("cannot clear queue: {error}")),
+                }
+            } else if args.is_empty() {
+                if state.queued_messages.is_empty() {
+                    state.notice = Some("queue: empty".into());
+                } else {
+                    let mut text = format!("queue: {} waiting", state.queued_messages.len());
+                    for (index, message) in state.queued_messages.iter().enumerate() {
+                        let preview: String = message.lines().next().unwrap_or("").chars().take(70).collect();
+                        text.push_str(&format!("\n  {}. {preview}", index + 1));
+                    }
+                    text.push_str("\n\n/queue clear to remove them");
+                    state.notice = Some(text);
+                }
+            } else {
+                state.notice = Some("usage: /queue · /queue clear".into());
+            }
         }
         "/compact" => {
             let messages: Vec<(String, String)> = state
@@ -3002,12 +3026,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 24);
+        assert_eq!(suggestions.len(), 25);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/24"), "position indicator must reflect the selection");
+        assert!(text.contains("11/25"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -3574,6 +3598,32 @@ mod tests {
             vec!["second".to_string()]
         );
         assert!(state.notice.as_deref().unwrap_or("").contains("already running"));
+    }
+
+    #[test]
+    fn queue_command_lists_and_clears_persisted_messages() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        enqueue_message(&mut state, &store, "first".into());
+        enqueue_message(&mut state, &store, "second line\nrest".into());
+
+        handle_command(&mut state, &store, &engine_command_sender, "/queue");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("queue: 2 waiting"));
+        assert!(notice.contains("1. first"));
+        assert!(notice.contains("2. second line"));
+        assert!(!notice.contains("rest"), "previews stay on one line");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/queue clear");
+        assert!(state.queued_messages.is_empty());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

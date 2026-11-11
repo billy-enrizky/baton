@@ -548,9 +548,19 @@ fn main_result() -> Result<()> {
                 let values: Vec<serde_json::Value> = turns
                     .iter()
                     .map(|turn| {
+                        let open = matches!(
+                            turn.phase,
+                            TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+                        );
                         serde_json::json!({
                             "turn": turn.turn,
                             "phase": turn.phase.as_str(),
+                            "open": open,
+                            "stale_hint": if open {
+                                Some("if no baton process is attached, this turn is stale and will be marked unverified on the next open")
+                            } else {
+                                None
+                            },
                             "provider": turn.provider.as_str(),
                             "model": turn.model,
                             "started_at": turn.started_at,

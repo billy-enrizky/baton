@@ -79,6 +79,10 @@ fn main_result() -> Result<()> {
                 )?;
                 drop(guard);
                 let _ = persisted;
+                store
+                    .lock()
+                    .unwrap()
+                    .set_thread_permission_mode(&thread.id, permission_mode)?;
             }
 
             let tokio_runtime = tokio::runtime::Builder::new_multi_thread()

@@ -280,10 +280,7 @@ fn main_result() -> Result<()> {
                     let latest_phase = turn_records.into_iter().last().map(|turn| turn.phase);
                     let open_turn = latest_phase
                         .map(|phase| {
-                            matches!(
-                                phase,
-                                TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
-                            )
+                            !phase.is_terminal()
                         })
                         .unwrap_or(false);
                     let phase = latest_phase
@@ -324,10 +321,7 @@ fn main_result() -> Result<()> {
                 let latest_phase = turns.into_iter().last().map(|turn| turn.phase);
                 if latest_phase
                     .map(|phase| {
-                        matches!(
-                            phase,
-                            TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
-                        )
+                        !phase.is_terminal()
                     })
                     .unwrap_or(false)
                 {
@@ -600,10 +594,7 @@ fn main_result() -> Result<()> {
                 let values: Vec<serde_json::Value> = turns
                     .iter()
                     .map(|turn| {
-                        let open = matches!(
-                            turn.phase,
-                            TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
-                        );
+                        let open = !turn.phase.is_terminal();
                         serde_json::json!({
                             "turn": turn.turn,
                             "phase": turn.phase.as_str(),
@@ -631,10 +622,7 @@ fn main_result() -> Result<()> {
                 println!("turns: {}", turns.len());
                 let mut has_open = false;
                 for turn in turns {
-                    if matches!(
-                        turn.phase,
-                        TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
-                    ) {
+                    if !turn.phase.is_terminal() {
                         has_open = true;
                     }
                     let ended = turn.ended_at.as_deref().unwrap_or("open");

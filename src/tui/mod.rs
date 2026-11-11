@@ -1502,10 +1502,7 @@ fn handle_command(
             let open_turn = latest
                 .as_ref()
                 .map(|turn| {
-                    matches!(
-                        turn.phase,
-                        TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
-                    )
+                    !turn.phase.is_terminal()
                 })
                 .unwrap_or(false);
             text.push_str(&format!(
@@ -1533,10 +1530,7 @@ fn handle_command(
                 let mut text = format!("turns: {}", turns.len());
                 let mut has_open = false;
                 for turn in turns.iter().rev().take(12) {
-                    if matches!(
-                        turn.phase,
-                        TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
-                    ) {
+                    if !turn.phase.is_terminal() {
                         has_open = true;
                     }
                     let ended = turn.ended_at.as_deref().unwrap_or("open");

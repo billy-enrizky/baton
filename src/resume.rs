@@ -41,10 +41,7 @@ pub fn ensure_no_open_turn(phase: Option<TurnPhase>, force: bool) -> Result<()> 
         return Ok(());
     }
     if let Some(phase) = phase.filter(|phase| {
-        matches!(
-            phase,
-            TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
-        )
+        !phase.is_terminal()
     }) {
         anyhow::bail!(
             "thread has an open {} turn; wait for it, use `baton status`, or pass --force to launch the native CLI anyway",

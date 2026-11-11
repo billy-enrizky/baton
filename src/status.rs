@@ -41,10 +41,7 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
         .latest_turn
         .as_ref()
         .map(|turn| {
-            matches!(
-                turn.phase,
-                TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
-            )
+            !turn.phase.is_terminal()
         })
         .unwrap_or(false);
     let stale_hint = if open_turn {
@@ -109,10 +106,7 @@ pub fn render(status: &ThreadStatus) -> String {
             if let Some(error) = &turn.error {
                 lines.push(format!("error: {}", preview(error)));
             }
-            if matches!(
-                turn.phase,
-                TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
-            ) {
+            if !turn.phase.is_terminal() {
                 lines.push(
                     "note: this turn is still open; if no baton process is running it is stale and will be marked unverified on the next open"
                         .to_string(),

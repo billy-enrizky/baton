@@ -9,6 +9,7 @@ pub mod mcp;
 pub mod memory;
 pub mod models;
 pub mod paths;
+pub mod process;
 pub mod resume;
 pub mod runtime;
 pub mod status;

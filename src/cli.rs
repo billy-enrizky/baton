@@ -147,4 +147,10 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List provider processes tracked by baton
+    Ps {
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
 }

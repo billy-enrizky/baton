@@ -7,6 +7,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::resolve_config;
+use crate::process;
 use crate::status::{self, ThreadStatus, TurnStatus};
 use crate::store::{BatonStore, MessageRow, ThreadRow, TurnRow};
 use crate::usage::{format_usage_line, sum_usage};
@@ -42,7 +43,7 @@ impl McpServer {
                     "version": env!("CARGO_PKG_VERSION"),
                     "title": "Baton thread state"
                 },
-                "instructions": "Use baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, and baton_latest_diff to inspect the local baton store."
+                "instructions": "Use baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, and baton_latest_diff to inspect the local baton store."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
@@ -210,6 +211,32 @@ impl McpServer {
                         "diff": null,
                     }),
                 })
+            }
+            "baton_processes" => {
+                let rows = self.store.list_provider_processes()?;
+                let processes = rows
+                    .iter()
+                    .map(|row| {
+                        let state = process::probe(row);
+                        json!({
+                            "pid": row.pid,
+                            "provider": row.provider.as_str(),
+                            "port": row.port,
+                            "cwd": row.cwd,
+                            "owner_pid": row.owner_pid,
+                            "owner_running": state.owner_running,
+                            "process_alive": state.alive,
+                            "command_matches": state.command_matches,
+                            "command": state.command.unwrap_or_else(|| row.command.clone()),
+                            "started_at": row.started_at,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({
+                    "schema_version": status::SCHEMA_VERSION,
+                    "count": processes.len(),
+                    "processes": processes,
+                }))
             }
             _ => anyhow::bail!("unknown baton tool {name}"),
         }
@@ -400,6 +427,16 @@ fn tool_descriptors() -> Vec<Value> {
             "inputSchema": thread_schema(),
             "annotations": { "readOnlyHint": true }
         }),
+        json!({
+            "name": "baton_processes",
+            "description": "List provider server processes tracked by baton, with process, owner, and command-line verification state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true }
+        }),
     ]
 }
 
@@ -502,6 +539,7 @@ mod tests {
         assert!(names.contains(&"baton_status"));
         assert!(names.contains(&"baton_messages"));
         assert!(names.contains(&"baton_latest_diff"));
+        assert!(names.contains(&"baton_processes"));
     }
 
     #[test]
@@ -531,6 +569,28 @@ mod tests {
         let cleared = tool_json(&server, "baton_queue", json!({ "clear": true }));
         assert_eq!(cleared["cleared"], true);
         assert_eq!(cleared["count"], 0);
+    }
+
+    #[test]
+    fn processes_report_tracked_provider_servers() {
+        let server = server();
+        server
+            .store
+            .record_provider_process(
+                u32::MAX,
+                ProviderId::OpenCode,
+                Some(41234),
+                "baton-test-process",
+                "/work",
+                u32::MAX,
+            )
+            .unwrap();
+        let processes = tool_json(&server, "baton_processes", json!({}));
+        assert_eq!(processes["schema_version"], status::SCHEMA_VERSION);
+        assert_eq!(processes["count"], 1);
+        assert_eq!(processes["processes"][0]["provider"], "opencode");
+        assert_eq!(processes["processes"][0]["process_alive"], false);
+        assert_eq!(processes["processes"][0]["command_matches"], false);
     }
 
     #[test]

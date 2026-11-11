@@ -1,6 +1,9 @@
 use baton::adapters::opencode::{OpenCodeAdapter, OpenCodeChild, OpenCodeSpawner};
 use baton::adapters::{BatonAdapter, ModelListInput};
+use baton::process::ProcessRecorder;
+use baton::store::BatonStore;
 use baton::types::PermissionMode;
+use baton::types::ProviderId;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -107,6 +110,10 @@ fn respond(
             respond_json(&mut stream, "204 No Content", "")
         }
         "/api/event" => {
+            if release.lock().unwrap().is_none() {
+                respond_json(&mut stream, "503 Service Unavailable", "{\"error\":\"event stream disabled\"}");
+                return;
+            }
             let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: keep-alive\r\n\r\n";
             if stream.write_all(headers.as_bytes()).is_err() {
                 return;
@@ -131,6 +138,44 @@ fn respond(
         }
         _ => respond_json(&mut stream, "404 Not Found", "{}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_dispose_removes_the_tracked_process() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_server = requests.clone();
+    std::thread::spawn(move || serve_opencode(listener, Arc::new(Mutex::new(None)), requests_for_server));
+
+    let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+    let recorder = ProcessRecorder::new(store.clone(), "/work");
+    let spawner: OpenCodeSpawner = {
+        let recorder = recorder.clone();
+        Arc::new(move |_auth_env: &[(String, String)]| {
+            let child = tokio::process::Command::new("sleep")
+                .arg("60")
+                .stdout(std::process::Stdio::null())
+                .spawn()?;
+            let pid = child.id().expect("sleep child pid");
+            let command = baton::process::command_line(pid).unwrap_or_else(|| "sleep 60".to_string());
+            recorder.record(pid, ProviderId::OpenCode, Some(port), &command)?;
+            Ok(OpenCodeChild { port, password: "pw".to_string(), child })
+        })
+    };
+    let mut adapter = OpenCodeAdapter::with_recorder(spawner, recorder);
+    adapter
+        .list_models(ModelListInput {
+            cwd: "/work".into(),
+            auth_env: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(store.lock().unwrap().list_provider_processes().unwrap().len(), 1);
+
+    adapter.dispose().await.unwrap();
+
+    assert!(store.lock().unwrap().list_provider_processes().unwrap().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -90,6 +90,17 @@ pub struct CheckpointRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProviderProcessRow {
+    pub pid: u32,
+    pub provider: ProviderId,
+    pub port: Option<u16>,
+    pub command: String,
+    pub cwd: String,
+    pub owner_pid: u32,
+    pub started_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct UsageRow {
     pub thread_id: String,
     pub turn: i64,
@@ -207,6 +218,15 @@ CREATE TABLE IF NOT EXISTS usage (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_thread_idx ON usage (thread_id, id);
+CREATE TABLE IF NOT EXISTS provider_processes (
+  pid INTEGER PRIMARY KEY,
+  provider TEXT NOT NULL,
+  port INTEGER,
+  command TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  owner_pid INTEGER NOT NULL,
+  started_at TEXT NOT NULL
+);
 "#;
 
 fn ensure_column(db: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
@@ -316,6 +336,10 @@ impl BatonStore {
             std::fs::create_dir_all(parent)?;
         }
         let db = Connection::open(path)?;
+        // Several baton processes can share the same store (for example two
+        // project windows). Wait for another writer instead of failing the
+        // command immediately with SQLITE_BUSY.
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch(MIGRATIONS)?;
         migrate_thread_model_nullable(&db)?;
         ensure_thread_columns(&db)?;
@@ -798,6 +822,64 @@ impl BatonStore {
                 params![now_iso(), row.thread_id, row.turn],
             )?;
         }
+        Ok(rows)
+    }
+
+    /// Records a provider child so a later baton process can identify and reap
+    /// it if this process exits without disposing it. The command line is the
+    /// identity check: a reused PID with a different command must never be
+    /// killed.
+    pub fn record_provider_process(
+        &self,
+        pid: u32,
+        provider: ProviderId,
+        port: Option<u16>,
+        command: &str,
+        cwd: &str,
+        owner_pid: u32,
+    ) -> Result<()> {
+        self.db.execute(
+            r#"INSERT INTO provider_processes (pid, provider, port, command, cwd, owner_pid, started_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(pid) DO UPDATE SET
+                 provider = excluded.provider,
+                 port = excluded.port,
+                 command = excluded.command,
+                 cwd = excluded.cwd,
+                 owner_pid = excluded.owner_pid,
+                 started_at = excluded.started_at"#,
+            params![pid, provider.as_str(), port, command, cwd, owner_pid, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_provider_process(&self, pid: u32) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM provider_processes WHERE pid = ?",
+            params![pid],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_provider_processes(&self) -> Result<Vec<ProviderProcessRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT pid, provider, port, command, cwd, owner_pid, started_at
+             FROM provider_processes ORDER BY started_at, pid",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let provider: String = row.get(1)?;
+                Ok(ProviderProcessRow {
+                    pid: row.get::<_, i64>(0)?.max(0) as u32,
+                    provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
+                    port: row.get::<_, Option<i64>>(2)?.map(|port| port.clamp(0, u16::MAX as i64) as u16),
+                    command: row.get(3)?,
+                    cwd: row.get(4)?,
+                    owner_pid: row.get::<_, i64>(5)?.max(0) as u32,
+                    started_at: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 

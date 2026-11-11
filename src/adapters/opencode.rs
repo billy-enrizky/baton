@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
+use crate::process::ProcessRecorder;
 use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub struct OpenCodeAdapter {
     runtime: Arc<AsyncMutex<Option<Arc<OpenCodeRuntime>>>>,
     auth_signature: Arc<Mutex<Option<String>>>,
     current_model: AsyncMutex<Option<String>>,
+    recorder: ProcessRecorder,
 }
 
 fn parse_model_slug(slug: &str) -> Result<(String, String)> {
@@ -60,11 +62,16 @@ fn parse_model_slug(slug: &str) -> Result<(String, String)> {
 
 impl OpenCodeAdapter {
     pub fn new(spawner: OpenCodeSpawner) -> Self {
+        Self::with_recorder(spawner, ProcessRecorder::disabled())
+    }
+
+    pub fn with_recorder(spawner: OpenCodeSpawner, recorder: ProcessRecorder) -> Self {
         OpenCodeAdapter {
             spawner,
             runtime: Arc::new(AsyncMutex::new(None)),
             auth_signature: Arc::new(Mutex::new(None)),
             current_model: AsyncMutex::new(None),
+            recorder,
         }
     }
 
@@ -75,7 +82,12 @@ impl OpenCodeAdapter {
             let mut slot = self.runtime.lock().await;
             if let Some(runtime) = slot.as_ref() {
                 let mut child = runtime.child.lock().await;
-                let _ = child.start_kill();
+                let pid = child.id();
+                if child.start_kill().is_ok() {
+                    if let Some(pid) = pid {
+                        self.recorder.forget(pid);
+                    }
+                }
             }
             let mut spawned = (self.spawner)(auth_env)?;
             let auth_header = format!(
@@ -653,7 +665,12 @@ impl BatonAdapter for OpenCodeAdapter {
         if let Some(runtime) = runtime {
             runtime.active_turn.store(false, Ordering::SeqCst);
             let mut child = runtime.child.lock().await;
-            let _ = child.start_kill();
+            let pid = child.id();
+            if child.start_kill().is_ok() {
+                if let Some(pid) = pid {
+                    self.recorder.forget(pid);
+                }
+            }
         }
         Ok(())
     }

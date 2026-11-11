@@ -52,6 +52,7 @@ baton status [-t id] [--json]  # phase, goal, queue, usage
 baton turns [-t id] [--json]   # full durable turn history
 baton queue [-t id] [--clear] [--json]  # inspect/clear queued follow-ups
 baton search <query> [--all] [--json]  # search thread titles and conversation text
+baton ps [--json]        # list provider servers tracked by baton
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
 baton exec -p <provider> [--json] "prompt"  # one non-interactive turn
 baton mcp                # MCP stdio server for agent access to the thread store
@@ -87,6 +88,7 @@ Tools:
 - `baton_messages`: newest conversation rows, including tool and diff rows
 - `baton_queue`: inspect queued follow-ups, or clear them explicitly
 - `baton_search`: search thread titles and conversation text in the project, or every project with `all=true`
+- `baton_processes`: provider server processes tracked by baton, including PID, owner, port, and command-line verification
 - `baton_latest_diff`: newest stored turn diff
 
 The server is read-only except for the explicit `baton_queue` clear option. It opens the same `~/.baton/baton.sqlite` database and honors `BATON_HOME`.
@@ -97,7 +99,7 @@ Each provider keeps its own native session per baton thread. On every turn only 
 
 ## Storage
 
-`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, durable turns, queued follow-ups, review notes, checkpoints, usage) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything.
+`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, durable turns, queued follow-ups, review notes, checkpoints, usage, and verified provider process records) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything. A provider server left behind by a killed baton process is reaped on the next start only when its PID, command line, and dead owner still match the recorded process.
 
 ## Development
 

@@ -1,4 +1,4 @@
-use baton::{adapters, checkpoints, cli, config, mcp, paths, resume, runtime, scanner, status, store, tui, types, usage};
+use baton::{adapters, checkpoints, cli, config, mcp, paths, process, resume, runtime, scanner, status, store, tui, types, usage};
 
 use anyhow::Result;
 use clap::Parser;
@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use adapters::{child_halves, BatonAdapter, AcpAdapter, ClaudeAdapter, CodexAdapter, OpenCodeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
-use runtime::{run_engine, EngineCommand, EngineEvent, SharedAdapter};
+use runtime::{run_engine, EngineCommand, EngineEvent, SharedAdapter, SharedStore};
 use store::{BatonStore, ImportedMessage, NewThread};
 use types::{PermissionMode, ProviderId, TurnPhase};
 use adapters::TurnEvent;
@@ -31,6 +31,8 @@ fn main_result() -> Result<()> {
     let home = paths::baton_home();
     let command = cli.command.clone().unwrap_or(cli::Commands::Chat);
     let cli_prompt = cli.prompt.clone();
+
+    reap_startup_processes();
 
     let permission_override = if cli.yolo {
         Some(PermissionMode::BypassPermissions)
@@ -88,7 +90,7 @@ fn main_result() -> Result<()> {
             let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            let adapters = build_all_adapters(&home, &cwd);
+            let adapters = build_all_adapters(&store, &home, &cwd);
             let interrupt_handles: Vec<(ProviderId, Arc<dyn Fn() + Send + Sync>)> =
                 tokio_runtime.block_on(async {
                     let mut handles = Vec::new();
@@ -788,6 +790,67 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Ps { json } => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let rows = store.list_provider_processes()?;
+            if json {
+                let processes = rows
+                    .iter()
+                    .map(|row| {
+                        let state = process::probe(row);
+                        serde_json::json!({
+                            "pid": row.pid,
+                            "provider": row.provider.as_str(),
+                            "port": row.port,
+                            "cwd": row.cwd,
+                            "owner_pid": row.owner_pid,
+                            "owner_running": state.owner_running,
+                            "process_alive": state.alive,
+                            "command_matches": state.command_matches,
+                            "command": state.command.unwrap_or_else(|| row.command.clone()),
+                            "started_at": row.started_at,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "processes": processes,
+                    }))?
+                );
+                return Ok(());
+            }
+            if rows.is_empty() {
+                println!("no tracked provider processes");
+                return Ok(());
+            }
+            println!("{:<7} {:<11} {:<6} {:<8} {}", "PID", "PROVIDER", "PORT", "OWNER", "COMMAND");
+            for row in &rows {
+                let state = process::probe(row);
+                let status = if !state.alive {
+                    "gone"
+                } else if !state.owner_running {
+                    "orphan"
+                } else if state.command_matches {
+                    "live"
+                } else {
+                    "mismatch"
+                };
+                let port = row.port.map(|port| port.to_string()).unwrap_or_else(|| "-".into());
+                println!(
+                    "{:<7} {:<11} {:<6} {:<8} {:<8} {}  {}",
+                    row.pid,
+                    row.provider,
+                    port,
+                    row.owner_pid,
+                    status,
+                    row.cwd,
+                    state.command.as_deref().unwrap_or(&row.command)
+                );
+            }
+            Ok(())
+        }
         cli::Commands::Status { thread_id, json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
@@ -942,11 +1005,45 @@ fn main_result() -> Result<()> {
     }
 }
 
+fn reap_startup_processes() {
+    let Ok(store) = BatonStore::open(&paths::baton_db_path()) else {
+        return;
+    };
+    let Ok(report) = process::reap_orphans(&store) else {
+        return;
+    };
+    if let Some(summary) = report.summary() {
+        eprintln!("{summary}");
+    }
+    if std::env::var_os("BATON_DEBUG_PROCESS").is_some() {
+        eprintln!(
+            "baton process check: reaped={} gone={} live_owners={} mismatches={} unverifiable={} errors={}",
+            report.reaped.len(),
+            report.already_gone,
+            report.live_owners,
+            report.command_mismatches.len(),
+            report.unverifiable,
+            report.errors.len()
+        );
+        for (row, actual) in &report.command_mismatches {
+            eprintln!(
+                "baton process mismatch: pid={} provider={} expected={:?} actual={:?}",
+                row.pid, row.provider, row.command, actual
+            );
+        }
+    }
+}
+
 
 fn build_all_adapters(
+    store: &SharedStore,
     home: &PathBuf,
     cwd: &PathBuf,
 ) -> Vec<SharedAdapter> {
+    let process_recorder = process::ProcessRecorder::new(
+        store.clone(),
+        cwd.to_string_lossy().to_string(),
+    );
     let cwd_for_codex = cwd.clone();
     let codex_spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
@@ -1014,6 +1111,7 @@ fn build_all_adapters(
             child_halves(command.spawn()?)
         },
     );
+    let opencode_recorder = process_recorder.clone();
     let opencode_spawner = Arc::new(
         move |_auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::opencode::OpenCodeChild> {
             let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
@@ -1030,7 +1128,16 @@ fn build_all_adapters(
             command.stderr(std::process::Stdio::null());
             // The server never sees stdin EOF (it is null), so it must die with baton.
             command.kill_on_drop(true);
-            let child = command.spawn()?;
+            let mut child = command.spawn()?;
+            let pid = child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("opencode did not expose a process id"))?;
+            let command_line = process::command_line(pid)
+                .unwrap_or_else(|| format!("opencode serve --hostname=127.0.0.1 --port {port}"));
+            if let Err(error) = opencode_recorder.record(pid, ProviderId::OpenCode, Some(port), &command_line) {
+                let _ = child.start_kill();
+                return Err(error);
+            }
             Ok(baton::adapters::opencode::OpenCodeChild { port, password, child })
         },
     );
@@ -1040,7 +1147,7 @@ fn build_all_adapters(
         Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(codex_spawner)) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Cursor, cursor_spawner)) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Grok, grok_spawner)) as Box<dyn BatonAdapter>)),
-        Arc::new(tokio::sync::Mutex::new(Box::new(OpenCodeAdapter::new(opencode_spawner)) as Box<dyn BatonAdapter>)),
+        Arc::new(tokio::sync::Mutex::new(Box::new(OpenCodeAdapter::with_recorder(opencode_spawner, process_recorder)) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Antigravity, antigravity_spawner)) as Box<dyn BatonAdapter>)),
     ]
 }
@@ -1112,113 +1219,8 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: O
         .enable_all()
         .build()?;
 
-    let (adapters, interrupt_handles, steer_handles) = tokio_runtime.block_on(async {
-        let cwd_for_codex = cwd.clone();
-        let codex_spawner = Arc::new(
-            move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
-                let mut command = tokio::process::Command::new("codex");
-                command.args(["app-server"]);
-                command.current_dir(&cwd_for_codex);
-                command.stdin(std::process::Stdio::piped());
-                command.stdout(std::process::Stdio::piped());
-                command.stderr(std::process::Stdio::null());
-                for (key, value) in auth_env {
-                    command.env(key, value);
-                }
-                child_halves(command.spawn()?)
-            },
-        );
-        let cwd_for_grok = cwd.clone();
-        let grok_spawner = Arc::new(
-            move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
-                let mut command = tokio::process::Command::new("grok");
-                command.args(["agent", "stdio"]);
-                command.current_dir(&cwd_for_grok);
-                command.env("GROK_OAUTH2_REFERRER", "baton");
-                command.stdin(std::process::Stdio::piped());
-                command.stdout(std::process::Stdio::piped());
-                command.stderr(std::process::Stdio::null());
-                for (key, value) in auth_env {
-                    command.env(key, value);
-                }
-                child_halves(command.spawn()?)
-            },
-        );
-        let cwd_for_antigravity = cwd.clone();
-        let antigravity_home = home.join("antigravity");
-        let antigravity_spawner = Arc::new(
-            move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
-                std::fs::create_dir_all(&antigravity_home)?;
-                let mut command = tokio::process::Command::new("antigravity");
-                command.current_dir(&cwd_for_antigravity);
-                command.env("AGY_ACP_FORCE_FILE_STORAGE", "1");
-                command.env("GEMINI_HOME", &antigravity_home);
-                if !auth_env.iter().any(|(key, _)| key == "GEMINI_API_KEY" || key == "GOOGLE_API_KEY") {
-                    command.env_remove("GEMINI_API_KEY");
-                    command.env_remove("GOOGLE_API_KEY");
-                }
-                command.stdin(std::process::Stdio::piped());
-                command.stdout(std::process::Stdio::piped());
-                command.stderr(std::process::Stdio::null());
-                for (key, value) in auth_env {
-                    command.env(key, value);
-                }
-                child_halves(command.spawn()?)
-            },
-        );
-        let cwd_for_cursor = cwd.clone();
-        let cursor_spawner = Arc::new(
-            move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
-                let mut command = tokio::process::Command::new("cursor-agent");
-                command.current_dir(&cwd_for_cursor);
-                command.stdin(std::process::Stdio::piped());
-                command.stdout(std::process::Stdio::piped());
-                command.stderr(std::process::Stdio::null());
-                for (key, value) in auth_env {
-                    command.env(key, value);
-                }
-                child_halves(command.spawn()?)
-            },
-        );
-        let opencode_spawner = Arc::new(
-            move |_auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::opencode::OpenCodeChild> {
-                let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-                let port = listener.local_addr()?.port();
-                drop(listener);
-                let password = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
-                let mut command = tokio::process::Command::new("opencode");
-                command.args(["serve", "--hostname=127.0.0.1", "--port", &port.to_string()]);
-                command.env("OPENCODE_PASSWORD", &password);
-                command.env("OPENCODE_SERVER_PASSWORD", &password);
-                command.env("OPENCODE_CONFIG_CONTENT", "{}");
-                command.stdin(std::process::Stdio::null());
-                command.stdout(std::process::Stdio::piped());
-                command.stderr(std::process::Stdio::null());
-                // The server never sees stdin EOF (it is null), so it must die with baton.
-                command.kill_on_drop(true);
-                let child = command.spawn()?;
-                Ok(baton::adapters::opencode::OpenCodeChild { port, password, child })
-            },
-        );
-
-        let claude: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner()))));
-        let codex: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(codex_spawner))));
-        let grok: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(
-            ProviderId::Grok,
-            grok_spawner,
-        ))));
-        let antigravity: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(
-            ProviderId::Antigravity,
-            antigravity_spawner,
-        ))));
-        let cursor: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(
-            ProviderId::Cursor,
-            cursor_spawner,
-        ))));
-        let opencode: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(OpenCodeAdapter::new(
-            opencode_spawner,
-        ))));
-        let adapters = vec![claude, codex, cursor, grok, opencode, antigravity];
+    let adapters = build_all_adapters(&store, &home, &cwd);
+    let (interrupt_handles, steer_handles) = tokio_runtime.block_on(async {
         let mut handles = Vec::new();
         let mut steer_handles = Vec::new();
         for adapter in &adapters {
@@ -1228,7 +1230,7 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: O
                 steer_handles.push((adapter.id(), handle));
             }
         }
-        (adapters, handles, steer_handles)
+        (handles, steer_handles)
     });
 
     let (engine_command_sender, engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();

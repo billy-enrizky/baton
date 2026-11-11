@@ -238,11 +238,21 @@ fn main_result() -> Result<()> {
                         .current_model
                         .clone()
                         .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
-                    let phase = store
+                    let latest_phase = store
                         .list_turn_records(&thread.id)?
                         .into_iter()
                         .last()
-                        .map(|turn| turn.phase.as_str().to_string())
+                        .map(|turn| turn.phase);
+                    let open_turn = latest_phase
+                        .map(|phase| {
+                            matches!(
+                                phase,
+                                TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+                            )
+                        })
+                        .unwrap_or(false);
+                    let phase = latest_phase
+                        .map(|phase| phase.as_str().to_string())
                         .unwrap_or_else(|| "idle".to_string());
                     values.push(serde_json::json!({
                         "thread_id": thread.id,
@@ -253,6 +263,12 @@ fn main_result() -> Result<()> {
                         "goal": thread.goal,
                         "goal_paused": thread.goal_paused,
                         "phase": phase,
+                        "open_turn": open_turn,
+                        "stale_hint": if open_turn {
+                            Some("if no baton process is attached, this turn is stale and will be marked unverified on the next open")
+                        } else {
+                            None
+                        },
                         "queue_count": store.list_queued_messages(&thread.id)?.len(),
                     }));
                 }

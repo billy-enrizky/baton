@@ -277,15 +277,18 @@ fn main_result() -> Result<()> {
                         .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
                     let turn_records = store.list_turn_records(&thread.id)?;
                     let turn_count = turn_records.len();
-                    let latest_phase = turn_records.into_iter().last().map(|turn| turn.phase);
+                    let latest = turn_records.last();
+                    let latest_phase = latest.map(|turn| turn.phase);
                     let open_turn = latest_phase
-                        .map(|phase| {
-                            !phase.is_terminal()
-                        })
+                        .map(|phase| !phase.is_terminal())
                         .unwrap_or(false);
                     let phase = latest_phase
                         .map(|phase| phase.as_str().to_string())
                         .unwrap_or_else(|| "idle".to_string());
+                    let last_error = latest.and_then(|turn| turn.error.clone());
+                    let provider_turn_id = latest.and_then(|turn| turn.provider_turn_id.clone());
+                    let started_at = latest.map(|turn| turn.started_at.clone());
+                    let ended_at = latest.and_then(|turn| turn.ended_at.clone());
                     let queued = store.list_queued_messages(&thread.id)?;
                     values.push(serde_json::json!({
                         "thread_id": thread.id,
@@ -297,6 +300,10 @@ fn main_result() -> Result<()> {
                         "goal_paused": thread.goal_paused,
                         "phase": phase,
                         "turn_count": turn_count,
+                        "provider_turn_id": provider_turn_id,
+                        "started_at": started_at,
+                        "ended_at": ended_at,
+                        "last_error": last_error,
                         "open_turn": open_turn,
                         "stale_hint": if open_turn {
                             Some("if no baton process is attached, this turn is stale and will be marked unverified on the next open")

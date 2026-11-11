@@ -88,14 +88,16 @@ fn main_result() -> Result<()> {
             let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            let (adapters, _) = build_all_adapters(&home, &cwd);
-            let interrupt_handles: Vec<Arc<dyn Fn() + Send + Sync>> = tokio_runtime.block_on(async {
-                let mut handles = Vec::new();
-                for adapter in &adapters {
-                    handles.push(adapter.lock().await.interrupt_handle());
-                }
-                handles
-            });
+            let adapters = build_all_adapters(&home, &cwd);
+            let interrupt_handles: Vec<(ProviderId, Arc<dyn Fn() + Send + Sync>)> =
+                tokio_runtime.block_on(async {
+                    let mut handles = Vec::new();
+                    for adapter in &adapters {
+                        let adapter = adapter.lock().await;
+                        handles.push((adapter.id(), adapter.interrupt_handle()));
+                    }
+                    handles
+                });
 
             let (engine_command_sender, engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
             let (engine_event_sender, engine_event_receiver) = std::sync::mpsc::channel();
@@ -886,7 +888,7 @@ fn main_result() -> Result<()> {
 fn build_all_adapters(
     home: &PathBuf,
     cwd: &PathBuf,
-) -> (Vec<SharedAdapter>, Vec<Arc<dyn Fn() + Send + Sync>>) {
+) -> Vec<SharedAdapter> {
     let cwd_for_codex = cwd.clone();
     let codex_spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
@@ -975,17 +977,14 @@ fn build_all_adapters(
         },
     );
 
-    (
-        vec![
-            Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner())) as Box<dyn BatonAdapter>)),
-            Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(codex_spawner)) as Box<dyn BatonAdapter>)),
-            Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Cursor, cursor_spawner)) as Box<dyn BatonAdapter>)),
-            Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Grok, grok_spawner)) as Box<dyn BatonAdapter>)),
-            Arc::new(tokio::sync::Mutex::new(Box::new(OpenCodeAdapter::new(opencode_spawner)) as Box<dyn BatonAdapter>)),
-            Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Antigravity, antigravity_spawner)) as Box<dyn BatonAdapter>)),
-        ],
-        Vec::new(),
-    )
+    vec![
+        Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner())) as Box<dyn BatonAdapter>)),
+        Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(codex_spawner)) as Box<dyn BatonAdapter>)),
+        Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Cursor, cursor_spawner)) as Box<dyn BatonAdapter>)),
+        Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Grok, grok_spawner)) as Box<dyn BatonAdapter>)),
+        Arc::new(tokio::sync::Mutex::new(Box::new(OpenCodeAdapter::new(opencode_spawner)) as Box<dyn BatonAdapter>)),
+        Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Antigravity, antigravity_spawner)) as Box<dyn BatonAdapter>)),
+    ]
 }
 
 fn default_provider_from_configs(home: &PathBuf, cwd: &PathBuf) -> ProviderId {
@@ -1152,7 +1151,7 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: O
         let mut steer_handles = Vec::new();
         for adapter in &adapters {
             let adapter = adapter.lock().await;
-            handles.push(adapter.interrupt_handle());
+            handles.push((adapter.id(), adapter.interrupt_handle()));
             if let Some(handle) = adapter.steer_handle() {
                 steer_handles.push((adapter.id(), handle));
             }

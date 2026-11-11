@@ -17,7 +17,7 @@ pub enum EngineCommand {
     Submit { thread_id: String, text: String, permission_mode: PermissionMode },
     Steer { thread_id: String, text: String },
     ListModels { thread_id: String, provider: ProviderId },
-    Interrupt,
+    Interrupt { thread_id: String },
     Quit,
 }
 
@@ -165,7 +165,7 @@ pub async fn run_engine(
     store: SharedStore,
     home: std::path::PathBuf,
     adapters: Vec<SharedAdapter>,
-    interrupt_handles: Vec<Arc<dyn Fn() + Send + Sync>>,
+    interrupt_handles: Vec<(ProviderId, Arc<dyn Fn() + Send + Sync>)>,
     steer_handles: Vec<(ProviderId, SteerHandle)>,
     mut command_receiver: tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
@@ -255,9 +255,21 @@ pub async fn run_engine(
                     });
                 });
             }
-            EngineCommand::Interrupt => {
-                for handle in &interrupt_handles {
-                    handle();
+            EngineCommand::Interrupt { thread_id } => {
+                let provider = store
+                    .lock()
+                    .unwrap()
+                    .get_thread(&thread_id)
+                    .ok()
+                    .flatten()
+                    .map(|thread| thread.current_provider);
+                if let Some(provider) = provider {
+                    if let Some((_, handle)) = interrupt_handles
+                        .iter()
+                        .find(|(candidate, _)| *candidate == provider)
+                    {
+                        handle();
+                    }
                 }
             }
             EngineCommand::Submit { thread_id, text, permission_mode } => {
@@ -870,6 +882,62 @@ mod tests {
         command_sender2.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine2).await;
+    }
+
+    #[tokio::test]
+    async fn interrupt_only_targets_the_owning_provider() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let claude_thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "claude".into(),
+                cwd: "/tmp/claude".into(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        let codex_interrupted = Arc::new(AtomicBool::new(false));
+        let claude_interrupted = Arc::new(AtomicBool::new(false));
+        let codex_flag = codex_interrupted.clone();
+        let claude_flag = claude_interrupted.clone();
+        let handles: Vec<(ProviderId, Arc<dyn Fn() + Send + Sync>)> = vec![
+            (
+                ProviderId::Codex,
+                Arc::new(move || codex_flag.store(true, Ordering::SeqCst)),
+            ),
+            (
+                ProviderId::Claude,
+                Arc::new(move || claude_flag.store(true, Ordering::SeqCst)),
+            ),
+        ];
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
+            Box::new(IdleAdapter) as Box<dyn BatonAdapter>
+        ))];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store,
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            handles,
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        command_sender
+            .send(EngineCommand::Interrupt {
+                thread_id: claude_thread.id.clone(),
+            })
+            .unwrap();
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+        assert!(!codex_interrupted.load(Ordering::SeqCst));
+        assert!(claude_interrupted.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

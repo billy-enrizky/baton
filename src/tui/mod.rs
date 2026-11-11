@@ -603,7 +603,7 @@ fn handle_key(
 ) {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if state.running {
-            let _ = engine_command_sender.send(EngineCommand::Interrupt);
+            let _ = engine_command_sender.send(EngineCommand::Interrupt { thread_id: state.thread.id.clone() });
             state.notice = Some("interrupting...".into());
             return;
         }
@@ -1411,7 +1411,7 @@ fn handle_composer_key(
         }
         KeyCode::Esc => {
             if state.running {
-                let _ = engine_command_sender.send(EngineCommand::Interrupt);
+                let _ = engine_command_sender.send(EngineCommand::Interrupt { thread_id: state.thread.id.clone() });
                 state.notice = Some("interrupting...".into());
             } else if state.input.is_empty() {
                 if state.esc_primed {

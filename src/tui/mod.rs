@@ -130,6 +130,27 @@ struct ApprovalState {
     respond: tokio::sync::oneshot::Sender<ApprovalDecision>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MultiStatus {
+    Running,
+    Done,
+    Failed,
+}
+
+struct MultiChild {
+    thread_id: String,
+    provider: ProviderId,
+    status: MultiStatus,
+    reply: String,
+    error: Option<String>,
+}
+
+struct MultiView {
+    prompt: String,
+    selected: usize,
+    children: Vec<MultiChild>,
+}
+
 #[derive(Debug, Clone)]
 struct InputRow {
     screen_y: u16,
@@ -183,6 +204,7 @@ pub struct TuiState {
     overlay: Overlay,
     approvals: Vec<ApprovalState>,
     review: Option<ReviewState>,
+    multi: Option<MultiView>,
     notice: Option<String>,
     diff_output: Option<String>,
     permission_mode: PermissionMode,
@@ -245,6 +267,7 @@ pub fn run_tui(
         overlay: Overlay::None,
         approvals: Vec::new(),
         review: None,
+        multi: None,
         notice: None,
         diff_output: None,
         permission_mode,
@@ -406,6 +429,14 @@ fn apply_engine_event(
         }
         EngineEvent::TurnStarted { thread_id } => {
             state.approvals.retain(|approval| approval.thread_id != thread_id);
+            if let Some(child) = state
+                .multi
+                .as_mut()
+                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+            {
+                child.status = MultiStatus::Running;
+                child.error = None;
+            }
             if thread_id != state.thread.id {
                 return;
             }
@@ -417,6 +448,31 @@ fn apply_engine_event(
         }
         EngineEvent::TurnFinished { thread_id, ok, error, phase } => {
             state.approvals.retain(|approval| approval.thread_id != thread_id);
+            if let Some(child) = state
+                .multi
+                .as_mut()
+                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+            {
+                child.status = if ok { MultiStatus::Done } else { MultiStatus::Failed };
+                child.error = error.clone();
+                if ok {
+                    let reply = store
+                        .lock()
+                        .unwrap()
+                        .list_messages(&thread_id)
+                        .ok()
+                        .and_then(|messages| {
+                            messages
+                                .into_iter()
+                                .rev()
+                                .find(|message| message.role == "assistant")
+                                .map(|message| message.text)
+                        });
+                    if let Some(reply) = reply {
+                        child.reply = reply;
+                    }
+                }
+            }
             if thread_id != state.thread.id {
                 return;
             }
@@ -514,6 +570,14 @@ fn apply_engine_event(
             state.notice = Some(format!("loaded {count} live model(s) for {provider}"));
         }
         EngineEvent::TurnRejected { thread_id, text, reason } => {
+            if let Some(child) = state
+                .multi
+                .as_mut()
+                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+            {
+                child.status = MultiStatus::Failed;
+                child.error = Some(reason.clone());
+            }
             if thread_id == state.thread.id {
                 enqueue_message(state, store, text);
                 state.notice = Some(format!(
@@ -594,6 +658,24 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
 }
 
 fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: TurnEvent) {
+    if let Some(child) = state
+        .multi
+        .as_mut()
+        .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+    {
+        match &event {
+            TurnEvent::TextDelta { text } => child.reply.push_str(text),
+            TurnEvent::TurnFailed { error } => {
+                child.status = MultiStatus::Failed;
+                child.error = Some(error.clone());
+            }
+            TurnEvent::TurnInterrupted { reason } => {
+                child.status = MultiStatus::Failed;
+                child.error = Some(reason.clone().unwrap_or_else(|| "interrupted".into()));
+            }
+            _ => {}
+        }
+    }
     match event {
         TurnEvent::ApprovalRequest {
             summary, respond, ..
@@ -605,6 +687,24 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
         event if thread_id == state.thread.id => apply_turn_event(state, event),
         _ => {}
     }
+}
+
+fn load_thread_state(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    thread: ThreadRow,
+) {
+    state.permission_mode = thread.permission_mode;
+    state.goal = thread.goal.clone();
+    state.goal_paused = thread.goal_paused;
+    state.thread = thread.clone();
+    let guard = store.lock().unwrap();
+    state.history = guard.list_messages(&thread.id).unwrap_or_default();
+    state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
+    state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
+    state.diff_output = None;
+    state.scroll_offset = 0;
+    state.notice = Some(format!("opened {}", thread.title));
 }
 
 fn input_index_at(state: &TuiState, column: u16, row: u16) -> Option<usize> {
@@ -699,6 +799,47 @@ fn handle_key(
                 ));
             }
         }
+        return;
+    }
+
+    if let Some(mut multi) = state.multi.take() {
+        let mut open_thread = None;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Up | KeyCode::Char('k') => {
+                multi.selected = multi.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !multi.children.is_empty() {
+                    multi.selected = (multi.selected + 1).min(multi.children.len() - 1);
+                }
+            }
+            KeyCode::PageUp => {
+                multi.selected = multi.selected.saturating_sub(5);
+            }
+            KeyCode::PageDown => {
+                if !multi.children.is_empty() {
+                    multi.selected = (multi.selected + 5).min(multi.children.len() - 1);
+                }
+            }
+            KeyCode::Enter => {
+                open_thread = multi
+                    .children
+                    .get(multi.selected)
+                    .map(|child| child.thread_id.clone());
+            }
+            _ => {}
+        }
+        if let Some(thread_id) = open_thread {
+            let thread = store.lock().unwrap().get_thread(&thread_id).unwrap_or(None);
+            if let Some(thread) = thread {
+                load_thread_state(state, store, thread);
+                state.multi = None;
+                return;
+            }
+            state.notice = Some(format!("parallel thread {thread_id} no longer exists"));
+        }
+        state.multi = Some(multi);
         return;
     }
 
@@ -1713,16 +1854,30 @@ fn handle_command(
                 };
                 threads.push(thread);
             }
-            for thread in threads {
-                let thread_id = thread.id.clone();
+            let children = threads
+                .iter()
+                .map(|thread| MultiChild {
+                    thread_id: thread.id.clone(),
+                    provider: thread.current_provider,
+                    status: MultiStatus::Running,
+                    reply: String::new(),
+                    error: None,
+                })
+                .collect();
+            for thread in &threads {
                 let _ = engine_command_sender.send(EngineCommand::Submit {
-                    thread_id,
+                    thread_id: thread.id.clone(),
                     text: prompt.clone(),
                     permission_mode: state.permission_mode,
                 });
             }
+            state.multi = Some(MultiView {
+                prompt: prompt.clone(),
+                selected: 0,
+                children,
+            });
             state.notice = Some(format!(
-                "sent to {} providers in parallel: {} · open their replies with /threads",
+                "sent to {} providers in parallel: {} · esc closes the merged view",
                 valid_providers.len(),
                 valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
             ));
@@ -2370,10 +2525,87 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_multi(frame: &mut ratatui::Frame, area: Rect, multi: &MultiView) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = inner.width as usize;
+    let prompt: String = multi.prompt.chars().take(width.saturating_sub(14)).collect();
+    let mut lines: Vec<Line> = vec![
+        Line::styled(
+            format!("multi · {} provider(s) · {prompt}", multi.children.len()),
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "↑↓ select · enter opens the thread · esc closes this view",
+            Style::default().fg(COLORS.muted),
+        ),
+    ];
+    for (index, child) in multi.children.iter().enumerate() {
+        let selected = index == multi.selected;
+        let (marker, status_style) = match child.status {
+            MultiStatus::Running => ("◐", Style::default().fg(COLORS.accent)),
+            MultiStatus::Done => ("✓", Style::default().fg(COLORS.success)),
+            MultiStatus::Failed => ("✗", Style::default().fg(COLORS.error)),
+        };
+        let preview = child
+            .error
+            .as_deref()
+            .or_else(|| child.reply.lines().find(|line| !line.trim().is_empty()))
+            .unwrap_or(if child.status == MultiStatus::Running {
+                "waiting..."
+            } else {
+                "no reply"
+            });
+        let provider = child.provider.as_str();
+        let used = provider.chars().count() + 8;
+        let preview: String = preview.chars().take(width.saturating_sub(used)).collect();
+        let pointer = if selected { "›" } else { " " };
+        let text_style = if selected {
+            Style::default().fg(COLORS.text).bg(COLORS.user_bg)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{pointer} {marker} "), status_style),
+            Span::styled(format!("{provider:<7} "), text_style),
+            Span::styled(preview, text_style),
+        ]));
+    }
+    let visible = inner.height.saturating_sub(2) as usize;
+    if lines.len() > visible {
+        lines.truncate(visible.max(1));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_floating_approval(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
+    let Some(approval) = state.approvals.last() else {
+        return;
+    };
+    if area.height < 4 {
+        return;
+    }
+    let approval_area = Rect {
+        y: area.y + area.height.saturating_sub(4),
+        height: 4,
+        ..area
+    };
+    draw_approval(frame, approval_area, state, approval);
+}
+
 fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     let area = frame.area();
+    if let Some(multi) = &state.multi {
+        draw_multi(frame, area, multi);
+        draw_floating_approval(frame, area, state);
+        return;
+    }
     if let Some(review) = &state.review {
         draw_review(frame, area, state, review);
+        draw_floating_approval(frame, area, state);
         return;
     }
     let suggestions = suggestions_for(&state.input);
@@ -3450,6 +3682,7 @@ mod tests {
             overlay: Overlay::None,
             approvals: Vec::new(),
             review: None,
+            multi: None,
             notice: None,
             diff_output: None,
             permission_mode: PermissionMode::Default,
@@ -4055,6 +4288,9 @@ mod tests {
         }
         assert_eq!(submitted.len(), 2, "one submit per provider");
         assert!(submitted.iter().all(|(_, text)| text == "compare notes"));
+        let multi = state.multi.as_ref().expect("multi view opens");
+        assert_eq!(multi.children.len(), 2);
+        assert!(multi.children.iter().all(|child| child.status == MultiStatus::Running));
         for (thread_id, _) in &submitted {
             let thread = store.lock().unwrap().get_thread(thread_id).unwrap();
             assert!(thread.is_some(), "parallel thread {thread_id} must be persisted before submit");
@@ -4064,6 +4300,81 @@ mod tests {
                 "parallel threads inherit the active mode"
             );
         }
+    }
+
+    #[test]
+    fn multi_view_tracks_children_and_opens_the_selected_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let child = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "parallel child".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        state.multi = Some(MultiView {
+            prompt: "compare notes".into(),
+            selected: 0,
+            children: vec![MultiChild {
+                thread_id: child.id.clone(),
+                provider: ProviderId::Codex,
+                status: MultiStatus::Running,
+                reply: String::new(),
+                error: None,
+            }],
+        });
+        apply_turn_event_for_thread(
+            &mut state,
+            child.id.clone(),
+            TurnEvent::TextDelta {
+                text: "partial".into(),
+            },
+        );
+        assert_eq!(state.multi.as_ref().unwrap().children[0].reply, "partial");
+        store
+            .lock()
+            .unwrap()
+            .add_message(&child.id, 1, "assistant", Some("codex"), None, "final answer")
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: child.id.clone(),
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+        let multi = state.multi.as_ref().unwrap();
+        assert_eq!(multi.children[0].status, MultiStatus::Done);
+        assert_eq!(multi.children[0].reply, "final answer");
+        let rendered = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(rendered.contains("multi"), "merged view: {rendered}");
+        assert!(rendered.contains("codex"), "provider row: {rendered}");
+        assert!(rendered.contains("final answer"), "reply preview: {rendered}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert!(state.multi.is_none());
+        assert_eq!(state.thread.id, child.id);
+        assert!(state.history.iter().any(|message| message.text == "final answer"));
     }
 
     #[test]

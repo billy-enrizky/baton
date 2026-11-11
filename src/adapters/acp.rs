@@ -283,13 +283,6 @@ impl AcpAdapter {
         }
     }
 
-    async fn notify(&self, runtime: &Arc<AcpRuntime>, method: &str, params: Value) -> Result<()> {
-        let frame = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let mut writer = runtime.writer.lock().await;
-        writer.write_line(&serde_json::to_string(&frame)?).await?;
-        Ok(())
-    }
-
     async fn ensure_initialized(&self, runtime: &Arc<AcpRuntime>) -> Result<()> {
         let params = json!({
             "protocolVersion": 2,
@@ -406,7 +399,6 @@ impl BatonAdapter for AcpAdapter {
         };
         let mut final_text = String::new();
         let mut usage: Option<TurnUsage> = None;
-        let mut prompt_done = false;
         let result: Result<()> = loop {
             tokio::select! {
                 notification = receiver.recv() => {
@@ -436,11 +428,9 @@ impl BatonAdapter for AcpAdapter {
                         _ => handle_session_update(&update, &emit, &mut final_text),
                     }
                 }
-                // The prompt RPC reply is the authoritative turn end. A
-                // completed oneshot cannot be polled again, so the guard
-                // keeps this arm disabled once the reply was consumed.
-                prompt_result = &mut prompt_receiver, if !prompt_done => {
-                    prompt_done = true;
+                // The prompt RPC reply is the authoritative turn end. Every
+                // branch below breaks, so the oneshot is never polled again.
+                prompt_result = &mut prompt_receiver => {
                     match prompt_result {
                         Ok(Ok(result)) => {
                             if let Some(result_usage) = result.get("usage") {

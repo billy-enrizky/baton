@@ -23,7 +23,7 @@ pub mod viewport;
 
 mod diff_render;
 
-use viewport::{window_messages, wrapped_rows, ViewportItem};
+use viewport::wrapped_rows;
 
 const COLORS: ColorConstants = ColorConstants {
     accent: Color::Rgb(240, 198, 116),
@@ -262,7 +262,7 @@ pub fn run_tui(
         state.prompt_history.push(prompt.clone());
         let thread_id = state.thread.id.clone();
         let result = {
-            let mut guard = store.lock().unwrap();
+            let guard = store.lock().unwrap();
             ensure_persisted(&guard, &mut state.thread)
         };
         if result.is_ok() {
@@ -1446,7 +1446,7 @@ fn handle_command(
             let mut threads = Vec::new();
             for provider in valid_providers.clone() {
                 let thread = {
-                    let mut guard = store.lock().unwrap();
+                    let guard = store.lock().unwrap();
                     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
                     let model = resolved.for_provider(provider).model.clone();
                     let mut thread = guard.draft_thread(crate::store::NewThread {
@@ -1600,7 +1600,7 @@ fn handle_command(
                 let thread_id = state.thread.id.clone();
                 let next_turn = store.lock().unwrap().next_turn_number(&thread_id).unwrap_or(1);
                 {
-                    let mut guard = store.lock().unwrap();
+                    let guard = store.lock().unwrap();
                     let _ = guard.rewind_thread(&thread_id, 1);
                     let _ = guard.add_message(&thread_id, next_turn, "user", None, None, "compact");
                     let _ = guard.add_message(&thread_id, next_turn, "assistant", None, None, &summary);

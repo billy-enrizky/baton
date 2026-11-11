@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{child_halves, BatonAdapter, LineReader, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{child_halves, BatonAdapter, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
 pub type ClaudeSpawner = Arc<dyn Fn(&TurnStartInput, Option<&NativeSessionRef>) -> Result<TransportHalves> + Send + Sync>;

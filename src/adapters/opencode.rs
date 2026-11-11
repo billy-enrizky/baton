@@ -131,19 +131,6 @@ impl OpenCodeAdapter {
         }
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
     }
-
-    async fn post_empty(&self, runtime: &Arc<OpenCodeRuntime>, path: &str) -> Result<()> {
-        let response = runtime
-            .http
-            .post(format!("{}{}", runtime.base_url, path))
-            .header("Authorization", &runtime.auth_header)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            anyhow::bail!("opencode {path} failed ({})", response.status());
-        }
-        Ok(())
-    }
 }
 
 fn spawn_sse_reader(
@@ -440,7 +427,7 @@ impl BatonAdapter for OpenCodeAdapter {
         let mut final_text = String::new();
         let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut usage: Option<TurnUsage> = None;
-        let mut pending_approvals: Vec<tokio::sync::oneshot::Receiver<ApprovalDecision>> = Vec::new();
+        let pending_approvals: Vec<tokio::sync::oneshot::Receiver<ApprovalDecision>> = Vec::new();
         let result: Result<()> = loop {
             let (event_type, data) = match receiver.recv().await {
                 Some(event) => event,

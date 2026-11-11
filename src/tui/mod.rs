@@ -1477,13 +1477,13 @@ fn handle_command(
             ));
         }
         "/status" => {
-            let latest = store
+            let turns = store
                 .lock()
                 .unwrap()
                 .list_turn_records(&state.thread.id)
-                .unwrap_or_default()
-                .into_iter()
-                .last();
+                .unwrap_or_default();
+            let turn_count = turns.len();
+            let latest = turns.into_iter().last();
             let mut text = format!(
                 "thread: {} {}\nprovider: {}/{}\nmode: {}",
                 &state.thread.id[..8.min(state.thread.id.len())],
@@ -1500,7 +1500,8 @@ fn handle_command(
                 None => text.push_str("\ngoal: none"),
             }
             text.push_str(&format!(
-                "\nturn: {}\nqueue: {} waiting",
+                "\nturns: {}\nturn: {}\nqueue: {} waiting",
+                turn_count,
                 latest
                     .map(|turn| format!("{} {}", turn.turn, turn.phase.as_str()))
                     .unwrap_or_else(|| "none".into()),
@@ -3691,6 +3692,7 @@ mod tests {
         assert!(notice.contains("provider: claude"));
         assert!(notice.contains("mode: plan"));
         assert!(notice.contains("goal: ship (paused)"));
+        assert!(notice.contains("turns: 1"));
         assert!(notice.contains("turn: 1 failed"));
         assert!(notice.contains("queue: 1 waiting"));
     }

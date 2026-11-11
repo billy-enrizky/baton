@@ -114,6 +114,9 @@ pub enum Commands {
     /// List durable turn phases for a thread
     Turns {
         thread_id: Option<String>,
+        /// Emit a JSON array instead of lines
+        #[arg(long)]
+        json: bool,
     },
     /// List or clear durable queued follow-ups
     Queue {

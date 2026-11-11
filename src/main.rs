@@ -478,7 +478,7 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
-        cli::Commands::Turns { thread_id } => {
+        cli::Commands::Turns { thread_id, json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
@@ -489,6 +489,25 @@ fn main_result() -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
             };
             let turns = store.list_turn_records(&thread.id)?;
+            if json {
+                let values: Vec<serde_json::Value> = turns
+                    .iter()
+                    .map(|turn| {
+                        serde_json::json!({
+                            "turn": turn.turn,
+                            "phase": turn.phase.as_str(),
+                            "provider": turn.provider.as_str(),
+                            "model": turn.model,
+                            "started_at": turn.started_at,
+                            "ended_at": turn.ended_at,
+                            "provider_turn_id": turn.provider_turn_id,
+                            "error": turn.error,
+                        })
+                    })
+                    .collect();
+                println!("{}", serde_json::to_string_pretty(&values)?);
+                return Ok(());
+            }
             if turns.is_empty() {
                 println!("no turn records");
             } else {

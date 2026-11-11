@@ -687,6 +687,7 @@ fn main_result() -> Result<()> {
                         }))?
                     );
                 } else {
+                    println!("thread: {} {}", &thread.id[..8.min(thread.id.len())], thread.title);
                     println!("queue cleared");
                 }
                 return Ok(());

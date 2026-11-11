@@ -119,8 +119,7 @@ pub fn read_claude_harness_config(global_dir: &Path, project_root: Option<&Path>
     }
 }
 
-pub fn read_codex_harness_config(global_home: &Path, project_root: Option<&Path>) -> HarnessProviderConfig {
-    let global = read_toml_if_exists(&global_home.join("config.toml"));
+pub fn read_codex_harness_config(global_home: &Path, project_root: Option<&Path>) -> HarnessProviderConfig {    let global = read_toml_if_exists(&global_home.join("config.toml"));
     let project = project_root.and_then(|root| read_toml_if_exists(&root.join(".codex").join("config.toml")));
     if global.is_none() && project.is_none() {
         return HarnessProviderConfig::default();
@@ -194,11 +193,149 @@ pub fn read_codex_harness_config(global_home: &Path, project_root: Option<&Path>
     }
 }
 
+/// Strips // and /* */ comments from JSONC text without touching string literals.
+fn strip_jsonc_comments(contents: &str) -> String {
+    let mut output = String::with_capacity(contents.len());
+    let mut chars = contents.chars().peekable();
+    let mut in_string = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            output.push(ch);
+            if ch == '\\' {
+                if let Some(escaped) = chars.next() {
+                    output.push(escaped);
+                }
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                output.push(ch);
+            }
+            '/' => match chars.peek() {
+                Some('/') => {
+                    for skip in chars.by_ref() {
+                        if skip == '\n' {
+                            output.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut previous = '\0';
+                    for skip in chars.by_ref() {
+                        if previous == '*' && skip == '/' {
+                            break;
+                        }
+                        if skip == '\n' {
+                            output.push('\n');
+                        }
+                        previous = skip;
+                    }
+                }
+                _ => output.push(ch),
+            },
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+/// Removes commas followed only by whitespace and a closing brace or bracket.
+fn strip_jsonc_trailing_commas(contents: &str) -> String {
+    let chars: Vec<char> = contents.chars().collect();
+    let mut output = String::with_capacity(contents.len());
+    let mut in_string = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            output.push(ch);
+            if ch == '\\' && index + 1 < chars.len() {
+                index += 1;
+                output.push(chars[index]);
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ',' {
+            let mut lookahead = index + 1;
+            while lookahead < chars.len() && chars[lookahead].is_whitespace() {
+                lookahead += 1;
+            }
+            if lookahead < chars.len() && (chars[lookahead] == '}' || chars[lookahead] == ']') {
+                index += 1;
+                continue;
+            }
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
+}
+
+fn parse_jsonc(contents: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str(contents) {
+        return Some(value);
+    }
+    let stripped = strip_jsonc_trailing_commas(&strip_jsonc_comments(contents));
+    serde_json::from_str(&stripped).ok()
+}
+
+fn read_opencode_config_file(path: &Path) -> Option<Value> {
+    if !path.is_file() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(path).ok()?;
+    parse_jsonc(&contents)
+}
+
+/// Reads the opencode config (`opencode.json`/`opencode.jsonc`, global then
+/// project) for the default `model` slug, e.g. `myprovider/rits/zai-org/glm-5-3`.
+/// Auth stays opencode's own concern: provider API keys live inside its config,
+/// so baton neither injects keys nor overrides the billing mode.
+pub fn read_opencode_harness_config(global_dir: &Path, project_root: Option<&Path>) -> HarnessProviderConfig {
+    let global = read_opencode_config_file(&global_dir.join("opencode.json"))
+        .or_else(|| read_opencode_config_file(&global_dir.join("opencode.jsonc")));
+    let project = project_root.and_then(|root| {
+        read_opencode_config_file(&root.join("opencode.json"))
+            .or_else(|| read_opencode_config_file(&root.join("opencode.jsonc")))
+    });
+    let model = project
+        .as_ref()
+        .and_then(|layer| layer.get("model").and_then(Value::as_str))
+        .or_else(|| global.as_ref().and_then(|layer| layer.get("model").and_then(Value::as_str)))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    HarnessProviderConfig {
+        model,
+        auth_mode: None,
+        api_key: None,
+        api_key_env_name: None,
+        permission_mode: None,
+        model_provider: None,
+    }
+}
+
 pub fn read_harness_config(
     provider: ProviderId,
     project_root: Option<&Path>,
     claude_dir: Option<&Path>,
     codex_home: Option<&Path>,
+    opencode_dir: Option<&Path>,
 ) -> HarnessProviderConfig {
     match provider {
         ProviderId::Claude => read_claude_harness_config(
@@ -209,7 +346,11 @@ pub fn read_harness_config(
             codex_home.unwrap_or(&crate::paths::codex_global_home()),
             project_root,
         ),
-        ProviderId::Cursor | ProviderId::Grok | ProviderId::OpenCode | ProviderId::Antigravity => {
+        ProviderId::OpenCode => read_opencode_harness_config(
+            opencode_dir.unwrap_or(&crate::paths::opencode_global_config_dir()),
+            project_root,
+        ),
+        ProviderId::Cursor | ProviderId::Grok | ProviderId::Antigravity => {
             HarnessProviderConfig::default()
         }
     }

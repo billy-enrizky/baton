@@ -32,6 +32,57 @@ struct TurnOutcome {
     rollout_path: Option<String>,
 }
 
+/// One tool invocation of a turn, kept for the conversation history.
+struct ToolRecord {
+    label: String,
+    /// None while running, Some(false) when it failed.
+    ok: Option<bool>,
+}
+
+/// Pairs ToolStarted/ToolCompleted events the same way the live TUI list does:
+/// a completion settles the most recent still-running record with that label.
+fn record_tool_event(records: &mut Vec<ToolRecord>, event: &TurnEvent) {
+    match event {
+        TurnEvent::ToolStarted { tool, detail } => {
+            let label = match detail {
+                Some(detail) => format!("{tool} {detail}"),
+                None => tool.clone(),
+            };
+            records.push(ToolRecord { label, ok: None });
+        }
+        TurnEvent::ToolCompleted { tool, detail, exit_code } => {
+            let label = match detail {
+                Some(detail) => format!("{tool} {detail}"),
+                None => tool.clone(),
+            };
+            let failed = exit_code.map(|code| code != 0).unwrap_or(false);
+            match records.iter_mut().rev().find(|record| record.ok.is_none() && record.label == label) {
+                Some(record) => record.ok = Some(!failed),
+                None => records.push(ToolRecord { label, ok: Some(!failed) }),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn persist_tool_records(
+    store: &BatonStore,
+    thread_id: &str,
+    turn: i64,
+    provider: ProviderId,
+    records: &[ToolRecord],
+) -> Result<()> {
+    for record in records {
+        let marker = match record.ok {
+            Some(true) => "✓",
+            Some(false) => "✗",
+            None => "·",
+        };
+        store.add_message(thread_id, turn, "tool", Some(provider.as_str()), None, &format!("{marker} {}", record.label))?;
+    }
+    Ok(())
+}
+
 pub async fn run_engine(
     store: SharedStore,
     home: std::path::PathBuf,
@@ -43,7 +94,12 @@ pub async fn run_engine(
 ) -> Result<()> {
     while let Some(command) = command_receiver.recv().await {
         match command {
-            EngineCommand::Quit => break,
+            EngineCommand::Quit => {
+                for adapter in &adapters {
+                    let _ = adapter.lock().await.dispose().await;
+                }
+                break;
+            }
             EngineCommand::Interrupt => {
                 for handle in &interrupt_handles {
                     handle();
@@ -167,6 +223,20 @@ async fn execute_turn(
         auth_env,
     };
 
+    // Snapshot the worktree before the turn so its own edits can be diffed.
+    let start_captured = {
+        let start_path = std::path::PathBuf::from(&cwd_for_checkpoint);
+        start_path.exists() && {
+            let start_ref = crate::checkpoints::checkpoint_start_ref(thread_id, turn);
+            crate::checkpoints::capture_checkpoint_at(
+                &start_path,
+                &start_ref,
+                &format!("baton checkpoint {thread_id} turn {turn} start"),
+            )
+            .is_ok()
+        }
+    };
+
     let adapter = adapters
         .iter()
         .find(|adapter| adapter.try_lock().map(|adapter| adapter.id() == provider).unwrap_or(false))
@@ -176,8 +246,10 @@ async fn execute_turn(
     let tui_sender = turn_event_sender.clone();
     let outcome_slot: Arc<Mutex<Option<TurnOutcome>>> = Arc::new(Mutex::new(None));
     let failure_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let tools_slot: Arc<Mutex<Vec<ToolRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let outcome_for_thread = outcome_slot.clone();
     let failure_for_thread = failure_slot.clone();
+    let tools_for_thread = tools_slot.clone();
     let forwarder = std::thread::spawn(move || {
         for event in event_receiver {
             match &event {
@@ -197,6 +269,7 @@ async fn execute_turn(
                     break;
                 }
                 _ => {
+                    record_tool_event(&mut tools_for_thread.lock().unwrap(), &event);
                     let _ = tui_sender.send(event);
                 }
             }
@@ -214,6 +287,12 @@ async fn execute_turn(
     let _ = adapter_result;
     let _ = forwarder.join();
 
+    let tool_records = tools_slot.lock().unwrap().drain(..).collect::<Vec<_>>();
+    if !tool_records.is_empty() {
+        let store = store.lock().unwrap();
+        persist_tool_records(&store, thread_id, turn, provider, &tool_records)?;
+    }
+
     if let Some(error) = failure_slot.lock().unwrap().take() {
         return Err(anyhow::anyhow!("{error}"));
     }
@@ -225,18 +304,49 @@ async fn execute_turn(
             if let Some(usage) = outcome.usage {
                 store.add_usage(thread_id, turn, provider, Some(&model), &usage)?;
             }
-            if let Some(native_session_id) = outcome.native_session_id {
-                store.upsert_provider_session(thread_id, provider, &native_session_id, Some(model.clone()), outcome.rollout_path.clone())?;
+            if let Some(native_session_id) = outcome.native_session_id.as_ref() {
+                store.upsert_provider_session(thread_id, provider, native_session_id, Some(model.clone()), outcome.rollout_path.clone())?;
             }
         }
         let cwd_path = std::path::PathBuf::from(&cwd_for_checkpoint);
         if cwd_path.exists() {
             if let Ok(reference) = capture_checkpoint(&cwd_path, thread_id, turn) {
                 store.lock().unwrap().add_checkpoint(thread_id, turn, &reference)?;
+                // The turn's own changes, kept in the conversation as a diff.
+                if start_captured {
+                    let start = crate::checkpoints::checkpoint_start_ref(thread_id, turn);
+                    if let Ok(diff) = crate::checkpoints::diff_checkpoints(&cwd_path, &start, &reference) {
+                        if !diff.trim().is_empty() {
+                            let capped = cap_diff(&diff);
+                            let _ = store.lock().unwrap().add_message(thread_id, turn, "diff", None, None, &capped);
+                        }
+                    }
+                }
             }
         }
+        // Non-TUI consumers (baton exec) read the final text from the engine
+        // event channel; the TUI ignores EngineEvent::Turn.
+        let _ = engine_event_sender.send(EngineEvent::Turn(TurnEvent::TurnCompleted {
+            final_text: outcome.final_text,
+            usage: outcome.usage,
+            native_session_id: outcome.native_session_id,
+            rollout_path: outcome.rollout_path,
+        }));
     }
     Ok(())
+}
+
+/// Keeps stored diffs bounded: the first 400 lines plus a truncation marker.
+fn cap_diff(diff: &str) -> String {
+    const MAX_LINES: usize = 400;
+    let mut lines = diff.lines();
+    let mut capped: Vec<&str> = lines.by_ref().take(MAX_LINES).collect();
+    if let Some(_more) = lines.next() {
+        capped.push("[...diff truncated]");
+    }
+    let mut text = capped.join("\n");
+    text.push('\n');
+    text
 }
 
 pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()> {
@@ -253,4 +363,63 @@ pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()
         *thread = created;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_events_pair_into_ordered_records() {
+        let mut records = Vec::new();
+        record_tool_event(&mut records, &TurnEvent::ToolStarted { tool: "shell".into(), detail: Some("cargo test".into()) });
+        record_tool_event(&mut records, &TurnEvent::ToolStarted { tool: "edit".into(), detail: Some("src/lib.rs".into()) });
+        record_tool_event(&mut records, &TurnEvent::ToolCompleted {
+            tool: "shell".into(),
+            detail: Some("cargo test".into()),
+            exit_code: Some(101),
+        });
+        record_tool_event(&mut records, &TurnEvent::ToolCompleted {
+            tool: "edit".into(),
+            detail: Some("src/lib.rs".into()),
+            exit_code: None,
+        });
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].label, "shell cargo test");
+        assert_eq!(records[0].ok, Some(false), "non-zero exit marks the record failed");
+        assert_eq!(records[1].label, "edit src/lib.rs");
+        assert_eq!(records[1].ok, Some(true));
+
+        // a completion with no running match becomes its own record
+        record_tool_event(&mut records, &TurnEvent::ToolCompleted { tool: "shell".into(), detail: Some("ls".into()), exit_code: Some(0) });
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[2].label, "shell ls");
+        assert_eq!(records[2].ok, Some(true));
+    }
+
+    #[test]
+    fn tool_records_persist_as_transcript_messages() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "t".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let records = vec![
+            ToolRecord { label: "shell cargo test".into(), ok: Some(false) },
+            ToolRecord { label: "edit src/lib.rs".into(), ok: Some(true) },
+        ];
+        persist_tool_records(&store, &thread.id, 1, ProviderId::Codex, &records).unwrap();
+        store.add_message(&thread.id, 1, "assistant", Some("codex"), None, "done").unwrap();
+
+        let messages = store.list_messages(&thread.id).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, "tool");
+        assert_eq!(messages[0].text, "✗ shell cargo test");
+        assert_eq!(messages[1].text, "✓ edit src/lib.rs");
+        assert_eq!(messages[2].role, "assistant", "tool history lands before the reply");
+    }
 }

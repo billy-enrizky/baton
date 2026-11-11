@@ -173,6 +173,7 @@ fn resolve_config_precedence() {
         std::path::Path::new("/nowhere"),
         Some(&claude_dir),
         Some(&codex_home),
+        None,
     );
     assert_eq!(resolved.for_provider(baton::types::ProviderId::Claude).model, "claude-opus-5-5");
     assert_eq!(
@@ -211,4 +212,82 @@ fn auth_signature_is_order_independent() {
         auth_signature(&[("B".into(), "2".into()), ("A".into(), "1".into())])
     );
     assert_eq!(auth_signature(&[]), "");
+}
+
+#[test]
+fn opencode_harness_config_reads_model_slug() {
+    let root = tempfile::tempdir().unwrap();
+    let global = root.path().join("opencode-config");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::write(
+        global.join("opencode.json"),
+        r#"{"$schema":"https://opencode.ai/config.json","provider":{"myprovider":{"npm":"@ai-sdk/openai-compatible","models":{"rits/zai-org/glm-5-3":{"name":"glm"}}}},"model":"myprovider/rits/zai-org/glm-5-3"}"#,
+    )
+    .unwrap();
+
+    let config = baton::harness_config::read_opencode_harness_config(&global, None);
+    assert_eq!(config.model.as_deref(), Some("myprovider/rits/zai-org/glm-5-3"));
+    assert_eq!(config.auth_mode, None, "opencode manages its own auth");
+
+    let resolved = baton::config::resolve_config_in(
+        root.path(),
+        std::path::Path::new("/nowhere"),
+        None,
+        None,
+        Some(&global),
+    );
+    assert_eq!(
+        resolved.for_provider(baton::types::ProviderId::OpenCode).model,
+        "myprovider/rits/zai-org/glm-5-3"
+    );
+}
+
+#[test]
+fn opencode_harness_config_project_jsonc_overrides_global() {
+    let root = tempfile::tempdir().unwrap();
+    let global = root.path().join("opencode-config");
+    std::fs::create_dir_all(&global).unwrap();
+    std::fs::write(global.join("opencode.json"), r#"{"model":"global/model"}"#).unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("opencode.jsonc"),
+        "{\n  // project-level provider\n  \"model\": \"myprovider/project-model\", // trailing comment\n}\n",
+    )
+    .unwrap();
+
+    let config = baton::harness_config::read_opencode_harness_config(&global, Some(project.path()));
+    assert_eq!(config.model.as_deref(), Some("myprovider/project-model"));
+
+    let global_only = baton::harness_config::read_opencode_harness_config(&global, None);
+    assert_eq!(global_only.model.as_deref(), Some("global/model"));
+}
+
+#[test]
+fn opencode_harness_config_missing_files_stay_default() {
+    let root = tempfile::tempdir().unwrap();
+    let config = baton::harness_config::read_opencode_harness_config(root.path(), None);
+    assert_eq!(config.model, None);
+}
+
+#[test]
+fn turn_diff_between_start_and_end_checkpoints() {
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "test@test"]);
+    git(repo.path(), &["config", "user.name", "test"]);
+    std::fs::write(repo.path().join("a.txt"), "initial\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "init"]);
+
+    let start = baton::checkpoints::checkpoint_start_ref("thread-diff", 1);
+    baton::checkpoints::capture_checkpoint_at(repo.path(), &start, "start").unwrap();
+    std::fs::write(repo.path().join("a.txt"), "changed\n").unwrap();
+    std::fs::write(repo.path().join("b.txt"), "new\n").unwrap();
+    let end = baton::checkpoints::capture_checkpoint(repo.path(), "thread-diff", 1).unwrap();
+
+    let diff = baton::checkpoints::diff_checkpoints(repo.path(), &start, &end).unwrap();
+    assert!(diff.contains("-initial"), "removed line shows: {}", diff);
+    assert!(diff.contains("+changed"), "added line shows: {}", diff);
+    assert!(diff.contains("+new"), "new file shows: {}", diff);
+    assert!(diff.contains("b.txt"));
 }

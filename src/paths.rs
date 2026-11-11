@@ -33,3 +33,16 @@ pub fn codex_global_home() -> PathBuf {
     }
     dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")).join(".codex")
 }
+
+pub fn opencode_global_config_dir() -> PathBuf {
+    if let Ok(config_home) = std::env::var("XDG_CONFIG_HOME") {
+        let trimmed = config_home.trim().to_string();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed).join("opencode");
+        }
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("opencode")
+}

@@ -101,6 +101,13 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages (thread_id, id);
+CREATE TABLE IF NOT EXISTS prompt_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cwd TEXT NOT NULL,
+  text TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS prompt_history_cwd_idx ON prompt_history (cwd, id);
 CREATE TABLE IF NOT EXISTS checkpoints (
   thread_id TEXT NOT NULL,
   turn INTEGER NOT NULL,
@@ -174,6 +181,9 @@ fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
 }
 
 const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at";
+
+/// Per-project prompt history cap, Claude Code style.
+pub const PROMPT_HISTORY_LIMIT: i64 = 100;
 
 impl BatonStore {
     pub fn open(path: &Path) -> Result<BatonStore> {
@@ -275,6 +285,44 @@ impl BatonStore {
             params![model, now_iso(), id],
         )?;
         Ok(())
+    }
+
+    /// Records a submitted prompt for a project, keeping the newest
+    /// [PROMPT_HISTORY_LIMIT] entries and skipping consecutive repeats.
+    pub fn record_prompt(&self, cwd: &str, text: &str) -> Result<()> {
+        let latest: Option<String> = self
+            .db
+            .query_row(
+                "SELECT text FROM prompt_history WHERE cwd = ? ORDER BY id DESC LIMIT 1",
+                params![cwd],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest.as_deref() == Some(text) {
+            return Ok(());
+        }
+        self.db.execute(
+            "INSERT INTO prompt_history (cwd, text, created_at) VALUES (?, ?, ?)",
+            params![cwd, text, now_iso()],
+        )?;
+        self.db.execute(
+            "DELETE FROM prompt_history WHERE cwd = ? AND id NOT IN (
+                 SELECT id FROM prompt_history WHERE cwd = ? ORDER BY id DESC LIMIT ?
+             )",
+            params![cwd, cwd, PROMPT_HISTORY_LIMIT],
+        )?;
+        Ok(())
+    }
+
+    /// Project prompt history, oldest first.
+    pub fn list_prompt_history(&self, cwd: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT text FROM prompt_history WHERE cwd = ? ORDER BY id ASC")?;
+        let rows = statement
+            .query_map(params![cwd], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     fn touch_thread(&self, id: &str) -> Result<()> {

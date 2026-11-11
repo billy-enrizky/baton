@@ -7,40 +7,56 @@ use tokio::sync::oneshot;
 use crate::adapters::{child_halves, BatonAdapter, LineReader, LineWriter, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
+pub type ClaudeSpawner = Arc<dyn Fn(&TurnStartInput, Option<&NativeSessionRef>) -> Result<TransportHalves> + Send + Sync>;
+
 pub struct ClaudeAdapter {
     interrupt: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+    spawner: ClaudeSpawner,
 }
 
 impl ClaudeAdapter {
-    pub fn new() -> ClaudeAdapter {
+    pub fn new(spawner: ClaudeSpawner) -> ClaudeAdapter {
         ClaudeAdapter {
             interrupt: Arc::new(Mutex::new(None)),
+            spawner,
         }
+    }
+
+    pub fn real_spawner() -> ClaudeSpawner {
+        Arc::new(|input, session| Self::spawn_halves(input, session))
+    }
+
+    pub fn command_args(input: &TurnStartInput, session: Option<&NativeSessionRef>) -> Vec<String> {
+        let mut args = vec![
+            "-p".to_string(),
+            "--input-format".to_string(),
+            "stream-json".to_string(),
+            "--output-format".to_string(),
+            "stream-json".to_string(),
+            "--verbose".to_string(),
+            "--include-partial-messages".to_string(),
+            "--model".to_string(),
+            input.model.clone(),
+        ];
+        if let Some(session) = session {
+            args.push("--resume".to_string());
+            args.push(session.native_session_id.clone());
+        }
+        match input.permission_mode {
+            PermissionMode::BypassPermissions => {
+                args.push("--dangerously-skip-permissions".to_string());
+            }
+            mode => {
+                args.push("--permission-mode".to_string());
+                args.push(mode.as_str().to_string());
+            }
+        }
+        args
     }
 
     pub fn spawn_halves(input: &TurnStartInput, session: Option<&NativeSessionRef>) -> Result<TransportHalves> {
         let mut command = tokio::process::Command::new("claude");
-        command.args([
-            "-p",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--verbose",
-            "--model",
-            &input.model,
-        ]);
-        if let Some(session) = session {
-            command.arg("--resume").arg(&session.native_session_id);
-        }
-        match input.permission_mode {
-            PermissionMode::BypassPermissions => {
-                command.arg("--dangerously-skip-permissions");
-            }
-            mode => {
-                command.arg("--permission-mode").arg(mode.as_str());
-            }
-        }
+        command.args(Self::command_args(input, session));
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::null());
@@ -49,12 +65,6 @@ impl ClaudeAdapter {
         }
         command.current_dir(&input.cwd);
         child_halves(command.spawn()?)
-    }
-}
-
-impl Default for ClaudeAdapter {
-    fn default() -> Self {
-        ClaudeAdapter::new()
     }
 }
 
@@ -102,7 +112,7 @@ impl BatonAdapter for ClaudeAdapter {
         session: Option<NativeSessionRef>,
         emit: TurnEventSender,
     ) -> Result<()> {
-        let (mut reader, mut writer) = Self::spawn_halves(&input, session.as_ref())?;
+        let (mut reader, mut writer) = (self.spawner)(&input, session.as_ref())?;
         let user_message = json!({
             "type": "user",
             "message": {
@@ -285,5 +295,34 @@ impl BatonAdapter for ClaudeAdapter {
 
     async fn dispose(&mut self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_args_request_partial_stream_messages() {
+        let input = TurnStartInput {
+            thread_id: "t".into(),
+            cwd: "/work".into(),
+            model: "claude-sonnet-4-5".into(),
+            prompt: "p".into(),
+            permission_mode: PermissionMode::Default,
+            auth_env: vec![],
+        };
+        let args = ClaudeAdapter::command_args(&input, None);
+        assert!(args.contains(&"--include-partial-messages".to_string()));
+        assert!(args.contains(&"--output-format".to_string()));
+        assert!(args.contains(&"stream-json".to_string()));
+
+        let resumed = ClaudeAdapter::command_args(
+            &input,
+            Some(&NativeSessionRef { native_session_id: "s-1".into(), rollout_path: None }),
+        );
+        let position = resumed.iter().position(|arg| arg == "--resume").expect("resume flag");
+        assert_eq!(resumed[position + 1], "s-1");
+        assert!(resumed.contains(&"--include-partial-messages".to_string()));
     }
 }

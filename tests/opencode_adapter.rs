@@ -1,0 +1,173 @@
+use baton::adapters::opencode::{OpenCodeAdapter, OpenCodeChild, OpenCodeSpawner};
+use baton::adapters::BatonAdapter;
+use baton::types::PermissionMode;
+use serde_json::{json, Value};
+use std::io::{Read, Write};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Minimal HTTP server speaking the opencode 1.x "next" flow: /api/info,
+/// session create/model/prompt, and an SSE /api/event stream whose final
+/// frames are held on a oneshot so the test can observe mid-turn deltas.
+fn serve_opencode(listener: std::net::TcpListener, release: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { break };
+        let release = release.clone();
+        std::thread::spawn(move || handle_connection(stream, &release));
+    }
+}
+
+fn handle_connection(mut stream: std::net::TcpStream, release: &Mutex<Option<tokio::sync::oneshot::Receiver<()>>>) {
+    let mut buffer = [0u8; 8192];
+    let mut head = Vec::new();
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        head.extend_from_slice(&buffer[..read]);
+        if let Some(header_end) = find_header_end(&head) {
+            let mut request = head.split_off(header_end);
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let content_length = head_text
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                .unwrap_or(0);
+            while request.len() < content_length {
+                let read = match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let path = head_text.lines().next().unwrap_or("").split(' ').nth(1).unwrap_or("").to_string();
+            respond(stream, &path, release);
+            return;
+        }
+    }
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|index| index + 4)
+}
+
+fn respond(mut stream: std::net::TcpStream, path: &str, release: &Mutex<Option<tokio::sync::oneshot::Receiver<()>>>) {
+    let respond_json = |stream: &mut std::net::TcpStream, status: &str, body: &str| {
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    };
+    match path {
+        "/api/info" => respond_json(&mut stream, "200 OK", r#"{"version":"fake"}"#),
+        "/api/session" => respond_json(&mut stream, "200 OK", r#"{"data":{"id":"ses_test"}}"#),
+        "/api/session/ses_test/model" => respond_json(&mut stream, "204 No Content", ""),
+        "/api/session/ses_test/prompt" => respond_json(&mut stream, "200 OK", r#"{"data":{"id":"msg_1"}}"#),
+        "/api/event" => {
+            let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: keep-alive\r\n\r\n";
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            let send = |stream: &mut std::net::TcpStream, frame: &Value| {
+                let payload = format!("data: {}\n\n", serde_json::to_string(frame).unwrap());
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+            };
+            let session = "ses_test";
+            send(&mut stream, &json!({"type": "session.next.text.delta", "data": {"sessionID": session, "delta": "streamed "}}));
+            send(&mut stream, &json!({"type": "session.next.tool.input.started", "data": {"sessionID": session, "callID": "call-1", "name": "read"}}));
+            send(&mut stream, &json!({"type": "session.next.tool.called", "data": {"sessionID": session, "callID": "call-1", "tool": "read", "input": {"path": "/work"}}}));
+            // The real 1.19 server omits the tool name on success; only the callID identifies it.
+            send(&mut stream, &json!({"type": "session.next.tool.success", "data": {"sessionID": session, "callID": "call-1"}}));
+            send(&mut stream, &json!({"type": "session.next.step.ended", "data": {"sessionID": session, "finish": "tool-calls", "tokens": {"input": 10, "output": 2, "reasoning": 0, "cache": {"read": 0, "write": 0}}}}));
+            send(&mut stream, &json!({"type": "session.next.text.delta", "data": {"sessionID": session, "delta": "live"}}));
+            let release = release.lock().unwrap().take().expect("release channel present");
+            let _ = release.blocking_recv();
+            send(&mut stream, &json!({"type": "session.next.text.ended", "data": {"sessionID": session, "text": "streamed live"}}));
+            send(&mut stream, &json!({"type": "session.next.step.ended", "data": {"sessionID": session, "finish": "stop", "tokens": {"input": 5, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}}}}));
+        }
+        _ => respond_json(&mut stream, "404 Not Found", "{}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (release_sender, release_receiver) = tokio::sync::oneshot::channel::<()>();
+    let release_slot = Arc::new(Mutex::new(Some(release_receiver)));
+    std::thread::spawn(move || serve_opencode(listener, release_slot));
+
+    let spawner: OpenCodeSpawner = Arc::new(move |_auth_env: &[(String, String)]| {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        Ok(OpenCodeChild { port, password: "pw".to_string(), child })
+    });
+    let mut adapter = OpenCodeAdapter::new(spawner);
+
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let turn_task = tokio::spawn(async move {
+        adapter
+            .start_turn(
+                baton::adapters::TurnStartInput {
+                    thread_id: "baton-thread".into(),
+                    cwd: "/work".into(),
+                    model: "myprovider/rits-zai-org/glm-5-3".into(),
+                    prompt: "hello".into(),
+                    permission_mode: PermissionMode::Default,
+                    auth_env: vec![],
+                },
+                None,
+                event_sender,
+            )
+            .await
+            .unwrap();
+    });
+
+    // Deltas (and the tool-calls step end) must arrive while the turn is held open.
+    let first_delta = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            match event_receiver.try_recv() {
+                Ok(baton::adapters::TurnEvent::TextDelta { text }) => break text,
+                Ok(_) => {}
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+    })
+    .await
+    .expect("text delta arrives while the turn is in flight");
+    assert_eq!(first_delta, "streamed ");
+    assert!(!turn_task.is_finished(), "a tool-calls step must not complete the turn");
+
+    let _ = release_sender.send(());
+    tokio::time::timeout(Duration::from_secs(10), turn_task).await.unwrap().unwrap();
+
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    let deltas: String = std::iter::once(first_delta)
+        .chain(events.iter().filter_map(|event| match event {
+            baton::adapters::TurnEvent::TextDelta { text } => Some(text.clone()),
+            _ => None,
+        }))
+        .collect();
+    assert_eq!(deltas, "streamed live");
+    assert!(events.iter().any(|event| matches!(event, baton::adapters::TurnEvent::ToolStarted { tool, .. } if tool == "read")));
+    assert!(events.iter().any(|event| matches!(event, baton::adapters::TurnEvent::ToolCompleted { tool, .. } if tool == "read")));
+    let completed = events
+        .iter()
+        .find_map(|event| match event {
+            baton::adapters::TurnEvent::TurnCompleted { final_text, usage, native_session_id, .. } => {
+                Some((final_text.clone(), usage.clone(), native_session_id.clone()))
+            }
+            _ => None,
+        })
+        .expect("turn completed event");
+    assert_eq!(completed.0, "streamed live", "final text comes from session.next.text.ended");
+    assert_eq!(completed.1.unwrap().input_tokens, 15, "usage sums across steps");
+    assert_eq!(completed.2.as_deref(), Some("ses_test"));
+}

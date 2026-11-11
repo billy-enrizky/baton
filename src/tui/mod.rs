@@ -21,6 +21,8 @@ use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_us
 
 pub mod viewport;
 
+mod diff_render;
+
 use viewport::{window_messages, wrapped_rows, ViewportItem};
 
 const COLORS: ColorConstants = ColorConstants {
@@ -58,7 +60,7 @@ const LOGO_ROWS: [&str; 6] = [
 ];
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/switch", "switch harness: /switch <claude|codex> [model]"),
+    ("/switch", "switch harness: /switch <provider> [model]"),
     ("/model", "set model for this thread"),
     ("/mode", "permission mode: default|acceptEdits|bypassPermissions|plan"),
     ("/auth", "billing mode: /auth <provider> <subscription|api>"),
@@ -133,7 +135,6 @@ pub struct TuiState {
     history: Vec<MessageRow>,
     input: String,
     running: bool,
-    turn_started: Option<Instant>,
     streaming_text: String,
     tool_lines: Vec<ToolLine>,
     overlay: Overlay,
@@ -146,6 +147,9 @@ pub struct TuiState {
     branch_label: Option<String>,
     quit: bool,
     suggestion_index: usize,
+    selection_anchor: Option<usize>,
+    selection: Option<(usize, usize)>,
+    input_origin: std::cell::Cell<(u16, u16)>,
 }
 
 pub fn run_tui(
@@ -159,13 +163,14 @@ pub fn run_tui(
     initial_permission_mode: PermissionMode,
 ) -> Result<()> {
     let history = store.lock().unwrap().list_messages(&thread.id)?;
+    let prompt_history = store.lock().unwrap().list_prompt_history(&thread.cwd).unwrap_or_default();
     let branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
     let permission_mode = initial_permission_mode;
 
     let custom_commands = discover_custom_commands(&thread.cwd);
     let mut state = TuiState {
         store: store.clone(),
-        prompt_history: Vec::new(),
+        prompt_history,
         prompt_history_index: None,
         queued_messages: Vec::new(),
         goal: None,
@@ -175,7 +180,6 @@ pub fn run_tui(
         history,
         input: String::new(),
         running: false,
-        turn_started: None,
         streaming_text: String::new(),
         tool_lines: Vec::new(),
         overlay: Overlay::None,
@@ -188,6 +192,9 @@ pub fn run_tui(
         branch_label,
         quit: false,
         suggestion_index: 0,
+        selection_anchor: None,
+        selection: None,
+        input_origin: std::cell::Cell::new((0, 0)),
     };
 
     if let Some(prompt) = initial_prompt {
@@ -204,13 +211,17 @@ pub fn run_tui(
                 permission_mode: state.permission_mode,
             });
             state.running = true;
-            state.turn_started = Some(Instant::now());
         }
     }
 
     terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide,
+        crossterm::event::EnableMouseCapture
+    )?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -223,10 +234,14 @@ pub fn run_tui(
             apply_engine_event(&mut state, &store, event, &engine_command_sender);
         }
         if crossterm::event::poll(Duration::from_millis(32))? {
-            if let Event::Key(key) = crossterm::event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    handle_key(&mut state, &store, &engine_command_sender, key);
+            match crossterm::event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        handle_key(&mut state, &store, &engine_command_sender, key);
+                    }
                 }
+                Event::Mouse(mouse) => handle_mouse(&mut state, mouse),
+                _ => {}
             }
         }
         spinner_frame = (spinner_frame + 1) % SPINNER_FRAMES.len();
@@ -237,10 +252,40 @@ pub fn run_tui(
     execute!(
         terminal.backend_mut(),
         crossterm::cursor::Show,
-        terminal::LeaveAlternateScreen
+        terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
     )?;
     let _ = engine_command_sender.send(EngineCommand::Quit);
     Ok(())
+}
+
+/// Mouse selection inside the composer input: click sets an anchor, drag
+/// extends an orange-highlighted range, and clicks outside the input clear it.
+fn handle_mouse(state: &mut TuiState, mouse: crossterm::event::MouseEvent) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (origin_x, origin_y) = state.input_origin.get();
+    let char_index = |column: u16, input: &str| input.chars().take(column.saturating_sub(origin_x) as usize).count();
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if mouse.row == origin_y {
+                let index = char_index(mouse.column, &state.input);
+                state.selection_anchor = Some(index);
+                state.selection = Some((index, index));
+            } else {
+                state.selection_anchor = None;
+                state.selection = None;
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(anchor) = state.selection_anchor {
+                if mouse.row == origin_y {
+                    let index = char_index(mouse.column, &state.input);
+                    state.selection = Some((anchor.min(index), anchor.max(index)));
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 fn apply_engine_event(
@@ -268,8 +313,7 @@ fn apply_engine_event(
         EngineEvent::TurnStarted { thread_id } => {
             if thread_id == state.thread.id {
                 state.running = true;
-                state.turn_started = Some(Instant::now());
-                state.streaming_text.clear();
+                    state.streaming_text.clear();
                 state.tool_lines.clear();
                 state.notice = None;
                 state.diff_output = None;
@@ -278,7 +322,6 @@ fn apply_engine_event(
         EngineEvent::TurnFinished { thread_id, ok, error } => {
             if thread_id == state.thread.id {
                 state.running = false;
-                state.turn_started = None;
                 state.streaming_text.clear();
                 state.tool_lines.clear();
                 {
@@ -814,6 +857,8 @@ fn handle_composer_key(
             state.input.clear();
             state.suggestion_index = 0;
             state.esc_primed = false;
+            state.selection = None;
+            state.selection_anchor = None;
             if text.starts_with('/') {
                 handle_command(state, store, engine_command_sender, &text);
             } else if state.running {
@@ -830,6 +875,38 @@ fn handle_composer_key(
             state.input.pop();
             state.suggestion_index = 0;
             state.esc_primed = false;
+            state.selection = None;
+            state.selection_anchor = None;
+            state.prompt_history_index = None;
+        }
+        // Claude Code style recall: with an empty input (or while already
+        // recalling), Up walks back through this project's prompt history
+        // and Down walks forward. Otherwise the arrows scroll the transcript.
+        KeyCode::Up if !state.prompt_history.is_empty() && (state.input.is_empty() || state.prompt_history_index.is_some()) => {
+            if !state.prompt_history.is_empty() {
+                let next = match state.prompt_history_index {
+                    None => state.prompt_history.len() - 1,
+                    Some(0) => 0,
+                    Some(index) => index - 1,
+                };
+                state.input = state.prompt_history[next].clone();
+                state.prompt_history_index = Some(next);
+                state.selection = None;
+                state.selection_anchor = None;
+                state.esc_primed = false;
+            }
+        }
+        KeyCode::Down if state.prompt_history_index.is_some() => {
+            let index = state.prompt_history_index.unwrap() + 1;
+            if index >= state.prompt_history.len() {
+                state.input.clear();
+                state.prompt_history_index = None;
+            } else {
+                state.input = state.prompt_history[index].clone();
+                state.prompt_history_index = Some(index);
+            }
+            state.selection = None;
+            state.selection_anchor = None;
         }
         KeyCode::Up => {
             state.scroll_offset += 1;
@@ -859,6 +936,7 @@ fn handle_composer_key(
                 }
             } else {
                 state.input.clear();
+                state.prompt_history_index = None;
                 state.notice = Some("composer cleared".into());
             }
         }
@@ -867,6 +945,9 @@ fn handle_composer_key(
                 state.input.push(char);
                 state.suggestion_index = 0;
                 state.esc_primed = false;
+                state.selection = None;
+                state.selection_anchor = None;
+                state.prompt_history_index = None;
             }
         }
         _ => {}
@@ -881,6 +962,13 @@ fn submit(
 ) {
     state.prompt_history.push(text.clone());
     state.prompt_history_index = None;
+    let recorded = {
+        let guard = store.lock().unwrap();
+        guard.record_prompt(&state.thread.cwd, &text)
+    };
+    if let Err(error) = recorded {
+        state.notice = Some(format!("cannot record prompt: {error}"));
+    }
     let text = if let Some(goal) = &state.goal {
         format!("[goal: {goal}]\n{text}")
     } else {
@@ -979,17 +1067,26 @@ fn handle_command(
         }
         "/multi" => {
             if args.len() < 2 {
-                state.notice = Some("usage: /multi <provider1> <provider2> ... <prompt>".into());
+                state.notice = Some("usage: /multi <provider> [<provider> ...] <prompt>".into());
                 return;
             }
-            let prompt = args.last().cloned().unwrap_or_default();
-            let providers: Vec<&str> = args[..args.len() - 1].iter().map(String::as_str).collect();
-            let valid_providers: Vec<ProviderId> = providers
-                .iter()
-                .filter_map(|provider| ProviderId::parse(provider))
-                .collect();
-            if valid_providers.is_empty() {
-                state.notice = Some("no valid providers. Use claude, codex, cursor, grok, opencode, or antigravity".into());
+            // Leading arguments that name providers; everything after them is
+            // the prompt, so multi-word prompts keep their words.
+            let mut valid_providers: Vec<ProviderId> = Vec::new();
+            let mut prompt_parts: Vec<String> = Vec::new();
+            for arg in &args {
+                match ProviderId::parse(arg) {
+                    Some(provider) if prompt_parts.is_empty() => {
+                        if !valid_providers.contains(&provider) {
+                            valid_providers.push(provider);
+                        }
+                    }
+                    _ => prompt_parts.push(arg.clone()),
+                }
+            }
+            let prompt = prompt_parts.join(" ");
+            if valid_providers.is_empty() || prompt.trim().is_empty() {
+                state.notice = Some("usage: /multi <provider> [<provider> ...] <prompt>".into());
                 return;
             }
             state.notice = Some(format!(
@@ -998,17 +1095,21 @@ fn handle_command(
                 valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
             ));
             let mut threads = Vec::new();
-            for provider in valid_providers {
+            for provider in valid_providers.clone() {
                 let thread = {
-                    let guard = store.lock().unwrap();
+                    let mut guard = store.lock().unwrap();
                     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
                     let model = resolved.for_provider(provider).model.clone();
-                    guard.draft_thread(crate::store::NewThread {
+                    let mut thread = guard.draft_thread(crate::store::NewThread {
                         title: format!("[multi] {prompt}"),
                         cwd: state.thread.cwd.clone(),
                         current_provider: provider,
                         current_model: Some(model),
-                    })
+                    });
+                    // Draft threads are not persisted until a turn runs; the
+                    // engine looks the thread up immediately, so create it now.
+                    let _ = ensure_persisted(&guard, &mut thread);
+                    thread
                 };
                 threads.push(thread);
             }
@@ -1020,6 +1121,11 @@ fn handle_command(
                     permission_mode: state.permission_mode,
                 });
             }
+            state.notice = Some(format!(
+                "sent to {} providers in parallel: {} · open their replies with /threads",
+                valid_providers.len(),
+                valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
+            ));
         }
         "/compact" => {
             let messages: Vec<(String, String)> = state
@@ -1118,12 +1224,7 @@ fn handle_command(
         }
         "/switch" => {
             let target = args.first().map(String::as_str);
-            let provider = match target {
-                Some("claude") => Some(ProviderId::Claude),
-                Some("codex") => Some(ProviderId::Codex),
-                _ => None,
-            };
-            match provider {
+            match target.and_then(ProviderId::parse) {
                 None => state.overlay = Overlay::SwitchPicker { selected: 0 },
                 Some(provider) => perform_switch(state, store, provider, args.get(1).cloned()),
             }
@@ -1149,8 +1250,12 @@ fn handle_command(
                         ensure_persisted(&guard, &mut state.thread)
                             .and_then(|()| guard.set_thread_model(&state.thread.id, model))
                     };
-                    if let Err(error) = result {
-                        state.notice = Some(format!("cannot set model: {error}"));
+                    match result {
+                        Ok(()) => {
+                            state.thread.current_model = Some(model.clone());
+                            state.notice = Some(format!("model set to {model}"));
+                        }
+                        Err(error) => state.notice = Some(format!("cannot set model: {error}")),
                     }
                 }
             }
@@ -1415,23 +1520,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
         Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
     };
-    let live_tool_rows = state.tool_lines.len().min(5);
-    let streaming_cap = ((area.height as usize).saturating_sub(composer_rows + 6) * 3 / 5).max(3);
-    let streaming_rows = if state.streaming_text.is_empty() {
-        0
-    } else {
-        wrapped_rows(&state.streaming_text, area.width as usize).min(streaming_cap)
-    };
-    let thinking = state.running && state.tool_lines.is_empty() && state.streaming_text.is_empty();
-    let live_rows = if thinking {
-        1
-    } else {
-        live_tool_rows + streaming_rows + if streaming_rows > 0 { 1 } else { 0 }
-    };
-
     let chunks = Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(live_rows as u16),
         Constraint::Length(overlay_rows as u16),
         Constraint::Length(notice_rows as u16),
         Constraint::Length(composer_rows as u16),
@@ -1439,41 +1529,38 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     ])
     .split(area);
 
-    draw_transcript(frame, state, chunks[0]);
-    if live_rows > 0 {
-        draw_live(frame, state, chunks[1], spinner_frame, thinking);
-    }
+    draw_transcript(frame, state, chunks[0], spinner_frame);
     match &state.overlay {
-        Overlay::Approval { summary, .. } => draw_approval(frame, chunks[2], summary),
-        Overlay::RewindPicker { selected } => draw_rewind_picker(frame, chunks[2], state, *selected),
-        Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[2], *turn),
-        Overlay::SwitchPicker { selected } => draw_switch_picker(frame, chunks[2], state, *selected),
+        Overlay::Approval { summary, .. } => draw_approval(frame, chunks[1], summary),
+        Overlay::RewindPicker { selected } => draw_rewind_picker(frame, chunks[1], state, *selected),
+        Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[1], *turn),
+        Overlay::SwitchPicker { selected } => draw_switch_picker(frame, chunks[1], state, *selected),
         Overlay::ModelPicker { provider, models, selected } => {
-            draw_model_picker(frame, chunks[2], state, *provider, models, *selected)
+            draw_model_picker(frame, chunks[1], state, *provider, models, *selected)
         }
         Overlay::SettingsPicker { provider, categories, category_index, value_index } => {
-            draw_settings_picker(frame, chunks[2], *provider, categories, *category_index, *value_index)
+            draw_settings_picker(frame, chunks[1], *provider, categories, *category_index, *value_index)
         }
-        Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[2], *selected),
+        Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[1], *selected),
         Overlay::SkillsPicker { selected, skills } => {
-            draw_skills_picker(frame, chunks[2], skills, *selected)
+            draw_skills_picker(frame, chunks[1], skills, *selected)
         }
-        Overlay::ModePicker { selected } => draw_mode_picker(frame, chunks[2], state, *selected),
-        Overlay::AuthPicker { selected } => draw_auth_picker(frame, chunks[2], state, *selected),
+        Overlay::ModePicker { selected } => draw_mode_picker(frame, chunks[1], state, *selected),
+        Overlay::AuthPicker { selected } => draw_auth_picker(frame, chunks[1], state, *selected),
         Overlay::ThreadPicker { selected, threads } => {
-            draw_thread_picker(frame, chunks[2], threads, *selected)
+            draw_thread_picker(frame, chunks[1], threads, *selected)
         }
         Overlay::CheckpointPicker { selected, checkpoints } => {
-            draw_checkpoint_picker(frame, chunks[2], checkpoints, *selected)
+            draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected)
         }
         Overlay::None => {}
     }
     if let Some(notice) = &state.notice {
         let paragraph = Paragraph::new(notice.clone()).style(Style::default().fg(COLORS.warning)).wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, chunks[3]);
+        frame.render_widget(paragraph, chunks[2]);
     }
-    draw_composer(frame, state, chunks[4], &suggestions);
-    draw_status(frame, state, chunks[5], spinner_frame);
+    draw_composer(frame, state, chunks[3], &suggestions);
+    draw_status(frame, state, chunks[4]);
 }
 
 fn discover_custom_commands(cwd: &str) -> Vec<(String, String)> {
@@ -1577,10 +1664,12 @@ fn perform_switch(
     let result = {
         let guard = store.lock().unwrap();
         ensure_persisted(&guard, &mut state.thread)
-            .and_then(|()| guard.set_thread_provider(&state.thread.id, provider, model))
+            .and_then(|()| guard.set_thread_provider(&state.thread.id, provider, model.clone()))
     };
     match result {
         Ok(()) => {
+            state.thread.current_provider = provider;
+            state.thread.current_model = model.clone();
             state.permission_mode = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd))
                 .for_provider(provider)
                 .permission_mode;
@@ -1800,19 +1889,10 @@ fn draw_checkpoint_picker(frame: &mut ratatui::Frame, area: Rect, checkpoints: &
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize) {
     if let Some(diff) = &state.diff_output {
         let lines: Vec<Line> = std::iter::once(Line::styled("diff · /clear to close", Style::default().fg(COLORS.muted)))
-            .chain(diff.lines().take(area.height.saturating_sub(1) as usize).map(|line| {
-                let style = if line.starts_with('+') {
-                    Style::default().fg(COLORS.success)
-                } else if line.starts_with('-') {
-                    Style::default().fg(COLORS.error)
-                } else {
-                    Style::default()
-                };
-                Line::styled(line.to_string(), style)
-            }))
+            .chain(diff_render::render_diff_lines(diff, area.width.saturating_sub(2) as usize))
             .collect();
         frame.render_widget(Paragraph::new(lines), area);
         return;
@@ -1866,6 +1946,27 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     // Build all terminal lines (each element = exactly 1 rendered row)
     let mut all_lines: Vec<Line> = Vec::new();
     for message in &state.history {
+        if message.role == "tool" {
+            let style = if message.text.starts_with("✗") {
+                COLORS.error
+            } else if message.text.starts_with("✓") {
+                COLORS.success
+            } else {
+                COLORS.muted
+            };
+            for line in wrap(&message.text) {
+                all_lines.push(Line::styled(line, Style::default().fg(style)));
+            }
+            continue;
+        }
+        if message.role == "diff" {
+            all_lines.extend(diff_render::render_diff_lines(
+                &message.text,
+                width.saturating_sub(2),
+            ));
+            all_lines.push(Line::from(vec![Span::raw(" ")]));
+            continue;
+        }
         if message.role == "user" {
             for line in wrap(&message.text) {
                 all_lines.push(Line::styled(line, Style::default().fg(COLORS.text).bg(COLORS.user_bg)));
@@ -1883,6 +1984,41 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
                 all_lines.push(Line::styled(line, Style::default().fg(COLORS.text)));
             }
         }
+        all_lines.push(Line::from(vec![Span::raw(" ")]));
+    }
+
+    // Live turn activity flows right after the newest message, in the
+    // transcript itself rather than a separate panel above the composer.
+    let mut live_lines = 0usize;
+    let spinner = SPINNER_FRAMES[spinner_frame];
+    if state.running && state.tool_lines.is_empty() && state.streaming_text.is_empty() {
+        all_lines.push(Line::from(vec![
+            Span::styled(spinner, Style::default().fg(COLORS.accent)),
+            Span::raw(" "),
+            Span::styled("Thinking", Style::default().fg(COLORS.accent)),
+        ]));
+        live_lines += 1;
+    }
+    for tool_line in &state.tool_lines {
+        let line = match tool_line.status {
+            ToolStatus::Running => Line::from(vec![
+                Span::styled(spinner, Style::default().fg(COLORS.accent)),
+                Span::raw(" "),
+                Span::styled(tool_line.label.clone(), Style::default().fg(COLORS.accent)),
+            ]),
+            ToolStatus::Done => Line::styled(format!("✓ {}", tool_line.label), Style::default().fg(COLORS.success)),
+            ToolStatus::Failed => Line::styled(format!("✗ {}", tool_line.label), Style::default().fg(COLORS.error)),
+        };
+        all_lines.push(line);
+        live_lines += 1;
+    }
+    if !state.streaming_text.is_empty() {
+        for line in wrap(&state.streaming_text) {
+            all_lines.push(Line::styled(line, Style::default().fg(COLORS.text)));
+            live_lines += 1;
+        }
+    }
+    if live_lines > 0 {
         all_lines.push(Line::from(vec![Span::raw(" ")]));
     }
 
@@ -1922,49 +2058,6 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     }
 
     frame.render_widget(Paragraph::new(render_lines), area);
-}
-
-fn draw_live(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize, thinking: bool) {
-    let spinner = SPINNER_FRAMES[spinner_frame];
-    if thinking {
-        let line = Line::from(vec![
-            Span::styled(spinner, Style::default().fg(COLORS.accent)),
-            Span::raw(" "),
-            Span::styled("Thinking", Style::default().fg(COLORS.accent)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
-    let mut lines: Vec<Line> = Vec::new();
-    for tool_line in state.tool_lines.iter().rev().take(area.height as usize) {
-        let line = match tool_line.status {
-            ToolStatus::Running => Line::from(vec![
-                Span::styled(spinner, Style::default().fg(COLORS.accent)),
-                Span::raw(" "),
-                Span::styled(tool_line.label.clone(), Style::default().fg(COLORS.accent)),
-            ]),
-            ToolStatus::Done => Line::styled(format!("✓ {}", tool_line.label), Style::default().fg(COLORS.success)),
-            ToolStatus::Failed => Line::styled(format!("✗ {}", tool_line.label), Style::default().fg(COLORS.error)),
-        };
-        lines.push(line);
-    }
-    if !state.streaming_text.is_empty() {
-        let all_lines: Vec<&str> = state.streaming_text.lines().collect();
-        let tool_row_count = lines.len();
-        let available = (area.height as usize).saturating_sub(tool_row_count);
-        if all_lines.len() > available && available > 0 {
-            lines.push(Line::styled("…", Style::default().fg(COLORS.muted)));
-            let start = all_lines.len().saturating_sub(available.saturating_sub(1));
-            for line in &all_lines[start..] {
-                lines.push(Line::styled(*line, Style::default().fg(COLORS.text)));
-            }
-        } else {
-            for line in &all_lines {
-                lines.push(Line::styled(*line, Style::default().fg(COLORS.text)));
-            }
-        }
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 fn draw_approval(frame: &mut ratatui::Frame, area: Rect, summary: &str) {
@@ -2051,12 +2144,31 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
         ));
         rows.push(Line::from(""));
     }
-    let display = if state.input.is_empty() {
-        Line::styled("Ask anything...", Style::default().fg(COLORS.muted))
+    let input_row_index = rows.len();
+    let display: Vec<Span> = if state.input.is_empty() {
+        vec![Span::styled("Ask anything...", Style::default().fg(COLORS.muted))]
     } else {
-        Line::styled(state.input.clone(), Style::default().fg(COLORS.text))
+        match state.selection {
+            Some((start, end)) if end > start => {
+                let chars: Vec<char> = state.input.chars().collect();
+                let (start, end) = (start.min(chars.len()), end.min(chars.len()));
+                if end > start {
+                    let selected = chars[start..end].iter().collect::<String>();
+                    vec![
+                        Span::styled(chars[..start].iter().collect::<String>(), Style::default().fg(COLORS.text)),
+                        Span::styled(selected, Style::default().fg(Color::Black).bg(COLORS.accent)),
+                        Span::styled(chars[end..].iter().collect::<String>(), Style::default().fg(COLORS.text)),
+                    ]
+                } else {
+                    vec![Span::styled(state.input.clone(), Style::default().fg(COLORS.text))]
+                }
+            }
+            _ => vec![Span::styled(state.input.clone(), Style::default().fg(COLORS.text))],
+        }
     };
-    rows.push(display);
+    // Screen position of the input text, for mapping mouse columns to chars.
+    state.input_origin.set((area.x + 1, area.y + 1 + input_row_index as u16));
+    rows.push(Line::from(display));
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
     let provider_config = resolved.for_provider(state.thread.current_provider);
     let effective_model = state
@@ -2088,20 +2200,8 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
     );
 }
 
-fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize) {
-    let left = if state.running {
-        let elapsed = state
-            .turn_started
-            .map(|started| started.elapsed().as_secs())
-            .unwrap_or(0);
-        Line::from(vec![
-            Span::styled(SPINNER_FRAMES[spinner_frame], Style::default().fg(COLORS.accent)),
-            Span::styled(
-                format!(" Working [{elapsed}s] · esc to interrupt"),
-                Style::default().fg(COLORS.accent),
-            ),
-        ])
-    } else if state.esc_primed {
+fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+    let left = if state.esc_primed {
         Line::styled("esc again to edit previous message", Style::default().fg(COLORS.muted))
     } else {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -2149,5 +2249,404 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner
 impl TuiState {
     fn store_rows(&self) -> Option<Vec<crate::store::UsageRow>> {
         self.store.lock().unwrap().list_usage(Some(&self.thread.id)).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn render_state(state: &TuiState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, state, 0)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn test_state(home: &std::path::Path, store: &Arc<Mutex<BatonStore>>, history: Vec<MessageRow>) -> TuiState {
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.to_string_lossy().to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        TuiState {
+            store: store.clone(),
+            prompt_history: Vec::new(),
+            prompt_history_index: None,
+            queued_messages: Vec::new(),
+            goal: None,
+            custom_commands: Vec::new(),
+            home: home.to_path_buf(),
+            thread,
+            history,
+            input: String::new(),
+            running: false,
+                streaming_text: String::new(),
+            tool_lines: Vec::new(),
+            overlay: Overlay::None,
+            notice: None,
+            diff_output: None,
+            permission_mode: PermissionMode::Default,
+            scroll_offset: 0,
+            esc_primed: false,
+            exit_armed: None,
+            branch_label: None,
+            quit: false,
+            suggestion_index: 0,
+            selection_anchor: None,
+            selection: None,
+            input_origin: std::cell::Cell::new((0, 0)),
+        }
+    }
+
+    fn history_message(thread_id: &str, index: usize) -> MessageRow {
+        MessageRow {
+            id: index as i64,
+            thread_id: thread_id.to_string(),
+            turn: index as i64,
+            role: "user".to_string(),
+            provider: None,
+            model: None,
+            text: format!("message {index:02}"),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn suggestion_window_follows_selection() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "/".to_string();
+        state.suggestion_index = 10;
+
+        let suggestions = suggestions_for(&state.input);
+        assert_eq!(suggestions.len(), 23);
+
+        let buffer = render_state(&state, 100, 30);
+        let text = buffer_lines(&buffer).join("\n");
+
+        assert!(text.contains("11/23"), "position indicator must reflect the selection");
+        let selected = suggestions[10].0;
+        assert!(text.contains(selected), "selected command {selected} must be visible");
+        assert!(!text.contains("/switch"), "commands above the window must be hidden");
+        assert!(!text.contains("/clear"), "commands below the window must be hidden");
+
+        let row = buffer_lines(&buffer)
+            .iter()
+            .position(|line| line.contains(selected))
+            .expect("selected row rendered");
+        let styled = (0..buffer.area.width).any(|x| {
+            let cell = buffer.get(x, row as u16);
+            cell.fg == COLORS.accent && cell.modifier.contains(Modifier::BOLD)
+        });
+        assert!(styled, "selected row must be highlighted");
+    }
+
+    #[test]
+    fn transcript_scroll_shows_older_lines() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        let history: Vec<MessageRow> = (1..=30).map(|index| history_message(&thread_id, index)).collect();
+        let mut state = test_state(home.path(), &store, history);
+
+        let bottom = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(bottom.contains("message 30"), "bottom view shows the newest message");
+        assert!(!bottom.contains("message 01"), "oldest message is off-screen");
+
+        state.scroll_offset = 8;
+        let scrolled = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(scrolled.contains("8 lines above"), "scroll indicator must render");
+        assert!(!scrolled.contains("message 30"), "scrolled view must move away from the bottom");
+        assert!(scrolled.contains("message 15"), "scrolled view must show older content");
+    }
+
+    #[test]
+    fn switch_updates_composer_immediately() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        assert_eq!(state.thread.current_provider, ProviderId::Claude);
+
+        perform_switch(&mut state, &store, ProviderId::Codex, Some("rits/zai-org/glm-5-3".to_string()));
+
+        assert_eq!(state.thread.current_provider, ProviderId::Codex, "in-memory thread must reflect the switch");
+        assert_eq!(state.thread.current_model.as_deref(), Some("rits/zai-org/glm-5-3"));
+        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(persisted.current_provider, ProviderId::Codex);
+
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        let composer_row = text
+            .lines()
+            .find(|line| line.contains("codex") || line.contains("claude"))
+            .expect("composer provider row rendered");
+        assert!(composer_row.contains("codex"), "composer must show the new provider: {composer_row}");
+        assert!(composer_row.contains("rits/zai-org/glm-5-3"), "composer must show the new model: {composer_row}");
+    }
+
+    #[test]
+    fn model_command_updates_composer_immediately() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/model claude-opus-5-5");
+
+        assert_eq!(state.thread.current_model.as_deref(), Some("claude-opus-5-5"));
+        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(persisted.current_model.as_deref(), Some("claude-opus-5-5"));
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("claude-opus-5-5"), "composer must show the new model immediately");
+    }
+
+    #[test]
+    fn input_selection_renders_orange_highlight() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "hello world".to_string();
+        state.selection = Some((0, 5));
+
+        let buffer = render_state(&state, 100, 30);
+        let (origin_x, origin_y) = state.input_origin.get();
+        assert!(origin_y > 0, "input origin must be recorded during draw");
+        let selected_cells_orange = (origin_x..origin_x + 5)
+            .filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent)
+            .count();
+        assert_eq!(selected_cells_orange, 5, "selected 'hello' must carry the orange background");
+        assert_ne!(buffer.get(origin_x + 6, origin_y).bg, COLORS.accent, "unselected text must not be highlighted");
+
+        state.selection = Some((6, 11));
+        let buffer = render_state(&state, 100, 30);
+        let world_orange = (origin_x + 6..origin_x + 11)
+            .filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent)
+            .count();
+        assert_eq!(world_orange, 5, "a later range highlights only that range");
+    }
+
+    #[test]
+    fn mouse_drag_builds_selection_from_input_origin() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "hello world".to_string();
+        render_state(&state, 100, 30);
+        let (origin_x, origin_y) = state.input_origin.get();
+
+        let mouse = |kind: crossterm::event::MouseEventKind, column: u16| crossterm::event::MouseEvent {
+            kind,
+            column,
+            row: origin_y,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_mouse(&mut state, mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), origin_x));
+        handle_mouse(&mut state, mouse(crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left), origin_x + 5));
+        assert_eq!(state.selection, Some((0, 5)), "drag from the first column selects 'hello'");
+
+        let buffer = render_state(&state, 100, 30);
+        let orange = (origin_x..origin_x + 5).filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent).count();
+        assert_eq!(orange, 5, "the dragged range renders with the orange background");
+    }
+
+    #[test]
+    fn live_activity_follows_last_message_in_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        let history = vec![history_message(&thread_id, 1)];
+        let mut state = test_state(home.path(), &store, history);
+
+        state.running = true;
+        let lines = buffer_lines(&render_state(&state, 100, 30));
+        let user_row = lines.iter().position(|line| line.contains("message 01")).expect("user message rendered");
+        let thinking_row = lines.iter().position(|line| line.contains("Thinking")).expect("thinking spinner in transcript");
+        assert!(thinking_row > user_row, "thinking renders after the user message, not above the composer");
+
+        state.tool_lines.push(ToolLine { label: "shell cargo test".into(), status: ToolStatus::Running });
+        state.streaming_text = "partial answer".into();
+        let lines = buffer_lines(&render_state(&state, 100, 30));
+        let user_row = lines.iter().position(|line| line.contains("message 01")).expect("user message rendered");
+        let tool_row = lines.iter().position(|line| line.contains("cargo test")).expect("tool line in transcript");
+        let stream_row = lines.iter().position(|line| line.contains("partial answer")).expect("streaming text in transcript");
+        assert!(user_row < tool_row && tool_row < stream_row, "tools and streaming follow the user message in order");
+        assert!(!lines.iter().any(|line| line.contains("Working [")), "the status bar no longer shows a Working spinner");
+    }
+
+    #[test]
+    fn persisted_tool_history_renders_in_conversation() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        {
+            let guard = store.lock().unwrap();
+            guard.add_message(&thread_id, 1, "user", None, None, "run the tests").unwrap();
+            guard.add_message(&thread_id, 1, "tool", Some("codex"), None, "✓ shell cargo test").unwrap();
+            guard.add_message(&thread_id, 1, "tool", Some("codex"), None, "✗ shell npm build").unwrap();
+            guard.add_message(&thread_id, 1, "assistant", Some("codex"), None, "tests pass").unwrap();
+        }
+        let history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        let state = test_state(home.path(), &store, history);
+
+        let buffer = render_state(&state, 100, 30);
+        let lines = buffer_lines(&buffer);
+        let user_row = lines.iter().position(|line| line.contains("run the tests")).expect("user message");
+        let ok_row = lines.iter().position(|line| line.contains("✓ shell cargo test")).expect("succeeded tool");
+        let fail_row = lines.iter().position(|line| line.contains("✗ shell npm build")).expect("failed tool");
+        let reply_row = lines.iter().position(|line| line.contains("tests pass")).expect("assistant reply");
+        assert!(user_row < ok_row && ok_row < fail_row && fail_row < reply_row, "tool history stays in conversation order");
+
+        let ok_line: Vec<(u16, u16)> = (0..buffer.area.width)
+            .filter(|&x| buffer.get(x, ok_row as u16).symbol() == "✓")
+            .map(|x| (x, ok_row as u16))
+            .collect();
+        assert!(!ok_line.is_empty());
+        assert_eq!(buffer.get(ok_line[0].0, ok_line[0].1).fg, COLORS.success, "succeeded tool renders green");
+        let fail_cell = (0..buffer.area.width).find(|&x| buffer.get(x, fail_row as u16).symbol() == "✗").expect("marker");
+        assert_eq!(buffer.get(fail_cell, fail_row as u16).fg, COLORS.error, "failed tool renders red");
+    }
+
+    #[test]
+    fn diff_messages_render_with_diff_colors() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        {
+            let guard = store.lock().unwrap();
+            guard.add_message(&thread_id, 1, "user", None, None, "edit the file").unwrap();
+            guard.add_message(&thread_id, 1, "assistant", Some("codex"), None, "edited").unwrap();
+            guard
+                .add_message(&thread_id, 1, "diff", None, None, "diff --git a/notes.txt b/notes.txt\nindex 123..456 100644\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old line\n+new line\n")
+                .unwrap();
+        }
+        let history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        let state = test_state(home.path(), &store, history);
+
+        let buffer = render_state(&state, 100, 30);
+        let lines = buffer_lines(&buffer);
+        let find_row = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap_or_else(|| panic!("{needle} rendered"));
+        let header_row = find_row("• Edited notes.txt (+1 -1)");
+        let added_row = find_row("+new line");
+        let removed_row = find_row("-old line");
+        let reply_row = find_row("edited");
+        assert!(reply_row < header_row && header_row < added_row, "the diff block renders after the reply, in conversation order");
+        let added_cell = (0..buffer.area.width).find(|&x| buffer.get(x, added_row as u16).symbol() == "+").unwrap();
+        let removed_cell = (0..buffer.area.width).find(|&x| buffer.get(x, removed_row as u16).symbol() == "-").unwrap();
+        assert_eq!(buffer.get(added_cell, added_row as u16).fg, COLORS.success, "added lines render green");
+        assert_eq!(buffer.get(removed_cell, removed_row as u16).fg, COLORS.error, "removed lines render red");
+        assert_eq!(buffer.get(0, added_row as u16).bg, ratatui::style::Color::Rgb(33, 58, 43), "added rows carry the tinted background");
+        assert_eq!(buffer.get(0, removed_row as u16).bg, ratatui::style::Color::Rgb(74, 34, 29), "removed rows carry the tinted background");
+    }
+
+    #[test]
+    fn multi_command_persists_parallel_threads() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/multi codex opencode compare notes");
+
+        let mut submitted = Vec::new();
+        while let Ok(command) = engine_command_receiver.try_recv() {
+            if let EngineCommand::Submit { thread_id, text, .. } = command {
+                submitted.push((thread_id, text));
+            }
+        }
+        assert_eq!(submitted.len(), 2, "one submit per provider");
+        assert!(submitted.iter().all(|(_, text)| text == "compare notes"));
+        for (thread_id, _) in &submitted {
+            let thread = store.lock().unwrap().get_thread(thread_id).unwrap();
+            assert!(thread.is_some(), "parallel thread {thread_id} must be persisted before submit");
+        }
+    }
+
+    #[test]
+    fn up_arrow_recalls_project_prompt_history() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        submit(&mut state, &store, &engine_command_sender, "first prompt".to_string());
+        submit(&mut state, &store, &engine_command_sender, "second prompt".to_string());
+        assert_eq!(
+            store.lock().unwrap().list_prompt_history(&state.thread.cwd).unwrap(),
+            vec!["first prompt", "second prompt"],
+            "submits persist to the project history"
+        );
+
+        let key = |code: KeyCode| KeyEvent { code, modifiers: KeyModifiers::empty(), kind: KeyEventKind::Press, state: crossterm::event::KeyEventState::empty() };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        assert_eq!(state.input, "second prompt", "Up on an empty composer recalls the newest prompt");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        assert_eq!(state.input, "first prompt", "Up again walks back");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        assert_eq!(state.input, "second prompt", "Down walks forward");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        assert_eq!(state.input, "", "Down past the newest returns to an empty composer");
+
+        // editing exits recall mode; Up then scrolls instead
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('x')));
+        let scrolled = state.scroll_offset;
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        assert_eq!(state.scroll_offset, scrolled + 1, "Up with edited input scrolls the transcript");
     }
 }

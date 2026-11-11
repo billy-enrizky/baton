@@ -472,8 +472,6 @@ fn build_all_adapters(
     home: &PathBuf,
     cwd: &PathBuf,
 ) -> (Vec<SharedAdapter>, Vec<Arc<dyn Fn() + Send + Sync>>) {
-    let tokio_runtime = tokio::runtime::Handle::current();
-
     let cwd_for_codex = cwd.clone();
     let codex_spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
@@ -555,15 +553,16 @@ fn build_all_adapters(
             command.stdin(std::process::Stdio::null());
             command.stdout(std::process::Stdio::piped());
             command.stderr(std::process::Stdio::null());
+            // The server never sees stdin EOF (it is null), so it must die with baton.
+            command.kill_on_drop(true);
             let child = command.spawn()?;
             Ok(baton::adapters::opencode::OpenCodeChild { port, password, child })
         },
     );
 
-    let _ = tokio_runtime;
     (
         vec![
-            Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new()) as Box<dyn BatonAdapter>)),
+            Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner())) as Box<dyn BatonAdapter>)),
             Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(codex_spawner)) as Box<dyn BatonAdapter>)),
             Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Cursor, cursor_spawner)) as Box<dyn BatonAdapter>)),
             Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Grok, grok_spawner)) as Box<dyn BatonAdapter>)),
@@ -709,12 +708,14 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_mode: Permi
                 command.stdin(std::process::Stdio::null());
                 command.stdout(std::process::Stdio::piped());
                 command.stderr(std::process::Stdio::null());
+                // The server never sees stdin EOF (it is null), so it must die with baton.
+                command.kill_on_drop(true);
                 let child = command.spawn()?;
                 Ok(baton::adapters::opencode::OpenCodeChild { port, password, child })
             },
         );
 
-        let claude: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new())));
+        let claude: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner()))));
         let codex: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(codex_spawner))));
         let grok: SharedAdapter = Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(
             ProviderId::Grok,

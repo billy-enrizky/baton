@@ -401,6 +401,7 @@ impl BatonAdapter for AcpAdapter {
         };
         let mut final_text = String::new();
         let mut usage: Option<TurnUsage> = None;
+        let mut prompt_done = false;
         let result: Result<()> = loop {
             tokio::select! {
                 notification = receiver.recv() => {
@@ -430,7 +431,11 @@ impl BatonAdapter for AcpAdapter {
                         _ => handle_session_update(&update, &emit, &mut final_text),
                     }
                 }
-                prompt_result = &mut prompt_receiver => {
+                // The prompt RPC reply is the authoritative turn end. A
+                // completed oneshot cannot be polled again, so the guard
+                // keeps this arm disabled once the reply was consumed.
+                prompt_result = &mut prompt_receiver, if !prompt_done => {
+                    prompt_done = true;
                     match prompt_result {
                         Ok(Ok(result)) => {
                             if let Some(result_usage) = result.get("usage") {
@@ -438,6 +443,23 @@ impl BatonAdapter for AcpAdapter {
                                     usage = Some(parse_usage(result_usage));
                                 }
                             }
+                            // Drain updates the agent sent before the reply
+                            // (usage, trailing message chunks), then end.
+                            while let Ok((method, params)) = receiver.try_recv() {
+                                if method != "session/update" {
+                                    continue;
+                                }
+                                let update = params.get("update").cloned().unwrap_or(Value::Null);
+                                let variant = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+                                if variant == "state_update" {
+                                    if let Some(state_usage) = update.get("usage") {
+                                        usage = Some(parse_usage(state_usage));
+                                    }
+                                } else {
+                                    handle_session_update(&update, &emit, &mut final_text);
+                                }
+                            }
+                            break Ok(());
                         }
                         Ok(Err(error)) => break Err(anyhow::anyhow!("acp error: {error}")),
                         Err(_) => break Err(anyhow::anyhow!("acp connection closed")),

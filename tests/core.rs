@@ -328,3 +328,23 @@ fn viewport_windowing() {
     assert_eq!(partial.visible.first().unwrap().id, 2);
     assert_eq!(partial.visible.last().unwrap().id, 3);
 }
+
+#[test]
+fn prompt_history_is_project_scoped_capped_and_deduped() {
+    let store = BatonStore::memory().unwrap();
+    store.record_prompt("/proj-a", "first").unwrap();
+    store.record_prompt("/proj-a", "first").unwrap(); // consecutive repeat skipped
+    store.record_prompt("/proj-b", "other project").unwrap();
+    store.record_prompt("/proj-a", "second").unwrap();
+    assert_eq!(store.list_prompt_history("/proj-a").unwrap(), vec!["first", "second"]);
+    assert_eq!(store.list_prompt_history("/proj-b").unwrap(), vec!["other project"]);
+    assert!(store.list_prompt_history("/proj-c").unwrap().is_empty());
+
+    for index in 0..150 {
+        store.record_prompt("/proj-a", &format!("prompt {index}")).unwrap();
+    }
+    let history = store.list_prompt_history("/proj-a").unwrap();
+    assert_eq!(history.len(), 100, "history caps at 100 entries");
+    assert_eq!(history.first().unwrap(), "prompt 50", "oldest entries fall off");
+    assert_eq!(history.last().unwrap(), "prompt 149");
+}

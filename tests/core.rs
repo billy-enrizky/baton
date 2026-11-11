@@ -170,6 +170,83 @@ fn store_thread_lookup_accepts_symlinked_project_paths() {
 }
 
 #[test]
+fn store_review_notes_track_sent_state_and_rewind() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "review".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+
+    let first = store
+        .add_review_note(&thread.id, 1, "src/lib.rs", 2, true, "fix this", "diff-a")
+        .unwrap();
+    store
+        .add_review_note(&thread.id, 2, "src/main.rs", 7, false, "remove this", "diff-b")
+        .unwrap();
+    assert_eq!(
+        store
+            .list_unsent_review_notes(&thread.id, 1, "diff-a")
+            .unwrap()
+            .len(),
+        1,
+        "unsent notes are restored for their exact diff"
+    );
+    assert!(
+        store
+            .list_unsent_review_notes(&thread.id, 1, "other-diff")
+            .unwrap()
+            .is_empty(),
+        "a fingerprint mismatch must not attach stale notes"
+    );
+
+    store.mark_review_notes_sent(&thread.id, &[first]).unwrap();
+    assert!(
+        store
+            .list_unsent_review_notes(&thread.id, 1, "diff-a")
+            .unwrap()
+            .is_empty(),
+        "sent notes do not reappear on reopen"
+    );
+
+    let second = store
+        .add_review_note(&thread.id, 2, "src/main.rs", 8, true, "delete me", "diff-b")
+        .unwrap();
+    store.delete_review_notes(&thread.id, &[second]).unwrap();
+    assert_eq!(
+        store
+            .list_unsent_review_notes(&thread.id, 2, "diff-b")
+            .unwrap()
+            .len(),
+        1,
+        "deleting one note leaves the other note on the same turn"
+    );
+
+    let turn_one = store
+        .add_review_note(&thread.id, 1, "src/lib.rs", 3, true, "keep", "diff-a")
+        .unwrap();
+    store
+        .add_review_note(&thread.id, 2, "src/main.rs", 9, true, "drop", "diff-b")
+        .unwrap();
+    store.rewind_thread(&thread.id, 2).unwrap();
+    let remaining = store
+        .list_unsent_review_notes(&thread.id, 1, "diff-a")
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, turn_one);
+    assert!(
+        store
+            .list_unsent_review_notes(&thread.id, 2, "diff-b")
+            .unwrap()
+            .is_empty(),
+        "rewind removes review notes at the cutoff"
+    );
+}
+
+#[test]
 fn store_queue_is_fifo_and_cleared_on_rewind() {
     let store = BatonStore::memory().unwrap();
     let thread = store

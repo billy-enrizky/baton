@@ -43,6 +43,20 @@ pub struct ProviderSessionRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct ReviewNoteRow {
+    pub id: i64,
+    pub thread_id: String,
+    pub turn: i64,
+    pub path: String,
+    pub line: usize,
+    pub added: bool,
+    pub body: String,
+    pub diff_fingerprint: String,
+    pub created_at: String,
+    pub sent_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct MessageRow {
     pub id: i64,
     pub thread_id: String,
@@ -132,6 +146,19 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages (thread_id, id);
+CREATE TABLE IF NOT EXISTS review_notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  turn INTEGER NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  added INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  diff_fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS review_notes_thread_turn_idx ON review_notes (thread_id, turn, sent_at);
 CREATE TABLE IF NOT EXISTS queued_messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   thread_id TEXT NOT NULL,
@@ -231,6 +258,21 @@ fn migrate_thread_model_nullable(db: &Connection) -> Result<()> {
         _ => {}
     }
     Ok(())
+}
+
+fn map_review_note(row: &rusqlite::Row) -> rusqlite::Result<ReviewNoteRow> {
+    Ok(ReviewNoteRow {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        turn: row.get(2)?,
+        path: row.get(3)?,
+        line: row.get::<_, i64>(4)?.max(0) as usize,
+        added: row.get::<_, i64>(5)? != 0,
+        body: row.get(6)?,
+        diff_fingerprint: row.get(7)?,
+        created_at: row.get(8)?,
+        sent_at: row.get(9)?,
+    })
 }
 
 fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
@@ -445,6 +487,78 @@ impl BatonStore {
             .query_map(params![cwd], |row| row.get::<_, String>(0))?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Saves a line-anchored review note before the user sends it. The diff
+    /// fingerprint prevents a reused turn number from attaching an old note to
+    /// a different diff after rewind.
+    pub fn add_review_note(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        path: &str,
+        line: usize,
+        added: bool,
+        body: &str,
+        diff_fingerprint: &str,
+    ) -> Result<i64> {
+        self.db.execute(
+            "INSERT INTO review_notes (thread_id, turn, path, line, added, body, diff_fingerprint, created_at, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            params![thread_id, turn, path, line as i64, if added { 1 } else { 0 }, body, diff_fingerprint, now_iso()],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Notes that are still waiting to be sent for this exact diff.
+    pub fn list_unsent_review_notes(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        diff_fingerprint: &str,
+    ) -> Result<Vec<ReviewNoteRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, thread_id, turn, path, line, added, body, diff_fingerprint, created_at, sent_at
+             FROM review_notes
+             WHERE thread_id = ? AND turn = ? AND diff_fingerprint = ? AND sent_at IS NULL
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![thread_id, turn, diff_fingerprint], map_review_note)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Records delivery without deleting the note. The text itself becomes a
+    /// normal user message; this timestamp keeps a reopen from resending it.
+    pub fn mark_review_notes_sent(&self, thread_id: &str, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let sent_at = now_iso();
+        let tx = self.db.unchecked_transaction()?;
+        for id in ids {
+            tx.execute(
+                "UPDATE review_notes SET sent_at = ? WHERE thread_id = ? AND id = ? AND sent_at IS NULL",
+                params![sent_at, thread_id, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_review_notes(&self, thread_id: &str, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.unchecked_transaction()?;
+        for id in ids {
+            tx.execute(
+                "DELETE FROM review_notes WHERE thread_id = ? AND id = ?",
+                params![thread_id, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn touch_thread(&self, id: &str) -> Result<()> {
@@ -874,6 +988,10 @@ impl BatonStore {
         tx.execute(
             "DELETE FROM queued_messages WHERE thread_id = ?",
             params![thread_id],
+        )?;
+        tx.execute(
+            "DELETE FROM review_notes WHERE thread_id = ? AND turn >= ?",
+            params![thread_id, from_turn],
         )?;
         tx.execute("DELETE FROM provider_sessions WHERE thread_id = ?", params![thread_id])?;
         tx.execute(

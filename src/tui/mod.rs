@@ -105,6 +105,7 @@ enum ToolStatus {
 
 #[derive(Debug, Clone)]
 struct ReviewNote {
+    id: i64,
     path: String,
     line: usize,
     added: bool,
@@ -113,6 +114,7 @@ struct ReviewNote {
 
 struct ReviewState {
     turn: i64,
+    fingerprint: String,
     rows: Vec<diff_render::DiffRowRef>,
     selected: usize,
     notes: Vec<ReviewNote>,
@@ -1030,12 +1032,27 @@ fn handle_review_key(
                 let body = input.trim().to_string();
                 if !body.is_empty() && !review.rows.is_empty() {
                     let row = &review.rows[review.selected.min(review.rows.len() - 1)];
-                    review.notes.push(ReviewNote {
-                        path: row.path.clone(),
-                        line: row.line_number,
-                        added: row.added,
-                        body,
-                    });
+                    let saved = store.lock().unwrap().add_review_note(
+                        &state.thread.id,
+                        review.turn,
+                        &row.path,
+                        row.line_number,
+                        row.added,
+                        &body,
+                        &review.fingerprint,
+                    );
+                    match saved {
+                        Ok(id) => review.notes.push(ReviewNote {
+                            id,
+                            path: row.path.clone(),
+                            line: row.line_number,
+                            added: row.added,
+                            body,
+                        }),
+                        Err(error) => {
+                            state.notice = Some(format!("cannot save review note: {error}"));
+                        }
+                    }
                 }
                 review.note_input = None;
             }
@@ -1078,11 +1095,28 @@ fn handle_review_key(
         }
         KeyCode::Char('d') => {
             if let Some(row) = review.rows.get(review.selected) {
-                review.notes.retain(|note| {
-                    !(note.path == row.path
-                        && note.line == row.line_number
-                        && note.added == row.added)
-                });
+                let ids: Vec<i64> = review
+                    .notes
+                    .iter()
+                    .filter(|note| {
+                        note.path == row.path
+                            && note.line == row.line_number
+                            && note.added == row.added
+                    })
+                    .map(|note| note.id)
+                    .collect();
+                if !ids.is_empty() {
+                    match store
+                        .lock()
+                        .unwrap()
+                        .delete_review_notes(&state.thread.id, &ids)
+                    {
+                        Ok(()) => review.notes.retain(|note| !ids.contains(&note.id)),
+                        Err(error) => {
+                            state.notice = Some(format!("cannot delete review note: {error}"));
+                        }
+                    }
+                }
             }
         }
         KeyCode::Char('s') => {
@@ -1092,13 +1126,22 @@ fn handle_review_key(
                 return;
             }
             let count = review.notes.len();
+            let ids: Vec<i64> = review.notes.iter().map(|note| note.id).collect();
             let text = format_review_notes(review.turn, &review.notes);
             let steering = state.running;
             dispatch_message(state, store, engine_command_sender, text, false);
-            state.notice = Some(if steering {
-                format!("steering {count} review note(s) into the current turn")
-            } else {
-                format!("sent {count} review note(s)")
+            let marked = store
+                .lock()
+                .unwrap()
+                .mark_review_notes_sent(&state.thread.id, &ids);
+            state.notice = Some(match marked {
+                Ok(()) if steering => {
+                    format!("steering {count} review note(s) into the current turn")
+                }
+                Ok(()) => format!("sent {count} review note(s)"),
+                Err(error) => format!(
+                    "sent {count} review note(s), but could not mark them sent: {error}"
+                ),
             });
             return;
         }
@@ -1903,14 +1946,37 @@ fn handle_command(
                     if rows.is_empty() {
                         state.notice = Some("this turn has no changed lines to review".into());
                     } else {
+                        let fingerprint = diff_render::fingerprint(&message.text);
+                        let saved = store.lock().unwrap().list_unsent_review_notes(
+                            &state.thread.id,
+                            message.turn,
+                            &fingerprint,
+                        );
+                        let (notes, load_error) = match saved {
+                            Ok(rows) => (
+                                rows.into_iter()
+                                    .map(|note| ReviewNote {
+                                        id: note.id,
+                                        path: note.path,
+                                        line: note.line,
+                                        added: note.added,
+                                        body: note.body,
+                                    })
+                                    .collect(),
+                                None,
+                            ),
+                            Err(error) => (Vec::new(), Some(error)),
+                        };
                         state.review = Some(ReviewState {
                             turn: message.turn,
+                            fingerprint,
                             rows,
                             selected: 0,
-                            notes: Vec::new(),
+                            notes,
                             note_input: None,
                         });
-                        state.notice = None;
+                        state.notice = load_error
+                            .map(|error| format!("cannot restore review notes: {error}"));
                     }
                 }
                 None => {
@@ -3567,6 +3633,80 @@ mod tests {
             }
             _ => panic!("expected submit"),
         }
+        let fingerprint = diff_render::fingerprint(&review_diff_message(&state.thread.id).text);
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .list_unsent_review_notes(&state.thread.id, 1, &fingerprint)
+                .unwrap()
+                .is_empty(),
+            "sending marks notes delivered so reopen cannot resend them"
+        );
+    }
+
+    #[test]
+    fn review_notes_restore_on_reopen_and_delete_persists() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let diff = review_diff_message(&state.thread.id);
+        state.history = vec![diff.clone()];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        for character in "persist me".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Char(character)),
+            );
+        }
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter));
+        let fingerprint = diff_render::fingerprint(&diff.text);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_unsent_review_notes(&state.thread.id, 1, &fingerprint)
+                .unwrap()
+                .len(),
+            1,
+            "adding a note persists it before sending"
+        );
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let review = state.review.as_ref().expect("review reopens");
+        assert_eq!(review.notes.len(), 1);
+        assert_eq!(review.notes[0].body, "persist me");
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('d')));
+        assert!(state.review.as_ref().unwrap().notes.is_empty());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .list_unsent_review_notes(&state.thread.id, 1, &fingerprint)
+                .unwrap()
+                .is_empty(),
+            "deleting a note removes its persisted row"
+        );
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        assert!(
+            state.review.as_ref().unwrap().notes.is_empty(),
+            "deleted notes do not come back on the next reopen"
+        );
     }
 
     #[test]
@@ -3578,8 +3718,23 @@ mod tests {
         let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &engine_command_sender, "/review");
         state.running = true;
+        let thread_id = state.thread.id.clone();
         let review = state.review.as_mut().unwrap();
+        let id = store
+            .lock()
+            .unwrap()
+            .add_review_note(
+                &thread_id,
+                review.turn,
+                "src/lib.rs",
+                3,
+                true,
+                "tighten this",
+                &review.fingerprint,
+            )
+            .unwrap();
         review.notes.push(ReviewNote {
+            id,
             path: "src/lib.rs".into(),
             line: 3,
             added: true,

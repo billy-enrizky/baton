@@ -166,6 +166,18 @@ fn counts_summary(added: usize, removed: usize) -> Vec<Span<'static>> {
     ]
 }
 
+/// Stable content fingerprint for persisted review notes. FNV-1a is not a
+/// security hash; it only keeps an old note from attaching to a different diff
+/// when a turn number is reused after rewind.
+pub fn fingerprint(diff: &str) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in diff.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{hash:016x}")
+}
+
 /// The changed rows of a diff, without context or hunk headers. Review mode
 /// uses these as stable anchors for notes.
 pub fn changed_rows(diff: &str) -> Vec<DiffRowRef> {

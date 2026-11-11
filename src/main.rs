@@ -44,7 +44,7 @@ fn main_result() -> Result<()> {
     let permission_mode = permission_override.unwrap_or(PermissionMode::Default);
 
     match command {
-        cli::Commands::Exec { prompt } => {
+        cli::Commands::Exec { prompt, json } => {
             let prompt = prompt.join(" ");
             if prompt.is_empty() {
                 anyhow::bail!("usage: baton exec <prompt>");
@@ -124,10 +124,12 @@ fn main_result() -> Result<()> {
 
             let mut result_text = String::new();
             let mut streamed_text = String::new();
+            let mut result_phase: Option<TurnPhase> = None;
+            let mut result_error: Option<String> = None;
             let mut result_ok: Option<bool> = None;
             let mut timed_out = false;
             let mut saw_output = false;
-            let show_progress = std::io::stderr().is_terminal();
+            let show_progress = std::io::stderr().is_terminal() && !json;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             loop {
                 if std::time::Instant::now() > deadline {
@@ -138,8 +140,10 @@ fn main_result() -> Result<()> {
                     match event {
                         TurnEvent::TextDelta { text } => {
                             if !text.is_empty() {
-                                print!("{text}");
-                                let _ = std::io::stdout().flush();
+                                if !json {
+                                    print!("{text}");
+                                    let _ = std::io::stdout().flush();
+                                }
                                 streamed_text.push_str(&text);
                                 saw_output = true;
                             }
@@ -163,6 +167,8 @@ fn main_result() -> Result<()> {
                 match engine_event_receiver.recv_timeout(std::time::Duration::from_millis(100)) {
                     Ok(EngineEvent::TurnFinished { ok, error, phase, .. }) => {
                         result_ok = Some(ok);
+                        result_phase = Some(phase);
+                        result_error = error.clone();
                         if !ok {
                             if let Some(error) = error {
                                 let label = match phase {
@@ -188,9 +194,11 @@ fn main_result() -> Result<()> {
             // Providers that do not emit deltas only deliver final text here.
             // If deltas were streamed, do not print the same answer twice.
             if streamed_text.is_empty() && !result_text.is_empty() {
-                println!("{result_text}");
+                if !json {
+                    println!("{result_text}");
+                }
                 saw_output = true;
-            } else if !streamed_text.is_empty() {
+            } else if !streamed_text.is_empty() && !json {
                 println!();
             }
             if timed_out {
@@ -198,7 +206,23 @@ fn main_result() -> Result<()> {
                 std::process::exit(1);
             }
             let result_ok = result_ok.unwrap_or(false);
-            if result_ok && !saw_output {
+            if json {
+                let text = if result_text.is_empty() {
+                    streamed_text
+                } else {
+                    result_text
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "thread_id": thread.id,
+                        "ok": result_ok,
+                        "phase": result_phase.map(|phase| phase.as_str()).unwrap_or("unverified"),
+                        "error": result_error,
+                        "text": text,
+                    }))?
+                );
+            } else if result_ok && !saw_output {
                 eprintln!("no output from provider");
             }
             if !result_ok || !saw_output {

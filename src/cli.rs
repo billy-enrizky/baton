@@ -57,6 +57,9 @@ pub enum Commands {
     /// Run a prompt non-interactively and print the result
     Exec {
         prompt: Vec<String>,
+        /// Emit a JSON result object instead of plain text
+        #[arg(long)]
+        json: bool,
     },
     /// Update baton to the latest version
     Update,

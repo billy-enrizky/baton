@@ -210,7 +210,7 @@ fn main_result() -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "schema_version": 1,
+                            "schema_version": status::SCHEMA_VERSION,
                             "thread_id": thread.id,
                             "ok": false,
                             "phase": "unverified",
@@ -233,7 +233,7 @@ fn main_result() -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "schema_version": 1,
+                        "schema_version": status::SCHEMA_VERSION,
                         "thread_id": thread.id,
                         "ok": result_ok,
                         "phase": result_phase.map(|phase| phase.as_str()).unwrap_or("unverified"),
@@ -297,7 +297,7 @@ fn main_result() -> Result<()> {
                     let ended_at = latest.and_then(|turn| turn.ended_at.clone());
                     let queued = store.list_queued_messages(&thread.id)?;
                     values.push(serde_json::json!({
-                        "schema_version": 1,
+                        "schema_version": status::SCHEMA_VERSION,
                         "thread_id": thread.id,
                         "title": thread.title,
                         "provider": thread.current_provider.as_str(),
@@ -611,7 +611,7 @@ fn main_result() -> Result<()> {
                     .map(|turn| {
                         let open = !turn.phase.is_terminal();
                         serde_json::json!({
-                            "schema_version": 1,
+                            "schema_version": status::SCHEMA_VERSION,
                             "turn": turn.turn,
                             "phase": turn.phase.as_str(),
                             "open": open,
@@ -686,7 +686,7 @@ fn main_result() -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
-                            "schema_version": 1,
+                            "schema_version": status::SCHEMA_VERSION,
                             "thread_id": thread.id,
                             "cleared": true,
                         }))?
@@ -702,7 +702,7 @@ fn main_result() -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
-                        "schema_version": 1,
+                        "schema_version": status::SCHEMA_VERSION,
                         "thread_id": thread.id,
                         "count": queued.len(),
                         "messages": queued,

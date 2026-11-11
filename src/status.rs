@@ -2,6 +2,7 @@
 
 use crate::types::{PermissionMode, ProviderId, TurnPhase};
 
+pub const SCHEMA_VERSION: u32 = 1;
 pub const STALE_HINT: &str = "if no baton process is attached, this turn is stale and will be marked unverified on the next open";
 
 #[derive(Debug, Clone)]
@@ -58,7 +59,7 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
         })
     });
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "thread_id": status.thread_id,
         "title": status.title,
         "provider": status.provider.as_str(),

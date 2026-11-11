@@ -132,6 +132,13 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages (thread_id, id);
+CREATE TABLE IF NOT EXISTS queued_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS queued_messages_thread_idx ON queued_messages (thread_id, id);
 CREATE TABLE IF NOT EXISTS prompt_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   cwd TEXT NOT NULL,
@@ -638,6 +645,54 @@ impl BatonStore {
         Ok(rows)
     }
 
+    pub fn enqueue_message(&self, thread_id: &str, text: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO queued_messages (thread_id, text, created_at) VALUES (?, ?, ?)",
+            params![thread_id, text, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_queued_messages(&self, thread_id: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT text FROM queued_messages WHERE thread_id = ? ORDER BY id")?;
+        let rows = statement
+            .query_map(params![thread_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// Removes and returns the oldest queued message for a thread.
+    pub fn pop_queued_message(&self, thread_id: &str) -> Result<Option<String>> {
+        let tx = self.db.unchecked_transaction()?;
+        let text: Option<String> = tx
+            .query_row(
+                "SELECT text FROM queued_messages WHERE thread_id = ? ORDER BY id LIMIT 1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if text.is_some() {
+            tx.execute(
+                "DELETE FROM queued_messages WHERE id = (
+                    SELECT id FROM queued_messages WHERE thread_id = ? ORDER BY id LIMIT 1
+                 )",
+                params![thread_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(text)
+    }
+
+    pub fn clear_queued_messages(&self, thread_id: &str) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM queued_messages WHERE thread_id = ?",
+            params![thread_id],
+        )?;
+        Ok(())
+    }
+
     pub fn add_message(
         &self,
         thread_id: &str,
@@ -786,6 +841,10 @@ impl BatonStore {
         tx.execute(
             "DELETE FROM turns WHERE thread_id = ? AND turn >= ?",
             params![thread_id, from_turn],
+        )?;
+        tx.execute(
+            "DELETE FROM queued_messages WHERE thread_id = ?",
+            params![thread_id],
         )?;
         tx.execute("DELETE FROM provider_sessions WHERE thread_id = ?", params![thread_id])?;
         tx.execute(

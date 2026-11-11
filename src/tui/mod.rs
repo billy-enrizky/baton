@@ -194,6 +194,11 @@ pub fn run_tui(
     permission_override: Option<PermissionMode>,
 ) -> Result<()> {
     let history = store.lock().unwrap().list_messages(&thread.id)?;
+    let queued_messages = store
+        .lock()
+        .unwrap()
+        .list_queued_messages(&thread.id)
+        .unwrap_or_default();
     let prompt_history = store.lock().unwrap().list_prompt_history(&thread.cwd).unwrap_or_default();
     let branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
     let permission_mode = permission_override.unwrap_or(thread.permission_mode);
@@ -210,7 +215,7 @@ pub fn run_tui(
         store: store.clone(),
         prompt_history,
         prompt_history_index: None,
-        queued_messages: Vec::new(),
+        queued_messages,
         goal,
         goal_paused,
         custom_commands,
@@ -417,8 +422,17 @@ fn apply_engine_event(
                 // Only advance the queue after a clean turn. A failure or an
                 // interrupt should not automatically fire the next prompt.
                 if ok {
-                    if let Some(next) = state.queued_messages.first().cloned() {
-                        state.queued_messages.remove(0);
+                    let next = store
+                        .lock()
+                        .unwrap()
+                        .pop_queued_message(&state.thread.id)
+                        .unwrap_or(None);
+                    if let Some(next) = next {
+                        state.queued_messages = store
+                            .lock()
+                            .unwrap()
+                            .list_queued_messages(&state.thread.id)
+                            .unwrap_or_default();
                         let remaining = state.queued_messages.len();
                         let preview: String = next.chars().take(60).collect();
                         state.notice = Some(format!("sending queued message ({remaining} remaining): {preview}"));
@@ -433,7 +447,7 @@ fn apply_engine_event(
         }
         EngineEvent::SteerRejected { thread_id, text } => {
             if thread_id == state.thread.id {
-                state.queued_messages.push(text);
+                enqueue_message(state, store, text);
                 state.notice = Some(format!(
                     "this provider cannot steer the live turn; queued ({} waiting)",
                     state.queued_messages.len()
@@ -840,6 +854,7 @@ fn handle_key(
                         state.thread = thread.clone();
                         let guard = store.lock().unwrap();
                         state.history = guard.list_messages(&thread.id).unwrap_or_default();
+                        state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
                         state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
                         state.diff_output = None;
                         state.scroll_offset = 0;
@@ -925,6 +940,7 @@ fn apply_rewind(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, turn: i64,
                 }
             }
             state.scroll_offset = 0;
+            state.queued_messages.clear();
             state.set_input(text);
             state.notice = Some(format!("rewound to before turn {turn}; message restored to composer"));
         }
@@ -932,6 +948,14 @@ fn apply_rewind(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, turn: i64,
             state.notice = Some(format!("rewind failed: {error}"));
         }
     }
+}
+
+fn enqueue_message(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, text: String) {
+    let _ = store
+        .lock()
+        .unwrap()
+        .enqueue_message(&state.thread.id, &text);
+    state.queued_messages.push(text);
 }
 
 fn dispatch_message(
@@ -1644,6 +1668,7 @@ fn handle_command(
             };
             state.thread.permission_mode = state.permission_mode;
             state.history.clear();
+            state.queued_messages.clear();
             state.goal = None;
             state.goal_paused = false;
             state.thread.goal = None;
@@ -1685,6 +1710,7 @@ fn handle_command(
                         state.thread = thread.clone();
                         let guard = store.lock().unwrap();
                         state.history = guard.list_messages(&thread.id).unwrap_or_default();
+                        state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
                         state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
                         state.diff_output = None;
                         state.scroll_offset = 0;
@@ -2906,11 +2932,16 @@ mod tests {
                 current_model: None,
             })
             .unwrap();
+        let queued_messages = store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&thread.id)
+            .unwrap_or_default();
         TuiState {
             store: store.clone(),
             prompt_history: Vec::new(),
             prompt_history_index: None,
-            queued_messages: Vec::new(),
+            queued_messages,
             goal: None,
             goal_paused: false,
             custom_commands: Vec::new(),
@@ -3503,7 +3534,50 @@ mod tests {
             &engine_command_sender,
         );
         assert_eq!(state.queued_messages, vec!["follow up".to_string()]);
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            vec!["follow up".to_string()],
+            "a rejected steer is durable"
+        );
         assert!(state.notice.as_deref().unwrap_or("").contains("queued"));
+    }
+
+    #[test]
+    fn a_successful_turn_pops_the_persisted_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        enqueue_message(&mut state, &store, "follow up".into());
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            vec!["follow up".to_string()]
+        );
+
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id,
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+
+        assert!(state.queued_messages.is_empty());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap()
+            .is_empty());
+        match engine_command_receiver.try_recv().expect("queued message is sent") {
+            EngineCommand::Submit { text, .. } => assert_eq!(text, "follow up"),
+            _ => panic!("expected submit"),
+        }
     }
 
     #[test]

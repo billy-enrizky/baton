@@ -148,6 +148,33 @@ fn store_turn_records_and_reconcile() {
 }
 
 #[test]
+fn store_queue_is_fifo_and_cleared_on_rewind() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "t".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    store.enqueue_message(&thread.id, "first").unwrap();
+    store.enqueue_message(&thread.id, "second").unwrap();
+    assert_eq!(
+        store.list_queued_messages(&thread.id).unwrap(),
+        vec!["first", "second"]
+    );
+    assert_eq!(store.pop_queued_message(&thread.id).unwrap().as_deref(), Some("first"));
+    assert_eq!(
+        store.list_queued_messages(&thread.id).unwrap(),
+        vec!["second"]
+    );
+
+    store.rewind_thread(&thread.id, 1).unwrap();
+    assert!(store.list_queued_messages(&thread.id).unwrap().is_empty());
+}
+
+#[test]
 fn store_thread_mode_and_goal_persist() {
     let store = BatonStore::memory().unwrap();
     let thread = store

@@ -478,6 +478,38 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Queue { thread_id, clear } => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
+                Some(thread_id) => resolve_thread(&store, thread_id)?,
+                None => store
+                    .list_threads(Some(cwd.to_string_lossy().as_ref()))?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
+            };
+            if clear {
+                store.clear_queued_messages(&thread.id)?;
+                println!("queue cleared");
+                return Ok(());
+            }
+            let queued = store.list_queued_messages(&thread.id)?;
+            if queued.is_empty() {
+                println!("queue: empty");
+            } else {
+                for (index, message) in queued.iter().enumerate() {
+                    let preview: String = message
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(100)
+                        .collect();
+                    println!("{:>3}. {preview}", index + 1);
+                }
+            }
+            Ok(())
+        }
         cli::Commands::Status { thread_id } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {

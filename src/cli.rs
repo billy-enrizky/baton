@@ -105,4 +105,11 @@ pub enum Commands {
     Status {
         thread_id: Option<String>,
     },
+    /// List or clear durable queued follow-ups
+    Queue {
+        thread_id: Option<String>,
+        /// Remove every queued message
+        #[arg(long)]
+        clear: bool,
+    },
 }

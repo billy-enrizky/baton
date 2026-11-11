@@ -3,12 +3,14 @@ use async_trait::async_trait;
 use base64::Engine;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use uuid::Uuid;
 
-use crate::adapters::{BatonAdapter, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
 
@@ -35,6 +37,9 @@ struct OpenCodeRuntime {
     child: Arc<AsyncMutex<Child>>,
     current_emit: AsyncMutex<Option<TurnEventSender>>,
     active_session: AsyncMutex<Option<String>>,
+    /// True only after the prompt request was accepted. Steering before that
+    /// would race session admission and can be rejected by opencode.
+    active_turn: AtomicBool,
 }
 
 pub struct OpenCodeAdapter {
@@ -108,6 +113,7 @@ impl OpenCodeAdapter {
                 child: Arc::new(AsyncMutex::new(spawned.child)),
                 current_emit: AsyncMutex::new(None),
                 active_session: AsyncMutex::new(None),
+                active_turn: AtomicBool::new(false),
             });
             spawn_sse_reader(http, runtime_base_url.clone(), auth_header, event_sender);
             *slot = Some(runtime.clone());
@@ -354,6 +360,54 @@ impl BatonAdapter for OpenCodeAdapter {
         })
     }
 
+    fn steer_handle(&self) -> Option<SteerHandle> {
+        let runtime = self.runtime.clone();
+        Some(Arc::new(move |text: String| -> bool {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return false;
+            };
+            let runtime = match runtime.try_lock() {
+                Ok(slot) => slot.clone(),
+                Err(_) => return false,
+            };
+            let runtime = match runtime {
+                Some(runtime) => runtime,
+                None => return false,
+            };
+            if runtime.version != OpenCodeVersion::V2
+                || !runtime.active_turn.load(Ordering::SeqCst)
+            {
+                return false;
+            }
+            let session_id = match runtime.active_session.try_lock() {
+                Ok(session_id) => session_id.clone(),
+                Err(_) => return false,
+            };
+            let Some(session_id) = session_id else {
+                return false;
+            };
+            let id = format!("msg_baton_steer_{}", Uuid::new_v4().simple());
+            handle.spawn(async move {
+                let body = json!({
+                    "id": id,
+                    "prompt": { "text": text },
+                    "delivery": "steer"
+                });
+                let _ = runtime
+                    .http
+                    .post(format!(
+                        "{}/api/session/{session_id}/prompt",
+                        runtime.base_url
+                    ))
+                    .header("Authorization", &runtime.auth_header)
+                    .json(&body)
+                    .send()
+                    .await;
+            });
+            true
+        }))
+    }
+
     async fn start_turn(
         &mut self,
         input: TurnStartInput,
@@ -422,6 +476,7 @@ impl BatonAdapter for OpenCodeAdapter {
                     .await;
             }
         }
+        runtime.active_turn.store(true, Ordering::SeqCst);
 
         let mut receiver = runtime.events.lock().await;
         let mut final_text = String::new();
@@ -487,6 +542,7 @@ impl BatonAdapter for OpenCodeAdapter {
             }
         };
         drop(receiver);
+        runtime.active_turn.store(false, Ordering::SeqCst);
         *runtime.current_emit.lock().await = None;
         *runtime.active_session.lock().await = None;
 
@@ -510,6 +566,7 @@ impl BatonAdapter for OpenCodeAdapter {
     async fn dispose(&mut self) -> Result<()> {
         let runtime = self.runtime.lock().await.clone();
         if let Some(runtime) = runtime {
+            runtime.active_turn.store(false, Ordering::SeqCst);
             let mut child = runtime.child.lock().await;
             let _ = child.start_kill();
         }

@@ -9,15 +9,26 @@ use std::time::Duration;
 /// Minimal HTTP server speaking the opencode 1.x "next" flow: /api/info,
 /// session create/model/prompt, and an SSE /api/event stream whose final
 /// frames are held on a oneshot so the test can observe mid-turn deltas.
-fn serve_opencode(listener: std::net::TcpListener, release: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>) {
+type Requests = Arc<Mutex<Vec<(String, String)>>>;
+
+fn serve_opencode(
+    listener: std::net::TcpListener,
+    release: Arc<Mutex<Option<tokio::sync::oneshot::Receiver<()>>>>,
+    requests: Requests,
+) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { break };
         let release = release.clone();
-        std::thread::spawn(move || handle_connection(stream, &release));
+        let requests = requests.clone();
+        std::thread::spawn(move || handle_connection(stream, &release, &requests));
     }
 }
 
-fn handle_connection(mut stream: std::net::TcpStream, release: &Mutex<Option<tokio::sync::oneshot::Receiver<()>>>) {
+fn handle_connection(
+    mut stream: std::net::TcpStream,
+    release: &Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    requests: &Requests,
+) {
     let mut buffer = [0u8; 8192];
     let mut head = Vec::new();
     loop {
@@ -43,7 +54,8 @@ fn handle_connection(mut stream: std::net::TcpStream, release: &Mutex<Option<tok
                 request.extend_from_slice(&buffer[..read]);
             }
             let path = head_text.lines().next().unwrap_or("").split(' ').nth(1).unwrap_or("").to_string();
-            respond(stream, &path, release);
+            let body = String::from_utf8_lossy(&request[..content_length.min(request.len())]).to_string();
+            respond(stream, &path, release, requests, &body);
             return;
         }
     }
@@ -53,7 +65,13 @@ fn find_header_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|window| window == b"\r\n\r\n").map(|index| index + 4)
 }
 
-fn respond(mut stream: std::net::TcpStream, path: &str, release: &Mutex<Option<tokio::sync::oneshot::Receiver<()>>>) {
+fn respond(
+    mut stream: std::net::TcpStream,
+    path: &str,
+    release: &Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    requests: &Requests,
+    body: &str,
+) {
     let respond_json = |stream: &mut std::net::TcpStream, status: &str, body: &str| {
         let response = format!(
             "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
@@ -66,7 +84,13 @@ fn respond(mut stream: std::net::TcpStream, path: &str, release: &Mutex<Option<t
         "/api/info" => respond_json(&mut stream, "200 OK", r#"{"version":"fake"}"#),
         "/api/session" => respond_json(&mut stream, "200 OK", r#"{"data":{"id":"ses_test"}}"#),
         "/api/session/ses_test/model" => respond_json(&mut stream, "204 No Content", ""),
-        "/api/session/ses_test/prompt" => respond_json(&mut stream, "200 OK", r#"{"data":{"id":"msg_1"}}"#),
+        "/api/session/ses_test/prompt" => {
+            requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.to_string()));
+            respond_json(&mut stream, "200 OK", r#"{"data":{"id":"msg_1"}}"#)
+        }
         "/api/event" => {
             let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: keep-alive\r\n\r\n";
             if stream.write_all(headers.as_bytes()).is_err() {
@@ -100,7 +124,9 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
     let port = listener.local_addr().unwrap().port();
     let (release_sender, release_receiver) = tokio::sync::oneshot::channel::<()>();
     let release_slot = Arc::new(Mutex::new(Some(release_receiver)));
-    std::thread::spawn(move || serve_opencode(listener, release_slot));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_server = requests.clone();
+    std::thread::spawn(move || serve_opencode(listener, release_slot, requests_for_server));
 
     let spawner: OpenCodeSpawner = Arc::new(move |_auth_env: &[(String, String)]| {
         let child = tokio::process::Command::new("sleep")
@@ -110,6 +136,8 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
         Ok(OpenCodeChild { port, password: "pw".to_string(), child })
     });
     let mut adapter = OpenCodeAdapter::new(spawner);
+    let steer = adapter.steer_handle().expect("opencode exposes steering");
+    assert!(!steer("too early".into()), "no runtime means no active turn");
 
     let (event_sender, event_receiver) = std::sync::mpsc::channel();
     let turn_task = tokio::spawn(async move {
@@ -145,6 +173,32 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
     assert_eq!(first_delta, "streamed ");
     assert!(!turn_task.is_finished(), "a tool-calls step must not complete the turn");
 
+    assert!(steer("change direction".into()), "steering is accepted during the live turn");
+    let steer_body = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let bodies = requests.lock().unwrap().clone();
+            if let Some((_, body)) = bodies
+                .iter()
+                .find(|(path, body)| path == "/api/session/ses_test/prompt" && body.contains("delivery"))
+            {
+                break body.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("steer request reaches opencode");
+    let steer_json: Value = serde_json::from_str(&steer_body).unwrap();
+    assert_eq!(steer_json["delivery"], "steer");
+    assert_eq!(steer_json["prompt"]["text"], "change direction");
+    assert!(
+        steer_json["id"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("msg_baton_steer_"),
+        "steer uses a stable native inbox id"
+    );
+
     let _ = release_sender.send(());
     tokio::time::timeout(Duration::from_secs(10), turn_task).await.unwrap().unwrap();
 
@@ -170,4 +224,5 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
     assert_eq!(completed.0, "streamed live", "final text comes from session.next.text.ended");
     assert_eq!(completed.1.unwrap().input_tokens, 15, "usage sums across steps");
     assert_eq!(completed.2.as_deref(), Some("ses_test"));
+    assert!(!steer("too late".into()), "steering after completion is rejected");
 }

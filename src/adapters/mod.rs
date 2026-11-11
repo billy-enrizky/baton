@@ -16,6 +16,12 @@ pub struct TurnStartInput {
     pub auth_env: Vec<(String, String)>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ModelListInput {
+    pub cwd: String,
+    pub auth_env: Vec<(String, String)>,
+}
+
 #[derive(Debug)]
 pub enum TurnEvent {
     TextDelta { text: String },
@@ -165,6 +171,12 @@ pub trait BatonAdapter: Send {
     /// when the handle cannot reach an active turn.
     fn steer_handle(&self) -> Option<SteerHandle> {
         None
+    }
+    /// Live model discovery. The default empty list tells the caller to keep
+    /// the static catalog; only adapters with a reliable catalog endpoint
+    /// override this.
+    async fn list_models(&mut self, _input: ModelListInput) -> Result<Vec<String>> {
+        Ok(Vec::new())
     }
     async fn start_turn(
         &mut self,

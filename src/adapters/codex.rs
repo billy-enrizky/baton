@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{BatonAdapter, LineReader, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, LineReader, LineWriter, ModelListInput, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -513,6 +513,47 @@ impl BatonAdapter for CodexAdapter {
             });
             true
         }))
+    }
+
+    async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        self.ensure_initialized(&runtime).await?;
+        let mut models: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = json!({ "limit": 200 });
+            if let Some(cursor) = cursor.as_ref() {
+                params["cursor"] = json!(cursor);
+            }
+            let response = self.request(&runtime, "model/list", params).await?;
+            if let Some(data) = response.get("data").and_then(Value::as_array) {
+                for model in data {
+                    if model.get("hidden").and_then(Value::as_bool).unwrap_or(false) {
+                        continue;
+                    }
+                    let slug = model
+                        .get("model")
+                        .or_else(|| model.get("id"))
+                        .and_then(Value::as_str)
+                        .filter(|slug| !slug.is_empty());
+                    if let Some(slug) = slug {
+                        if !models.iter().any(|known| known == slug) {
+                            models.push(slug.to_string());
+                        }
+                    }
+                }
+            }
+            let next = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|next| !next.is_empty())
+                .map(str::to_string);
+            match next {
+                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(models)
     }
 
     async fn start_turn(

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use crate::adapters::{BatonAdapter, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::checkpoints::capture_checkpoint;
 use crate::config::{provider_auth_env, resolve_config};
 use crate::handoff::{build_handoff, derive_title, git_status_summary, wrap_prompt_with_handoff, HandoffMessage};
@@ -16,6 +16,7 @@ pub type SharedAdapter = Arc<tokio::sync::Mutex<Box<dyn BatonAdapter>>>;
 pub enum EngineCommand {
     Submit { thread_id: String, text: String, permission_mode: PermissionMode },
     Steer { thread_id: String, text: String },
+    ListModels { thread_id: String, provider: ProviderId },
     Interrupt,
     Quit,
 }
@@ -25,6 +26,7 @@ pub enum EngineEvent {
     TurnStarted { thread_id: String },
     Turn(TurnEvent),
     SteerRejected { thread_id: String, text: String },
+    ModelsLoaded { thread_id: String, provider: ProviderId, models: Vec<String>, error: Option<String> },
     TurnRejected { thread_id: String, text: String, reason: String },
     TurnFinished { thread_id: String, ok: bool, error: Option<String>, phase: TurnPhase },
 }
@@ -234,6 +236,25 @@ pub async fn run_engine(
                     });
                 }
             }
+            EngineCommand::ListModels { thread_id, provider } => {
+                let store = store.clone();
+                let home = home.clone();
+                let adapters = adapters.clone();
+                let sender = engine_event_sender.clone();
+                tokio::spawn(async move {
+                    let result = load_provider_models(&store, &home, &adapters, &thread_id, provider).await;
+                    let (models, error) = match result {
+                        Ok(models) => (models, None),
+                        Err(error) => (Vec::new(), Some(error.to_string())),
+                    };
+                    let _ = sender.send(EngineEvent::ModelsLoaded {
+                        thread_id,
+                        provider,
+                        models,
+                        error,
+                    });
+                });
+            }
             EngineCommand::Interrupt => {
                 for handle in &interrupt_handles {
                     handle();
@@ -311,6 +332,44 @@ async fn run_turn(
         error,
         phase,
     });
+}
+
+/// Asks one provider for its live model catalog without blocking the engine
+/// command loop. A busy adapter is reported as busy, not waited on: a picker
+/// should keep its static fallback rather than stall behind a turn.
+async fn load_provider_models(
+    store: &SharedStore,
+    home: &std::path::PathBuf,
+    adapters: &[SharedAdapter],
+    thread_id: &str,
+    provider: ProviderId,
+) -> Result<Vec<String>> {
+    let cwd = {
+        let store = store.lock().unwrap();
+        store
+            .get_thread(thread_id)?
+            .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?
+            .cwd
+    };
+    let config = resolve_config(home, std::path::Path::new(&cwd));
+    let input = ModelListInput {
+        cwd,
+        auth_env: provider_auth_env(config.for_provider(provider)),
+    };
+    for adapter in adapters {
+        if let Ok(mut adapter) = adapter.try_lock() {
+            if adapter.id() == provider {
+                let models = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    adapter.list_models(input),
+                )
+                .await
+                .map_err(|_| anyhow::anyhow!("{provider} model catalog timed out"))??;
+                return Ok(models);
+            }
+        }
+    }
+    anyhow::bail!("{provider} is busy; keeping the cached model list")
 }
 
 async fn execute_turn(
@@ -693,6 +752,10 @@ mod tests {
             Arc::new(|| {})
         }
 
+        async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
+            Ok(vec![format!("live:{}", input.cwd)])
+        }
+
         async fn start_turn(
             &mut self,
             _input: TurnStartInput,
@@ -807,6 +870,69 @@ mod tests {
         command_sender2.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine2).await;
+    }
+
+    #[tokio::test]
+    async fn engine_lists_models_for_the_requested_thread() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "models".into(),
+                cwd: "/tmp/models".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
+            Box::new(IdleAdapter) as Box<dyn BatonAdapter>
+        ))];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store,
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        command_sender
+            .send(EngineCommand::ListModels {
+                thread_id: thread.id.clone(),
+                provider: ProviderId::Codex,
+            })
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(event @ EngineEvent::ModelsLoaded { .. }) = event_receiver.try_recv() {
+                    break event;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("model event arrives");
+        match event {
+            EngineEvent::ModelsLoaded {
+                thread_id,
+                provider,
+                models,
+                error,
+            } => {
+                assert_eq!(thread_id, thread.id);
+                assert_eq!(provider, ProviderId::Codex);
+                assert_eq!(models, vec!["live:/tmp/models".to_string()]);
+                assert!(error.is_none());
+            }
+            _ => unreachable!(),
+        }
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
     }
 
     #[tokio::test]

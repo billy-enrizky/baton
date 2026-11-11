@@ -10,7 +10,7 @@ use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use uuid::Uuid;
 
-use crate::adapters::{BatonAdapter, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
 
@@ -406,6 +406,47 @@ impl BatonAdapter for OpenCodeAdapter {
             });
             true
         }))
+    }
+
+    async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        if runtime.version != OpenCodeVersion::V2 {
+            return Ok(Vec::new());
+        }
+        let response = runtime
+            .http
+            .get(format!("{}/api/model", runtime.base_url))
+            .header("Authorization", &runtime.auth_header)
+            .query(&[("location[directory]", input.cwd.as_str())])
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("opencode /api/model failed ({status}): {text}");
+        }
+        let frame: Value = serde_json::from_str(&text)?;
+        let mut models: Vec<String> = Vec::new();
+        if let Some(data) = frame.get("data").and_then(Value::as_array) {
+            for model in data {
+                let provider = model
+                    .get("providerID")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                let id = model
+                    .get("id")
+                    .or_else(|| model.get("modelID"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                if let (Some(provider), Some(id)) = (provider, id) {
+                    let slug = format!("{provider}/{id}");
+                    if !models.contains(&slug) {
+                        models.push(slug);
+                    }
+                }
+            }
+        }
+        Ok(models)
     }
 
     async fn start_turn(

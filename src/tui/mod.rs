@@ -458,6 +458,46 @@ fn apply_engine_event(
                 }
             }
         }
+        EngineEvent::ModelsLoaded { thread_id, provider, models, error } => {
+            if thread_id != state.thread.id {
+                return;
+            }
+            let picker_matches = matches!(
+                &state.overlay,
+                Overlay::ModelPicker { provider: current, .. } if *current == provider
+            );
+            if !picker_matches {
+                return;
+            }
+            if models.is_empty() {
+                if let Some(error) = error {
+                    state.notice = Some(format!(
+                        "live model catalog unavailable for {provider}: {error}"
+                    ));
+                }
+                return;
+            }
+            let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+            let default_model = resolved.for_provider(provider).model.clone();
+            let mut live = models;
+            if !default_model.is_empty() && !live.contains(&default_model) {
+                live.insert(0, default_model);
+            }
+            let count = live.len();
+            if let Overlay::ModelPicker {
+                models: current,
+                selected,
+                ..
+            } = &mut state.overlay
+            {
+                let previous = current.get(*selected).cloned();
+                *selected = previous
+                    .and_then(|model| live.iter().position(|candidate| candidate == &model))
+                    .unwrap_or(0);
+                *current = live;
+            }
+            state.notice = Some(format!("loaded {count} live model(s) for {provider}"));
+        }
         EngineEvent::TurnRejected { thread_id, text, reason } => {
             if thread_id == state.thread.id {
                 enqueue_message(state, store, text);
@@ -666,6 +706,10 @@ fn handle_key(
                     if !models.contains(&default_model) {
                         models.insert(0, default_model);
                     }
+                    let _ = engine_command_sender.send(EngineCommand::ListModels {
+                        thread_id: state.thread.id.clone(),
+                        provider,
+                    });
                     state.overlay = Overlay::ModelPicker { provider, models, selected: 0 };
                 }
             }
@@ -688,6 +732,16 @@ fn handle_key(
             KeyCode::Down => {
                 if !models.is_empty() {
                     selected = (selected + 1) % models.len();
+                }
+                state.overlay = Overlay::ModelPicker { provider, models, selected };
+            }
+            KeyCode::PageUp => {
+                selected = selected.saturating_sub(10);
+                state.overlay = Overlay::ModelPicker { provider, models, selected };
+            }
+            KeyCode::PageDown => {
+                if !models.is_empty() {
+                    selected = (selected + 10).min(models.len() - 1);
                 }
                 state.overlay = Overlay::ModelPicker { provider, models, selected };
             }
@@ -2469,13 +2523,35 @@ fn draw_model_picker(
     selected: usize,
 ) {
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
-    let default_model = resolved.for_provider(provider).model.clone();
+    let selected_model = if state.thread.current_provider == provider {
+        state
+            .thread
+            .current_model
+            .clone()
+            .unwrap_or_else(|| resolved.for_provider(provider).model.clone())
+    } else {
+        resolved.for_provider(provider).model.clone()
+    };
+    let visible = models.len().min(8);
+    let start = if visible == 0 || models.len() <= visible {
+        0
+    } else {
+        selected
+            .saturating_sub(visible / 2)
+            .min(models.len() - visible)
+    };
+    let end = (start + visible).min(models.len());
     let mut lines: Vec<Line> = vec![Line::styled(
-        format!("{provider} models · enter select · esc cancel"),
+        format!(
+            "{provider} models · {}/{} · enter select · esc cancel",
+            selected.saturating_add(1).min(models.len().max(1)),
+            models.len()
+        ),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, model) in models.iter().take(8).enumerate() {
-        let marker = if *model == default_model { "●" } else { " " };
+    for (offset, model) in models[start..end].iter().enumerate() {
+        let index = start + offset;
+        let marker = if *model == selected_model { "●" } else { " " };
         let style = if index == selected {
             Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
         } else {
@@ -3349,6 +3425,61 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::AcceptAlways);
         assert!(state.approvals.is_empty());
         assert!(state.review.is_some(), "review resumes after the approval");
+    }
+
+    #[test]
+    fn model_picker_window_follows_a_large_live_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::ModelPicker {
+            provider: ProviderId::Codex,
+            models: (0..20).map(|index| format!("model-{index:02}")).collect(),
+            selected: 15,
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("16/20"), "position header: {text}");
+        assert!(text.contains("model-15"), "selected model: {text}");
+        assert!(!text.contains("model-00"), "first row should be outside the window");
+    }
+
+    #[test]
+    fn live_model_catalog_updates_the_open_picker_without_losing_selection() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::ModelPicker {
+            provider: ProviderId::Codex,
+            models: vec!["selected-model".into()],
+            selected: 0,
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::ModelsLoaded {
+                thread_id,
+                provider: ProviderId::Codex,
+                models: vec!["selected-model".into(), "live-model".into()],
+                error: None,
+            },
+            &engine_command_sender,
+        );
+        match &state.overlay {
+            Overlay::ModelPicker {
+                models, selected, ..
+            } => {
+                assert!(models.iter().any(|model| model == "live-model"));
+                assert_eq!(models.get(*selected).map(String::as_str), Some("selected-model"));
+            }
+            _ => panic!("model picker closed"),
+        }
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("live model"),
+            "notice: {:?}",
+            state.notice
+        );
     }
 
     #[test]

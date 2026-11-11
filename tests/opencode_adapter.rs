@@ -1,5 +1,5 @@
 use baton::adapters::opencode::{OpenCodeAdapter, OpenCodeChild, OpenCodeSpawner};
-use baton::adapters::BatonAdapter;
+use baton::adapters::{BatonAdapter, ModelListInput};
 use baton::types::PermissionMode;
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -80,6 +80,14 @@ fn respond(
         let _ = stream.write_all(response.as_bytes());
         let _ = stream.flush();
     };
+    if path.starts_with("/api/model") {
+        respond_json(
+            &mut stream,
+            "200 OK",
+            r#"{"data":[{"providerID":"myprovider","id":"model-a"},{"providerID":"myprovider","id":"model-b"}]}"#,
+        );
+        return;
+    }
     match path {
         "/api/info" => respond_json(&mut stream, "200 OK", r#"{"version":"fake"}"#),
         "/api/session" => respond_json(&mut stream, "200 OK", r#"{"data":{"id":"ses_test"}}"#),
@@ -136,6 +144,14 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
         Ok(OpenCodeChild { port, password: "pw".to_string(), child })
     });
     let mut adapter = OpenCodeAdapter::new(spawner);
+    let models = adapter
+        .list_models(ModelListInput {
+            cwd: "/work".into(),
+            auth_env: vec![],
+        })
+        .await
+        .unwrap();
+    assert_eq!(models, vec!["myprovider/model-a", "myprovider/model-b"]);
     let steer = adapter.steer_handle().expect("opencode exposes steering");
     assert!(!steer("too early".into()), "no runtime means no active turn");
 

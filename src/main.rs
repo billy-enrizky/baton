@@ -318,19 +318,21 @@ fn main_result() -> Result<()> {
                     .current_model
                     .clone()
                     .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
-                let phase = store
-                    .list_turn_records(&thread.id)?
+                let turns = store.list_turn_records(&thread.id)?;
+                let turn_count = turns.len();
+                let phase = turns
                     .into_iter()
                     .last()
                     .map(|turn| turn.phase.as_str().to_string())
                     .unwrap_or_else(|| "idle".to_string());
                 let queued = store.list_queued_messages(&thread.id)?.len();
                 println!(
-                    "{}  {}/{}  {}  queue:{}  {}",
+                    "{}  {}/{}  {}  turns:{}  queue:{}  {}",
                     &thread.id[..8],
                     thread.current_provider,
                     model,
                     phase,
+                    turn_count,
                     queued,
                     thread.title
                 );

@@ -210,6 +210,7 @@ fn main_result() -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": 1,
                             "thread_id": thread.id,
                             "ok": false,
                             "phase": "unverified",
@@ -232,6 +233,7 @@ fn main_result() -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
                         "thread_id": thread.id,
                         "ok": result_ok,
                         "phase": result_phase.map(|phase| phase.as_str()).unwrap_or("unverified"),
@@ -682,6 +684,7 @@ fn main_result() -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": 1,
                             "thread_id": thread.id,
                             "cleared": true,
                         }))?
@@ -697,6 +700,7 @@ fn main_result() -> Result<()> {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
                         "thread_id": thread.id,
                         "count": queued.len(),
                         "messages": queued,

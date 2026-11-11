@@ -309,11 +309,7 @@ fn main_result() -> Result<()> {
                         "ended_at": ended_at,
                         "last_error": last_error,
                         "open_turn": open_turn,
-                        "stale_hint": if open_turn {
-                            Some("if no baton process is attached, this turn is stale and will be marked unverified on the next open")
-                        } else {
-                            None
-                        },
+                        "stale_hint": if open_turn { Some(status::STALE_HINT) } else { None },
                         "queue_count": queued.len(),
                         "queue": queued,
                     }));
@@ -615,11 +611,7 @@ fn main_result() -> Result<()> {
                             "turn": turn.turn,
                             "phase": turn.phase.as_str(),
                             "open": open,
-                            "stale_hint": if open {
-                                Some("if no baton process is attached, this turn is stale and will be marked unverified on the next open")
-                            } else {
-                                None
-                            },
+                            "stale_hint": if open { Some(status::STALE_HINT) } else { None },
                             "provider": turn.provider.as_str(),
                             "model": turn.model,
                             "started_at": turn.started_at,

@@ -2,6 +2,8 @@
 
 use crate::types::{PermissionMode, ProviderId, TurnPhase};
 
+pub const STALE_HINT: &str = "if no baton process is attached, this turn is stale and will be marked unverified on the next open";
+
 #[derive(Debug, Clone)]
 pub struct TurnStatus {
     pub turn: i64,
@@ -44,11 +46,7 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
             !turn.phase.is_terminal()
         })
         .unwrap_or(false);
-    let stale_hint = if open_turn {
-        Some("if no baton process is attached, this turn is stale and will be marked unverified on the next open")
-    } else {
-        None
-    };
+    let stale_hint = if open_turn { Some(STALE_HINT) } else { None };
     let latest_turn = status.latest_turn.as_ref().map(|turn| {
         serde_json::json!({
             "turn": turn.turn,

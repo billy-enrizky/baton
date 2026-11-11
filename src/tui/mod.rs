@@ -121,6 +121,11 @@ struct ReviewState {
     note_input: Option<String>,
 }
 
+struct ApprovalState {
+    summary: String,
+    respond: tokio::sync::oneshot::Sender<ApprovalDecision>,
+}
+
 #[derive(Debug, Clone)]
 struct InputRow {
     screen_y: u16,
@@ -132,7 +137,6 @@ struct InputRow {
 
 enum Overlay {
     None,
-    Approval { summary: String, respond: tokio::sync::oneshot::Sender<ApprovalDecision> },
     RewindPicker { selected: usize },
     CodeConfirm { turn: i64, git_ref: String },
     SwitchPicker { selected: usize },
@@ -173,6 +177,7 @@ pub struct TuiState {
     streaming_text: String,
     tool_lines: Vec<ToolLine>,
     overlay: Overlay,
+    approvals: Vec<ApprovalState>,
     review: Option<ReviewState>,
     notice: Option<String>,
     diff_output: Option<String>,
@@ -234,6 +239,7 @@ pub fn run_tui(
         streaming_text: String::new(),
         tool_lines: Vec::new(),
         overlay: Overlay::None,
+        approvals: Vec::new(),
         review: None,
         notice: None,
         diff_output: None,
@@ -397,8 +403,9 @@ fn apply_engine_event(
         EngineEvent::TurnStarted { thread_id } => {
             if thread_id == state.thread.id {
                 state.running = true;
-                    state.streaming_text.clear();
+                state.streaming_text.clear();
                 state.tool_lines.clear();
+                state.approvals.clear();
                 state.notice = None;
                 state.diff_output = None;
             }
@@ -408,6 +415,7 @@ fn apply_engine_event(
                 state.running = false;
                 state.streaming_text.clear();
                 state.tool_lines.clear();
+                state.approvals.clear();
                 {
                     let guard = store.lock().unwrap();
                     state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
@@ -510,7 +518,7 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
             }
         }
         TurnEvent::ApprovalRequest { summary, respond, .. } => {
-            state.overlay = Overlay::Approval { summary, respond };
+            state.approvals.push(ApprovalState { summary, respond });
         }
         TurnEvent::Usage { .. } => {}
         TurnEvent::TurnCompleted { .. }
@@ -568,26 +576,40 @@ fn handle_key(
         return;
     }
 
+    if !state.approvals.is_empty() {
+        let decision = match key.code {
+            KeyCode::Char('y') => Some(ApprovalDecision::Accept),
+            KeyCode::Char('a') => Some(ApprovalDecision::AcceptAlways),
+            KeyCode::Char('n') => Some(ApprovalDecision::Deny),
+            _ => None,
+        };
+        if let Some(decision) = decision {
+            let approval = state.approvals.pop().expect("approval checked above");
+            let label = match decision {
+                ApprovalDecision::Accept => "accepted once",
+                ApprovalDecision::AcceptAlways => "accepted for the session",
+                ApprovalDecision::Deny => "denied",
+            };
+            if approval.respond.send(decision).is_err() {
+                state.notice = Some("approval request expired".into());
+            } else if state.approvals.is_empty() {
+                state.notice = Some(format!("approval {label}"));
+            } else {
+                state.notice = Some(format!(
+                    "approval {label} · {} request(s) still waiting",
+                    state.approvals.len()
+                ));
+            }
+        }
+        return;
+    }
+
     if state.review.is_some() {
         handle_review_key(state, store, engine_command_sender, key);
         return;
     }
 
     match std::mem::replace(&mut state.overlay, Overlay::None) {
-        Overlay::Approval { summary, respond } => match key.code {
-            KeyCode::Char('y') => {
-                let _ = respond.send(ApprovalDecision::Accept);
-            }
-            KeyCode::Char('a') => {
-                let _ = respond.send(ApprovalDecision::AcceptAlways);
-            }
-            KeyCode::Char('n') => {
-                let _ = respond.send(ApprovalDecision::Deny);
-            }
-            _ => {
-                state.overlay = Overlay::Approval { summary, respond };
-            }
-        },
         Overlay::RewindPicker { mut selected } => {
             let user_messages: Vec<(i64, String)> = state
                 .history
@@ -2179,28 +2201,43 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         .as_ref()
         .map(|notice| wrapped_rows(notice, area.width as usize))
         .unwrap_or(0);
-    let overlay_rows = match &state.overlay {
-        Overlay::None => 0,
-        Overlay::Approval { .. } => 4,
-        Overlay::RewindPicker { .. } => state
-            .history
-            .iter()
-            .filter(|message| message.role == "user")
-            .count()
-            .min(8)
-            + 4,
-        Overlay::CodeConfirm { .. } => 4,
-        Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
-        Overlay::ModelPicker { models, .. } => models.len().min(8) + 4,
-        Overlay::SettingsPicker { categories, category_index, .. } => {
-            categories.get(*category_index).map(|(_, values): &(String, Vec<String>)| values.len()).unwrap_or(0).min(6) + categories.len().min(4) + 4
-        },
-        Overlay::McpPicker { .. } => 8,
-        Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
-        Overlay::ModePicker { .. } => 7,
-        Overlay::AuthPicker { .. } => 9,
-        Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
-        Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
+    let overlay_rows = if !state.approvals.is_empty() {
+        4
+    } else {
+        match &state.overlay {
+            Overlay::None => 0,
+            Overlay::RewindPicker { .. } => {
+                state
+                    .history
+                    .iter()
+                    .filter(|message| message.role == "user")
+                    .count()
+                    .min(8)
+                    + 4
+            }
+            Overlay::CodeConfirm { .. } => 4,
+            Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
+            Overlay::ModelPicker { models, .. } => models.len().min(8) + 4,
+            Overlay::SettingsPicker {
+                categories,
+                category_index,
+                ..
+            } => {
+                categories
+                    .get(*category_index)
+                    .map(|(_, values): &(String, Vec<String>)| values.len())
+                    .unwrap_or(0)
+                    .min(6)
+                    + categories.len().min(4)
+                    + 4
+            }
+            Overlay::McpPicker { .. } => 8,
+            Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
+            Overlay::ModePicker { .. } => 7,
+            Overlay::AuthPicker { .. } => 9,
+            Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
+            Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
+        }
     };
     let chunks = Layout::vertical([
         Constraint::Min(3),
@@ -2212,30 +2249,54 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     .split(area);
 
     draw_transcript(frame, state, chunks[0], spinner_frame);
-    match &state.overlay {
-        Overlay::Approval { summary, .. } => draw_approval(frame, chunks[1], summary),
-        Overlay::RewindPicker { selected } => draw_rewind_picker(frame, chunks[1], state, *selected),
-        Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[1], *turn),
-        Overlay::SwitchPicker { selected } => draw_switch_picker(frame, chunks[1], state, *selected),
-        Overlay::ModelPicker { provider, models, selected } => {
-            draw_model_picker(frame, chunks[1], state, *provider, models, *selected)
+    if let Some(approval) = state.approvals.last() {
+        draw_approval(frame, chunks[1], &approval.summary);
+    } else {
+        match &state.overlay {
+            Overlay::RewindPicker { selected } => {
+                draw_rewind_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[1], *turn),
+            Overlay::SwitchPicker { selected } => {
+                draw_switch_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::ModelPicker {
+                provider,
+                models,
+                selected,
+            } => draw_model_picker(frame, chunks[1], state, *provider, models, *selected),
+            Overlay::SettingsPicker {
+                provider,
+                categories,
+                category_index,
+                value_index,
+            } => draw_settings_picker(
+                frame,
+                chunks[1],
+                *provider,
+                categories,
+                *category_index,
+                *value_index,
+            ),
+            Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[1], *selected),
+            Overlay::SkillsPicker { selected, skills } => {
+                draw_skills_picker(frame, chunks[1], skills, *selected)
+            }
+            Overlay::ModePicker { selected } => {
+                draw_mode_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::AuthPicker { selected } => {
+                draw_auth_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::ThreadPicker { selected, threads } => {
+                draw_thread_picker(frame, chunks[1], threads, *selected)
+            }
+            Overlay::CheckpointPicker {
+                selected,
+                checkpoints,
+            } => draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected),
+            Overlay::None => {}
         }
-        Overlay::SettingsPicker { provider, categories, category_index, value_index } => {
-            draw_settings_picker(frame, chunks[1], *provider, categories, *category_index, *value_index)
-        }
-        Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[1], *selected),
-        Overlay::SkillsPicker { selected, skills } => {
-            draw_skills_picker(frame, chunks[1], skills, *selected)
-        }
-        Overlay::ModePicker { selected } => draw_mode_picker(frame, chunks[1], state, *selected),
-        Overlay::AuthPicker { selected } => draw_auth_picker(frame, chunks[1], state, *selected),
-        Overlay::ThreadPicker { selected, threads } => {
-            draw_thread_picker(frame, chunks[1], threads, *selected)
-        }
-        Overlay::CheckpointPicker { selected, checkpoints } => {
-            draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected)
-        }
-        Overlay::None => {}
     }
     if let Some(notice) = &state.notice {
         let paragraph = Paragraph::new(notice.clone()).style(Style::default().fg(COLORS.warning)).wrap(Wrap { trim: false });
@@ -3144,6 +3205,7 @@ mod tests {
                 streaming_text: String::new(),
             tool_lines: Vec::new(),
             overlay: Overlay::None,
+            approvals: Vec::new(),
             review: None,
             notice: None,
             diff_output: None,
@@ -3202,6 +3264,91 @@ mod tests {
             cell.fg == COLORS.accent && cell.modifier.contains(Modifier::BOLD)
         });
         assert!(styled, "selected row must be highlighted");
+    }
+
+    #[test]
+    fn approvals_stack_over_pickers_without_losing_them() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::SwitchPicker { selected: 2 };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (first_sender, mut first_receiver) = tokio::sync::oneshot::channel();
+        let (second_sender, mut second_receiver) = tokio::sync::oneshot::channel();
+        apply_turn_event(
+            &mut state,
+            TurnEvent::ApprovalRequest {
+                id: "first".into(),
+                kind: "permissions".into(),
+                summary: "run first".into(),
+                respond: first_sender,
+            },
+        );
+        apply_turn_event(
+            &mut state,
+            TurnEvent::ApprovalRequest {
+                id: "second".into(),
+                kind: "permissions".into(),
+                summary: "run second".into(),
+                respond: second_sender,
+            },
+        );
+        assert_eq!(state.approvals.len(), 2);
+
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        assert_eq!(second_receiver.try_recv().unwrap(), ApprovalDecision::Deny);
+        assert_eq!(state.approvals.len(), 1, "the older approval stays queued");
+        assert!(
+            matches!(state.overlay, Overlay::SwitchPicker { selected: 2 }),
+            "answering a request must not destroy the picker underneath"
+        );
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('y')));
+        assert_eq!(first_receiver.try_recv().unwrap(), ApprovalDecision::Accept);
+        assert!(state.approvals.is_empty());
+        assert!(matches!(state.overlay, Overlay::SwitchPicker { selected: 2 }));
+        assert!(state.notice.as_deref().unwrap_or("").contains("accepted once"));
+    }
+
+    #[test]
+    fn an_approval_can_be_answered_while_review_is_open() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        assert!(state.review.is_some());
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        apply_turn_event(
+            &mut state,
+            TurnEvent::ApprovalRequest {
+                id: "review-approval".into(),
+                kind: "permissions".into(),
+                summary: "edit file".into(),
+                respond: sender,
+            },
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::AcceptAlways);
+        assert!(state.approvals.is_empty());
+        assert!(state.review.is_some(), "review resumes after the approval");
     }
 
     #[test]

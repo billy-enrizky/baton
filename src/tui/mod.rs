@@ -1518,7 +1518,14 @@ fn handle_command(
                 state.notice = Some("no turn records yet".into());
             } else {
                 let mut text = format!("turns: {}", turns.len());
+                let mut has_open = false;
                 for turn in turns.iter().rev().take(12) {
+                    if matches!(
+                        turn.phase,
+                        TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+                    ) {
+                        has_open = true;
+                    }
                     let ended = turn.ended_at.as_deref().unwrap_or("open");
                     let error = turn
                         .error
@@ -1532,6 +1539,9 @@ fn handle_command(
                         ended,
                         error
                     ));
+                }
+                if has_open {
+                    text.push_str("\n\nopen turn may be stale; /status shows the guard details");
                 }
                 state.notice = Some(text);
             }
@@ -3702,6 +3712,7 @@ mod tests {
         assert!(notice.contains("turns: 2"));
         assert!(notice.contains("2 running"));
         assert!(notice.contains("1 completed"));
+        assert!(notice.contains("may be stale"));
     }
 
     #[test]

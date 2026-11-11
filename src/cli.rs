@@ -62,7 +62,11 @@ pub enum Commands {
     Update,
     Chat,
     #[command(visible_alias = "list")]
-    Threads,
+    Threads {
+        /// Emit a JSON array
+        #[arg(long)]
+        json: bool,
+    },
     New {
         title: Vec<String>,
     },

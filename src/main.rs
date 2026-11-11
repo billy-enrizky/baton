@@ -223,12 +223,38 @@ fn main_result() -> Result<()> {
             return Ok(());
         }
         cli::Commands::Chat => run_chat(cli, &home, &cwd, permission_override, cli_prompt),
-        cli::Commands::Threads => {
+        cli::Commands::Threads { json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let resolved = resolve_config(&home, &cwd);
             let threads = store.list_threads_for_path(&cwd)?;
             if threads.is_empty() {
                 println!("no threads in this directory yet. Run baton to start one.");
+                return Ok(());
+            }
+            if json {
+                let mut values = Vec::new();
+                for thread in &threads {
+                    let model = thread
+                        .current_model
+                        .clone()
+                        .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
+                    let phase = store
+                        .list_turn_records(&thread.id)?
+                        .into_iter()
+                        .last()
+                        .map(|turn| turn.phase.as_str().to_string())
+                        .unwrap_or_else(|| "idle".to_string());
+                    values.push(serde_json::json!({
+                        "thread_id": thread.id,
+                        "title": thread.title,
+                        "provider": thread.current_provider.as_str(),
+                        "model": model,
+                        "permission_mode": thread.permission_mode.as_str(),
+                        "phase": phase,
+                        "queue_count": store.list_queued_messages(&thread.id)?.len(),
+                    }));
+                }
+                println!("{}", serde_json::to_string_pretty(&values)?);
                 return Ok(());
             }
             for thread in threads {

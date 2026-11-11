@@ -170,6 +170,50 @@ fn store_thread_lookup_accepts_symlinked_project_paths() {
 }
 
 #[test]
+fn store_search_is_project_scoped_and_matches_titles_or_text() {
+    let store = BatonStore::memory().unwrap();
+    let first = store
+        .create_thread(NewThread {
+            title: "authentication refactor".into(),
+            cwd: "/tmp/one".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    let second = store
+        .create_thread(NewThread {
+            title: "other project".into(),
+            cwd: "/tmp/two".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    store
+        .add_message(&first.id, 1, "user", None, None, "Fix the LOGIN redirect")
+        .unwrap();
+    store
+        .add_message(&first.id, 2, "assistant", None, None, "coverage is 100% now")
+        .unwrap();
+    store
+        .add_message(&second.id, 1, "assistant", None, None, "login also appears here")
+        .unwrap();
+    let scoped = store.search_messages(Some("/tmp/one"), "login", 20).unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].thread_id, first.id);
+    let by_title = store
+        .search_messages(Some("/tmp/one"), "AUTHENTICATION", 20)
+        .unwrap();
+    assert_eq!(by_title.len(), 2, "a title match returns each matching message");
+    assert!(by_title.iter().all(|result| result.title == "authentication refactor"));
+    let all = store.search_messages(None, "login", 20).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(store.search_messages(None, "", 20).unwrap().len(), 0);
+    let literal_percent = store.search_messages(Some("/tmp/one"), "%", 20).unwrap();
+    assert_eq!(literal_percent.len(), 1, "LIKE wildcards are escaped");
+    assert!(literal_percent[0].text.contains("100%"));
+}
+
+#[test]
 fn store_review_notes_track_sent_state_and_rewind() {
     let store = BatonStore::memory().unwrap();
     let thread = store

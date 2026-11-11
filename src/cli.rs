@@ -120,6 +120,16 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Search thread titles and conversation text
+    Search {
+        query: Vec<String>,
+        /// Search every project instead of the current directory
+        #[arg(long)]
+        all: bool,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     /// List durable turn phases for a thread
     Turns {
         thread_id: Option<String>,

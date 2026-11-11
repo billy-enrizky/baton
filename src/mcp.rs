@@ -42,7 +42,7 @@ impl McpServer {
                     "version": env!("CARGO_PKG_VERSION"),
                     "title": "Baton thread state"
                 },
-                "instructions": "Use baton_status, baton_threads, baton_turns, baton_queue, baton_messages, and baton_latest_diff to inspect the local baton store."
+                "instructions": "Use baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, and baton_latest_diff to inspect the local baton store."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
@@ -151,6 +151,39 @@ impl McpServer {
                     "title": thread.title,
                     "count": messages.len(),
                     "messages": messages.iter().map(message_json).collect::<Vec<_>>(),
+                }))
+            }
+            "baton_search" => {
+                let query = arguments
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|query| !query.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("query is required"))?;
+                let all = arguments.get("all").and_then(Value::as_bool).unwrap_or(false);
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 200) as usize;
+                let cwd = (!all).then(|| self.cwd.to_string_lossy().to_string());
+                let results = self.store.search_messages(cwd.as_deref(), query, limit)?;
+                Ok(json!({
+                    "schema_version": status::SCHEMA_VERSION,
+                    "query": query,
+                    "all": all,
+                    "count": results.len(),
+                    "results": results.iter().map(|result| json!({
+                        "thread_id": result.thread_id,
+                        "title": result.title,
+                        "message_id": result.message_id,
+                        "turn": result.turn,
+                        "role": result.role,
+                        "provider": result.provider,
+                        "model": result.model,
+                        "text": result.text,
+                        "created_at": result.created_at,
+                    })).collect::<Vec<_>>(),
                 }))
             }
             "baton_latest_diff" => {
@@ -347,6 +380,21 @@ fn tool_descriptors() -> Vec<Value> {
             "annotations": { "readOnlyHint": true }
         }),
         json!({
+            "name": "baton_search",
+            "description": "Search conversation text and thread titles in the server cwd, or every project with all=true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Case-insensitive substring to search for." },
+                    "all": { "type": "boolean", "description": "Search every project instead of the server cwd." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
             "name": "baton_latest_diff",
             "description": "Read the newest stored turn diff for a thread.",
             "inputSchema": thread_schema(),
@@ -477,6 +525,9 @@ mod tests {
         assert_eq!(messages["messages"][0]["role"], "assistant");
         let diff = tool_json(&server, "baton_latest_diff", json!({}));
         assert!(diff["diff"].as_str().unwrap().contains("diff --git"));
+        let found = tool_json(&server, "baton_search", json!({ "query": "world" }));
+        assert_eq!(found["count"], 1);
+        assert_eq!(found["results"][0]["role"], "assistant");
         let cleared = tool_json(&server, "baton_queue", json!({ "clear": true }));
         assert_eq!(cleared["cleared"], true);
         assert_eq!(cleared["count"], 0);

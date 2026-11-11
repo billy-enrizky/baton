@@ -57,6 +57,19 @@ pub struct ReviewNoteRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct MessageSearchRow {
+    pub message_id: i64,
+    pub thread_id: String,
+    pub title: String,
+    pub turn: i64,
+    pub role: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub text: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct MessageRow {
     pub id: i64,
     pub thread_id: String,
@@ -895,6 +908,63 @@ impl BatonStore {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Substring search across conversation text and thread titles. A cwd
+    /// limits results to one project; None searches every durable thread.
+    pub fn search_messages(
+        &self,
+        cwd: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageSearchRow>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let escaped = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let limit = limit.clamp(1, 500) as i64;
+        let mut statement = match cwd {
+            Some(_) => self.db.prepare(
+                "SELECT m.id, m.thread_id, t.title, m.turn, m.role, m.provider, m.model, m.text, m.created_at
+                 FROM messages m JOIN threads t ON t.id = m.thread_id
+                 WHERE t.cwd = ? AND (lower(m.text) LIKE ? ESCAPE '\\' OR lower(t.title) LIKE ? ESCAPE '\\')
+                 ORDER BY m.id DESC LIMIT ?",
+            )?,
+            None => self.db.prepare(
+                "SELECT m.id, m.thread_id, t.title, m.turn, m.role, m.provider, m.model, m.text, m.created_at
+                 FROM messages m JOIN threads t ON t.id = m.thread_id
+                 WHERE lower(m.text) LIKE ? ESCAPE '\\' OR lower(t.title) LIKE ? ESCAPE '\\'
+                 ORDER BY m.id DESC LIMIT ?",
+            )?,
+        };
+        let map = |row: &rusqlite::Row| {
+            Ok(MessageSearchRow {
+                message_id: row.get(0)?,
+                thread_id: row.get(1)?,
+                title: row.get(2)?,
+                turn: row.get(3)?,
+                role: row.get(4)?,
+                provider: row.get(5)?,
+                model: row.get(6)?,
+                text: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        };
+        let rows = match cwd {
+            Some(cwd) => statement
+                .query_map(params![cwd, pattern, pattern, limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => statement
+                .query_map(params![pattern, pattern, limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
         Ok(rows)
     }
 

@@ -603,6 +603,57 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Search { query, all, json } => {
+            let query = query.join(" ");
+            if query.trim().is_empty() {
+                anyhow::bail!("usage: baton search <query> [--all] [--json]");
+            }
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let cwd_filter = (!all).then(|| cwd.to_string_lossy().to_string());
+            let results = store.search_messages(cwd_filter.as_deref(), &query, cli.limit)?;
+            if json {
+                let values: Vec<serde_json::Value> = results
+                    .iter()
+                    .map(|result| {
+                        serde_json::json!({
+                            "schema_version": status::SCHEMA_VERSION,
+                            "thread_id": result.thread_id,
+                            "title": result.title,
+                            "message_id": result.message_id,
+                            "turn": result.turn,
+                            "role": result.role,
+                            "provider": result.provider,
+                            "model": result.model,
+                            "text": result.text,
+                            "created_at": result.created_at,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "query": query,
+                        "all": all,
+                        "count": values.len(),
+                        "results": values,
+                    }))?
+                );
+                return Ok(());
+            }
+            println!("query: {query}");
+            println!("results: {}", results.len());
+            for result in results {
+                println!(
+                    "{}  turn {}  {}  {}",
+                    &result.thread_id[..8.min(result.thread_id.len())],
+                    result.turn,
+                    result.role,
+                    search_snippet(&result.text, &query)
+                );
+            }
+            Ok(())
+        }
         cli::Commands::Turns { thread_id, json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
@@ -992,6 +1043,20 @@ fn build_all_adapters(
         Arc::new(tokio::sync::Mutex::new(Box::new(OpenCodeAdapter::new(opencode_spawner)) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Antigravity, antigravity_spawner)) as Box<dyn BatonAdapter>)),
     ]
+}
+
+fn search_snippet(text: &str, query: &str) -> String {
+    let query = query.to_lowercase();
+    let line = text
+        .lines()
+        .find(|line| line.to_lowercase().contains(&query))
+        .or_else(|| text.lines().next())
+        .unwrap_or("");
+    let mut snippet: String = line.trim().chars().take(160).collect();
+    if line.trim().chars().count() > 160 {
+        snippet.push('…');
+    }
+    snippet
 }
 
 fn default_provider_from_configs(home: &PathBuf, cwd: &PathBuf) -> ProviderId {

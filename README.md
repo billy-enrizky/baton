@@ -51,6 +51,7 @@ baton threads [--json]   # list threads with phase, turns, goal, queue
 baton status [-t id] [--json]  # phase, goal, queue, usage
 baton turns [-t id] [--json]   # full durable turn history
 baton queue [-t id] [--clear] [--json]  # inspect/clear queued follow-ups
+baton search <query> [--all] [--json]  # search thread titles and conversation text
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
 baton exec -p <provider> [--json] "prompt"  # one non-interactive turn
 baton mcp                # MCP stdio server for agent access to the thread store
@@ -85,6 +86,7 @@ Tools:
 - `baton_turns`: turn phases, timestamps, provider turn ids, errors
 - `baton_messages`: newest conversation rows, including tool and diff rows
 - `baton_queue`: inspect queued follow-ups, or clear them explicitly
+- `baton_search`: search thread titles and conversation text in the project, or every project with `all=true`
 - `baton_latest_diff`: newest stored turn diff
 
 The server is read-only except for the explicit `baton_queue` clear option. It opens the same `~/.baton/baton.sqlite` database and honors `BATON_HOME`.

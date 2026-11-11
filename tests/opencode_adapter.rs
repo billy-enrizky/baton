@@ -99,6 +99,13 @@ fn respond(
                 .push((path.to_string(), body.to_string()));
             respond_json(&mut stream, "200 OK", r#"{"data":{"id":"msg_1"}}"#)
         }
+        "/api/session/ses_test/interrupt" => {
+            requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.to_string()));
+            respond_json(&mut stream, "204 No Content", "")
+        }
         "/api/event" => {
             let headers = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: keep-alive\r\n\r\n";
             if stream.write_all(headers.as_bytes()).is_err() {
@@ -153,6 +160,7 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
         .unwrap();
     assert_eq!(models, vec!["myprovider/model-a", "myprovider/model-b"]);
     let steer = adapter.steer_handle().expect("opencode exposes steering");
+    let interrupt = adapter.interrupt_handle();
     assert!(!steer("too early".into()), "no runtime means no active turn");
 
     let (event_sender, event_receiver) = std::sync::mpsc::channel();
@@ -214,6 +222,23 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
             .starts_with("msg_baton_steer_"),
         "steer uses a stable native inbox id"
     );
+
+    interrupt();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(path, _)| path == "/api/session/ses_test/interrupt")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("interrupt request reaches opencode");
 
     let _ = release_sender.send(());
     tokio::time::timeout(Duration::from_secs(10), turn_task).await.unwrap().unwrap();

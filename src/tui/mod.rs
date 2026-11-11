@@ -76,6 +76,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/find", "search the conversation"),
     ("/multi", "send the same prompt to multiple providers"),
     ("/queue", "show or clear queued follow-ups"),
+    ("/turns", "list durable turn phases"),
     ("/compact", "compact the conversation to free context"),
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),
@@ -1473,6 +1474,34 @@ fn handle_command(
                 valid_providers.len(),
                 valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
             ));
+        }
+        "/turns" => {
+            let turns = store
+                .lock()
+                .unwrap()
+                .list_turn_records(&state.thread.id)
+                .unwrap_or_default();
+            if turns.is_empty() {
+                state.notice = Some("no turn records yet".into());
+            } else {
+                let mut text = format!("turns: {}", turns.len());
+                for turn in turns.iter().rev().take(12) {
+                    let ended = turn.ended_at.as_deref().unwrap_or("open");
+                    let error = turn
+                        .error
+                        .as_deref()
+                        .map(|error| format!(" · {error}"))
+                        .unwrap_or_default();
+                    text.push_str(&format!(
+                        "\n  {} {} · ended {}{}",
+                        turn.turn,
+                        turn.phase.as_str(),
+                        ended,
+                        error
+                    ));
+                }
+                state.notice = Some(text);
+            }
         }
         "/queue" => {
             if args.first().map(String::as_str) == Some("clear") {
@@ -3026,12 +3055,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 25);
+        assert_eq!(suggestions.len(), 26);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/25"), "position indicator must reflect the selection");
+        assert!(text.contains("11/26"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -3598,6 +3627,25 @@ mod tests {
             vec!["second".to_string()]
         );
         assert!(state.notice.as_deref().unwrap_or("").contains("already running"));
+    }
+
+    #[test]
+    fn turns_command_lists_durable_phases() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let guard = store.lock().unwrap();
+            guard.start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m")).unwrap();
+            guard.finish_turn_record(&state.thread.id, 1, TurnPhase::Completed, None).unwrap();
+            guard.start_turn_record(&state.thread.id, 2, ProviderId::Codex, Some("m")).unwrap();
+        }
+        handle_command(&mut state, &store, &engine_command_sender, "/turns");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("turns: 2"));
+        assert!(notice.contains("2 running"));
+        assert!(notice.contains("1 completed"));
     }
 
     #[test]

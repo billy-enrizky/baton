@@ -22,6 +22,7 @@ use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_us
 pub mod viewport;
 
 mod diff_render;
+mod markdown;
 
 use viewport::wrapped_rows;
 
@@ -32,6 +33,7 @@ const COLORS: ColorConstants = ColorConstants {
     muted: Color::Rgb(148, 163, 184),
     border: Color::Rgb(59, 68, 80),
     user_bg: Color::Rgb(48, 54, 61),
+    code_bg: Color::Rgb(30, 36, 46),
     success: Color::Rgb(134, 239, 172),
     error: Color::Rgb(252, 165, 165),
     warning: Color::Rgb(251, 191, 36),
@@ -44,6 +46,7 @@ struct ColorConstants {
     muted: Color,
     border: Color,
     user_bg: Color,
+    code_bg: Color,
     success: Color,
     error: Color,
     warning: Color,
@@ -2799,9 +2802,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
                 ),
                 Style::default().fg(COLORS.muted),
             ));
-            for line in wrap(&message.text) {
-                all_lines.push(Line::styled(line, Style::default().fg(COLORS.text)));
-            }
+            all_lines.extend(markdown::render(&message.text, width.saturating_sub(2)));
         }
         all_lines.push(Line::from(vec![Span::raw(" ")]));
     }
@@ -2832,10 +2833,9 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         live_lines += 1;
     }
     if !state.streaming_text.is_empty() {
-        for line in wrap(&state.streaming_text) {
-            all_lines.push(Line::styled(line, Style::default().fg(COLORS.text)));
-            live_lines += 1;
-        }
+        let markdown_lines = markdown::render(&state.streaming_text, width.saturating_sub(2));
+        live_lines += markdown_lines.len();
+        all_lines.extend(markdown_lines);
     }
     if live_lines > 0 {
         all_lines.push(Line::from(vec![Span::raw(" ")]));
@@ -3631,6 +3631,39 @@ mod tests {
         let stream_row = lines.iter().position(|line| line.contains("partial answer")).expect("streaming text in transcript");
         assert!(user_row < tool_row && tool_row < stream_row, "tools and streaming follow the user message in order");
         assert!(!lines.iter().any(|line| line.contains("Working [")), "the status bar no longer shows a Working spinner");
+    }
+
+    #[test]
+    fn assistant_messages_render_basic_markdown() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![MessageRow {
+            id: 1,
+            thread_id: state.thread.id.clone(),
+            turn: 1,
+            role: "assistant".into(),
+            provider: Some("codex".into()),
+            model: Some("m".into()),
+            text: "# Title\n\n- **one** with `code`\n\n```rust\nlet x = 1;\n```".into(),
+            created_at: String::new(),
+        }];
+        let buffer = render_state(&state, 80, 30);
+        let lines = buffer_lines(&buffer);
+        let text = lines.join("\n");
+        assert!(text.contains("Title"), "heading stripped: {text}");
+        assert!(!text.contains('#' ), "heading marker removed: {text}");
+        assert!(text.contains("• one with code"), "inline markers stripped: {text}");
+        assert!(text.contains("let x = 1;"), "code body visible: {text}");
+        assert!(!text.contains("```"), "fence markers removed: {text}");
+        let code_row = lines
+            .iter()
+            .position(|line| line.contains("let x = 1;"))
+            .expect("code row");
+        assert!(
+            (0..buffer.area.width).any(|x| buffer.get(x, code_row as u16).bg == COLORS.code_bg),
+            "code row carries a tinted background"
+        );
     }
 
     #[test]

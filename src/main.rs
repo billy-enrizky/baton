@@ -629,7 +629,14 @@ fn main_result() -> Result<()> {
                 println!("no turn records");
             } else {
                 println!("turns: {}", turns.len());
+                let mut has_open = false;
                 for turn in turns {
+                    if matches!(
+                        turn.phase,
+                        TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+                    ) {
+                        has_open = true;
+                    }
                     let ended = turn.ended_at.as_deref().unwrap_or("open");
                     let provider_turn = turn
                         .provider_turn_id
@@ -655,6 +662,9 @@ fn main_result() -> Result<()> {
                         provider_turn,
                         error
                     );
+                }
+                if has_open {
+                    println!("note: an open turn may be stale; use `baton status` for details");
                 }
             }
             Ok(())

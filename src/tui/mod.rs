@@ -1458,6 +1458,12 @@ fn handle_command(
                     // Draft threads are not persisted until a turn runs; the
                     // engine looks the thread up immediately, so create it now.
                     let _ = ensure_persisted(&guard, &mut thread);
+                    let _ = guard.set_thread_permission_mode(&thread.id, state.permission_mode);
+                    let _ = guard.set_thread_goal(
+                        &thread.id,
+                        state.goal.as_deref(),
+                        state.goal_paused,
+                    );
                     thread
                 };
                 threads.push(thread);
@@ -3369,6 +3375,7 @@ mod tests {
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
         let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.apply_permission_mode(&store, PermissionMode::Plan);
 
         handle_command(&mut state, &store, &engine_command_sender, "/multi codex opencode compare notes");
 
@@ -3383,6 +3390,11 @@ mod tests {
         for (thread_id, _) in &submitted {
             let thread = store.lock().unwrap().get_thread(thread_id).unwrap();
             assert!(thread.is_some(), "parallel thread {thread_id} must be persisted before submit");
+            assert_eq!(
+                thread.unwrap().permission_mode,
+                PermissionMode::Plan,
+                "parallel threads inherit the active mode"
+            );
         }
     }
 

@@ -1499,6 +1499,15 @@ fn handle_command(
                 }
                 None => text.push_str("\ngoal: none"),
             }
+            let open_turn = latest
+                .as_ref()
+                .map(|turn| {
+                    matches!(
+                        turn.phase,
+                        TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+                    )
+                })
+                .unwrap_or(false);
             text.push_str(&format!(
                 "\nturns: {}\nturn: {}\nqueue: {} waiting",
                 turn_count,
@@ -1507,6 +1516,9 @@ fn handle_command(
                     .unwrap_or_else(|| "none".into()),
                 state.queued_messages.len()
             ));
+            if open_turn {
+                text.push_str("\nnote: open turn may be stale; /turns shows history");
+            }
             state.notice = Some(text);
         }
         "/turns" => {
@@ -3695,6 +3707,23 @@ mod tests {
         assert!(notice.contains("turns: 1"));
         assert!(notice.contains("turn: 1 failed"));
         assert!(notice.contains("queue: 1 waiting"));
+    }
+
+    #[test]
+    fn status_command_warns_about_open_turns() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        store
+            .lock()
+            .unwrap()
+            .start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m"))
+            .unwrap();
+        handle_command(&mut state, &store, &engine_command_sender, "/status");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("1 running"));
+        assert!(notice.contains("may be stale"));
     }
 
     #[test]

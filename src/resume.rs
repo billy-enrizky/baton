@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 
-use crate::types::ProviderId;
+use crate::types::{ProviderId, TurnPhase};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeCommand {
@@ -32,6 +32,26 @@ fn shell_quote(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Refuses to launch a native CLI while baton still considers a turn open.
+/// `--force` exists for deliberate recovery from a dead process.
+pub fn ensure_no_open_turn(phase: Option<TurnPhase>, force: bool) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    if let Some(phase) = phase.filter(|phase| {
+        matches!(
+            phase,
+            TurnPhase::Queued | TurnPhase::Running | TurnPhase::Settling
+        )
+    }) {
+        anyhow::bail!(
+            "thread has an open {} turn; wait for it, use `baton status`, or pass --force to launch the native CLI anyway",
+            phase.as_str()
+        );
+    }
+    Ok(())
 }
 
 /// Builds the native CLI command for resuming a provider session.
@@ -96,6 +116,16 @@ pub fn build(provider: ProviderId, session_id: &str, fork: bool) -> Result<Resum
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resume_guard_blocks_open_turns_unless_forced() {
+        assert!(ensure_no_open_turn(None, false).is_ok());
+        assert!(ensure_no_open_turn(Some(TurnPhase::Completed), false).is_ok());
+        assert!(ensure_no_open_turn(Some(TurnPhase::Failed), false).is_ok());
+        let error = ensure_no_open_turn(Some(TurnPhase::Running), false).unwrap_err();
+        assert!(error.to_string().contains("open running turn"));
+        assert!(ensure_no_open_turn(Some(TurnPhase::Running), true).is_ok());
+    }
 
     #[test]
     fn claude_resume_and_fork() {

@@ -854,6 +854,29 @@ impl BatonStore {
         Ok(id)
     }
 
+    pub fn list_recent_messages(&self, thread_id: &str, limit: usize) -> Result<Vec<MessageRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, thread_id, turn, role, provider, model, text, created_at
+             FROM messages WHERE thread_id = ? ORDER BY id DESC LIMIT ?",
+        )?;
+        let mut rows = statement
+            .query_map(params![thread_id, limit as i64], |row| {
+                Ok(MessageRow {
+                    id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    turn: row.get(2)?,
+                    role: row.get(3)?,
+                    provider: row.get(4)?,
+                    model: row.get(5)?,
+                    text: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
+        Ok(rows)
+    }
+
     pub fn list_messages(&self, thread_id: &str) -> Result<Vec<MessageRow>> {
         let mut statement = self
             .db

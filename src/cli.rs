@@ -64,6 +64,8 @@ pub enum Commands {
     /// Update baton to the latest version
     Update,
     Chat,
+    /// Serve the local thread store over MCP stdio for coding agents
+    Mcp,
     #[command(visible_alias = "list")]
     Threads {
         /// Emit a JSON array

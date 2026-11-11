@@ -1,4 +1,4 @@
-use baton::{adapters, checkpoints, cli, config, paths, resume, runtime, scanner, status, store, tui, types, usage};
+use baton::{adapters, checkpoints, cli, config, mcp, paths, resume, runtime, scanner, status, store, tui, types, usage};
 
 use anyhow::Result;
 use clap::Parser;
@@ -271,6 +271,10 @@ fn main_result() -> Result<()> {
             return Ok(());
         }
         cli::Commands::Chat => run_chat(cli, &home, &cwd, permission_override, cli_prompt),
+        cli::Commands::Mcp => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            mcp::run_stdio(mcp::McpServer::new(store, home.clone(), cwd.clone()))
+        }
         cli::Commands::Threads { json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let resolved = resolve_config(&home, &cwd);

@@ -13,8 +13,12 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 - **High prompt cache hit rates.** baton never replays history into a harness. The cache hit rate is always visible in the status bar.
 - **Reads the same context jsonl.** `baton import` discovers existing native sessions (claude transcripts, codex rollouts) and imports them as resumable baton threads.
 - **Checkpoints.** Every turn ends with a hidden git ref capturing the working tree. `/rewind` restores the conversation and optionally the code.
+- **Review from the terminal.** `/review` shows the turn diff with context, keeps notes on exact changed lines, and sends them back as a steer or the next prompt.
+- **Live catalogs.** `/switch` loads the provider's current model list (Codex, OpenCode, and ACP providers), with type-to-filter search.
+- **Parallel, then merged.** `/multi` fans one prompt across providers and opens a merged live view; press Enter to inspect any child thread.
+- **Agent-readable state.** `status`, `threads`, `turns`, `queue`, and `exec` have versioned JSON output. `baton mcp` exposes the same durable state over MCP stdio.
 - **Subscription or API billing.** Each provider runs on its harness login or an API key, switchable per provider (`baton auth <provider> api`).
-- **codex-style keys.** Esc interrupts, Esc-Esc backtracks to a previous prompt, braille `Working [Ns]` spinner, per-tool spinners with commands.
+- **codex-style keys.** Esc interrupts, Esc-Esc backtracks to a previous prompt, streaming Markdown, tinted diffs, and per-tool activity rows.
 
 ## Install
 
@@ -49,6 +53,7 @@ baton turns [-t id] [--json]   # full durable turn history
 baton queue [-t id] [--clear] [--json]  # inspect/clear queued follow-ups
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
 baton exec -p <provider> [--json] "prompt"  # one non-interactive turn
+baton mcp                # MCP stdio server for agent access to the thread store
 baton import [--dry-run] # import recent native sessions as threads
 baton usage              # token usage and cache hit rates
 baton auth [provider] [subscription|api]
@@ -56,7 +61,33 @@ baton diff <id> [turn]   # checkpoint diff against the working tree
 baton restore <id> <turn>
 ```
 
-In the TUI: `/help /status /switch /model /mode /auth /new /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /queue /turns /clear /quit`. Approvals answer with y/a/n. Ctrl+C interrupts a running turn, press twice to exit. While a turn is running, a new composer message is sent as a steer on Codex and Claude; other providers queue it durably.
+In the TUI: `/help /status /switch /model /mode /auth /new /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /queue /turns /clear /quit`. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn, press twice to exit. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably.
+
+## MCP
+
+`baton mcp` serves the local baton store over MCP stdio. It is intended for coding agents that need to inspect the threads they are working alongside.
+
+```json
+{
+  "mcpServers": {
+    "baton": {
+      "command": "baton",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Tools:
+
+- `baton_status`: provider, model, mode, goal, latest turn, queue, usage, stale warning
+- `baton_threads`: durable threads for the current project, or every project with `all=true`
+- `baton_turns`: turn phases, timestamps, provider turn ids, errors
+- `baton_messages`: newest conversation rows, including tool and diff rows
+- `baton_queue`: inspect queued follow-ups, or clear them explicitly
+- `baton_latest_diff`: newest stored turn diff
+
+The server is read-only except for the explicit `baton_queue` clear option. It opens the same `~/.baton/baton.sqlite` database and honors `BATON_HOME`.
 
 ## How context and caching work
 
@@ -64,7 +95,7 @@ Each provider keeps its own native session per baton thread. On every turn only 
 
 ## Storage
 
-`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, durable turns, queued follow-ups, checkpoints, usage) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything.
+`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, durable turns, queued follow-ups, review notes, checkpoints, usage) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything.
 
 ## Development
 

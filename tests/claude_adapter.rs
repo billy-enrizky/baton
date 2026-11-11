@@ -223,3 +223,103 @@ async fn claude_adapter_pairs_tool_use_with_tool_result() {
         "tool_result completes the matching tool_use with the same label"
     );
 }
+
+
+async fn fake_claude_steer(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    observed: std::sync::mpsc::Sender<String>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+        return;
+    }
+    send(
+        &mut write,
+        json!({
+            "type": "stream_event",
+            "event": { "type": "content_block_delta", "delta": { "type": "text_delta", "text": "working" } }
+        }),
+    )
+    .await;
+    line.clear();
+    if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+        return;
+    }
+    let steer: Value = serde_json::from_str(line.trim()).unwrap_or(Value::Null);
+    let text = steer["message"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    let _ = observed.send(text);
+    send(
+        &mut write,
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "steered",
+            "session_id": "claude-steer",
+            "usage": { "input_tokens": 10, "output_tokens": 5 }
+        }),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_steer_writes_a_user_message_into_the_live_turn() {
+    let (observed_sender, observed_receiver) = std::sync::mpsc::channel::<String>();
+    let spawner: baton::adapters::claude::ClaudeSpawner =
+        Arc::new(move |_input: &baton::adapters::TurnStartInput, _session: Option<&baton::types::NativeSessionRef>| {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_claude_steer(server_read, server_write, observed_sender.clone()));
+            Ok(halves)
+        });
+    let mut adapter = ClaudeAdapter::new(spawner);
+    let steer = adapter.steer_handle().expect("claude exposes steering");
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let turn = tokio::spawn(async move {
+        adapter
+            .start_turn(
+                baton::adapters::TurnStartInput {
+                    thread_id: "baton-thread".into(),
+                    cwd: "/work".into(),
+                    model: "claude-sonnet-4-5".into(),
+                    prompt: "hello".into(),
+                    permission_mode: PermissionMode::Default,
+                    auth_env: vec![],
+                },
+                None,
+                event_sender,
+            )
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(event_receiver.try_recv(), Ok(baton::adapters::TurnEvent::TextDelta { .. })) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("turn is running");
+
+    assert!(steer("change direction".into()));
+    let observed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Ok(text) = observed_receiver.try_recv() {
+                break text;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("steer reaches the claude input stream");
+    assert_eq!(observed, "change direction");
+
+    let result = tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap();
+    assert!(result.is_ok());
+    assert!(!steer("too late".into()), "steering after completion is rejected");
+}

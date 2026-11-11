@@ -2,23 +2,38 @@ use anyhow::Result;
 use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{child_halves, BatonAdapter, LineReader, LineWriter, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{child_halves, BatonAdapter, LineReader, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
 pub type ClaudeSpawner = Arc<dyn Fn(&TurnStartInput, Option<&NativeSessionRef>) -> Result<TransportHalves> + Send + Sync>;
 
+type SharedWriter = Arc<AsyncMutex<Option<Box<dyn LineWriter>>>>;
+
 pub struct ClaudeAdapter {
     interrupt: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
+    writer: SharedWriter,
+    active_turn: Arc<AtomicBool>,
     spawner: ClaudeSpawner,
+}
+
+async fn write_value(writer: &SharedWriter, value: &Value) -> Result<()> {
+    let mut guard = writer.lock().await;
+    let writer = guard
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("claude input stream is closed"))?;
+    writer.write_line(&serde_json::to_string(value)?).await
 }
 
 impl ClaudeAdapter {
     pub fn new(spawner: ClaudeSpawner) -> ClaudeAdapter {
         ClaudeAdapter {
             interrupt: Arc::new(Mutex::new(None)),
+            writer: Arc::new(AsyncMutex::new(None)),
+            active_turn: Arc::new(AtomicBool::new(false)),
             spawner,
         }
     }
@@ -107,13 +122,42 @@ impl BatonAdapter for ClaudeAdapter {
         })
     }
 
+    fn steer_handle(&self) -> Option<SteerHandle> {
+        let writer = self.writer.clone();
+        let active = self.active_turn.clone();
+        Some(Arc::new(move |text: String| -> bool {
+            if !active.load(Ordering::SeqCst) {
+                return false;
+            }
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return false;
+            };
+            let writer = writer.clone();
+            handle.spawn(async move {
+                let message = json!({
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": [ { "type": "text", "text": text } ]
+                    }
+                });
+                let _ = write_value(&writer, &message).await;
+            });
+            true
+        }))
+    }
+
     async fn start_turn(
         &mut self,
         input: TurnStartInput,
         session: Option<NativeSessionRef>,
         emit: TurnEventSender,
     ) -> Result<()> {
-        let (mut reader, mut writer) = (self.spawner)(&input, session.as_ref())?;
+        let (mut reader, writer) = (self.spawner)(&input, session.as_ref())?;
+        let writer_handle = self.writer.clone();
+        *writer_handle.lock().await = Some(writer);
+        self.active_turn.store(true, Ordering::SeqCst);
+        let writer = writer_handle;
         let user_message = json!({
             "type": "user",
             "message": {
@@ -121,7 +165,14 @@ impl BatonAdapter for ClaudeAdapter {
                 "content": [ { "type": "text", "text": input.prompt } ]
             }
         });
-        writer.write_line(&serde_json::to_string(&user_message)?).await?;
+        if let Err(error) = write_value(&writer, &user_message).await {
+            self.active_turn.store(false, Ordering::SeqCst);
+            let mut guard = self.writer.lock().await;
+            if let Some(mut writer) = guard.take() {
+                let _ = writer.shutdown().await;
+            }
+            return Err(error);
+        }
 
         let (interrupt_sender, interrupt_receiver) = tokio::sync::watch::channel(false);
         *self.interrupt.lock().unwrap() = Some(interrupt_sender);
@@ -271,7 +322,7 @@ impl BatonAdapter for ClaudeAdapter {
                                 }
                             }
                         });
-                        writer.write_line(&serde_json::to_string(&response)?).await?;
+                        write_value(&writer, &response).await?;
                     }
                 }
                 "result" => {
@@ -308,8 +359,14 @@ impl BatonAdapter for ClaudeAdapter {
             }
         }
 
-        let _ = writer.shutdown().await;
+        self.active_turn.store(false, Ordering::SeqCst);
         *self.interrupt.lock().unwrap() = None;
+        {
+            let mut guard = self.writer.lock().await;
+            if let Some(mut writer) = guard.take() {
+                let _ = writer.shutdown().await;
+            }
+        }
 
         match result {
             Ok(()) => {
@@ -335,6 +392,11 @@ impl BatonAdapter for ClaudeAdapter {
     }
 
     async fn dispose(&mut self) -> Result<()> {
+        self.active_turn.store(false, Ordering::SeqCst);
+        let mut guard = self.writer.lock().await;
+        if let Some(mut writer) = guard.take() {
+            let _ = writer.shutdown().await;
+        }
         Ok(())
     }
 }

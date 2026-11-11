@@ -107,6 +107,34 @@ fn tool_input_summary(input: &Value) -> Option<String> {
     None
 }
 
+/// Builds the host-side answer for Claude's `can_use_tool` control request.
+/// The CLI treats `AcceptAlways` as a permanent user decision only when the
+/// answer carries its suggested permission updates.
+fn permission_response(request: &Value, tool_input: &Value, decision: ApprovalDecision) -> Value {
+    let (behavior, classification) = match decision {
+        ApprovalDecision::Accept => ("allow", "user_temporary"),
+        ApprovalDecision::AcceptAlways => ("allow", "user_permanent"),
+        ApprovalDecision::Deny => ("deny", "user_reject"),
+    };
+    let mut result = json!({
+        "behavior": behavior,
+        "updatedInput": tool_input,
+        "decisionClassification": classification,
+    });
+    if decision == ApprovalDecision::AcceptAlways {
+        if let Some(suggestions) = request.get("permission_suggestions").and_then(Value::as_array) {
+            result["updatedPermissions"] = Value::Array(suggestions.clone());
+        }
+    }
+    if decision == ApprovalDecision::Deny {
+        result["message"] = json!("User declined tool execution.");
+    }
+    if let Some(tool_use_id) = request.get("tool_use_id").and_then(Value::as_str) {
+        result["toolUseID"] = json!(tool_use_id);
+    }
+    result
+}
+
 #[async_trait]
 impl BatonAdapter for ClaudeAdapter {
     fn id(&self) -> ProviderId {
@@ -307,19 +335,14 @@ impl BatonAdapter for ClaudeAdapter {
                             summary,
                             respond,
                         });
-                        let decision = match receiver.await {
-                            Ok(ApprovalDecision::Accept) | Ok(ApprovalDecision::AcceptAlways) => "allow",
-                            Ok(ApprovalDecision::Deny) | Err(_) => "deny",
-                        };
+                        let decision = receiver.await.unwrap_or(ApprovalDecision::Deny);
+                        let result = permission_response(&request, &tool_input, decision);
                         let response = json!({
                             "type": "control_response",
                             "response": {
                                 "subtype": "success",
                                 "request_id": request_id,
-                                "response": {
-                                    "behavior": decision,
-                                    "updatedInput": tool_input
-                                }
+                                "response": result
                             }
                         });
                         write_value(&writer, &response).await?;
@@ -427,5 +450,37 @@ mod tests {
         let position = resumed.iter().position(|arg| arg == "--resume").expect("resume flag");
         assert_eq!(resumed[position + 1], "s-1");
         assert!(resumed.contains(&"--include-partial-messages".to_string()));
+    }
+
+    #[test]
+    fn accept_always_grants_suggested_session_permissions() {
+        let request = json!({
+            "tool_use_id": "tool-1",
+            "permission_suggestions": [
+                {
+                    "type": "addRules",
+                    "rules": [{ "toolName": "Bash", "ruleContent": "ls" }],
+                    "behavior": "allow",
+                    "destination": "session"
+                }
+            ]
+        });
+        let tool_input = json!({ "command": "ls" });
+
+        let always = permission_response(&request, &tool_input, ApprovalDecision::AcceptAlways);
+        assert_eq!(always["behavior"], "allow");
+        assert_eq!(always["decisionClassification"], "user_permanent");
+        assert_eq!(always["toolUseID"], "tool-1");
+        assert_eq!(always["updatedInput"], tool_input);
+        assert_eq!(always["updatedPermissions"], request["permission_suggestions"]);
+
+        let once = permission_response(&request, &tool_input, ApprovalDecision::Accept);
+        assert_eq!(once["decisionClassification"], "user_temporary");
+        assert!(once.get("updatedPermissions").is_none());
+
+        let denied = permission_response(&request, &tool_input, ApprovalDecision::Deny);
+        assert_eq!(denied["behavior"], "deny");
+        assert_eq!(denied["decisionClassification"], "user_reject");
+        assert_eq!(denied["message"], "User declined tool execution.");
     }
 }

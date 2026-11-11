@@ -534,6 +534,17 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                 Some(detail) => format!("{tool} {detail}"),
                 None => tool,
             };
+            if let Some(id) = id.as_deref() {
+                if let Some(line) = state
+                    .tool_lines
+                    .iter_mut()
+                    .rev()
+                    .find(|line| line.status == ToolStatus::Running && line.id.as_deref() == Some(id))
+                {
+                    line.label = label;
+                    return;
+                }
+            }
             state.tool_lines.push(ToolLine { id, label, status: ToolStatus::Running });
         }
         TurnEvent::ToolCompleted { id, tool, detail, exit_code } => {
@@ -3708,6 +3719,31 @@ mod tests {
             (0..buffer.area.width).any(|x| buffer.get(x, code_row as u16).bg == COLORS.code_bg),
             "code row carries a tinted background"
         );
+    }
+
+    #[test]
+    fn live_tool_detail_updates_the_existing_call_id_row() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        apply_turn_event(
+            &mut state,
+            TurnEvent::ToolStarted {
+                id: Some("call-1".into()),
+                tool: "read".into(),
+                detail: None,
+            },
+        );
+        apply_turn_event(
+            &mut state,
+            TurnEvent::ToolStarted {
+                id: Some("call-1".into()),
+                tool: "read".into(),
+                detail: Some("/work".into()),
+            },
+        );
+        assert_eq!(state.tool_lines.len(), 1);
+        assert_eq!(state.tool_lines[0].label, "read /work");
     }
 
     #[test]

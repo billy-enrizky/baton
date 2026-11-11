@@ -188,6 +188,40 @@ fn spawn_sse_reader(
     });
 }
 
+fn summarize_tool_input(input: &Value) -> Option<String> {
+    let input = input.get("input").unwrap_or(input);
+    for key in [
+        "command",
+        "path",
+        "filePath",
+        "file_path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+        "agent",
+    ] {
+        let Some(value) = input.get(key) else {
+            continue;
+        };
+        let text = if let Some(text) = value.as_str() {
+            text.lines().next().unwrap_or("").trim().to_string()
+        } else if let Some(parts) = value.as_array() {
+            parts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            continue;
+        };
+        if !text.is_empty() {
+            return Some(text.chars().take(100).collect());
+        }
+    }
+    None
+}
+
 fn handle_event(
     event_type: &str,
     data: &Value,
@@ -225,12 +259,22 @@ fn handle_event(
             let _ = emit.send(TurnEvent::ToolStarted { id, tool: name, detail: None });
             false
         }
-        // The called frame carries the authoritative tool name for the call.
+        // The called frame carries the authoritative tool name and input. The
+        // earlier input.started frame gave the spinner a name immediately; this
+        // frame upgrades the same call id with the useful detail.
         "session.next.tool.called" if session_matches => {
             if let Some(call_id) = data.get("callID").and_then(Value::as_str) {
-                if let Some(tool) = data.get("tool").and_then(Value::as_str) {
-                    tool_names.insert(call_id.to_string(), tool.to_string());
-                }
+                let tool = data
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                tool_names.insert(call_id.to_string(), tool.clone());
+                let _ = emit.send(TurnEvent::ToolStarted {
+                    id: Some(call_id.to_string()),
+                    tool,
+                    detail: summarize_tool_input(data),
+                });
             }
             false
         }

@@ -227,6 +227,14 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
         .collect();
     assert_eq!(deltas, "streamed live");
     assert!(events.iter().any(|event| matches!(event, baton::adapters::TurnEvent::ToolStarted { tool, .. } if tool == "read")));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            baton::adapters::TurnEvent::ToolStarted { detail: Some(detail), .. }
+                if detail == "/work"
+        )),
+        "the called frame upgrades the tool row with its input"
+    );
     assert!(events.iter().any(|event| matches!(event, baton::adapters::TurnEvent::ToolCompleted { tool, .. } if tool == "read")));
     let completed = events
         .iter()

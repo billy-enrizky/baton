@@ -114,6 +114,16 @@ fn record_tool_event(records: &mut Vec<ToolRecord>, event: &TurnEvent) {
                 Some(detail) => format!("{tool} {detail}"),
                 None => tool.clone(),
             };
+            if let Some(id) = id.as_deref() {
+                if let Some(record) = records
+                    .iter_mut()
+                    .rev()
+                    .find(|record| record.ok.is_none() && record.id.as_deref() == Some(id))
+                {
+                    record.label = label;
+                    return;
+                }
+            }
             records.push(ToolRecord { id: id.clone(), label, ok: None });
         }
         TurnEvent::ToolCompleted { id, tool, detail, exit_code } => {
@@ -1154,6 +1164,29 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].label, "shell ls");
         assert_eq!(records[2].ok, Some(true));
+    }
+
+    #[test]
+    fn repeated_tool_started_updates_the_same_call_id() {
+        let mut records = Vec::new();
+        record_tool_event(
+            &mut records,
+            &TurnEvent::ToolStarted {
+                id: Some("call-1".into()),
+                tool: "read".into(),
+                detail: None,
+            },
+        );
+        record_tool_event(
+            &mut records,
+            &TurnEvent::ToolStarted {
+                id: Some("call-1".into()),
+                tool: "read".into(),
+                detail: Some("/work".into()),
+            },
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].label, "read /work");
     }
 
     #[test]

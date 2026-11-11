@@ -69,6 +69,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/open", "open a thread by id prefix"),
     ("/usage", "token usage and cache hit rate"),
     ("/checkpoints", "list checkpoints for this thread"),
+    ("/review", "review the latest turn diff with line notes"),
     ("/diff", "diff a checkpoint against the working tree"),
     ("/rewind", "rewind to a previous message"),
     ("/goal", "set a multi-turn objective the agent works toward"),
@@ -97,6 +98,22 @@ enum ToolStatus {
     Running,
     Done,
     Failed,
+}
+
+#[derive(Debug, Clone)]
+struct ReviewNote {
+    path: String,
+    line: usize,
+    added: bool,
+    body: String,
+}
+
+struct ReviewState {
+    turn: i64,
+    rows: Vec<diff_render::DiffRowRef>,
+    selected: usize,
+    notes: Vec<ReviewNote>,
+    note_input: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -151,6 +168,7 @@ pub struct TuiState {
     streaming_text: String,
     tool_lines: Vec<ToolLine>,
     overlay: Overlay,
+    review: Option<ReviewState>,
     notice: Option<String>,
     diff_output: Option<String>,
     permission_mode: PermissionMode,
@@ -206,6 +224,7 @@ pub fn run_tui(
         streaming_text: String::new(),
         tool_lines: Vec::new(),
         overlay: Overlay::None,
+        review: None,
         notice: None,
         diff_output: None,
         permission_mode,
@@ -518,6 +537,11 @@ fn handle_key(
         }
         state.exit_armed = Some(now);
         state.notice = Some("press ctrl+c again to exit".into());
+        return;
+    }
+
+    if state.review.is_some() {
+        handle_review_key(state, store, engine_command_sender, key);
         return;
     }
 
@@ -910,6 +934,144 @@ fn apply_rewind(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, turn: i64,
     }
 }
 
+fn dispatch_message(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    text: String,
+    allow_commands: bool,
+) {
+    if allow_commands && text.starts_with('/') {
+        handle_command(state, store, engine_command_sender, &text);
+    } else if state.running {
+        let _ = engine_command_sender.send(EngineCommand::Steer {
+            thread_id: state.thread.id.clone(),
+            text,
+        });
+        state.notice = Some("steering the current turn...".into());
+    } else {
+        submit(state, store, engine_command_sender, text);
+    }
+}
+
+fn escape_review_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn format_review_notes(turn: i64, notes: &[ReviewNote]) -> String {
+    let mut text = format!(
+        "Review the following line-anchored notes from turn {turn}:\n\n"
+    );
+    for note in notes {
+        text.push_str(&format!(
+            "File: {}\nLine: {}\nChange: {}\nUser comment: \"{}\"\n\n",
+            note.path,
+            note.line,
+            if note.added { "added" } else { "removed" },
+            escape_review_text(&note.body)
+        ));
+    }
+    text.trim_end().to_string()
+}
+
+fn handle_review_key(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    key: KeyEvent,
+) {
+    let Some(mut review) = state.review.take() else {
+        return;
+    };
+
+    if let Some(input) = review.note_input.as_mut() {
+        match key.code {
+            KeyCode::Esc => review.note_input = None,
+            KeyCode::Enter => {
+                let body = input.trim().to_string();
+                if !body.is_empty() && !review.rows.is_empty() {
+                    let row = &review.rows[review.selected.min(review.rows.len() - 1)];
+                    review.notes.push(ReviewNote {
+                        path: row.path.clone(),
+                        line: row.line_number,
+                        added: row.added,
+                        body,
+                    });
+                }
+                review.note_input = None;
+            }
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(character) => {
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                    input.push(character);
+                }
+            }
+            _ => {}
+        }
+        state.review = Some(review);
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => return,
+        KeyCode::Up | KeyCode::Char('k') => {
+            review.selected = review.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !review.rows.is_empty() {
+                review.selected = (review.selected + 1).min(review.rows.len() - 1);
+            }
+        }
+        KeyCode::PageUp => {
+            review.selected = review.selected.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            if !review.rows.is_empty() {
+                review.selected = (review.selected + 10).min(review.rows.len() - 1);
+            }
+        }
+        KeyCode::Char('n') => {
+            if !review.rows.is_empty() {
+                review.note_input = Some(String::new());
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(row) = review.rows.get(review.selected) {
+                review.notes.retain(|note| {
+                    !(note.path == row.path
+                        && note.line == row.line_number
+                        && note.added == row.added)
+                });
+            }
+        }
+        KeyCode::Char('s') => {
+            if review.notes.is_empty() {
+                state.notice = Some("no review notes to send yet; press n on a changed line".into());
+                state.review = Some(review);
+                return;
+            }
+            let count = review.notes.len();
+            let text = format_review_notes(review.turn, &review.notes);
+            let steering = state.running;
+            dispatch_message(state, store, engine_command_sender, text, false);
+            state.notice = Some(if steering {
+                format!("steering {count} review note(s) into the current turn")
+            } else {
+                format!("sent {count} review note(s)")
+            });
+            return;
+        }
+        _ => {}
+    }
+
+    state.review = Some(review);
+}
+
 fn handle_composer_key(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -977,17 +1139,7 @@ fn handle_composer_key(
             state.set_input(String::new());
             state.suggestion_index = 0;
             state.esc_primed = false;
-            if text.starts_with('/') {
-                handle_command(state, store, engine_command_sender, &text);
-            } else if state.running {
-                let _ = engine_command_sender.send(EngineCommand::Steer {
-                    thread_id: state.thread.id.clone(),
-                    text: text.clone(),
-                });
-                state.notice = Some("steering the current turn...".into());
-            } else {
-                submit(state, store, engine_command_sender, text);
-            }
+            dispatch_message(state, store, engine_command_sender, text, true);
         }
         KeyCode::Backspace => {
             state.backspace_input();
@@ -1586,6 +1738,39 @@ fn handle_command(
                 state.overlay = Overlay::CheckpointPicker { selected: checkpoints.len().saturating_sub(1), checkpoints };
             }
         }
+        "/review" => {
+            let requested = args.first().and_then(|turn| turn.parse::<i64>().ok());
+            let message = match requested {
+                Some(turn) => state
+                    .history
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "diff" && message.turn == turn),
+                None => state.history.iter().rev().find(|message| message.role == "diff"),
+            };
+            match message {
+                Some(message) => {
+                    let rows = diff_render::changed_rows(&message.text);
+                    if rows.is_empty() {
+                        state.notice = Some("this turn has no changed lines to review".into());
+                    } else {
+                        state.review = Some(ReviewState {
+                            turn: message.turn,
+                            rows,
+                            selected: 0,
+                            notes: Vec::new(),
+                            note_input: None,
+                        });
+                        state.notice = None;
+                    }
+                }
+                None => {
+                    state.notice = Some(
+                        "no turn diff yet; run a turn or use /review <turn>".into(),
+                    );
+                }
+            }
+        }
         "/diff" => {
             if args.is_empty() {
                 let checkpoints: Vec<(i64, String)> = {
@@ -1654,8 +1839,118 @@ fn handle_command(
     }
 }
 
+fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review: &ReviewState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::styled(
+        format!(
+            "review turn {} · {} changed lines · ↑↓ move · n note · d delete · s send · esc close",
+            review.turn,
+            review.rows.len()
+        ),
+        Style::default().fg(COLORS.muted),
+    ));
+
+    let footer_rows = 1u16;
+    let available = inner.height.saturating_sub(1 + footer_rows) as usize;
+    let start = if available == 0 || review.rows.len() <= available {
+        0
+    } else {
+        review
+            .selected
+            .saturating_sub(available / 2)
+            .min(review.rows.len() - available)
+    };
+    let end = (start + available).min(review.rows.len());
+
+    for index in start..end {
+        let row = &review.rows[index];
+        let selected = index == review.selected;
+        let noted = review.notes.iter().any(|note| {
+            note.path == row.path && note.line == row.line_number && note.added == row.added
+        });
+        let path_label = format!("{}:{}", row.path, row.line_number);
+        let max_path = (inner.width as usize).saturating_sub(12).max(12);
+        let path_label = if path_label.chars().count() > max_path {
+            let tail: String = path_label
+                .chars()
+                .rev()
+                .take(max_path.saturating_sub(1))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("…{tail}")
+        } else {
+            path_label
+        };
+        let marker = if selected { "›" } else { " " };
+        let note_marker = if noted { "•" } else { " " };
+        let sign = if row.added { "+" } else { "-" };
+        let used = path_label.chars().count() + 4;
+        let text_width = (inner.width as usize).saturating_sub(used).max(1);
+        let text: String = row.text.chars().take(text_width).collect();
+        let mut style = Style::default().fg(if row.added {
+            COLORS.success
+        } else {
+            COLORS.error
+        });
+        if selected {
+            style = style.bg(COLORS.user_bg).add_modifier(Modifier::BOLD);
+        }
+        let prefix_style = if selected {
+            Style::default().fg(COLORS.accent).bg(COLORS.user_bg)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}{note_marker} "), prefix_style),
+            Span::styled(path_label, prefix_style),
+            Span::styled(format!(" {sign} "), style),
+            Span::styled(text, style),
+        ]));
+    }
+
+    if let Some(input) = review.note_input.as_ref() {
+        let row = review.rows.get(review.selected);
+        let target = row
+            .map(|row| format!("{}:{}", row.path, row.line_number))
+            .unwrap_or_else(|| "no line".into());
+        lines.push(Line::from(vec![
+            Span::styled(format!("note {target} › "), Style::default().fg(COLORS.accent)),
+            Span::styled(input.clone(), Style::default().fg(COLORS.text)),
+            Span::styled("█", Style::default().fg(COLORS.accent)),
+        ]));
+    } else {
+        lines.push(Line::styled(
+            format!(
+                "notes: {} · {}",
+                review.notes.len(),
+                if review.notes.is_empty() {
+                    "press n on a changed line to add one"
+                } else {
+                    "press s to send them to the agent"
+                }
+            ),
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+
+    let _ = state;
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     let area = frame.area();
+    if let Some(review) = &state.review {
+        draw_review(frame, area, state, review);
+        return;
+    }
     let suggestions = suggestions_for(&state.input);
     let composer_rows = 4u16
         + state.visible_input_lines().saturating_sub(1) as u16
@@ -2629,6 +2924,7 @@ mod tests {
                 streaming_text: String::new(),
             tool_lines: Vec::new(),
             overlay: Overlay::None,
+            review: None,
             notice: None,
             diff_output: None,
             permission_mode: PermissionMode::Default,
@@ -2666,12 +2962,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 23);
+        assert_eq!(suggestions.len(), 24);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/23"), "position indicator must reflect the selection");
+        assert!(text.contains("11/24"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -3049,6 +3345,116 @@ mod tests {
             Some((9, 13)),
             "the second line maps to the absolute char range"
         );
+    }
+
+    fn review_diff_message(thread_id: &str) -> MessageRow {
+        MessageRow {
+            id: 90,
+            thread_id: thread_id.to_string(),
+            turn: 1,
+            role: "diff".to_string(),
+            provider: None,
+            model: None,
+            text: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,3 @@\n context\n-old line\n+new line\n+another line\n".to_string(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn review_mode_sends_line_anchored_notes() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let review = state.review.as_ref().expect("review opens");
+        assert_eq!(review.rows.len(), 3, "only changed lines are anchors");
+        assert_eq!(review.rows[0].text, "old line");
+
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        for character in "fix this".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Char(character)),
+            );
+        }
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter));
+        let review = state.review.as_ref().expect("review stays open");
+        assert_eq!(review.notes.len(), 1);
+        assert_eq!(review.notes[0].path, "src/lib.rs");
+        assert_eq!(review.notes[0].line, 2);
+        assert!(review.notes[0].added);
+        assert_eq!(review.notes[0].body, "fix this");
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('s')));
+        assert!(state.review.is_none(), "sending closes review");
+        match engine_command_receiver.try_recv().expect("submit") {
+            EngineCommand::Submit { text, .. } => {
+                assert!(text.contains("File: src/lib.rs"));
+                assert!(text.contains("Line: 2"));
+                assert!(text.contains("Change: added"));
+                assert!(text.contains("User comment: \"fix this\""));
+            }
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn review_notes_steer_when_a_turn_is_running() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        state.running = true;
+        let review = state.review.as_mut().unwrap();
+        review.notes.push(ReviewNote {
+            path: "src/lib.rs".into(),
+            line: 3,
+            added: true,
+            body: "tighten this".into(),
+        });
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        match engine_command_receiver.try_recv().expect("steer") {
+            EngineCommand::Steer { text, .. } => assert!(text.contains("Line: 3")),
+            _ => panic!("expected steer"),
+        }
+    }
+
+    #[test]
+    fn review_overlay_renders_rows_and_note_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("review turn 1"), "header: {text}");
+        assert!(text.contains("src/lib.rs:2"), "anchored row: {text}");
+        assert!(text.contains("new line"));
+        assert!(text.contains("press n on a changed line"));
     }
 
     #[test]

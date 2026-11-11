@@ -33,6 +33,15 @@ struct DiffHunk {
     rows: Vec<DiffRow>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiffRowRef {
+    pub path: String,
+    pub line_number: usize,
+    pub added: bool,
+    pub removed: bool,
+    pub text: String,
+}
+
 struct DiffFile {
     path: String,
     verb: &'static str,
@@ -155,6 +164,29 @@ fn counts_summary(added: usize, removed: usize) -> Vec<Span<'static>> {
         Span::styled(format!("-{removed}"), Style::default().fg(COLORS.error)),
         Span::raw(")"),
     ]
+}
+
+/// The changed rows of a diff, without context or hunk headers. Review mode
+/// uses these as stable anchors for notes.
+pub fn changed_rows(diff: &str) -> Vec<DiffRowRef> {
+    let mut rows = Vec::new();
+    for file in parse_unified_diff(diff) {
+        for hunk in file.hunks {
+            for row in hunk.rows {
+                if matches!(row.kind, DiffLineKind::Context) {
+                    continue;
+                }
+                rows.push(DiffRowRef {
+                    path: file.path.clone(),
+                    line_number: row.line_number,
+                    added: matches!(row.kind, DiffLineKind::Insert),
+                    removed: matches!(row.kind, DiffLineKind::Delete),
+                    text: row.text,
+                });
+            }
+        }
+    }
+    rows
 }
 
 /// Renders a unified diff as terminal lines, codex style.
@@ -294,6 +326,20 @@ mod tests {
         let removed = &lines[2];
         assert_eq!(removed.style.bg, Some(DEL_LINE_BG));
         assert_eq!(removed.spans[1].style.fg, Some(COLORS.error));
+    }
+
+    #[test]
+    fn changed_rows_expose_file_line_and_side() {
+        let rows = changed_rows(SAMPLE);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].path, "notes.txt");
+        assert_eq!(rows[0].line_number, 2);
+        assert!(rows[0].removed);
+        assert!(!rows[0].added);
+        assert_eq!(rows[0].text, "old line");
+        assert!(rows[1].added);
+        assert_eq!(rows[2].line_number, 3);
+        assert_eq!(rows[2].text, "another new line");
     }
 
     #[test]

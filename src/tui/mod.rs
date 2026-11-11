@@ -445,6 +445,15 @@ fn apply_engine_event(
                 }
             }
         }
+        EngineEvent::TurnRejected { thread_id, text, reason } => {
+            if thread_id == state.thread.id {
+                enqueue_message(state, store, text);
+                state.notice = Some(format!(
+                    "{reason}; queued ({} waiting)",
+                    state.queued_messages.len()
+                ));
+            }
+        }
         EngineEvent::SteerRejected { thread_id, text } => {
             if thread_id == state.thread.id {
                 enqueue_message(state, store, text);
@@ -3540,6 +3549,31 @@ mod tests {
             "a rejected steer is durable"
         );
         assert!(state.notice.as_deref().unwrap_or("").contains("queued"));
+    }
+
+    #[test]
+    fn a_second_submit_for_the_same_thread_falls_back_to_the_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnRejected {
+                thread_id,
+                text: "second".into(),
+                reason: "a turn is already running for this thread".into(),
+            },
+            &engine_command_sender,
+        );
+        assert_eq!(state.queued_messages, vec!["second".to_string()]);
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            vec!["second".to_string()]
+        );
+        assert!(state.notice.as_deref().unwrap_or("").contains("already running"));
     }
 
     #[test]

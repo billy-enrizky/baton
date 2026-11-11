@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -24,6 +25,7 @@ pub enum EngineEvent {
     TurnStarted { thread_id: String },
     Turn(TurnEvent),
     SteerRejected { thread_id: String, text: String },
+    TurnRejected { thread_id: String, text: String, reason: String },
     TurnFinished { thread_id: String, ok: bool, error: Option<String>, phase: TurnPhase },
 }
 
@@ -167,6 +169,7 @@ pub async fn run_engine(
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: TurnEventSender,
 ) -> Result<()> {
+    let active_threads: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     while let Some(command) = command_receiver.recv().await {
         match command {
             EngineCommand::Quit => {
@@ -237,6 +240,18 @@ pub async fn run_engine(
                 }
             }
             EngineCommand::Submit { thread_id, text, permission_mode } => {
+                let accepted = active_threads
+                    .lock()
+                    .unwrap()
+                    .insert(thread_id.clone());
+                if !accepted {
+                    let _ = engine_event_sender.send(EngineEvent::TurnRejected {
+                        thread_id,
+                        text,
+                        reason: "a turn is already running for this thread".into(),
+                    });
+                    continue;
+                }
                 tokio::spawn(run_turn(
                     store.clone(),
                     home.clone(),
@@ -246,6 +261,7 @@ pub async fn run_engine(
                     permission_mode,
                     engine_event_sender.clone(),
                     turn_event_sender.clone(),
+                    active_threads.clone(),
                 ));
             }
         }
@@ -262,6 +278,7 @@ async fn run_turn(
     permission_mode: PermissionMode,
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: TurnEventSender,
+    active_threads: Arc<Mutex<HashSet<String>>>,
 ) {
     let expected_turn = store
         .lock()
@@ -287,6 +304,7 @@ async fn run_turn(
         .and_then(|record| record.error.clone())
         .or_else(|| result.as_ref().err().map(ToString::to_string));
     let ok = matches!(phase, TurnPhase::Completed);
+    active_threads.lock().unwrap().remove(&thread_id);
     let _ = engine_event_sender.send(EngineEvent::TurnFinished {
         thread_id,
         ok,
@@ -569,6 +587,7 @@ mod tests {
         Complete,
         Fail,
         Interrupt,
+        Slow,
     }
 
     struct ScriptAdapter {
@@ -609,6 +628,15 @@ mod tests {
                 AdapterMode::Interrupt => {
                     let _ = emit.send(TurnEvent::TurnInterrupted {
                         reason: Some("stopped by user".into()),
+                    });
+                }
+                AdapterMode::Slow => {
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    let _ = emit.send(TurnEvent::TurnCompleted {
+                        final_text: "slow done".into(),
+                        usage: None,
+                        native_session_id: None,
+                        rollout_path: None,
                     });
                 }
             }
@@ -779,6 +807,64 @@ mod tests {
         command_sender2.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine2).await;
+    }
+
+    #[tokio::test]
+    async fn engine_rejects_overlapping_turns_for_one_thread() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "t".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
+            Box::new(ScriptAdapter { mode: AdapterMode::Slow }) as Box<dyn BatonAdapter>
+        ))];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store.clone(),
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        for text in ["first", "second"] {
+            command_sender
+                .send(EngineCommand::Submit {
+                    thread_id: thread.id.clone(),
+                    text: text.into(),
+                    permission_mode: PermissionMode::Default,
+                })
+                .unwrap();
+        }
+
+        let mut rejected = None;
+        let mut finished = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline && (rejected.is_none() || finished == 0) {
+            while let Ok(event) = event_receiver.try_recv() {
+                match event {
+                    EngineEvent::TurnRejected { text, .. } => rejected = Some(text),
+                    EngineEvent::TurnFinished { .. } => finished += 1,
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(rejected.as_deref(), Some("second"));
+        assert_eq!(finished, 1, "only the accepted turn finishes");
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
     }
 
     #[tokio::test]

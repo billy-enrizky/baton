@@ -240,6 +240,7 @@ pub struct TuiState {
     transcript_selection: std::cell::Cell<Option<(usize, usize)>>,
     transcript_anchor: std::cell::Cell<Option<usize>>,
     transcript_total: std::cell::Cell<usize>,
+    model_request_id: u64,
 }
 
 pub fn run_tui(
@@ -310,6 +311,7 @@ pub fn run_tui(
         transcript_selection: std::cell::Cell::new(None),
         transcript_anchor: std::cell::Cell::new(None),
         transcript_total: std::cell::Cell::new(0),
+        model_request_id: 0,
     };
 
     if !reconciled.is_empty() {
@@ -679,8 +681,14 @@ fn apply_engine_event(
                 state.notice = Some(format!("{prefix} · {waiting} queued message(s) kept; press enter to send"));
             }
         }
-        EngineEvent::ModelsLoaded { thread_id, provider, models, error } => {
-            if thread_id != state.thread.id {
+        EngineEvent::ModelsLoaded {
+            thread_id,
+            provider,
+            request_id,
+            models,
+            error,
+        } => {
+            if thread_id != state.thread.id || request_id != state.model_request_id {
                 return;
             }
             let picker_matches = matches!(
@@ -1064,9 +1072,11 @@ fn handle_key(
                     if !models.contains(&default_model) {
                         models.insert(0, default_model);
                     }
+                    state.model_request_id = state.model_request_id.wrapping_add(1);
                     let _ = engine_command_sender.send(EngineCommand::ListModels {
                         thread_id: state.thread.id.clone(),
                         provider,
+                        request_id: state.model_request_id,
                     });
                     state.overlay = Overlay::ModelPicker {
                         provider,
@@ -4007,6 +4017,7 @@ mod tests {
             transcript_selection: std::cell::Cell::new(None),
             transcript_anchor: std::cell::Cell::new(None),
             transcript_total: std::cell::Cell::new(0),
+            model_request_id: 0,
         }
     }
 
@@ -4261,12 +4272,14 @@ mod tests {
         };
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let thread_id = state.thread.id.clone();
+        let request_id = state.model_request_id;
         apply_engine_event(
             &mut state,
             &store,
             EngineEvent::ModelsLoaded {
                 thread_id,
                 provider: ProviderId::Codex,
+                request_id,
                 models: vec!["selected-model".into(), "live-model".into()],
                 error: None,
             },
@@ -4286,6 +4299,59 @@ mod tests {
             "notice: {:?}",
             state.notice
         );
+    }
+
+    #[test]
+    fn stale_model_catalog_response_is_ignored() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::ModelPicker {
+            provider: ProviderId::Codex,
+            models: vec!["current-model".into()],
+            selected: 0,
+            filter: String::new(),
+        };
+        state.model_request_id = 2;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::ModelsLoaded {
+                thread_id: thread_id.clone(),
+                provider: ProviderId::Codex,
+                request_id: 1,
+                models: vec!["stale-model".into()],
+                error: None,
+            },
+            &engine_command_sender,
+        );
+        match &state.overlay {
+            Overlay::ModelPicker { models, .. } => {
+                assert_eq!(models, &vec!["current-model".to_string()]);
+            }
+            _ => panic!("model picker closed"),
+        }
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::ModelsLoaded {
+                thread_id,
+                provider: ProviderId::Codex,
+                request_id: 2,
+                models: vec!["fresh-model".into()],
+                error: None,
+            },
+            &engine_command_sender,
+        );
+        match &state.overlay {
+            Overlay::ModelPicker { models, .. } => {
+                assert!(models.iter().any(|model| model == "fresh-model"));
+                assert!(!models.iter().any(|model| model == "stale-model"));
+            }
+            _ => panic!("model picker closed"),
+        }
     }
 
     #[test]

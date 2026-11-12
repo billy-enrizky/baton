@@ -17,7 +17,7 @@ pub type ThreadTurnEventSender = std::sync::mpsc::Sender<(String, TurnEvent)>;
 pub enum EngineCommand {
     Submit { thread_id: String, text: String, permission_mode: PermissionMode },
     Steer { thread_id: String, text: String },
-    ListModels { thread_id: String, provider: ProviderId },
+    ListModels { thread_id: String, provider: ProviderId, request_id: u64 },
     Interrupt { thread_id: String },
     Quit,
 }
@@ -28,7 +28,13 @@ pub enum EngineEvent {
     TurnStarted { thread_id: String },
     Turn(TurnEvent),
     SteerRejected { thread_id: String, text: String },
-    ModelsLoaded { thread_id: String, provider: ProviderId, models: Vec<String>, error: Option<String> },
+    ModelsLoaded {
+        thread_id: String,
+        provider: ProviderId,
+        request_id: u64,
+        models: Vec<String>,
+        error: Option<String>,
+    },
     TurnRejected { thread_id: String, text: String, reason: String },
     TurnFinished { thread_id: String, ok: bool, error: Option<String>, phase: TurnPhase },
 }
@@ -432,7 +438,11 @@ pub async fn run_engine(
                     });
                 }
             }
-            EngineCommand::ListModels { thread_id, provider } => {
+            EngineCommand::ListModels {
+                thread_id,
+                provider,
+                request_id,
+            } => {
                 let store = store.clone();
                 let home = home.clone();
                 let adapters = adapters.clone();
@@ -446,6 +456,7 @@ pub async fn run_engine(
                     let _ = sender.send(EngineEvent::ModelsLoaded {
                         thread_id,
                         provider,
+                        request_id,
                         models,
                         error,
                     });
@@ -1735,6 +1746,7 @@ mod tests {
             .send(EngineCommand::ListModels {
                 thread_id: thread.id.clone(),
                 provider: ProviderId::Codex,
+                request_id: 7,
             })
             .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1751,11 +1763,13 @@ mod tests {
             EngineEvent::ModelsLoaded {
                 thread_id,
                 provider,
+                request_id,
                 models,
                 error,
             } => {
                 assert_eq!(thread_id, thread.id);
                 assert_eq!(provider, ProviderId::Codex);
+                assert_eq!(request_id, 7);
                 assert_eq!(models, vec!["live:/tmp/models".to_string()]);
                 assert!(error.is_none());
             }

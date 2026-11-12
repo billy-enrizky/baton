@@ -1,4 +1,4 @@
-use baton::{adapters, checkpoints, cli, config, mcp, paths, process, resume, runtime, scanner, status, store, tui, types, usage};
+use baton::{adapters, checkpoints, cli, config, doctor, mcp, paths, process, resume, runtime, scanner, status, store, tui, types, usage};
 
 use anyhow::Result;
 use clap::Parser;
@@ -834,6 +834,16 @@ fn main_result() -> Result<()> {
                         .collect();
                     println!("{:>3}. {preview}", index + 1);
                 }
+            }
+            Ok(())
+        }
+        cli::Commands::Doctor { json } => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let report = doctor::build(&home, &cwd, &store)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&doctor::to_json(&report))?);
+            } else {
+                println!("{}", doctor::render(&report));
             }
             Ok(())
         }

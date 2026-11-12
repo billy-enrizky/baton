@@ -43,7 +43,7 @@ impl McpServer {
                     "version": env!("CARGO_PKG_VERSION"),
                     "title": "Baton thread state"
                 },
-                "instructions": "Use baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, and baton_latest_diff to inspect the local baton store. baton_fork creates a new thread from an existing conversation."
+                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, and baton_latest_diff to inspect the local baton store and provider readiness. baton_fork creates a new thread from an existing conversation."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
@@ -211,6 +211,10 @@ impl McpServer {
                         "diff": null,
                     }),
                 })
+            }
+            "baton_doctor" => {
+                let report = crate::doctor::build(&self.home, &self.cwd, &self.store)?;
+                Ok(crate::doctor::to_json(&report))
             }
             "baton_processes" => {
                 let rows = self.store.list_provider_processes()?;
@@ -457,6 +461,11 @@ fn tool_descriptors() -> Vec<Value> {
             "annotations": { "readOnlyHint": true }
         }),
         json!({
+            "name": "baton_doctor",
+            "description": "Check provider binaries, effective models/auth/modes, config files, database size, thread count, and tracked provider process health.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+        }),
+        json!({
             "name": "baton_processes",
             "description": "List provider server processes tracked by baton, with process, owner, command-line, and process-start verification state.",
             "inputSchema": {
@@ -580,6 +589,7 @@ mod tests {
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"baton_status"));
+        assert!(names.contains(&"baton_doctor"));
         assert!(names.contains(&"baton_messages"));
         assert!(names.contains(&"baton_latest_diff"));
         assert!(names.contains(&"baton_processes"));
@@ -613,6 +623,21 @@ mod tests {
         let cleared = tool_json(&server, "baton_queue", json!({ "clear": true }));
         assert_eq!(cleared["cleared"], true);
         assert_eq!(cleared["count"], 0);
+    }
+
+    #[test]
+    fn doctor_reports_provider_readiness() {
+        let server = server();
+        let doctor = tool_json(&server, "baton_doctor", json!({}));
+        assert_eq!(doctor["schema_version"], crate::doctor::SCHEMA_VERSION);
+        assert_eq!(doctor["db"]["thread_count"], 1);
+        assert!(doctor["providers"].as_array().unwrap().len() >= 6);
+        assert_eq!(doctor["processes"].as_array().unwrap().len(), 0);
+        assert!(doctor["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|provider| provider["provider"] == "codex"));
     }
 
     #[test]

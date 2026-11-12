@@ -3,6 +3,7 @@ pub mod checkpoints;
 pub mod clipboard;
 pub mod cli;
 pub mod config;
+pub mod doctor;
 pub mod handoff;
 pub mod harness_config;
 pub mod mcp;

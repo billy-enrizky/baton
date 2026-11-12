@@ -1,9 +1,11 @@
+use base64::Engine as _;
 use baton::checkpoints::{capture_checkpoint, checkpoint_ref, diff_checkpoint_against_worktree, restore_checkpoint};
 use baton::config::{
-    auth_signature, load_config_file, provider_auth_env, resolve_config, save_config_file, AuthMode,
+    auth_signature, load_config_file, provider_auth_env, save_config_file, AuthMode,
 };
-use baton::harness_config::{read_claude_harness_config, read_codex_harness_config};
-use std::io::Write;
+use baton::harness_config::{
+    read_claude_harness_config, read_claude_model_catalog, read_codex_harness_config,
+};
 use std::process::Command;
 
 fn git(repo: &std::path::Path, args: &[&str]) -> String {
@@ -92,6 +94,68 @@ fn claude_harness_config_layers() {
     assert_eq!(config.auth_mode, Some(AuthMode::Api));
     assert_eq!(config.api_key.as_deref(), Some("sk-ant-from-settings"));
     assert_eq!(config.permission_mode, Some(baton::types::PermissionMode::AcceptEdits));
+}
+
+#[test]
+fn claude_model_catalog_reads_newest_cached_cc_surface() {
+    let root = tempfile::tempdir().unwrap();
+    let claude = root.path().join("claude");
+    let cache = claude.join("cache").join("model-catalog");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(
+        cache.join("old-cc.json"),
+        r#"{"version":2,"fetchedAt":1000,"catalog":{"surface":"cc","config":{"models":[{"id":"old-model"}]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cache.join("new-cc.json"),
+        r#"{"version":2,"fetchedAt":2000,"catalog":{"surface":"cc","config":{"models":[{"id":"claude-opus-5-5"},{"id":"claude-sonnet-5-5"},"claude-opus-5-5",{"id":""}]}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        cache.join("newer-ccd.json"),
+        r#"{"version":2,"fetchedAt":3000,"catalog":{"surface":"ccd","config":{"models":[{"id":"desktop-only"}]}}}"#,
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_claude_model_catalog(&claude),
+        vec!["claude-opus-5-5", "claude-sonnet-5-5"]
+    );
+}
+
+#[test]
+fn claude_model_catalog_falls_back_to_published_document() {
+    let root = tempfile::tempdir().unwrap();
+    let claude = root.path().join("claude");
+    let cache = claude.join("cache").join("model-catalog");
+    std::fs::create_dir_all(&cache).unwrap();
+    let document = serde_json::json!({
+        "surfaces": {
+            "cc": {
+                "model_selector_config": [{
+                    "models": [
+                        {"id": "claude-fable-5-1"},
+                        {"id": "claude-opus-5-5"}
+                    ]
+                }]
+            }
+        }
+    });
+    let encoded = base64::engine::general_purpose::STANDARD.encode(document.to_string());
+    std::fs::write(
+        cache.join("published-test.json"),
+        serde_json::json!({"version": 2, "fetchedAt": 4000, "documentBytes": encoded}).to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(
+        read_claude_model_catalog(&claude),
+        vec!["claude-fable-5-1", "claude-opus-5-5"]
+    );
+
+    std::fs::write(cache.join("broken.json"), "{").unwrap();
+    assert_eq!(read_claude_model_catalog(&claude).len(), 2);
 }
 
 #[test]

@@ -513,6 +513,14 @@ async fn load_provider_models(
             .cwd
     };
     let config = resolve_config(home, std::path::Path::new(&cwd));
+    if provider == ProviderId::Claude {
+        let models = crate::harness_config::read_claude_model_catalog(
+            &crate::paths::claude_global_settings_dir(),
+        );
+        if !models.is_empty() {
+            return Ok(models);
+        }
+    }
     let input = ModelListInput {
         cwd,
         auth_env: provider_auth_env(config.for_provider(provider)),

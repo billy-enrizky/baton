@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -51,18 +52,7 @@ fn codex_approval_policy_map(value: &str) -> Option<PermissionMode> {
 }
 
 pub fn read_claude_harness_config(global_dir: &Path, project_root: Option<&Path>) -> HarnessProviderConfig {
-    let mut layers: Vec<Value> = Vec::new();
-    if let Some(value) = read_json_if_exists(&global_dir.join("settings.json")) {
-        layers.push(value);
-    }
-    if let Some(root) = project_root {
-        if let Some(value) = read_json_if_exists(&root.join(".claude").join("settings.json")) {
-            layers.push(value);
-        }
-        if let Some(value) = read_json_if_exists(&root.join(".claude").join("settings.local.json")) {
-            layers.push(value);
-        }
-    }
+    let layers = claude_settings_layers(global_dir, project_root);
     if layers.is_empty() {
         return HarnessProviderConfig::default();
     }
@@ -117,6 +107,144 @@ pub fn read_claude_harness_config(global_dir: &Path, project_root: Option<&Path>
         permission_mode: default_mode.as_deref().and_then(claude_permission_mode_map),
         model_provider: None,
     }
+}
+
+fn claude_settings_layers(global_dir: &Path, project_root: Option<&Path>) -> Vec<Value> {
+    let mut layers = Vec::new();
+    if let Some(value) = read_json_if_exists(&global_dir.join("settings.json")) {
+        layers.push(value);
+    }
+    if let Some(root) = project_root {
+        if let Some(value) = read_json_if_exists(&root.join(".claude").join("settings.json")) {
+            layers.push(value);
+        }
+        if let Some(value) = read_json_if_exists(&root.join(".claude").join("settings.local.json")) {
+            layers.push(value);
+        }
+    }
+    layers
+}
+
+fn claude_model_id(entry: &Value) -> Option<&str> {
+    entry
+        .as_str()
+        .or_else(|| entry.get("id").and_then(Value::as_str))
+        .or_else(|| entry.get("model").and_then(Value::as_str))
+        .or_else(|| entry.get("value").and_then(Value::as_str))
+        .or_else(|| entry.get("slug").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+}
+
+fn push_model(models: &mut Vec<String>, model: &str) {
+    if !models.iter().any(|known| known == model) {
+        models.push(model.to_string());
+    }
+}
+
+fn model_ids_from_value(value: &Value) -> Vec<String> {
+    let Some(entries) = value
+        .as_array()
+        .or_else(|| value.get("models").and_then(Value::as_array))
+    else {
+        return Vec::new();
+    };
+    let mut models = Vec::new();
+    for entry in entries {
+        if let Some(model) = claude_model_id(entry) {
+            push_model(&mut models, model);
+        }
+    }
+    models
+}
+
+fn model_ids_from_config(value: &Value) -> Vec<String> {
+    if let Some(configs) = value.as_array() {
+        for config in configs {
+            let models = model_ids_from_value(config);
+            if !models.is_empty() {
+                return models;
+            }
+        }
+        return Vec::new();
+    }
+    model_ids_from_value(value)
+}
+
+fn cached_catalog_models(value: &Value) -> Option<(i64, String, Vec<String>)> {
+    let catalog = value.get("catalog")?;
+    let surface = catalog.get("surface")?.as_str()?.to_string();
+    let models = model_ids_from_config(catalog.get("config")?);
+    if models.is_empty() {
+        return None;
+    }
+    let fetched_at = value.get("fetchedAt").and_then(Value::as_i64).unwrap_or(0);
+    Some((fetched_at, surface, models))
+}
+
+fn published_catalog_models(value: &Value) -> Option<(i64, Vec<String>)> {
+    let decoded;
+    let document = if value.get("document").is_some_and(Value::is_object) {
+        value.get("document")?
+    } else {
+        let encoded = value.get("documentBytes")?.as_str()?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+        decoded = serde_json::from_slice::<Value>(&bytes).ok()?;
+        &decoded
+    };
+    let config = document
+        .get("surfaces")?
+        .get("cc")?
+        .get("model_selector_config")?;
+    let models = model_ids_from_config(config);
+    if models.is_empty() {
+        return None;
+    }
+    let fetched_at = value.get("fetchedAt").and_then(Value::as_i64).unwrap_or(0);
+    Some((fetched_at, models))
+}
+
+/// Model ids from Claude Code's own cached catalog for the `cc` (CLI) surface.
+/// The cache is written by Claude Code itself, so baton does not need to guess
+/// the model list or call a private endpoint. Falls back to the published
+/// catalog document when no per-user `cc` entry exists; returns an empty list
+/// when neither cache shape is present so the picker keeps its static fallback.
+pub fn read_claude_model_catalog(claude_dir: &Path) -> Vec<String> {
+    let cache_dir = claude_dir.join("cache").join("model-catalog");
+    let Ok(entries) = std::fs::read_dir(&cache_dir) else {
+        return Vec::new();
+    };
+    let mut newest_cached: Option<(i64, Vec<String>)> = None;
+    let mut newest_published: Option<(i64, Vec<String>)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(value) = read_json_if_exists(&path) else {
+            continue;
+        };
+        if let Some((fetched_at, surface, models)) = cached_catalog_models(&value) {
+            if surface == "cc"
+                && newest_cached
+                    .as_ref()
+                    .is_none_or(|(known, _)| fetched_at > *known)
+            {
+                newest_cached = Some((fetched_at, models));
+            }
+        } else if let Some((fetched_at, models)) = published_catalog_models(&value) {
+            if newest_published
+                .as_ref()
+                .is_none_or(|(known, _)| fetched_at > *known)
+            {
+                newest_published = Some((fetched_at, models));
+            }
+        }
+    }
+    newest_cached
+        .or(newest_published)
+        .map(|(_, models)| models)
+        .unwrap_or_default()
 }
 
 pub fn read_codex_harness_config(global_home: &Path, project_root: Option<&Path>) -> HarnessProviderConfig {    let global = read_toml_if_exists(&global_home.join("config.toml"));

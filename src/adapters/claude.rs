@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{child_halves, BatonAdapter, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{child_halves, child_halves_with_cleanup, BatonAdapter, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::process::{self, ProcessRecorder};
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
 pub type ClaudeSpawner = Arc<dyn Fn(&TurnStartInput, Option<&NativeSessionRef>) -> Result<TransportHalves> + Send + Sync>;
@@ -42,6 +43,10 @@ impl ClaudeAdapter {
         Arc::new(|input, session| Self::spawn_halves(input, session))
     }
 
+    pub fn real_spawner_with_recorder(recorder: ProcessRecorder) -> ClaudeSpawner {
+        Arc::new(move |input, session| Self::spawn_halves_tracked(input, session, &recorder))
+    }
+
     pub fn command_args(input: &TurnStartInput, session: Option<&NativeSessionRef>) -> Vec<String> {
         let mut args = vec![
             "-p".to_string(),
@@ -71,8 +76,25 @@ impl ClaudeAdapter {
     }
 
     pub fn spawn_halves(input: &TurnStartInput, session: Option<&NativeSessionRef>) -> Result<TransportHalves> {
+        Self::spawn_halves_inner(input, session, None)
+    }
+
+    pub fn spawn_halves_tracked(
+        input: &TurnStartInput,
+        session: Option<&NativeSessionRef>,
+        recorder: &ProcessRecorder,
+    ) -> Result<TransportHalves> {
+        Self::spawn_halves_inner(input, session, Some(recorder))
+    }
+
+    fn spawn_halves_inner(
+        input: &TurnStartInput,
+        session: Option<&NativeSessionRef>,
+        recorder: Option<&ProcessRecorder>,
+    ) -> Result<TransportHalves> {
         let mut command = tokio::process::Command::new("claude");
         command.args(Self::command_args(input, session));
+        command.kill_on_drop(true);
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::null());
@@ -80,7 +102,27 @@ impl ClaudeAdapter {
             command.env(key, value);
         }
         command.current_dir(&input.cwd);
-        child_halves(command.spawn()?)
+        let child = command.spawn()?;
+        let Some(recorder) = recorder else {
+            return child_halves(child);
+        };
+        let pid = child
+            .id()
+            .ok_or_else(|| anyhow::anyhow!("claude did not expose a process id"))?;
+        let command_line = process::command_line(pid).unwrap_or_default();
+        let process_start = process::process_start(pid);
+        recorder.record(
+            pid,
+            ProviderId::Claude,
+            None,
+            &command_line,
+            process_start.as_deref(),
+        )?;
+        let recorder = recorder.clone();
+        child_halves_with_cleanup(
+            child,
+            Some(Box::new(move || recorder.forget(pid))),
+        )
     }
 }
 

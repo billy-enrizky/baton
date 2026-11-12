@@ -159,7 +159,8 @@ async fn opencode_dispose_removes_the_tracked_process() {
                 .spawn()?;
             let pid = child.id().expect("sleep child pid");
             let command = baton::process::command_line(pid).unwrap_or_else(|| "sleep 60".to_string());
-            recorder.record(pid, ProviderId::OpenCode, Some(port), &command)?;
+            let start = baton::process::process_start(pid);
+            recorder.record(pid, ProviderId::OpenCode, Some(port), &command, start.as_deref())?;
             Ok(OpenCodeChild { port, password: "pw".to_string(), child })
         })
     };

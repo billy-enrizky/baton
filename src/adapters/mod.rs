@@ -80,6 +80,7 @@ impl LineReader for ChildReader {
 pub struct ChildWriter {
     stdin: Option<tokio::process::ChildStdin>,
     child: Option<Child>,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 #[async_trait]
@@ -101,6 +102,9 @@ impl LineWriter for ChildWriter {
         if let Some(mut child) = self.child.take() {
             let _ = child.kill().await;
         }
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
         Ok(())
     }
 }
@@ -111,16 +115,30 @@ impl Drop for ChildWriter {
         if let Some(mut child) = self.child.take() {
             let _ = child.start_kill();
         }
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
     }
 }
 
 pub fn child_halves(child: Child) -> Result<TransportHalves> {
+    child_halves_with_cleanup(child, None)
+}
+
+pub fn child_halves_with_cleanup(
+    child: Child,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
+) -> Result<TransportHalves> {
     let mut child = child;
     let stdin = child.stdin.take().expect("child stdin piped");
     let stdout = child.stdout.take().expect("child stdout piped");
     Ok((
         Box::new(ChildReader { reader: BufReader::new(stdout) }),
-        Box::new(ChildWriter { stdin: Some(stdin), child: Some(child) }),
+        Box::new(ChildWriter {
+            stdin: Some(stdin),
+            child: Some(child),
+            cleanup,
+        }),
     ))
 }
 
@@ -205,3 +223,30 @@ pub use acp::AcpAdapter;
 pub use claude::ClaudeAdapter;
 pub use codex::CodexAdapter;
 pub use opencode::OpenCodeAdapter;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn dropping_a_child_writer_runs_cleanup_and_kills_the_child() {
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("30")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let child = command.spawn().unwrap();
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let cleaned_flag = cleaned.clone();
+        let (reader, writer) = child_halves_with_cleanup(
+            child,
+            Some(Box::new(move || cleaned_flag.store(true, Ordering::SeqCst))),
+        )
+        .unwrap();
+        drop(reader);
+        drop(writer);
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+}

@@ -95,6 +95,7 @@ pub struct ProviderProcessRow {
     pub provider: ProviderId,
     pub port: Option<u16>,
     pub command: String,
+    pub process_start: Option<String>,
     pub cwd: String,
     pub owner_pid: u32,
     pub started_at: String,
@@ -223,6 +224,7 @@ CREATE TABLE IF NOT EXISTS provider_processes (
   provider TEXT NOT NULL,
   port INTEGER,
   command TEXT NOT NULL,
+  process_start TEXT,
   cwd TEXT NOT NULL,
   owner_pid INTEGER NOT NULL,
   started_at TEXT NOT NULL
@@ -343,6 +345,7 @@ impl BatonStore {
         db.execute_batch(MIGRATIONS)?;
         migrate_thread_model_nullable(&db)?;
         ensure_thread_columns(&db)?;
+        ensure_column(&db, "provider_processes", "process_start", "TEXT")?;
         Ok(BatonStore { db })
     }
 
@@ -844,20 +847,22 @@ impl BatonStore {
         provider: ProviderId,
         port: Option<u16>,
         command: &str,
+        process_start: Option<&str>,
         cwd: &str,
         owner_pid: u32,
     ) -> Result<()> {
         self.db.execute(
-            r#"INSERT INTO provider_processes (pid, provider, port, command, cwd, owner_pid, started_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
+            r#"INSERT INTO provider_processes (pid, provider, port, command, process_start, cwd, owner_pid, started_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(pid) DO UPDATE SET
                  provider = excluded.provider,
                  port = excluded.port,
                  command = excluded.command,
+                 process_start = excluded.process_start,
                  cwd = excluded.cwd,
                  owner_pid = excluded.owner_pid,
                  started_at = excluded.started_at"#,
-            params![pid, provider.as_str(), port, command, cwd, owner_pid, now_iso()],
+            params![pid, provider.as_str(), port, command, process_start, cwd, owner_pid, now_iso()],
         )?;
         Ok(())
     }
@@ -872,7 +877,7 @@ impl BatonStore {
 
     pub fn list_provider_processes(&self) -> Result<Vec<ProviderProcessRow>> {
         let mut statement = self.db.prepare(
-            "SELECT pid, provider, port, command, cwd, owner_pid, started_at
+            "SELECT pid, provider, port, command, process_start, cwd, owner_pid, started_at
              FROM provider_processes ORDER BY started_at, pid",
         )?;
         let rows = statement
@@ -883,9 +888,10 @@ impl BatonStore {
                     provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
                     port: row.get::<_, Option<i64>>(2)?.map(|port| port.clamp(0, u16::MAX as i64) as u16),
                     command: row.get(3)?,
-                    cwd: row.get(4)?,
-                    owner_pid: row.get::<_, i64>(5)?.max(0) as u32,
-                    started_at: row.get(6)?,
+                    process_start: row.get(4)?,
+                    cwd: row.get(5)?,
+                    owner_pid: row.get::<_, i64>(6)?.max(0) as u32,
+                    started_at: row.get(7)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

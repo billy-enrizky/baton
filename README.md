@@ -89,7 +89,7 @@ Tools:
 - `baton_messages`: newest conversation rows, including tool and diff rows
 - `baton_queue`: inspect queued follow-ups, or clear them explicitly
 - `baton_search`: search thread titles and conversation text in the project, or every project with `all=true`
-- `baton_processes`: provider server processes tracked by baton, including PID, owner, port, and command-line verification
+- `baton_processes`: provider server processes tracked by baton, including PID, owner, port, command-line, and process-start verification
 - `baton_latest_diff`: newest stored turn diff
 
 The server is read-only except for the explicit `baton_queue` clear option. It opens the same `~/.baton/baton.sqlite` database and honors `BATON_HOME`.
@@ -100,7 +100,7 @@ Each provider keeps its own native session per baton thread. On every turn only 
 
 ## Storage
 
-`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, durable turns, queued follow-ups, review notes, checkpoints, usage, and verified provider process records) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything. A provider server left behind by a killed baton process is reaped on the next start only when its PID, command line, and dead owner still match the recorded process.
+`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, durable turns, queued follow-ups, review notes, checkpoints, usage, and verified provider process records) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything. A provider child left behind by a killed baton process is reaped on the next start only when its dead owner, PID, command line, and process start time still match the recorded process.
 
 ## Development
 

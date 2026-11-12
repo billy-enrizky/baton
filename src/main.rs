@@ -6,7 +6,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use adapters::{child_halves, BatonAdapter, AcpAdapter, ClaudeAdapter, CodexAdapter, OpenCodeAdapter};
+use adapters::{BatonAdapter, AcpAdapter, ClaudeAdapter, CodexAdapter, OpenCodeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use runtime::{run_engine, EngineCommand, EngineEvent, SharedAdapter, SharedStore};
 use store::{BatonStore, ImportedMessage, NewThread};
@@ -807,6 +807,8 @@ fn main_result() -> Result<()> {
                             "owner_running": state.owner_running,
                             "process_alive": state.alive,
                             "command_matches": state.command_matches,
+                            "process_start": state.process_start,
+                            "start_matches": state.start_matches,
                             "command": state.command.unwrap_or_else(|| row.command.clone()),
                             "started_at": row.started_at,
                         })
@@ -1034,6 +1036,32 @@ fn reap_startup_processes() {
     }
 }
 
+fn spawn_tracked_provider(
+    mut command: tokio::process::Command,
+    provider: ProviderId,
+    recorder: &process::ProcessRecorder,
+) -> anyhow::Result<baton::adapters::TransportHalves> {
+    command.kill_on_drop(true);
+    let child = command.spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| anyhow::anyhow!("{provider} did not expose a process id"))?;
+    let command_line = process::command_line(pid).unwrap_or_default();
+    let process_start = process::process_start(pid);
+    recorder.record(
+        pid,
+        provider,
+        None,
+        &command_line,
+        process_start.as_deref(),
+    )?;
+    let recorder = recorder.clone();
+    baton::adapters::child_halves_with_cleanup(
+        child,
+        Some(Box::new(move || recorder.forget(pid))),
+    )
+}
+
 
 fn build_all_adapters(
     store: &SharedStore,
@@ -1044,6 +1072,8 @@ fn build_all_adapters(
         store.clone(),
         cwd.to_string_lossy().to_string(),
     );
+    let claude_recorder = process_recorder.clone();
+    let codex_recorder = process_recorder.clone();
     let cwd_for_codex = cwd.clone();
     let codex_spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
@@ -1056,9 +1086,10 @@ fn build_all_adapters(
             for (key, value) in auth_env {
                 command.env(key, value);
             }
-            child_halves(command.spawn()?)
+            spawn_tracked_provider(command, ProviderId::Codex, &codex_recorder)
         },
     );
+    let grok_recorder = process_recorder.clone();
     let cwd_for_grok = cwd.clone();
     let grok_spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
@@ -1072,9 +1103,10 @@ fn build_all_adapters(
             for (key, value) in auth_env {
                 command.env(key, value);
             }
-            child_halves(command.spawn()?)
+            spawn_tracked_provider(command, ProviderId::Grok, &grok_recorder)
         },
     );
+    let antigravity_recorder = process_recorder.clone();
     let cwd_for_antigravity = cwd.clone();
     let antigravity_home = home.join("antigravity");
     let antigravity_spawner = Arc::new(
@@ -1094,9 +1126,10 @@ fn build_all_adapters(
             for (key, value) in auth_env {
                 command.env(key, value);
             }
-            child_halves(command.spawn()?)
+            spawn_tracked_provider(command, ProviderId::Antigravity, &antigravity_recorder)
         },
     );
+    let cursor_recorder = process_recorder.clone();
     let cwd_for_cursor = cwd.clone();
     let cursor_spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
@@ -1108,7 +1141,7 @@ fn build_all_adapters(
             for (key, value) in auth_env {
                 command.env(key, value);
             }
-            child_halves(command.spawn()?)
+            spawn_tracked_provider(command, ProviderId::Cursor, &cursor_recorder)
         },
     );
     let opencode_recorder = process_recorder.clone();
@@ -1134,7 +1167,14 @@ fn build_all_adapters(
                 .ok_or_else(|| anyhow::anyhow!("opencode did not expose a process id"))?;
             let command_line = process::command_line(pid)
                 .unwrap_or_else(|| format!("opencode serve --hostname=127.0.0.1 --port {port}"));
-            if let Err(error) = opencode_recorder.record(pid, ProviderId::OpenCode, Some(port), &command_line) {
+            let process_start = process::process_start(pid);
+            if let Err(error) = opencode_recorder.record(
+                pid,
+                ProviderId::OpenCode,
+                Some(port),
+                &command_line,
+                process_start.as_deref(),
+            ) {
                 let _ = child.start_kill();
                 return Err(error);
             }
@@ -1143,7 +1183,7 @@ fn build_all_adapters(
     );
 
     vec![
-        Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner())) as Box<dyn BatonAdapter>)),
+        Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner_with_recorder(claude_recorder))) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(codex_spawner)) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Cursor, cursor_spawner)) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Grok, grok_spawner)) as Box<dyn BatonAdapter>)),

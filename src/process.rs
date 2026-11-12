@@ -11,6 +11,8 @@ pub struct ProcessState {
     pub owner_running: bool,
     pub command: Option<String>,
     pub command_matches: bool,
+    pub process_start: Option<String>,
+    pub start_matches: bool,
 }
 
 #[derive(Debug, Default)]
@@ -71,6 +73,7 @@ impl ProcessRecorder {
         provider: ProviderId,
         port: Option<u16>,
         command: &str,
+        process_start: Option<&str>,
     ) -> Result<()> {
         let Some(store) = &self.store else {
             return Ok(());
@@ -83,6 +86,7 @@ impl ProcessRecorder {
             provider,
             port,
             command,
+            process_start,
             &self.cwd,
             std::process::id(),
         )
@@ -101,10 +105,16 @@ impl ProcessRecorder {
 pub fn probe(row: &ProviderProcessRow) -> ProcessState {
     let alive = pid_alive(row.pid);
     let command = command_line(row.pid);
+    let process_start = process_start(row.pid);
     ProcessState {
         alive,
         owner_running: pid_alive(row.owner_pid),
         command_matches: command.as_deref() == Some(row.command.as_str()),
+        start_matches: row
+            .process_start
+            .as_deref()
+            .map_or(true, |start| process_start.as_deref() == Some(start)),
+        process_start,
         command,
     }
 }
@@ -127,8 +137,15 @@ pub fn reap_orphans(store: &BatonStore) -> Result<ReapReport> {
             report.already_gone += 1;
             continue;
         }
-        match command_line(row.pid) {
-            Some(actual) if actual == row.command => {
+        let command = command_line(row.pid);
+        let process_start = process_start(row.pid);
+        let identity_matches = command.as_deref() == Some(row.command.as_str())
+            && row
+                .process_start
+                .as_deref()
+                .map_or(true, |start| process_start.as_deref() == Some(start));
+        match command {
+            Some(_) if identity_matches => {
                 if terminate_verified(row.pid) {
                     store.remove_provider_process(row.pid)?;
                     report.reaped.push(row);
@@ -176,8 +193,29 @@ pub fn command_line(pid: u32) -> Option<String> {
     (!line.is_empty()).then_some(line)
 }
 
+#[cfg(unix)]
+pub fn process_start(pid: u32) -> Option<String> {
+    if pid == 0 {
+        return None;
+    }
+    let output = std::process::Command::new("ps")
+        .args(["-ww", "-p", &pid.to_string(), "-o", "lstart="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let line = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
 #[cfg(not(unix))]
 pub fn command_line(_pid: u32) -> Option<String> {
+    None
+}
+
+#[cfg(not(unix))]
+pub fn process_start(_pid: u32) -> Option<String> {
     None
 }
 
@@ -256,26 +294,28 @@ mod tests {
         }
     }
 
-    fn sleeper() -> (ChildGuard, u32, String) {
+    fn sleeper() -> (ChildGuard, u32, String, String) {
         let child = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .expect("spawn sleeper");
         let pid = child.id();
         let command = command_line(pid).expect("read sleeper command line");
-        (ChildGuard(child), pid, command)
+        let start = process_start(pid).expect("read sleeper start time");
+        (ChildGuard(child), pid, command, start)
     }
 
     #[test]
     fn reaps_a_verified_orphan() {
         let store = BatonStore::memory().unwrap();
-        let (mut child, pid, command) = sleeper();
+        let (mut child, pid, command, start) = sleeper();
         store
             .record_provider_process(
                 pid,
                 ProviderId::OpenCode,
                 Some(41234),
                 &command,
+                Some(&start),
                 "/tmp/project",
                 u32::MAX,
             )
@@ -293,13 +333,14 @@ mod tests {
     #[test]
     fn leaves_a_live_owners_process_alone() {
         let store = BatonStore::memory().unwrap();
-        let (mut child, pid, command) = sleeper();
+        let (mut child, pid, command, start) = sleeper();
         store
             .record_provider_process(
                 pid,
                 ProviderId::OpenCode,
                 None,
                 &command,
+                Some(&start),
                 "/tmp/project",
                 std::process::id(),
             )
@@ -316,13 +357,14 @@ mod tests {
     #[test]
     fn does_not_kill_a_reused_pid_with_a_different_command() {
         let store = BatonStore::memory().unwrap();
-        let (mut child, pid, _) = sleeper();
+        let (mut child, pid, _, start) = sleeper();
         store
             .record_provider_process(
                 pid,
                 ProviderId::OpenCode,
                 None,
                 "definitely-not-this-process",
+                Some(&start),
                 "/tmp/project",
                 u32::MAX,
             )
@@ -337,13 +379,37 @@ mod tests {
     }
 
     #[test]
+    fn does_not_kill_a_reused_pid_with_a_different_start_time() {
+        let store = BatonStore::memory().unwrap();
+        let (mut child, pid, command, _) = sleeper();
+        store
+            .record_provider_process(
+                pid,
+                ProviderId::Codex,
+                None,
+                &command,
+                Some("not the real start time"),
+                "/tmp/project",
+                u32::MAX,
+            )
+            .unwrap();
+
+        let report = reap_orphans(&store).unwrap();
+
+        assert_eq!(report.command_mismatches.len(), 1);
+        assert!(report.errors.is_empty());
+        assert!(store.list_provider_processes().unwrap().is_empty());
+        assert!(child.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
     fn removes_a_row_whose_process_already_exited() {
         let store = BatonStore::memory().unwrap();
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let pid = child.id();
         child.wait().unwrap();
         store
-            .record_provider_process(pid, ProviderId::OpenCode, None, "true", "/tmp", u32::MAX)
+            .record_provider_process(pid, ProviderId::OpenCode, None, "true", None, "/tmp", u32::MAX)
             .unwrap();
 
         let report = reap_orphans(&store).unwrap();

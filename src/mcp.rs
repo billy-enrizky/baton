@@ -227,6 +227,8 @@ impl McpServer {
                             "owner_running": state.owner_running,
                             "process_alive": state.alive,
                             "command_matches": state.command_matches,
+                            "process_start": state.process_start,
+                            "start_matches": state.start_matches,
                             "command": state.command.unwrap_or_else(|| row.command.clone()),
                             "started_at": row.started_at,
                         })
@@ -429,7 +431,7 @@ fn tool_descriptors() -> Vec<Value> {
         }),
         json!({
             "name": "baton_processes",
-            "description": "List provider server processes tracked by baton, with process, owner, and command-line verification state.",
+            "description": "List provider server processes tracked by baton, with process, owner, command-line, and process-start verification state.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -581,6 +583,7 @@ mod tests {
                 ProviderId::OpenCode,
                 Some(41234),
                 "baton-test-process",
+                None,
                 "/work",
                 u32::MAX,
             )

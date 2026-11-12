@@ -212,6 +212,7 @@ pub struct TuiState {
     notice: Option<String>,
     diff_output: Option<String>,
     diff_cache: std::cell::RefCell<diff_render::DiffCache>,
+    markdown_cache: std::cell::RefCell<markdown::MarkdownCache>,
     permission_mode: PermissionMode,
     scroll_offset: usize,
     esc_primed: bool,
@@ -277,6 +278,7 @@ pub fn run_tui(
         notice: None,
         diff_output: None,
         diff_cache: std::cell::RefCell::new(diff_render::DiffCache::default()),
+        markdown_cache: std::cell::RefCell::new(markdown::MarkdownCache::default()),
         permission_mode,
         scroll_offset: 0,
         esc_primed: false,
@@ -3311,7 +3313,11 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
                 ),
                 Style::default().fg(COLORS.muted),
             ));
-            all_lines.extend(markdown::render(&message.text, width.saturating_sub(2)));
+            let rendered = state
+                .markdown_cache
+                .borrow_mut()
+                .render(&message.text, width.saturating_sub(2));
+            all_lines.extend(rendered.iter().cloned());
         }
         all_lines.push(Line::from(vec![Span::raw(" ")]));
     }
@@ -3818,6 +3824,7 @@ mod tests {
             notice: None,
             diff_output: None,
             diff_cache: std::cell::RefCell::new(diff_render::DiffCache::default()),
+            markdown_cache: std::cell::RefCell::new(markdown::MarkdownCache::default()),
             permission_mode: PermissionMode::Default,
             scroll_offset: 0,
             esc_primed: false,

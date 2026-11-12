@@ -4,6 +4,7 @@
 
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::rc::Rc;
 
 use super::COLORS;
 
@@ -234,6 +235,43 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
+struct MarkdownCacheEntry {
+    text: String,
+    width: usize,
+    lines: Rc<Vec<Line<'static>>>,
+}
+
+#[derive(Default)]
+pub struct MarkdownCache {
+    entries: Vec<MarkdownCacheEntry>,
+}
+
+impl MarkdownCache {
+    pub fn render(&mut self, text: &str, width: usize) -> Rc<Vec<Line<'static>>> {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.width == width && entry.text == text)
+        {
+            let entry = self.entries.remove(index);
+            let lines = entry.lines.clone();
+            self.entries.insert(0, entry);
+            return lines;
+        }
+        let lines = Rc::new(render(text, width));
+        self.entries.insert(
+            0,
+            MarkdownCacheEntry {
+                text: text.to_string(),
+                width,
+                lines: lines.clone(),
+            },
+        );
+        self.entries.truncate(16);
+        lines
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +318,25 @@ mod tests {
     fn links_keep_the_label_and_url() {
         let rendered = text(&render("[docs](https://example.com)", 80));
         assert_eq!(rendered, "docs (https://example.com)");
+    }
+
+    #[test]
+    fn cache_reuses_the_same_markdown_and_width() {
+        let mut cache = MarkdownCache::default();
+        let first = cache.render("# title", 80);
+        let second = cache.render("# title", 80);
+        assert!(Rc::ptr_eq(&first, &second));
+        let narrow = cache.render("# title", 20);
+        assert!(!Rc::ptr_eq(&first, &narrow));
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn cache_stays_bounded() {
+        let mut cache = MarkdownCache::default();
+        for index in 0..20 {
+            cache.render(&format!("# heading {index}"), 80);
+        }
+        assert_eq!(cache.entries.len(), 16);
     }
 }

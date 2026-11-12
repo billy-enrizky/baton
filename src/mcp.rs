@@ -1,5 +1,5 @@
 //! Minimal MCP stdio server exposing baton's durable thread state to coding
-//! agents. The server is read-only except for the explicit queue-clear tool.
+//! agents. The server is read-only except for explicit queue clear and fork.
 
 use anyhow::Result;
 use serde_json::{json, Value};
@@ -43,7 +43,7 @@ impl McpServer {
                     "version": env!("CARGO_PKG_VERSION"),
                     "title": "Baton thread state"
                 },
-                "instructions": "Use baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, and baton_latest_diff to inspect the local baton store."
+                "instructions": "Use baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, and baton_latest_diff to inspect the local baton store. baton_fork creates a new thread from an existing conversation."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
@@ -238,6 +238,33 @@ impl McpServer {
                     "schema_version": status::SCHEMA_VERSION,
                     "count": processes.len(),
                     "processes": processes,
+                }))
+            }
+            "baton_fork" => {
+                let thread = self.resolve_thread(argument_thread(arguments))?;
+                let turn = arguments.get("turn").and_then(Value::as_i64);
+                let title = arguments
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|title| !title.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| match turn {
+                        Some(turn) => format!("{} (fork at turn {turn})", thread.title),
+                        None => format!("{} (fork)", thread.title),
+                    });
+                let forked = self
+                    .store
+                    .fork_thread_through_turn(&thread.id, &title, turn)?;
+                Ok(json!({
+                    "schema_version": status::SCHEMA_VERSION,
+                    "source_thread_id": thread.id,
+                    "thread_id": forked.id,
+                    "title": forked.title,
+                    "cwd": forked.cwd,
+                    "provider": forked.current_provider.as_str(),
+                    "model": forked.current_model,
+                    "through_turn": turn,
                 }))
             }
             _ => anyhow::bail!("unknown baton tool {name}"),
@@ -439,6 +466,20 @@ fn tool_descriptors() -> Vec<Value> {
             },
             "annotations": { "readOnlyHint": true }
         }),
+        json!({
+            "name": "baton_fork",
+            "description": "Create a new thread by copying a conversation, optionally only through a completed turn. The source thread is unchanged.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "thread": { "type": "string", "description": "Source thread id or unique prefix. Omit for the newest thread in the server cwd." },
+                    "title": { "type": "string", "description": "Title for the new thread." },
+                    "turn": { "type": "integer", "minimum": 1, "description": "Copy only messages and turns through this completed turn." }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false }
+        }),
     ]
 }
 
@@ -542,6 +583,7 @@ mod tests {
         assert!(names.contains(&"baton_messages"));
         assert!(names.contains(&"baton_latest_diff"));
         assert!(names.contains(&"baton_processes"));
+        assert!(names.contains(&"baton_fork"));
     }
 
     #[test]
@@ -594,6 +636,35 @@ mod tests {
         assert_eq!(processes["processes"][0]["provider"], "opencode");
         assert_eq!(processes["processes"][0]["process_alive"], false);
         assert_eq!(processes["processes"][0]["command_matches"], false);
+    }
+
+    #[test]
+    fn fork_creates_a_branch_through_a_completed_turn() {
+        let server = server();
+        let source = tool_json(&server, "baton_status", json!({}));
+        let source_id = source["thread_id"].as_str().unwrap().to_string();
+        let forked = tool_json(
+            &server,
+            "baton_fork",
+            json!({ "thread": source_id, "turn": 1, "title": "mcp branch" }),
+        );
+        assert_eq!(forked["through_turn"], 1);
+        assert_eq!(forked["source_thread_id"], source_id);
+        assert_ne!(forked["thread_id"], source_id);
+        assert_eq!(forked["title"], "mcp branch");
+        let branch = tool_json(
+            &server,
+            "baton_status",
+            json!({ "thread": forked["thread_id"].as_str().unwrap() }),
+        );
+        assert_eq!(branch["turn_count"], 1);
+        assert_eq!(branch["latest_turn"]["phase"], "completed");
+        let messages = tool_json(
+            &server,
+            "baton_messages",
+            json!({ "thread": forked["thread_id"].as_str().unwrap(), "limit": 20 }),
+        );
+        assert_eq!(messages["count"], 3, "user, assistant, and diff rows copy");
     }
 
     #[test]

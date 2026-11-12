@@ -91,9 +91,10 @@ Tools:
 - `baton_queue`: inspect queued follow-ups, or clear them explicitly
 - `baton_search`: search thread titles and conversation text in the project, or every project with `all=true`
 - `baton_processes`: provider server processes tracked by baton, including PID, owner, port, command-line, and process-start verification
+- `baton_fork`: create a new thread from a conversation, optionally through a completed turn, without changing the source
 - `baton_latest_diff`: newest stored turn diff
 
-The server is read-only except for the explicit `baton_queue` clear option. It opens the same `~/.baton/baton.sqlite` database and honors `BATON_HOME`.
+The server is read-only except for the explicit `baton_queue` clear option and `baton_fork`, which creates a new thread and leaves the source unchanged. It opens the same `~/.baton/baton.sqlite` database and honors `BATON_HOME`.
 
 ## How context and caching work
 

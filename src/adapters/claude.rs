@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{child_halves, child_halves_with_cleanup, BatonAdapter, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{child_halves, child_halves_with_cleanup, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::process::{self, ProcessRecorder};
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -19,6 +19,7 @@ pub struct ClaudeAdapter {
     writer: SharedWriter,
     active_turn: Arc<AtomicBool>,
     spawner: ClaudeSpawner,
+    lifecycle: AdapterLifecycle,
 }
 
 async fn write_value(writer: &SharedWriter, value: &Value) -> Result<()> {
@@ -36,6 +37,7 @@ impl ClaudeAdapter {
             writer: Arc::new(AsyncMutex::new(None)),
             active_turn: Arc::new(AtomicBool::new(false)),
             spawner,
+            lifecycle: AdapterLifecycle::new(),
         }
     }
 
@@ -183,9 +185,15 @@ impl BatonAdapter for ClaudeAdapter {
         ProviderId::Claude
     }
 
+    fn lifecycle(&self) -> Option<AdapterLifecycle> {
+        Some(self.lifecycle.clone())
+    }
+
     fn interrupt_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
         let interrupt = self.interrupt.clone();
+        let lifecycle = self.lifecycle.clone();
         Arc::new(move || {
+            lifecycle.cancelling();
             if let Some(sender) = interrupt.lock().unwrap().as_ref() {
                 let _ = sender.send(true);
             }
@@ -223,10 +231,13 @@ impl BatonAdapter for ClaudeAdapter {
         session: Option<NativeSessionRef>,
         emit: TurnEventSender,
     ) -> Result<()> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting(&input.thread_id);
         let (mut reader, writer) = (self.spawner)(&input, session.as_ref())?;
         let writer_handle = self.writer.clone();
         *writer_handle.lock().await = Some(writer);
         self.active_turn.store(true, Ordering::SeqCst);
+        self.lifecycle.turn_running(&input.thread_id);
         let writer = writer_handle;
         let user_message = json!({
             "type": "user",
@@ -457,11 +468,14 @@ impl BatonAdapter for ClaudeAdapter {
     }
 
     async fn dispose(&mut self) -> Result<()> {
+        self.lifecycle.disposing();
         self.active_turn.store(false, Ordering::SeqCst);
         let mut guard = self.writer.lock().await;
         if let Some(mut writer) = guard.take() {
             let _ = writer.shutdown().await;
         }
+        drop(guard);
+        self.lifecycle.disposed();
         Ok(())
     }
 }

@@ -1,10 +1,203 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::oneshot;
 
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, TurnUsage};
+
+/// Explicit lifecycle for one provider adapter. The engine can read this
+/// without taking the adapter mutex, so a busy or stuck turn remains
+/// observable instead of looking like a locked black box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdapterState {
+    Unloaded,
+    Starting,
+    Ready,
+    TurnRunning,
+    Cancelling,
+    Disposing,
+    Disposed,
+}
+
+impl AdapterState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AdapterState::Unloaded => "unloaded",
+            AdapterState::Starting => "starting",
+            AdapterState::Ready => "ready",
+            AdapterState::TurnRunning => "turn-running",
+            AdapterState::Cancelling => "cancelling",
+            AdapterState::Disposing => "disposing",
+            AdapterState::Disposed => "disposed",
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            AdapterState::Unloaded => 0,
+            AdapterState::Starting => 1,
+            AdapterState::Ready => 2,
+            AdapterState::TurnRunning => 3,
+            AdapterState::Cancelling => 4,
+            AdapterState::Disposing => 5,
+            AdapterState::Disposed => 6,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => AdapterState::Starting,
+            2 => AdapterState::Ready,
+            3 => AdapterState::TurnRunning,
+            4 => AdapterState::Cancelling,
+            5 => AdapterState::Disposing,
+            6 => AdapterState::Disposed,
+            _ => AdapterState::Unloaded,
+        }
+    }
+}
+
+/// A cheap, cloneable handle to one adapter's lifecycle. Transitions only move
+/// forward from an allowed source state, so a late `ready()` cannot resurrect
+/// a disposing adapter and a cancellation cannot overwrite an idle adapter.
+#[derive(Debug, Clone)]
+pub struct AdapterLifecycle {
+    state: Arc<AtomicU8>,
+    thread_id: Arc<Mutex<Option<String>>>,
+}
+
+impl Default for AdapterLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdapterLifecycle {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(AtomicU8::new(AdapterState::Unloaded.as_u8())),
+            thread_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn state(&self) -> AdapterState {
+        AdapterState::from_u8(self.state.load(Ordering::SeqCst))
+    }
+
+    pub fn thread_id(&self) -> Option<String> {
+        self.thread_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn transition(&self, from: &[AdapterState], to: AdapterState, thread: Option<&str>) -> bool {
+        let current = self.state.load(Ordering::SeqCst);
+        if !from.iter().any(|state| state.as_u8() == current) {
+            return false;
+        }
+        if self
+            .state
+            .compare_exchange(current, to.as_u8(), Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return false;
+        }
+        *self
+            .thread_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = thread.map(str::to_string);
+        true
+    }
+
+    pub fn starting(&self, thread_id: &str) {
+        self.transition(
+            &[AdapterState::Unloaded, AdapterState::Ready],
+            AdapterState::Starting,
+            Some(thread_id),
+        );
+    }
+
+    pub fn turn_running(&self, thread_id: &str) {
+        self.transition(
+            &[
+                AdapterState::Unloaded,
+                AdapterState::Starting,
+                AdapterState::Ready,
+            ],
+            AdapterState::TurnRunning,
+            Some(thread_id),
+        );
+    }
+
+    pub fn ready(&self) {
+        self.transition(
+            &[
+                AdapterState::Starting,
+                AdapterState::TurnRunning,
+                AdapterState::Cancelling,
+            ],
+            AdapterState::Ready,
+            None,
+        );
+    }
+
+    pub fn cancelling(&self) {
+        let thread = self.thread_id();
+        self.transition(
+            &[AdapterState::TurnRunning],
+            AdapterState::Cancelling,
+            thread.as_deref(),
+        );
+    }
+
+    pub fn disposing(&self) {
+        self.transition(
+            &[
+                AdapterState::Unloaded,
+                AdapterState::Starting,
+                AdapterState::Ready,
+                AdapterState::TurnRunning,
+                AdapterState::Cancelling,
+            ],
+            AdapterState::Disposing,
+            None,
+        );
+    }
+
+    pub fn disposed(&self) {
+        self.transition(&[AdapterState::Disposing], AdapterState::Disposed, None);
+    }
+
+    pub fn describe(&self) -> String {
+        let state = self.state().as_str();
+        match self.thread_id() {
+            Some(thread) if !thread.is_empty() => {
+                format!("{state}({})", thread.chars().take(8).collect::<String>())
+            }
+            _ => state.to_string(),
+        }
+    }
+}
+
+pub(crate) struct AdapterTurnGuard {
+    lifecycle: AdapterLifecycle,
+}
+
+impl AdapterTurnGuard {
+    pub(crate) fn new(lifecycle: AdapterLifecycle) -> Self {
+        Self { lifecycle }
+    }
+}
+
+impl Drop for AdapterTurnGuard {
+    fn drop(&mut self) {
+        self.lifecycle.ready();
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TurnStartInput {
@@ -192,6 +385,11 @@ pub fn duplex_halves(buffer_size: usize) -> (TransportHalves, tokio::io::DuplexS
 #[async_trait]
 pub trait BatonAdapter: Send {
     fn id(&self) -> crate::types::ProviderId;
+    /// Optional live lifecycle handle. Real adapters return a handle; test
+    /// adapters that do not track a session leave the default.
+    fn lifecycle(&self) -> Option<AdapterLifecycle> {
+        None
+    }
     fn interrupt_handle(&self) -> std::sync::Arc<dyn Fn() + Send + Sync>;
     /// Providers that can inject a correction into a live turn return a
     /// handle here. The engine falls back to queueing when this is None or
@@ -229,6 +427,61 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn lifecycle_moves_forward_and_never_resurrects() {
+        let lifecycle = AdapterLifecycle::new();
+        assert_eq!(lifecycle.state(), AdapterState::Unloaded);
+        lifecycle.starting("thread-1");
+        assert_eq!(lifecycle.state(), AdapterState::Starting);
+        assert_eq!(lifecycle.thread_id().as_deref(), Some("thread-1"));
+        lifecycle.turn_running("thread-1");
+        assert_eq!(lifecycle.state(), AdapterState::TurnRunning);
+        lifecycle.cancelling();
+        assert_eq!(lifecycle.state(), AdapterState::Cancelling);
+        lifecycle.ready();
+        assert_eq!(lifecycle.state(), AdapterState::Ready);
+        assert_eq!(lifecycle.thread_id(), None);
+        lifecycle.disposing();
+        assert_eq!(lifecycle.state(), AdapterState::Disposing);
+        lifecycle.disposed();
+        assert_eq!(lifecycle.state(), AdapterState::Disposed);
+        lifecycle.ready();
+        lifecycle.starting("thread-2");
+        assert_eq!(lifecycle.state(), AdapterState::Disposed);
+    }
+
+    #[test]
+    fn cancelling_without_a_running_turn_is_ignored() {
+        let lifecycle = AdapterLifecycle::new();
+        lifecycle.cancelling();
+        assert_eq!(lifecycle.state(), AdapterState::Unloaded);
+        lifecycle.starting("thread-1");
+        lifecycle.cancelling();
+        assert_eq!(lifecycle.state(), AdapterState::Starting);
+        lifecycle.ready();
+        lifecycle.cancelling();
+        assert_eq!(lifecycle.state(), AdapterState::Ready);
+    }
+
+    #[test]
+    fn turn_guard_returns_to_ready_but_not_from_disposing() {
+        let lifecycle = AdapterLifecycle::new();
+        lifecycle.starting("thread-1");
+        {
+            let _guard = AdapterTurnGuard::new(lifecycle.clone());
+            lifecycle.turn_running("thread-1");
+        }
+        assert_eq!(lifecycle.state(), AdapterState::Ready);
+
+        lifecycle.starting("thread-2");
+        let guard = AdapterTurnGuard::new(lifecycle.clone());
+        lifecycle.turn_running("thread-2");
+        lifecycle.disposing();
+        lifecycle.disposed();
+        drop(guard);
+        assert_eq!(lifecycle.state(), AdapterState::Disposed);
+    }
 
     #[tokio::test]
     async fn dropping_a_child_writer_runs_cleanup_and_kills_the_child() {

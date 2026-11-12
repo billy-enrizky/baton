@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{BatonAdapter, LineReader, LineWriter, ModelListInput, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineReader, LineWriter, ModelListInput, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -28,6 +28,7 @@ pub struct CodexAdapter {
     notification_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<(String, Value)>>,
     next_id: Arc<AtomicU32>,
     auth_signature: Arc<Mutex<Option<String>>>,
+    lifecycle: AdapterLifecycle,
 }
 
 fn spawn_reader(runtime: Arc<CodexRuntime>) {
@@ -236,6 +237,7 @@ impl CodexAdapter {
             notification_receiver: None,
             next_id: Arc::new(AtomicU32::new(1)),
             auth_signature: Arc::new(Mutex::new(None)),
+            lifecycle: AdapterLifecycle::new(),
         }
     }
 
@@ -411,10 +413,16 @@ impl BatonAdapter for CodexAdapter {
         ProviderId::Codex
     }
 
+    fn lifecycle(&self) -> Option<AdapterLifecycle> {
+        Some(self.lifecycle.clone())
+    }
+
     fn interrupt_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
         let runtime = self.runtime.clone();
         let next_id = self.next_id.clone();
+        let lifecycle = self.lifecycle.clone();
         Arc::new(move || {
+            lifecycle.cancelling();
             let runtime = runtime.clone();
             let next_id = next_id.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -516,6 +524,8 @@ impl BatonAdapter for CodexAdapter {
     }
 
     async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting("model-list");
         let runtime = self.ensure_runtime(&input.auth_env).await?;
         self.ensure_initialized(&runtime).await?;
         let mut models: Vec<String> = Vec::new();
@@ -562,8 +572,11 @@ impl BatonAdapter for CodexAdapter {
         session: Option<NativeSessionRef>,
         emit: TurnEventSender,
     ) -> Result<()> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting(&input.thread_id);
         let runtime = self.ensure_runtime(&input.auth_env).await?;
         self.ensure_initialized(&runtime).await?;
+        self.lifecycle.turn_running(&input.thread_id);
         *runtime.current_emit.lock().await = Some(emit.clone());
 
         let (thread_id, rollout_path) = match session {
@@ -732,11 +745,13 @@ impl BatonAdapter for CodexAdapter {
     }
 
     async fn dispose(&mut self) -> Result<()> {
+        self.lifecycle.disposing();
         let runtime = self.runtime.lock().await.clone();
         if let Some(runtime) = runtime {
             let mut writer = runtime.writer.lock().await;
             let _ = writer.shutdown().await;
         }
+        self.lifecycle.disposed();
         Ok(())
     }
 }

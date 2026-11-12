@@ -9,7 +9,7 @@ use ratatui::Terminal;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::adapters::TurnEvent;
+use crate::adapters::{AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
 use crate::config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
@@ -210,6 +210,7 @@ pub struct TuiState {
     custom_commands: Vec<(String, String)>,
     home: std::path::PathBuf,
     thread: ThreadRow,
+    adapter_lifecycles: std::collections::HashMap<ProviderId, AdapterLifecycle>,
     history: Vec<MessageRow>,
     input: String,
     input_cursor: usize,
@@ -247,6 +248,7 @@ pub fn run_tui(
     store: Arc<Mutex<BatonStore>>,
     home: std::path::PathBuf,
     thread: ThreadRow,
+    adapter_lifecycles: std::collections::HashMap<ProviderId, AdapterLifecycle>,
     engine_command_sender: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     engine_event_receiver: std::sync::mpsc::Receiver<EngineEvent>,
     turn_event_receiver: std::sync::mpsc::Receiver<(String, TurnEvent)>,
@@ -281,6 +283,7 @@ pub fn run_tui(
         custom_commands,
         home,
         thread,
+        adapter_lifecycles,
         history,
         input: String::new(),
         input_cursor: 0,
@@ -2123,6 +2126,22 @@ fn handle_command(
             }
             if open_turn {
                 text.push_str("\nnote: open turn may be stale; /turns shows history");
+            }
+            if !state.adapter_lifecycles.is_empty() {
+                let mut adapters: Vec<(String, String)> = state
+                    .adapter_lifecycles
+                    .iter()
+                    .map(|(provider, lifecycle)| (provider.to_string(), lifecycle.describe()))
+                    .collect();
+                adapters.sort();
+                text.push_str(&format!(
+                    "\nadapters: {}",
+                    adapters
+                        .iter()
+                        .map(|(provider, state)| format!("{provider}={state}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
             }
             state.notice = Some(text);
         }
@@ -3987,6 +4006,7 @@ mod tests {
             custom_commands: Vec::new(),
             home: home.to_path_buf(),
             thread,
+            adapter_lifecycles: std::collections::HashMap::new(),
             history,
             input: String::new(),
             input_cursor: 0,
@@ -5383,6 +5403,10 @@ mod tests {
         state.apply_permission_mode(&store, PermissionMode::Plan);
         state.set_goal_state(&store, Some("ship".into()), true);
         enqueue_message(&mut state, &store, "later".into());
+        let lifecycle = AdapterLifecycle::new();
+        lifecycle.starting("thread-1");
+        lifecycle.turn_running("thread-1");
+        state.adapter_lifecycles.insert(ProviderId::Codex, lifecycle);
         {
             let guard = store.lock().unwrap();
             guard.start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m")).unwrap();
@@ -5397,6 +5421,10 @@ mod tests {
         assert!(notice.contains("turn: 1 failed"));
         assert!(notice.contains("error: boom"));
         assert!(notice.contains("queue: 1 waiting"));
+        assert!(
+            notice.contains("adapters: codex=turn-running(thread-1)"),
+            "adapter lifecycle missing from status: {notice}"
+        );
     }
 
     #[test]

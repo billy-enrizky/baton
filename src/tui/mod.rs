@@ -211,6 +211,7 @@ pub struct TuiState {
     multi: Option<MultiView>,
     notice: Option<String>,
     diff_output: Option<String>,
+    diff_cache: std::cell::RefCell<diff_render::DiffCache>,
     permission_mode: PermissionMode,
     scroll_offset: usize,
     esc_primed: bool,
@@ -275,6 +276,7 @@ pub fn run_tui(
         multi: None,
         notice: None,
         diff_output: None,
+        diff_cache: std::cell::RefCell::new(diff_render::DiffCache::default()),
         permission_mode,
         scroll_offset: 0,
         esc_primed: false,
@@ -3212,9 +3214,16 @@ fn draw_checkpoint_picker(frame: &mut ratatui::Frame, area: Rect, checkpoints: &
 
 fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize) {
     if let Some(diff) = &state.diff_output {
-        let lines: Vec<Line> = std::iter::once(Line::styled("diff · /clear to close", Style::default().fg(COLORS.muted)))
-            .chain(diff_render::render_diff_lines(diff, area.width.saturating_sub(2) as usize))
-            .collect();
+        let rendered = state
+            .diff_cache
+            .borrow_mut()
+            .render(diff, area.width.saturating_sub(2) as usize);
+        let lines: Vec<Line> = std::iter::once(Line::styled(
+            "diff · /clear to close",
+            Style::default().fg(COLORS.muted),
+        ))
+        .chain(rendered.iter().cloned())
+        .collect();
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
@@ -3281,10 +3290,11 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
             continue;
         }
         if message.role == "diff" {
-            all_lines.extend(diff_render::render_diff_lines(
-                &message.text,
-                width.saturating_sub(2),
-            ));
+            let rendered = state
+                .diff_cache
+                .borrow_mut()
+                .render(&message.text, width.saturating_sub(2));
+            all_lines.extend(rendered.iter().cloned());
             all_lines.push(Line::from(vec![Span::raw(" ")]));
             continue;
         }
@@ -3807,6 +3817,7 @@ mod tests {
             multi: None,
             notice: None,
             diff_output: None,
+            diff_cache: std::cell::RefCell::new(diff_render::DiffCache::default()),
             permission_mode: PermissionMode::Default,
             scroll_offset: 0,
             esc_primed: false,

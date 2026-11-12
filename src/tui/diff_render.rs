@@ -8,6 +8,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::rc::Rc;
 
 use super::COLORS;
 
@@ -51,6 +52,43 @@ struct DiffFile {
     max_line_number: usize,
     old_line: usize,
     new_line: usize,
+}
+
+struct DiffCacheEntry {
+    diff: String,
+    width: usize,
+    lines: Rc<Vec<Line<'static>>>,
+}
+
+#[derive(Default)]
+pub struct DiffCache {
+    entries: Vec<DiffCacheEntry>,
+}
+
+impl DiffCache {
+    pub fn render(&mut self, diff: &str, width: usize) -> Rc<Vec<Line<'static>>> {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| entry.width == width && entry.diff == diff)
+        {
+            let entry = self.entries.remove(index);
+            let lines = entry.lines.clone();
+            self.entries.insert(0, entry);
+            return lines;
+        }
+        let lines = Rc::new(render_diff_lines(diff, width));
+        self.entries.insert(
+            0,
+            DiffCacheEntry {
+                diff: diff.to_string(),
+                width,
+                lines: lines.clone(),
+            },
+        );
+        self.entries.truncate(8);
+        lines
+    }
 }
 
 fn line_number_width(max_line_number: usize) -> usize {
@@ -367,5 +405,28 @@ mod tests {
         assert!(text[1].ends_with("+abcdefghi"), "first chunk: {}", text[1]);
         assert!(text[2].starts_with("   "), "continuation keeps the gutter indent: {}", text[2]);
         assert!(text[2].ends_with("jklmnopqr"), "second chunk: {}", text[2]);
+    }
+
+    #[test]
+    fn cache_reuses_the_same_diff_and_width() {
+        let mut cache = DiffCache::default();
+        let first = cache.render(SAMPLE, 80);
+        let second = cache.render(SAMPLE, 80);
+        assert!(Rc::ptr_eq(&first, &second));
+        let narrow = cache.render(SAMPLE, 40);
+        assert!(!Rc::ptr_eq(&first, &narrow));
+        assert_eq!(cache.entries.len(), 2);
+    }
+
+    #[test]
+    fn cache_stays_bounded() {
+        let mut cache = DiffCache::default();
+        for index in 0..10 {
+            let diff = format!(
+                "diff --git a/f{index} b/f{index}\n--- a/f{index}\n+++ b/f{index}\n@@ -1 +1 @@\n-a\n+b\n"
+            );
+            cache.render(&diff, 80);
+        }
+        assert_eq!(cache.entries.len(), 8);
     }
 }

@@ -16,6 +16,7 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 - **Review from the terminal.** `/review` shows the turn diff with context, keeps notes on exact changed lines, and sends them back as a steer or the next prompt.
 - **Live catalogs.** `/switch` loads the provider's current model list (Codex, OpenCode, and ACP providers), with type-to-filter search.
 - **Parallel, then merged.** `/multi` fans one prompt across providers and opens a merged live view; press Enter to inspect any child thread.
+- **Queued by provider.** If two threads target the same provider at once, the second waits in a durable `queued` phase and starts when the adapter is free instead of failing.
 - **Agent-readable state.** `status`, `threads`, `turns`, `queue`, and `exec` have versioned JSON output. `baton mcp` exposes the same durable state over MCP stdio.
 - **Subscription or API billing.** Each provider runs on its harness login or an API key, switchable per provider (`baton auth <provider> api`).
 - **codex-style keys.** Esc interrupts, Esc-Esc backtracks to a previous prompt, streaming Markdown, tinted diffs, and per-tool activity rows.

@@ -133,6 +133,7 @@ struct ApprovalState {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MultiStatus {
+    Queued,
     Running,
     Done,
     Failed,
@@ -200,6 +201,7 @@ pub struct TuiState {
     input_cursor: usize,
     input_layout: std::cell::RefCell<Vec<InputRow>>,
     running: bool,
+    queued_provider: Option<ProviderId>,
     streaming_text: String,
     tool_lines: Vec<ToolLine>,
     overlay: Overlay,
@@ -263,6 +265,7 @@ pub fn run_tui(
         input_cursor: 0,
         input_layout: std::cell::RefCell::new(Vec::new()),
         running: false,
+        queued_provider: None,
         streaming_text: String::new(),
         tool_lines: Vec::new(),
         overlay: Overlay::None,
@@ -428,6 +431,26 @@ fn apply_engine_event(
                 state.scroll_offset = 0;
             }
         }
+        EngineEvent::TurnQueued { thread_id, provider } => {
+            if let Some(child) = state
+                .multi
+                .as_mut()
+                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+            {
+                child.status = MultiStatus::Queued;
+                child.error = None;
+            }
+            if thread_id != state.thread.id {
+                return;
+            }
+            state.running = true;
+            state.queued_provider = Some(provider);
+            state.streaming_text.clear();
+            state.tool_lines.clear();
+            state.notice = Some(format!(
+                "queued for {provider}; waiting for that provider's active turn to finish"
+            ));
+        }
         EngineEvent::TurnStarted { thread_id } => {
             state.approvals.retain(|approval| approval.thread_id != thread_id);
             if let Some(child) = state
@@ -442,6 +465,7 @@ fn apply_engine_event(
                 return;
             }
             state.running = true;
+            state.queued_provider = None;
             state.streaming_text.clear();
             state.tool_lines.clear();
             state.notice = None;
@@ -478,6 +502,7 @@ fn apply_engine_event(
                 return;
             }
             state.running = false;
+            state.queued_provider = None;
             state.streaming_text.clear();
             state.tool_lines.clear();
             {
@@ -591,7 +616,7 @@ fn apply_engine_event(
             if thread_id == state.thread.id {
                 enqueue_message(state, store, text);
                 state.notice = Some(format!(
-                    "this provider cannot steer the live turn; queued ({} waiting)",
+                    "message queued for after this turn ({} waiting)",
                     state.queued_messages.len()
                 ));
             }
@@ -2575,6 +2600,7 @@ fn draw_multi(frame: &mut ratatui::Frame, area: Rect, multi: &MultiView) {
     for (index, child) in multi.children.iter().enumerate() {
         let selected = index == multi.selected;
         let (marker, status_style) = match child.status {
+            MultiStatus::Queued => ("·", Style::default().fg(COLORS.muted)),
             MultiStatus::Running => ("◐", Style::default().fg(COLORS.accent)),
             MultiStatus::Done => ("✓", Style::default().fg(COLORS.success)),
             MultiStatus::Failed => ("✗", Style::default().fg(COLORS.error)),
@@ -2583,10 +2609,10 @@ fn draw_multi(frame: &mut ratatui::Frame, area: Rect, multi: &MultiView) {
             .error
             .as_deref()
             .or_else(|| child.reply.lines().find(|line| !line.trim().is_empty()))
-            .unwrap_or(if child.status == MultiStatus::Running {
-                "waiting..."
-            } else {
-                "no reply"
+            .unwrap_or(match child.status {
+                MultiStatus::Queued => "queued behind another turn",
+                MultiStatus::Running => "waiting...",
+                _ => "no reply",
             });
         let provider = child.provider.as_str();
         let used = provider.chars().count() + 8;
@@ -3227,11 +3253,19 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
     let mut live_lines = 0usize;
     let spinner = SPINNER_FRAMES[spinner_frame];
     if state.running && state.tool_lines.is_empty() && state.streaming_text.is_empty() {
-        all_lines.push(Line::from(vec![
-            Span::styled(spinner, Style::default().fg(COLORS.accent)),
-            Span::raw(" "),
-            Span::styled("Thinking", Style::default().fg(COLORS.accent)),
-        ]));
+        if let Some(provider) = state.queued_provider {
+            all_lines.push(Line::from(vec![
+                Span::styled("·", Style::default().fg(COLORS.muted)),
+                Span::raw(" "),
+                Span::styled(format!("Queued for {provider}"), Style::default().fg(COLORS.muted)),
+            ]));
+        } else {
+            all_lines.push(Line::from(vec![
+                Span::styled(spinner, Style::default().fg(COLORS.accent)),
+                Span::raw(" "),
+                Span::styled("Thinking", Style::default().fg(COLORS.accent)),
+            ]));
+        }
         live_lines += 1;
     }
     for tool_line in &state.tool_lines {
@@ -3706,7 +3740,8 @@ mod tests {
             input_cursor: 0,
             input_layout: std::cell::RefCell::new(Vec::new()),
             running: false,
-                streaming_text: String::new(),
+            queued_provider: None,
+            streaming_text: String::new(),
             tool_lines: Vec::new(),
             overlay: Overlay::None,
             approvals: Vec::new(),
@@ -4154,6 +4189,45 @@ mod tests {
         let stream_row = lines.iter().position(|line| line.contains("partial answer")).expect("streaming text in transcript");
         assert!(user_row < tool_row && tool_row < stream_row, "tools and streaming follow the user message in order");
         assert!(!lines.iter().any(|line| line.contains("Working [")), "the status bar no longer shows a Working spinner");
+    }
+
+    #[test]
+    fn queued_turn_renders_queued_status_instead_of_thinking() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let history = vec![history_message(&thread_id, 1)];
+        state.history = history;
+        let (command_sender, _command_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnQueued {
+                thread_id: thread_id.clone(),
+                provider: ProviderId::Codex,
+            },
+            &command_sender,
+        );
+        assert_eq!(state.queued_provider, Some(ProviderId::Codex));
+        assert!(state.running);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("queued for codex"));
+        let lines = buffer_lines(&render_state(&state, 100, 30));
+        assert!(lines.iter().any(|line| line.contains("Queued for codex")));
+        assert!(!lines.iter().any(|line| line.contains("Thinking")));
+
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnStarted { thread_id },
+            &command_sender,
+        );
+        assert_eq!(state.queued_provider, None);
     }
 
     #[test]

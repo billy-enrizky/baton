@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -24,6 +24,7 @@ pub enum EngineCommand {
 
 pub enum EngineEvent {
     UserEcho { thread_id: String, turn: i64, text: String, provider: ProviderId, model: Option<String> },
+    TurnQueued { thread_id: String, provider: ProviderId },
     TurnStarted { thread_id: String },
     Turn(TurnEvent),
     SteerRejected { thread_id: String, text: String },
@@ -77,6 +78,15 @@ impl TurnLedger {
         }
         self.settled = true;
     }
+
+    fn set_phase(&mut self, phase: TurnPhase) {
+        if self.settled {
+            return;
+        }
+        if let Ok(store) = self.store.lock() {
+            let _ = store.set_turn_phase(&self.thread_id, self.turn, phase);
+        }
+    }
 }
 
 impl Drop for TurnLedger {
@@ -95,6 +105,42 @@ fn phase_for_error(error: &str) -> TurnPhase {
         TurnPhase::Interrupted
     } else {
         TurnPhase::Failed
+    }
+}
+
+/// Marks the thread that currently owns a provider adapter. This keeps
+/// steering and interrupts from reaching another thread's live turn.
+struct ProviderOwnerGuard {
+    owners: Arc<Mutex<HashMap<ProviderId, String>>>,
+    provider: ProviderId,
+    thread_id: String,
+}
+
+impl ProviderOwnerGuard {
+    fn claim(
+        owners: Arc<Mutex<HashMap<ProviderId, String>>>,
+        provider: ProviderId,
+        thread_id: &str,
+    ) -> Self {
+        owners
+            .lock()
+            .unwrap()
+            .insert(provider, thread_id.to_string());
+        Self {
+            owners,
+            provider,
+            thread_id: thread_id.to_string(),
+        }
+    }
+}
+
+impl Drop for ProviderOwnerGuard {
+    fn drop(&mut self) {
+        if let Ok(mut owners) = self.owners.lock() {
+            if owners.get(&self.provider).map(String::as_str) == Some(self.thread_id.as_str()) {
+                owners.remove(&self.provider);
+            }
+        }
     }
 }
 
@@ -183,6 +229,19 @@ pub async fn run_engine(
     turn_event_sender: ThreadTurnEventSender,
 ) -> Result<()> {
     let active_threads: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let adapter_indices: Arc<HashMap<ProviderId, usize>> = Arc::new({
+        let mut indices = HashMap::new();
+        for (index, adapter) in adapters.iter().enumerate() {
+            if let Ok(adapter) = adapter.try_lock() {
+                indices.insert(adapter.id(), index);
+            }
+        }
+        indices
+    });
+    let provider_owners: Arc<Mutex<HashMap<ProviderId, String>>> =
+        Arc::new(Mutex::new(HashMap::new()));
+    let turn_cancellations: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     while let Some(command) = command_receiver.recv().await {
         match command {
             EngineCommand::Quit => {
@@ -201,6 +260,14 @@ pub async fn run_engine(
                     .map(|thread| thread.current_provider);
                 let accepted = provider
                     .and_then(|provider| {
+                        let owner = provider_owners
+                            .lock()
+                            .unwrap()
+                            .get(&provider)
+                            .cloned();
+                        if owner.as_deref() != Some(thread_id.as_str()) {
+                            return None;
+                        }
                         steer_handles
                             .iter()
                             .find(|(candidate, _)| *candidate == provider)
@@ -275,11 +342,26 @@ pub async fn run_engine(
                     .flatten()
                     .map(|thread| thread.current_provider);
                 if let Some(provider) = provider {
-                    if let Some((_, handle)) = interrupt_handles
-                        .iter()
-                        .find(|(candidate, _)| *candidate == provider)
-                    {
-                        handle();
+                    let owner = provider_owners
+                        .lock()
+                        .unwrap()
+                        .get(&provider)
+                        .cloned();
+                    let cancel = turn_cancellations
+                        .lock()
+                        .unwrap()
+                        .get(&thread_id)
+                        .cloned();
+                    if let Some(cancel) = cancel {
+                        let _ = cancel.send(true);
+                    }
+                    if owner.as_deref() == Some(thread_id.as_str()) {
+                        if let Some((_, handle)) = interrupt_handles
+                            .iter()
+                            .find(|(candidate, _)| *candidate == provider)
+                        {
+                            handle();
+                        }
                     }
                 }
             }
@@ -296,10 +378,19 @@ pub async fn run_engine(
                     });
                     continue;
                 }
+                let (cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+                turn_cancellations
+                    .lock()
+                    .unwrap()
+                    .insert(thread_id.clone(), cancel_sender);
                 tokio::spawn(run_turn(
                     store.clone(),
                     home.clone(),
                     adapters.clone(),
+                    adapter_indices.clone(),
+                    provider_owners.clone(),
+                    turn_cancellations.clone(),
+                    cancel_receiver,
                     thread_id,
                     text,
                     permission_mode,
@@ -317,6 +408,10 @@ async fn run_turn(
     store: SharedStore,
     home: std::path::PathBuf,
     adapters: Vec<SharedAdapter>,
+    adapter_indices: Arc<HashMap<ProviderId, usize>>,
+    provider_owners: Arc<Mutex<HashMap<ProviderId, String>>>,
+    turn_cancellations: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    cancel_receiver: tokio::sync::watch::Receiver<bool>,
     thread_id: String,
     text: String,
     permission_mode: PermissionMode,
@@ -329,7 +424,21 @@ async fn run_turn(
         .unwrap()
         .next_turn_number(&thread_id)
         .unwrap_or(0);
-    let result = execute_turn(&store, &home, &adapters, &thread_id, &text, permission_mode, &engine_event_sender, &turn_event_sender).await;
+    let result = execute_turn(
+        &store,
+        &home,
+        &adapters,
+        &adapter_indices,
+        &provider_owners,
+        cancel_receiver,
+        &thread_id,
+        &text,
+        permission_mode,
+        &engine_event_sender,
+        &turn_event_sender,
+    )
+    .await;
+    turn_cancellations.lock().unwrap().remove(&thread_id);
     let record = if expected_turn > 0 {
         store
             .lock()
@@ -399,6 +508,9 @@ async fn execute_turn(
     store: &SharedStore,
     home: &std::path::PathBuf,
     adapters: &[SharedAdapter],
+    adapter_indices: &HashMap<ProviderId, usize>,
+    provider_owners: &Arc<Mutex<HashMap<ProviderId, String>>>,
+    mut cancel_receiver: tokio::sync::watch::Receiver<bool>,
     thread_id: &str,
     text: &str,
     permission_mode: PermissionMode,
@@ -412,6 +524,10 @@ async fn execute_turn(
             .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
         (thread.current_provider, thread.cwd, thread.title, thread.current_model)
     };
+    let adapter_index = adapter_indices
+        .get(&provider)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("no adapter for {provider}"))?;
 
     let config = resolve_config(home, std::path::Path::new(&cwd));
     let provider_config = config.for_provider(provider);
@@ -436,7 +552,6 @@ async fn execute_turn(
         provider,
         model: Some(model.clone()),
     });
-    let _ = engine_event_sender.send(EngineEvent::TurnStarted { thread_id: thread_id.to_string() });
     let _ = Instant::now();
 
     if thread_title == "New thread" {
@@ -476,6 +591,35 @@ async fn execute_turn(
         auth_env,
     };
 
+    let adapter = &adapters[adapter_index];
+    let mut adapter_guard = match adapter.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            turn_ledger.set_phase(TurnPhase::Queued);
+            let _ = engine_event_sender.send(EngineEvent::TurnQueued {
+                thread_id: thread_id.to_string(),
+                provider,
+            });
+            let guard = tokio::select! {
+                guard = adapter.lock() => guard,
+                _ = cancel_receiver.changed() => {
+                    let message = "interrupted while queued".to_string();
+                    turn_ledger.settle(TurnPhase::Interrupted, Some(&message));
+                    return Err(anyhow::anyhow!(message));
+                }
+            };
+            guard
+        }
+    };
+    let _provider_owner = ProviderOwnerGuard::claim(provider_owners.clone(), provider, thread_id);
+    if *cancel_receiver.borrow() {
+        let message = "interrupted while queued".to_string();
+        turn_ledger.settle(TurnPhase::Interrupted, Some(&message));
+        return Err(anyhow::anyhow!(message));
+    }
+    turn_ledger.set_phase(TurnPhase::Running);
+    let _ = engine_event_sender.send(EngineEvent::TurnStarted { thread_id: thread_id.to_string() });
+
     // Snapshot the worktree before the turn so its own edits can be diffed.
     let start_captured = {
         let start_path = std::path::PathBuf::from(&cwd_for_checkpoint);
@@ -489,11 +633,6 @@ async fn execute_turn(
             .is_ok()
         }
     };
-
-    let adapter = adapters
-        .iter()
-        .find(|adapter| adapter.try_lock().map(|adapter| adapter.id() == provider).unwrap_or(false))
-        .ok_or_else(|| anyhow::anyhow!("no adapter for {provider}"))?;
 
     let (event_sender, event_receiver) = std::sync::mpsc::channel::<TurnEvent>();
     let tui_sender = turn_event_sender.clone();
@@ -542,10 +681,7 @@ async fn execute_turn(
         native_session_id: session.native_session_id,
         rollout_path: session.rollout_path,
     });
-    let adapter_result = {
-        let mut adapter = adapter.lock().await;
-        adapter.start_turn(input, session_ref, event_sender).await
-    };
+    let adapter_result = adapter_guard.start_turn(input, session_ref, event_sender).await;
     let _ = forwarder.join();
 
     let tool_records = tools_slot.lock().unwrap().drain(..).collect::<Vec<_>>();
@@ -749,12 +885,18 @@ mod tests {
         let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
             Box::new(ScriptAdapter { mode }) as Box<dyn BatonAdapter>
         ))];
+        let adapter_indices = HashMap::from([(ProviderId::Codex, 0)]);
+        let provider_owners = Arc::new(Mutex::new(HashMap::new()));
+        let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
         let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
         let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
         let result = execute_turn(
             &store,
             &home.path().to_path_buf(),
             &adapters,
+            &adapter_indices,
+            &provider_owners,
+            cancel_receiver,
             &thread.id,
             "hello",
             PermissionMode::Default,
@@ -795,8 +937,79 @@ mod tests {
         }
     }
 
+    struct GateAdapter {
+        provider: ProviderId,
+        started: tokio::sync::mpsc::UnboundedSender<String>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl BatonAdapter for GateAdapter {
+        fn id(&self) -> ProviderId {
+            self.provider
+        }
+
+        fn interrupt_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+            Arc::new(|| {})
+        }
+
+        async fn start_turn(
+            &mut self,
+            input: TurnStartInput,
+            _session: Option<crate::types::NativeSessionRef>,
+            emit: TurnEventSender,
+        ) -> Result<()> {
+            let _ = self.started.send(input.thread_id.clone());
+            self.release.notified().await;
+            let _ = emit.send(TurnEvent::TurnCompleted {
+                final_text: format!("done {}", input.thread_id),
+                usage: None,
+                native_session_id: None,
+                rollout_path: None,
+            });
+            Ok(())
+        }
+
+        async fn dispose(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn gate_shared(provider: ProviderId, started: &tokio::sync::mpsc::UnboundedSender<String>, release: &Arc<tokio::sync::Notify>) -> SharedAdapter {
+        Arc::new(tokio::sync::Mutex::new(Box::new(GateAdapter {
+            provider,
+            started: started.clone(),
+            release: release.clone(),
+        }) as Box<dyn BatonAdapter>))
+    }
+
+    async fn next_started(receiver: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> String {
+        tokio::time::timeout(std::time::Duration::from_secs(3), receiver.recv())
+            .await
+            .expect("adapter turn starts")
+            .expect("adapter start channel")
+    }
+
+    async fn wait_engine_event(
+        receiver: &std::sync::mpsc::Receiver<EngineEvent>,
+        mut matches: impl FnMut(&EngineEvent) -> bool,
+    ) -> EngineEvent {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                while let Ok(event) = receiver.try_recv() {
+                    if matches(&event) {
+                        return event;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("engine event arrives")
+    }
+
     #[tokio::test]
-    async fn engine_accepts_steering_and_rejects_it_without_a_handle() {
+    async fn steering_is_scoped_to_the_provider_owner() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -810,9 +1023,9 @@ mod tests {
                 current_model: Some("m".into()),
             })
             .unwrap();
-        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
-            Box::new(IdleAdapter) as Box<dyn BatonAdapter>
-        ))];
+        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let adapters = vec![gate_shared(ProviderId::Codex, &started_sender, &release)];
         let accepted = Arc::new(AtomicBool::new(false));
         let accepted_handle = accepted.clone();
         let steer: SteerHandle = Arc::new(move |text: String| {
@@ -833,68 +1046,49 @@ mod tests {
             turn_sender,
         ));
         command_sender
+            .send(EngineCommand::Submit {
+                thread_id: thread.id.clone(),
+                text: "hello".into(),
+                permission_mode: PermissionMode::Default,
+            })
+            .unwrap();
+        assert_eq!(next_started(&mut started_receiver).await, thread.id);
+
+        command_sender
             .send(EngineCommand::Steer {
                 thread_id: thread.id.clone(),
                 text: "try this".into(),
             })
             .unwrap();
-
-        let echo = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Ok(EngineEvent::UserEcho { text, .. }) = event_receiver.try_recv() {
-                    break text;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::UserEcho { text, .. } if text == "try this")
         })
-        .await
-        .expect("steer is accepted");
-        assert_eq!(echo, "try this");
+        .await;
         assert!(accepted.load(Ordering::SeqCst));
 
         let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
-        assert_eq!(messages.len(), 1, "steering text is persisted in the conversation");
-        assert_eq!(messages[0].text, "try this");
+        assert!(messages.iter().any(|message| message.text == "hello"));
+        assert!(messages.iter().any(|message| message.text == "try this"));
 
-        // A provider without a steer handle falls back to the queue event.
-        let (command_sender2, command_receiver2) = tokio::sync::mpsc::unbounded_channel();
-        let (event_sender2, event_receiver2) = std::sync::mpsc::channel();
-        let (turn_sender2, _turn_receiver2) = std::sync::mpsc::channel();
-        let adapters2: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
-            Box::new(IdleAdapter) as Box<dyn BatonAdapter>
-        ))];
-        let engine2 = tokio::spawn(run_engine(
-            store.clone(),
-            std::path::PathBuf::from("/tmp"),
-            adapters2,
-            Vec::new(),
-            Vec::new(),
-            command_receiver2,
-            event_sender2,
-            turn_sender2,
-        ));
-        command_sender2
+        release.notify_one();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnFinished { thread_id, ok: true, .. } if thread_id == &thread.id)
+        })
+        .await;
+
+        command_sender
             .send(EngineCommand::Steer {
                 thread_id: thread.id.clone(),
                 text: "queue me".into(),
             })
             .unwrap();
-        let rejected = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            loop {
-                if let Ok(EngineEvent::SteerRejected { text, .. }) = event_receiver2.try_recv() {
-                    break text;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::SteerRejected { text, .. } if text == "queue me")
         })
-        .await
-        .expect("missing handle rejects steering");
-        assert_eq!(rejected, "queue me");
+        .await;
 
         command_sender.send(EngineCommand::Quit).unwrap();
-        command_sender2.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine2).await;
     }
 
     #[tokio::test]
@@ -912,10 +1106,12 @@ mod tests {
                 current_model: None,
             })
             .unwrap();
+        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let adapters = vec![gate_shared(ProviderId::Claude, &started_sender, &release)];
         let codex_interrupted = Arc::new(AtomicBool::new(false));
-        let claude_interrupted = Arc::new(AtomicBool::new(false));
+        let (claude_tx, mut claude_rx) = tokio::sync::mpsc::unbounded_channel();
         let codex_flag = codex_interrupted.clone();
-        let claude_flag = claude_interrupted.clone();
         let handles: Vec<(ProviderId, Arc<dyn Fn() + Send + Sync>)> = vec![
             (
                 ProviderId::Codex,
@@ -923,17 +1119,16 @@ mod tests {
             ),
             (
                 ProviderId::Claude,
-                Arc::new(move || claude_flag.store(true, Ordering::SeqCst)),
+                Arc::new(move || {
+                    let _ = claude_tx.send(());
+                }),
             ),
         ];
-        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
-            Box::new(IdleAdapter) as Box<dyn BatonAdapter>
-        ))];
         let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (event_sender, _event_receiver) = std::sync::mpsc::channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
         let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
         let engine = tokio::spawn(run_engine(
-            store,
+            store.clone(),
             std::path::PathBuf::from("/tmp"),
             adapters,
             handles,
@@ -943,14 +1138,251 @@ mod tests {
             turn_sender,
         ));
         command_sender
+            .send(EngineCommand::Submit {
+                thread_id: claude_thread.id.clone(),
+                text: "hello".into(),
+                permission_mode: PermissionMode::Default,
+            })
+            .unwrap();
+        assert_eq!(next_started(&mut started_receiver).await, claude_thread.id);
+
+        command_sender
             .send(EngineCommand::Interrupt {
                 thread_id: claude_thread.id.clone(),
             })
             .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), claude_rx.recv())
+            .await
+            .expect("claude interrupt arrives")
+            .expect("claude interrupt channel");
+        assert!(!codex_interrupted.load(Ordering::SeqCst));
+
+        release.notify_one();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnFinished { thread_id, ok: true, .. } if thread_id == &claude_thread.id)
+        })
+        .await;
         command_sender.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
-        assert!(!codex_interrupted.load(Ordering::SeqCst));
-        assert!(claude_interrupted.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn queues_a_second_thread_on_the_same_provider() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let first = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "first".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let second = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "second".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let adapters = vec![gate_shared(ProviderId::Codex, &started_sender, &release)];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store.clone(),
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+
+        command_sender
+            .send(EngineCommand::Submit {
+                thread_id: first.id.clone(),
+                text: "first prompt".into(),
+                permission_mode: PermissionMode::Default,
+            })
+            .unwrap();
+        assert_eq!(next_started(&mut started_receiver).await, first.id);
+
+        command_sender
+            .send(EngineCommand::Submit {
+                thread_id: second.id.clone(),
+                text: "second prompt".into(),
+                permission_mode: PermissionMode::Default,
+            })
+            .unwrap();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnQueued { thread_id, provider }
+                if thread_id == &second.id && *provider == ProviderId::Codex)
+        })
+        .await;
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_turn_record(&second.id, 1)
+                .unwrap()
+                .expect("second turn record")
+                .phase,
+            TurnPhase::Queued
+        );
+
+        release.notify_one();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnFinished { thread_id, ok: true, .. } if thread_id == &first.id)
+        })
+        .await;
+        assert_eq!(next_started(&mut started_receiver).await, second.id);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_turn_record(&second.id, 1)
+                .unwrap()
+                .expect("second turn record")
+                .phase,
+            TurnPhase::Running
+        );
+
+        release.notify_one();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnFinished { thread_id, ok: true, .. } if thread_id == &second.id)
+        })
+        .await;
+
+        for thread in [&first, &second] {
+            assert_eq!(
+                store
+                    .lock()
+                    .unwrap()
+                    .get_turn_record(&thread.id, 1)
+                    .unwrap()
+                    .expect("turn record")
+                    .phase,
+                TurnPhase::Completed
+            );
+            assert!(store
+                .lock()
+                .unwrap()
+                .list_messages(&thread.id)
+                .unwrap()
+                .iter()
+                .any(|message| message.role == "assistant"));
+        }
+
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+    }
+
+    #[tokio::test]
+    async fn interrupting_a_queued_turn_does_not_touch_the_provider_owner() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let first = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "first".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let second = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "second".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let adapters = vec![gate_shared(ProviderId::Codex, &started_sender, &release)];
+        let interrupts = Arc::new(AtomicUsize::new(0));
+        let interrupt_flag = interrupts.clone();
+        let handles: Vec<(ProviderId, Arc<dyn Fn() + Send + Sync>)> = vec![(
+            ProviderId::Codex,
+            Arc::new(move || {
+                interrupt_flag.fetch_add(1, Ordering::SeqCst);
+            }),
+        )];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store.clone(),
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            handles,
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+
+        command_sender
+            .send(EngineCommand::Submit {
+                thread_id: first.id.clone(),
+                text: "first prompt".into(),
+                permission_mode: PermissionMode::Default,
+            })
+            .unwrap();
+        assert_eq!(next_started(&mut started_receiver).await, first.id);
+        command_sender
+            .send(EngineCommand::Submit {
+                thread_id: second.id.clone(),
+                text: "second prompt".into(),
+                permission_mode: PermissionMode::Default,
+            })
+            .unwrap();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnQueued { thread_id, .. } if thread_id == &second.id)
+        })
+        .await;
+
+        command_sender
+            .send(EngineCommand::Interrupt {
+                thread_id: second.id.clone(),
+            })
+            .unwrap();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnFinished { thread_id, phase: TurnPhase::Interrupted, .. } if thread_id == &second.id)
+        })
+        .await;
+        assert_eq!(interrupts.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_turn_record(&first.id, 1)
+                .unwrap()
+                .expect("first turn record")
+                .phase,
+            TurnPhase::Running
+        );
+
+        release.notify_one();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnFinished { thread_id, ok: true, .. } if thread_id == &first.id)
+        })
+        .await;
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
     }
 
     struct TaggedAdapter {

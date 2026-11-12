@@ -761,6 +761,15 @@ impl BatonStore {
         Ok(())
     }
 
+    /// Moves an open turn between queued and running without ending it.
+    pub fn set_turn_phase(&self, thread_id: &str, turn: i64, phase: TurnPhase) -> Result<()> {
+        self.db.execute(
+            "UPDATE turns SET phase = ?, error = NULL, ended_at = NULL WHERE thread_id = ? AND turn = ?",
+            params![phase.as_str(), thread_id, turn],
+        )?;
+        Ok(())
+    }
+
     pub fn set_turn_provider_id(&self, thread_id: &str, turn: i64, provider_turn_id: &str) -> Result<()> {
         self.db.execute(
             "UPDATE turns SET provider_turn_id = ? WHERE thread_id = ? AND turn = ?",

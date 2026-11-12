@@ -43,6 +43,82 @@ fn store_crud_and_thread_lifecycle() {
 }
 
 #[test]
+fn store_fork_copies_conversation_and_config_but_not_sessions() {
+    let store = BatonStore::memory().unwrap();
+    let source = store
+        .create_thread(NewThread {
+            title: "source".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: Some("model-1".into()),
+        })
+        .unwrap();
+    store
+        .set_thread_permission_mode(&source.id, PermissionMode::Plan)
+        .unwrap();
+    store
+        .set_thread_goal(&source.id, Some("ship the fork"), true)
+        .unwrap();
+    store
+        .add_message(&source.id, 1, "user", Some("codex"), Some("model-1"), "hello")
+        .unwrap();
+    store
+        .add_message(&source.id, 1, "assistant", Some("codex"), Some("model-1"), "hi")
+        .unwrap();
+    store
+        .add_message(&source.id, 1, "tool", Some("codex"), None, "✓ shell ls")
+        .unwrap();
+    store
+        .start_turn_record(&source.id, 1, ProviderId::Codex, Some("model-1"))
+        .unwrap();
+    store
+        .finish_turn_record(&source.id, 1, TurnPhase::Completed, None)
+        .unwrap();
+    store
+        .upsert_provider_session(
+            &source.id,
+            ProviderId::Codex,
+            "native-source",
+            Some("model-1".into()),
+            None,
+        )
+        .unwrap();
+
+    let forked = store.fork_thread(&source.id, "branched").unwrap();
+
+    assert_ne!(forked.id, source.id);
+    assert_eq!(forked.title, "branched");
+    assert_eq!(forked.cwd, source.cwd);
+    assert_eq!(forked.current_provider, ProviderId::Codex);
+    assert_eq!(forked.current_model.as_deref(), Some("model-1"));
+    assert_eq!(forked.permission_mode, PermissionMode::Plan);
+    assert_eq!(forked.goal.as_deref(), Some("ship the fork"));
+    assert!(forked.goal_paused);
+    let source_messages = store.list_messages(&source.id).unwrap();
+    let forked_messages = store.list_messages(&forked.id).unwrap();
+    assert_eq!(forked_messages.len(), source_messages.len());
+    assert_eq!(
+        forked_messages
+            .iter()
+            .map(|message| (message.turn, message.role.as_str(), message.text.as_str()))
+            .collect::<Vec<_>>(),
+        source_messages
+            .iter()
+            .map(|message| (message.turn, message.role.as_str(), message.text.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(store
+        .get_provider_session(&forked.id, ProviderId::Codex)
+        .unwrap()
+        .is_none());
+    let forked_turns = store.list_turn_records(&forked.id).unwrap();
+    assert_eq!(forked_turns.len(), 1);
+    assert_eq!(forked_turns[0].phase, TurnPhase::Completed);
+    assert_eq!(store.next_turn_number(&forked.id).unwrap(), 2);
+    assert_eq!(store.list_messages(&source.id).unwrap().len(), source_messages.len());
+}
+
+#[test]
 fn store_provider_sessions_per_provider() {
     let store = BatonStore::memory().unwrap();
     let thread = store

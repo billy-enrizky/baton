@@ -68,6 +68,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/mode", "permission mode: default|acceptEdits|bypassPermissions|plan"),
     ("/auth", "billing mode: /auth <provider> <subscription|api>"),
     ("/new", "start a new thread"),
+    ("/fork", "branch this conversation into a new thread"),
     ("/threads", "list threads in this directory"),
     ("/open", "open a thread by id prefix"),
     ("/usage", "token usage and cache hit rate"),
@@ -2255,6 +2256,39 @@ fn handle_command(
             state.scroll_offset = 0;
             state.notice = Some("new thread, unsaved until you send a message".into());
         }
+        "/fork" => {
+            let latest_phase = store
+                .lock()
+                .unwrap()
+                .list_turn_records(&state.thread.id)
+                .unwrap_or_default()
+                .into_iter()
+                .last()
+                .map(|turn| turn.phase);
+            if latest_phase
+                .map(|phase| !phase.is_terminal())
+                .unwrap_or(false)
+            {
+                state.notice = Some("cannot fork while a turn is open".into());
+                return;
+            }
+            let title = if args.is_empty() {
+                format!("{} (fork)", state.thread.title)
+            } else {
+                args.join(" ")
+            };
+            let source_title = state.thread.title.clone();
+            let result = store.lock().unwrap().fork_thread(&state.thread.id, &title);
+            match result {
+                Ok(thread) => {
+                    load_thread_state(state, store, thread);
+                    state.notice = Some(format!(
+                        "forked {source_title}; both threads share this working tree"
+                    ));
+                }
+                Err(error) => state.notice = Some(format!("cannot fork: {error}")),
+            }
+        }
         "/threads" => {
             let threads: Vec<(String, String)> = {
                 let guard = store.lock().unwrap();
@@ -3784,12 +3818,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 28);
+        assert_eq!(suggestions.len(), 29);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/28"), "position indicator must reflect the selection");
+        assert!(text.contains("11/29"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -5159,6 +5193,45 @@ mod tests {
         assert_eq!(state.permission_mode, PermissionMode::BypassPermissions);
         assert_eq!(state.goal.as_deref(), Some("other goal"));
         assert!(state.goal_paused);
+    }
+
+    #[test]
+    fn fork_command_branches_the_conversation_and_opens_the_new_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let source_id = state.thread.id.clone();
+        {
+            let guard = store.lock().unwrap();
+            guard.set_thread_permission_mode(&source_id, PermissionMode::Plan).unwrap();
+            guard.set_thread_goal(&source_id, Some("fork goal"), false).unwrap();
+            guard
+                .add_message(&source_id, 1, "user", Some("claude"), None, "hello")
+                .unwrap();
+            guard
+                .add_message(&source_id, 1, "assistant", Some("claude"), None, "hi")
+                .unwrap();
+        }
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/fork branched",
+        );
+
+        assert_ne!(state.thread.id, source_id);
+        assert_eq!(state.thread.title, "branched");
+        assert_eq!(state.permission_mode, PermissionMode::Plan);
+        assert_eq!(state.goal.as_deref(), Some("fork goal"));
+        assert_eq!(state.history.len(), 2);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("forked"));
+        assert!(store.lock().unwrap().get_thread(&source_id).unwrap().is_some());
     }
 
     #[test]

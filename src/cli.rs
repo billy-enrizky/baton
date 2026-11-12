@@ -75,6 +75,13 @@ pub enum Commands {
     New {
         title: Vec<String>,
     },
+    /// Branch a thread's conversation into a new thread
+    Fork {
+        title: Vec<String>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     Import,
     Checkpoints {
         thread_id: String,

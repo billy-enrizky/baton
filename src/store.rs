@@ -379,6 +379,68 @@ impl BatonStore {
         })
     }
 
+    /// Branches a thread's conversation into a new thread without copying
+    /// native provider sessions. The first turn in the fork therefore gets a
+    /// transcript handoff rather than sharing a live provider session.
+    pub fn fork_thread(&self, source_id: &str, title: &str) -> Result<ThreadRow> {
+        let source = self
+            .get_thread(source_id)?
+            .ok_or_else(|| anyhow::anyhow!("thread not found: {source_id}"))?;
+        let messages = self.list_messages(source_id)?;
+        let turns = self.list_turn_records(source_id)?;
+        let id = Uuid::new_v4().to_string();
+        let now = now_iso();
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                id,
+                title,
+                source.cwd,
+                source.current_provider.as_str(),
+                source.current_model,
+                source.permission_mode.as_str(),
+                source.goal,
+                source.goal_paused as i64,
+                now,
+                now,
+            ],
+        )?;
+        for message in messages {
+            tx.execute(
+                "INSERT INTO messages (thread_id, turn, role, provider, model, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    id,
+                    message.turn,
+                    message.role,
+                    message.provider,
+                    message.model,
+                    message.text,
+                    message.created_at,
+                ],
+            )?;
+        }
+        for turn in turns {
+            tx.execute(
+                "INSERT INTO turns (thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    id,
+                    turn.turn,
+                    turn.provider.as_str(),
+                    turn.model,
+                    turn.phase.as_str(),
+                    turn.error,
+                    turn.provider_turn_id,
+                    turn.started_at,
+                    turn.ended_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        self.get_thread(&id)?
+            .ok_or_else(|| anyhow::anyhow!("forked thread disappeared: {id}"))
+    }
+
     pub fn draft_thread(&self, input: NewThread) -> ThreadRow {
         let now = now_iso();
         ThreadRow {

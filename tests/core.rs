@@ -119,6 +119,74 @@ fn store_fork_copies_conversation_and_config_but_not_sessions() {
 }
 
 #[test]
+fn store_fork_can_stop_at_a_completed_turn() {
+    let store = BatonStore::memory().unwrap();
+    let source = store
+        .create_thread(NewThread {
+            title: "source".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: Some("model-1".into()),
+        })
+        .unwrap();
+    for turn in 1..=2 {
+        store
+            .add_message(
+                &source.id,
+                turn,
+                "user",
+                Some("codex"),
+                Some("model-1"),
+                &format!("user {turn}"),
+            )
+            .unwrap();
+        store
+            .add_message(
+                &source.id,
+                turn,
+                "assistant",
+                Some("codex"),
+                Some("model-1"),
+                &format!("assistant {turn}"),
+            )
+            .unwrap();
+        store
+            .start_turn_record(&source.id, turn, ProviderId::Codex, Some("model-1"))
+            .unwrap();
+        store
+            .finish_turn_record(&source.id, turn, TurnPhase::Completed, None)
+            .unwrap();
+    }
+    store
+        .start_turn_record(&source.id, 3, ProviderId::Codex, Some("model-1"))
+        .unwrap();
+
+    let first = store
+        .fork_thread_through_turn(&source.id, "through one", Some(1))
+        .unwrap();
+    let first_messages = store.list_messages(&first.id).unwrap();
+    assert_eq!(first_messages.len(), 2);
+    assert!(first_messages.iter().all(|message| message.turn == 1));
+    assert_eq!(store.list_turn_records(&first.id).unwrap().len(), 1);
+    assert_eq!(store.next_turn_number(&first.id).unwrap(), 2);
+
+    let second = store
+        .fork_thread_through_turn(&source.id, "through two", Some(2))
+        .unwrap();
+    assert_eq!(store.list_messages(&second.id).unwrap().len(), 4);
+    assert_eq!(store.list_turn_records(&second.id).unwrap().len(), 2);
+    assert_eq!(store.next_turn_number(&second.id).unwrap(), 3);
+
+    assert!(store.fork_thread(&source.id, "whole").is_err());
+    assert!(store
+        .fork_thread_through_turn(&source.id, "open cutoff", Some(3))
+        .is_err());
+    assert!(store
+        .fork_thread_through_turn(&source.id, "missing cutoff", Some(99))
+        .is_err());
+}
+
+#[test]
 fn store_provider_sessions_per_provider() {
     let store = BatonStore::memory().unwrap();
     let thread = store

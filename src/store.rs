@@ -383,11 +383,40 @@ impl BatonStore {
     /// native provider sessions. The first turn in the fork therefore gets a
     /// transcript handoff rather than sharing a live provider session.
     pub fn fork_thread(&self, source_id: &str, title: &str) -> Result<ThreadRow> {
+        self.fork_thread_through_turn(source_id, title, None)
+    }
+
+    /// Branches a thread through a specific completed turn. Later turns,
+    /// including a currently open turn, are left in the source thread.
+    pub fn fork_thread_through_turn(
+        &self,
+        source_id: &str,
+        title: &str,
+        through_turn: Option<i64>,
+    ) -> Result<ThreadRow> {
         let source = self
             .get_thread(source_id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found: {source_id}"))?;
-        let messages = self.list_messages(source_id)?;
-        let turns = self.list_turn_records(source_id)?;
+        let mut messages = self.list_messages(source_id)?;
+        let mut turns = self.list_turn_records(source_id)?;
+        match through_turn {
+            Some(cutoff) => {
+                let turn = turns
+                    .iter()
+                    .find(|turn| turn.turn == cutoff)
+                    .ok_or_else(|| anyhow::anyhow!("turn {cutoff} not found in thread"))?;
+                if !turn.phase.is_terminal() {
+                    anyhow::bail!("turn {cutoff} is not terminal");
+                }
+                messages.retain(|message| message.turn <= cutoff);
+                turns.retain(|turn| turn.turn <= cutoff);
+            }
+            None => {
+                if turns.iter().any(|turn| !turn.phase.is_terminal()) {
+                    anyhow::bail!("cannot fork while a turn is open");
+                }
+            }
+        }
         let id = Uuid::new_v4().to_string();
         let now = now_iso();
         let tx = self.db.unchecked_transaction()?;

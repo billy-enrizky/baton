@@ -57,7 +57,7 @@ baton ps [--json]        # list provider servers tracked by baton
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
 baton exec -p <provider> [--json] "prompt"  # one non-interactive turn
 baton mcp                # MCP stdio server for agent access to the thread store
-baton fork [-t id] [--json] [title]  # branch a thread's conversation into a new thread
+baton fork [-t id] [--turn n] [--json] [title]  # branch a thread, optionally through a completed turn
 baton import [--dry-run] # import recent native sessions as threads
 baton usage              # token usage and cache hit rates
 baton auth [provider] [subscription|api]
@@ -65,7 +65,7 @@ baton diff <id> [turn]   # checkpoint diff against the working tree
 baton restore <id> <turn>
 ```
 
-In the TUI: `/help /status /switch /model /mode /auth /new /fork /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /queue /turns /copy /clear /quit`. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn, press twice to exit. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably. `/fork` branches the conversation into a new thread; both threads share the same working tree, and the fork starts with a transcript handoff instead of the source provider session.
+In the TUI: `/help /status /switch /model /mode /auth /new /fork /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /queue /turns /copy /clear /quit`. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn, press twice to exit. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably. `/fork [--turn N] [title]` branches the conversation into a new thread; both threads share the same working tree, and the fork starts with a transcript handoff instead of the source provider session.
 
 ## MCP
 

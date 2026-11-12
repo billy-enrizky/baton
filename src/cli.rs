@@ -78,6 +78,9 @@ pub enum Commands {
     /// Branch a thread's conversation into a new thread
     Fork {
         title: Vec<String>,
+        /// Copy only messages and turns through this completed turn
+        #[arg(long)]
+        turn: Option<i64>,
         /// Emit a JSON object instead of lines
         #[arg(long)]
         json: bool,

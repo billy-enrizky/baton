@@ -2257,34 +2257,58 @@ fn handle_command(
             state.notice = Some("new thread, unsaved until you send a message".into());
         }
         "/fork" => {
-            let latest_phase = store
-                .lock()
-                .unwrap()
-                .list_turn_records(&state.thread.id)
-                .unwrap_or_default()
-                .into_iter()
-                .last()
-                .map(|turn| turn.phase);
-            if latest_phase
-                .map(|phase| !phase.is_terminal())
-                .unwrap_or(false)
-            {
-                state.notice = Some("cannot fork while a turn is open".into());
-                return;
-            }
-            let title = if args.is_empty() {
-                format!("{} (fork)", state.thread.title)
+            let mut title_args = args.clone();
+            let through_turn = if title_args.first().map(String::as_str) == Some("--turn") {
+                let Some(turn) = title_args.get(1).and_then(|value| value.parse::<i64>().ok()) else {
+                    state.notice = Some("usage: /fork [--turn N] [title]".into());
+                    return;
+                };
+                title_args.drain(..2);
+                Some(turn)
             } else {
-                args.join(" ")
+                None
+            };
+            if through_turn.is_none() {
+                let latest_phase = store
+                    .lock()
+                    .unwrap()
+                    .list_turn_records(&state.thread.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .last()
+                    .map(|turn| turn.phase);
+                if latest_phase
+                    .map(|phase| !phase.is_terminal())
+                    .unwrap_or(false)
+                {
+                    state.notice = Some("cannot fork while a turn is open".into());
+                    return;
+                }
+            }
+            let title = if title_args.is_empty() {
+                match through_turn {
+                    Some(turn) => format!("{} (fork at turn {turn})", state.thread.title),
+                    None => format!("{} (fork)", state.thread.title),
+                }
+            } else {
+                title_args.join(" ")
             };
             let source_title = state.thread.title.clone();
-            let result = store.lock().unwrap().fork_thread(&state.thread.id, &title);
+            let result = store
+                .lock()
+                .unwrap()
+                .fork_thread_through_turn(&state.thread.id, &title, through_turn);
             match result {
                 Ok(thread) => {
                     load_thread_state(state, store, thread);
-                    state.notice = Some(format!(
-                        "forked {source_title}; both threads share this working tree"
-                    ));
+                    state.notice = Some(match through_turn {
+                        Some(turn) => format!(
+                            "forked {source_title} through turn {turn}; both threads share this working tree"
+                        ),
+                        None => format!(
+                            "forked {source_title}; both threads share this working tree"
+                        ),
+                    });
                 }
                 Err(error) => state.notice = Some(format!("cannot fork: {error}")),
             }
@@ -5232,6 +5256,63 @@ mod tests {
             .unwrap_or("")
             .contains("forked"));
         assert!(store.lock().unwrap().get_thread(&source_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn fork_command_can_stop_at_a_completed_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let source_id = state.thread.id.clone();
+        {
+            let guard = store.lock().unwrap();
+            for turn in 1..=2 {
+                guard
+                    .add_message(
+                        &source_id,
+                        turn,
+                        "user",
+                        Some("claude"),
+                        None,
+                        &format!("user {turn}"),
+                    )
+                    .unwrap();
+                guard
+                    .add_message(
+                        &source_id,
+                        turn,
+                        "assistant",
+                        Some("claude"),
+                        None,
+                        &format!("assistant {turn}"),
+                    )
+                    .unwrap();
+                guard
+                    .start_turn_record(&source_id, turn, ProviderId::Claude, None)
+                    .unwrap();
+                guard
+                    .finish_turn_record(&source_id, turn, TurnPhase::Completed, None)
+                    .unwrap();
+            }
+        }
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/fork --turn 1 branched one",
+        );
+
+        assert_ne!(state.thread.id, source_id);
+        assert_eq!(state.thread.title, "branched one");
+        assert_eq!(state.history.len(), 2);
+        assert!(state.history.iter().all(|message| message.turn == 1));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("through turn 1"));
     }
 
     #[test]

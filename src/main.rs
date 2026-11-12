@@ -404,7 +404,7 @@ fn main_result() -> Result<()> {
             );
             Ok(())
         }
-        cli::Commands::Fork { title, json } => {
+        cli::Commands::Fork { title, turn, json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let source = match cli.thread.as_deref() {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
@@ -414,29 +414,22 @@ fn main_result() -> Result<()> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
             };
-            let latest_phase = store
-                .list_turn_records(&source.id)?
-                .into_iter()
-                .last()
-                .map(|turn| turn.phase);
-            if latest_phase
-                .map(|phase| !phase.is_terminal())
-                .unwrap_or(false)
-            {
-                anyhow::bail!("cannot fork while a turn is open; wait for it to finish");
-            }
             let title = if title.is_empty() {
-                format!("{} (fork)", source.title)
+                match turn {
+                    Some(turn) => format!("{} (fork at turn {turn})", source.title),
+                    None => format!("{} (fork)", source.title),
+                }
             } else {
                 title.join(" ")
             };
-            let forked = store.fork_thread(&source.id, &title)?;
+            let forked = store.fork_thread_through_turn(&source.id, &title, turn)?;
             if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "schema_version": status::SCHEMA_VERSION,
                         "source_thread_id": source.id,
+                        "through_turn": turn,
                         "thread_id": forked.id,
                         "title": forked.title,
                         "cwd": forked.cwd,
@@ -446,9 +439,11 @@ fn main_result() -> Result<()> {
                 );
             } else {
                 println!(
-                    "forked {} -> {} ({}/{})",
+                    "forked {} -> {}{} ({}/{})",
                     &source.id[..8.min(source.id.len())],
                     &forked.id[..8.min(forked.id.len())],
+                    turn.map(|turn| format!(" through turn {turn}"))
+                        .unwrap_or_default(),
                     forked.current_provider,
                     forked.current_model.as_deref().unwrap_or("default"),
                 );

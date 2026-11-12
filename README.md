@@ -54,6 +54,7 @@ baton turns [-t id] [--json]   # full durable turn history
 baton queue [-t id] [--clear] [--json]  # inspect/clear queued follow-ups
 baton search <query> [--all] [--json]  # search thread titles and conversation text
 baton ps [--json]        # list provider servers tracked by baton
+baton doctor [--json]    # provider binaries, configs, database, and process health
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
 baton exec -p <provider> [--json] "prompt"  # one non-interactive turn
 baton mcp                # MCP stdio server for agent access to the thread store
@@ -84,6 +85,7 @@ In the TUI: `/help /status /switch /model /mode /auth /new /fork /threads /open 
 
 Tools:
 
+- `baton_doctor`: provider binaries, effective models/auth/modes, config files, database size, thread count, and tracked process health
 - `baton_status`: provider, model, mode, goal, latest turn, queue, usage, stale warning
 - `baton_threads`: durable threads for the current project, or every project with `all=true`
 - `baton_turns`: turn phases, timestamps, provider turn ids, errors

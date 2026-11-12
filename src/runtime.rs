@@ -1,7 +1,7 @@
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnStartInput};
 use crate::checkpoints::capture_checkpoint;
@@ -92,13 +92,17 @@ impl TurnLedger {
 impl Drop for TurnLedger {
     fn drop(&mut self) {
         if !self.settled {
+            // A dropped ledger means the task ended without a provider
+            // verdict. Do not claim the provider failed.
             self.settle(
-                TurnPhase::Failed,
+                TurnPhase::Unverified,
                 Some("turn ended without a terminal state"),
             );
         }
     }
 }
+
+const QUIT_DISPOSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 fn phase_for_error(error: &str) -> TurnPhase {
     if error.to_ascii_lowercase().contains("interrupt") {
@@ -245,8 +249,33 @@ pub async fn run_engine(
     while let Some(command) = command_receiver.recv().await {
         match command {
             EngineCommand::Quit => {
+                // Wake queued turns, ask the provider owners to stop, then
+                // dispose without letting one stuck adapter hold the process
+                // open forever.
+                let cancellations = turn_cancellations
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .cloned()
+                    .collect::<Vec<_>>();
+                for cancel in cancellations {
+                    let _ = cancel.send(true);
+                }
+                let owners = provider_owners.lock().unwrap().clone();
+                for (provider, _) in owners {
+                    if let Some((_, handle)) = interrupt_handles
+                        .iter()
+                        .find(|(candidate, _)| *candidate == provider)
+                    {
+                        handle();
+                    }
+                }
                 for adapter in &adapters {
-                    let _ = adapter.lock().await.dispose().await;
+                    if let Ok(mut adapter) =
+                        tokio::time::timeout(QUIT_DISPOSE_TIMEOUT, adapter.lock()).await
+                    {
+                        let _ = adapter.dispose().await;
+                    }
                 }
                 break;
             }
@@ -1383,6 +1412,80 @@ mod tests {
         .await;
         command_sender.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+    }
+
+    #[test]
+    fn a_dropped_turn_ledger_is_unverified() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "t".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let ledger = TurnLedger::start(&store, &thread.id, 1, ProviderId::Codex, "m").unwrap();
+        drop(ledger);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_turn_record(&thread.id, 1)
+                .unwrap()
+                .expect("turn record")
+                .phase,
+            TurnPhase::Unverified
+        );
+    }
+
+    #[tokio::test]
+    async fn quit_does_not_wait_forever_for_a_stuck_adapter() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "t".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let adapters = vec![gate_shared(ProviderId::Codex, &started_sender, &release)];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, _event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store,
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        command_sender
+            .send(EngineCommand::Submit {
+                thread_id: thread.id.clone(),
+                text: "hello".into(),
+                permission_mode: PermissionMode::Default,
+            })
+            .unwrap();
+        assert_eq!(next_started(&mut started_receiver).await, thread.id);
+
+        command_sender.send(EngineCommand::Quit).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), engine)
+            .await
+            .expect("quit returns after the dispose timeout")
+            .expect("engine task")
+            .expect("engine result");
+        release.notify_one();
     }
 
     struct TaggedAdapter {

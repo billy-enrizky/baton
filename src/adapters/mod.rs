@@ -105,6 +105,15 @@ impl LineWriter for ChildWriter {
     }
 }
 
+impl Drop for ChildWriter {
+    fn drop(&mut self) {
+        self.stdin = None;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 pub fn child_halves(child: Child) -> Result<TransportHalves> {
     let mut child = child;
     let stdin = child.stdin.take().expect("child stdin piped");

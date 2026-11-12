@@ -143,9 +143,9 @@ impl TurnRunGuard {
         }
     }
 
-    fn finish(mut self, phase: TurnPhase, error: Option<String>) {
-        self.finished = true;
+    fn finish(&mut self, phase: TurnPhase, error: Option<String>) {
         self.release_claim();
+        self.finished = true;
         let ok = matches!(phase, TurnPhase::Completed);
         let _ = self.engine_event_sender.send(EngineEvent::TurnFinished {
             thread_id: self.thread_id.clone(),
@@ -169,10 +169,13 @@ impl TurnRunGuard {
 
 impl Drop for TurnRunGuard {
     fn drop(&mut self) {
-        self.release_claim();
         if self.finished {
+            // `finish` already released the claim. A new turn for this thread
+            // may have inserted its own cancellation sender since then; do not
+            // remove that newer claim.
             return;
         }
+        self.release_claim();
         let (phase, error) = self
             .store
             .lock()
@@ -550,10 +553,10 @@ async fn run_turn(
 ) {
     let expected_turn = store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .next_turn_number(&thread_id)
         .unwrap_or(0);
-    let guard = TurnRunGuard::new(
+    let mut guard = TurnRunGuard::new(
         store.clone(),
         active_threads.clone(),
         turn_cancellations.clone(),
@@ -1913,6 +1916,51 @@ mod tests {
         );
         command_sender.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+    }
+
+    #[test]
+    fn finished_guard_does_not_remove_a_newer_turn_claim() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let active = Arc::new(Mutex::new(HashSet::from(["thread-1".to_string()])));
+        let cancellations: Arc<
+            Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
+        let (old_sender, _old_receiver) = tokio::sync::watch::channel(false);
+        cancellations
+            .lock()
+            .unwrap()
+            .insert("thread-1".into(), old_sender);
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let mut guard = TurnRunGuard::new(
+            store,
+            active.clone(),
+            cancellations.clone(),
+            event_sender,
+            "thread-1".into(),
+            1,
+        );
+        guard.finish(TurnPhase::Completed, None);
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(EngineEvent::TurnFinished { .. })
+        ));
+        assert!(!active.lock().unwrap().contains("thread-1"));
+
+        // A new turn for the same thread can start as soon as finish releases
+        // the claim, before the old guard's Drop runs.
+        active.lock().unwrap().insert("thread-1".into());
+        let (new_sender, _new_receiver) = tokio::sync::watch::channel(false);
+        cancellations
+            .lock()
+            .unwrap()
+            .insert("thread-1".into(), new_sender);
+        drop(guard);
+        assert!(active.lock().unwrap().contains("thread-1"));
+        assert!(cancellations.lock().unwrap().contains_key("thread-1"));
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "finish must emit exactly one terminal event"
+        );
     }
 
     #[tokio::test]

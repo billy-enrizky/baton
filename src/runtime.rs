@@ -17,7 +17,7 @@ pub type ThreadTurnEventSender = std::sync::mpsc::Sender<(String, TurnEvent)>;
 pub enum EngineCommand {
     Submit { thread_id: String, text: String, permission_mode: PermissionMode },
     Steer { thread_id: String, text: String },
-    ListModels { thread_id: String, provider: ProviderId },
+    ListModels { thread_id: String, provider: ProviderId, request_id: u64 },
     Interrupt { thread_id: String },
     Quit,
 }
@@ -28,7 +28,13 @@ pub enum EngineEvent {
     TurnStarted { thread_id: String },
     Turn(TurnEvent),
     SteerRejected { thread_id: String, text: String },
-    ModelsLoaded { thread_id: String, provider: ProviderId, models: Vec<String>, error: Option<String> },
+    ModelsLoaded {
+        thread_id: String,
+        provider: ProviderId,
+        request_id: u64,
+        models: Vec<String>,
+        error: Option<String>,
+    },
     TurnRejected { thread_id: String, text: String, reason: String },
     TurnFinished { thread_id: String, ok: bool, error: Option<String>, phase: TurnPhase },
 }
@@ -99,6 +105,98 @@ impl Drop for TurnLedger {
                 Some("turn ended without a terminal state"),
             );
         }
+    }
+}
+
+/// Owns the engine's in-memory claim on a thread for the whole spawned task.
+/// `run_turn` normally calls `finish`, but a panic or a dropped future still
+/// releases the thread, its cancellation slot, and tells the UI the turn is
+/// unverified. Without this guard a panicking adapter leaves `active_threads`
+/// permanently set and every later submit is rejected.
+struct TurnRunGuard {
+    store: SharedStore,
+    active_threads: Arc<Mutex<HashSet<String>>>,
+    turn_cancellations: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+    engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
+    thread_id: String,
+    expected_turn: i64,
+    finished: bool,
+}
+
+impl TurnRunGuard {
+    fn new(
+        store: SharedStore,
+        active_threads: Arc<Mutex<HashSet<String>>>,
+        turn_cancellations: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
+        engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
+        thread_id: String,
+        expected_turn: i64,
+    ) -> Self {
+        Self {
+            store,
+            active_threads,
+            turn_cancellations,
+            engine_event_sender,
+            thread_id,
+            expected_turn,
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self, phase: TurnPhase, error: Option<String>) {
+        self.release_claim();
+        self.finished = true;
+        let ok = matches!(phase, TurnPhase::Completed);
+        let _ = self.engine_event_sender.send(EngineEvent::TurnFinished {
+            thread_id: self.thread_id.clone(),
+            ok,
+            error,
+            phase,
+        });
+    }
+
+    fn release_claim(&self) {
+        self.turn_cancellations
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.thread_id);
+        self.active_threads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.thread_id);
+    }
+}
+
+impl Drop for TurnRunGuard {
+    fn drop(&mut self) {
+        if self.finished {
+            // `finish` already released the claim. A new turn for this thread
+            // may have inserted its own cancellation sender since then; do not
+            // remove that newer claim.
+            return;
+        }
+        self.release_claim();
+        let (phase, error) = self
+            .store
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_turn_record(&self.thread_id, self.expected_turn)
+            .ok()
+            .flatten()
+            .map(|record| (record.phase, record.error))
+            .unwrap_or_else(|| {
+                (
+                    TurnPhase::Unverified,
+                    Some("turn task ended without a terminal state".to_string()),
+                )
+            });
+        let ok = matches!(phase, TurnPhase::Completed);
+        let _ = self.engine_event_sender.send(EngineEvent::TurnFinished {
+            thread_id: self.thread_id.clone(),
+            ok,
+            error,
+            phase,
+        });
     }
 }
 
@@ -343,7 +441,11 @@ pub async fn run_engine(
                     });
                 }
             }
-            EngineCommand::ListModels { thread_id, provider } => {
+            EngineCommand::ListModels {
+                thread_id,
+                provider,
+                request_id,
+            } => {
                 let store = store.clone();
                 let home = home.clone();
                 let adapters = adapters.clone();
@@ -357,6 +459,7 @@ pub async fn run_engine(
                     let _ = sender.send(EngineEvent::ModelsLoaded {
                         thread_id,
                         provider,
+                        request_id,
                         models,
                         error,
                     });
@@ -450,9 +553,17 @@ async fn run_turn(
 ) {
     let expected_turn = store
         .lock()
-        .unwrap()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .next_turn_number(&thread_id)
         .unwrap_or(0);
+    let mut guard = TurnRunGuard::new(
+        store.clone(),
+        active_threads.clone(),
+        turn_cancellations.clone(),
+        engine_event_sender.clone(),
+        thread_id.clone(),
+        expected_turn,
+    );
     let result = execute_turn(
         &store,
         &home,
@@ -467,7 +578,6 @@ async fn run_turn(
         &turn_event_sender,
     )
     .await;
-    turn_cancellations.lock().unwrap().remove(&thread_id);
     let record = if expected_turn > 0 {
         store
             .lock()
@@ -485,14 +595,7 @@ async fn run_turn(
         .as_ref()
         .and_then(|record| record.error.clone())
         .or_else(|| result.as_ref().err().map(ToString::to_string));
-    let ok = matches!(phase, TurnPhase::Completed);
-    active_threads.lock().unwrap().remove(&thread_id);
-    let _ = engine_event_sender.send(EngineEvent::TurnFinished {
-        thread_id,
-        ok,
-        error,
-        phase,
-    });
+    guard.finish(phase, error);
 }
 
 /// Asks one provider for its live model catalog without blocking the engine
@@ -845,6 +948,7 @@ mod tests {
         Fail,
         Interrupt,
         Slow,
+        Panic,
     }
 
     struct ScriptAdapter {
@@ -896,6 +1000,7 @@ mod tests {
                         rollout_path: None,
                     });
                 }
+                AdapterMode::Panic => panic!("scripted adapter panic"),
             }
             Ok(())
         }
@@ -1644,6 +1749,7 @@ mod tests {
             .send(EngineCommand::ListModels {
                 thread_id: thread.id.clone(),
                 provider: ProviderId::Codex,
+                request_id: 7,
             })
             .unwrap();
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
@@ -1660,11 +1766,13 @@ mod tests {
             EngineEvent::ModelsLoaded {
                 thread_id,
                 provider,
+                request_id,
                 models,
                 error,
             } => {
                 assert_eq!(thread_id, thread.id);
                 assert_eq!(provider, ProviderId::Codex);
+                assert_eq!(request_id, 7);
                 assert_eq!(models, vec!["live:/tmp/models".to_string()]);
                 assert!(error.is_none());
             }
@@ -1749,6 +1857,110 @@ mod tests {
             .unwrap()
             .expect("turn record");
         assert_eq!(turn.phase, TurnPhase::Unverified);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_turn_releases_the_thread_and_reports_unverified() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "panic".into(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
+            Box::new(ScriptAdapter { mode: AdapterMode::Panic }) as Box<dyn BatonAdapter>,
+        ))];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store.clone(),
+            home.path().to_path_buf(),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        for text in ["first", "second"] {
+            command_sender
+                .send(EngineCommand::Submit {
+                    thread_id: thread.id.clone(),
+                    text: text.into(),
+                    permission_mode: PermissionMode::Default,
+                })
+                .unwrap();
+            let event = wait_engine_event(&event_receiver, |event| {
+                matches!(
+                    event,
+                    EngineEvent::TurnFinished { thread_id, phase, .. }
+                        if thread_id == &thread.id && *phase == TurnPhase::Unverified
+                )
+            })
+            .await;
+            assert!(matches!(
+                event,
+                EngineEvent::TurnFinished { ok: false, phase: TurnPhase::Unverified, .. }
+            ));
+        }
+        assert!(
+            !event_receiver.try_iter().any(|event| matches!(event, EngineEvent::TurnRejected { .. })),
+            "the second submit must be accepted after the first panic"
+        );
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+    }
+
+    #[test]
+    fn finished_guard_does_not_remove_a_newer_turn_claim() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let active = Arc::new(Mutex::new(HashSet::from(["thread-1".to_string()])));
+        let cancellations: Arc<
+            Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
+        > = Arc::new(Mutex::new(HashMap::new()));
+        let (old_sender, _old_receiver) = tokio::sync::watch::channel(false);
+        cancellations
+            .lock()
+            .unwrap()
+            .insert("thread-1".into(), old_sender);
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let mut guard = TurnRunGuard::new(
+            store,
+            active.clone(),
+            cancellations.clone(),
+            event_sender,
+            "thread-1".into(),
+            1,
+        );
+        guard.finish(TurnPhase::Completed, None);
+        assert!(matches!(
+            event_receiver.try_recv(),
+            Ok(EngineEvent::TurnFinished { .. })
+        ));
+        assert!(!active.lock().unwrap().contains("thread-1"));
+
+        // A new turn for the same thread can start as soon as finish releases
+        // the claim, before the old guard's Drop runs.
+        active.lock().unwrap().insert("thread-1".into());
+        let (new_sender, _new_receiver) = tokio::sync::watch::channel(false);
+        cancellations
+            .lock()
+            .unwrap()
+            .insert("thread-1".into(), new_sender);
+        drop(guard);
+        assert!(active.lock().unwrap().contains("thread-1"));
+        assert!(cancellations.lock().unwrap().contains_key("thread-1"));
+        assert!(
+            event_receiver.try_recv().is_err(),
+            "finish must emit exactly one terminal event"
+        );
     }
 
     #[tokio::test]

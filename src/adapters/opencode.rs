@@ -10,7 +10,7 @@ use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use uuid::Uuid;
 
-use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::process::ProcessRecorder;
 use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
@@ -49,6 +49,7 @@ pub struct OpenCodeAdapter {
     auth_signature: Arc<Mutex<Option<String>>>,
     current_model: AsyncMutex<Option<String>>,
     recorder: ProcessRecorder,
+    lifecycle: AdapterLifecycle,
 }
 
 fn parse_model_slug(slug: &str) -> Result<(String, String)> {
@@ -72,6 +73,7 @@ impl OpenCodeAdapter {
             auth_signature: Arc::new(Mutex::new(None)),
             current_model: AsyncMutex::new(None),
             recorder,
+            lifecycle: AdapterLifecycle::new(),
         }
     }
 
@@ -386,9 +388,15 @@ impl BatonAdapter for OpenCodeAdapter {
         ProviderId::OpenCode
     }
 
+    fn lifecycle(&self) -> Option<AdapterLifecycle> {
+        Some(self.lifecycle.clone())
+    }
+
     fn interrupt_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
         let runtime = self.runtime.clone();
+        let lifecycle = self.lifecycle.clone();
         Arc::new(move || {
+            lifecycle.cancelling();
             let runtime = runtime.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
@@ -465,6 +473,8 @@ impl BatonAdapter for OpenCodeAdapter {
     }
 
     async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting("model-list");
         let runtime = self.ensure_runtime(&input.auth_env).await?;
         if runtime.version != OpenCodeVersion::V2 {
             return Ok(Vec::new());
@@ -511,6 +521,8 @@ impl BatonAdapter for OpenCodeAdapter {
         session: Option<NativeSessionRef>,
         emit: TurnEventSender,
     ) -> Result<()> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting(&input.thread_id);
         let runtime = self.ensure_runtime(&input.auth_env).await?;
         *runtime.current_emit.lock().await = Some(emit.clone());
         let _ = &self.current_model;
@@ -574,6 +586,7 @@ impl BatonAdapter for OpenCodeAdapter {
             }
         }
         runtime.active_turn.store(true, Ordering::SeqCst);
+        self.lifecycle.turn_running(&input.thread_id);
 
         let mut receiver = runtime.events.lock().await;
         let mut final_text = String::new();
@@ -661,6 +674,7 @@ impl BatonAdapter for OpenCodeAdapter {
     }
 
     async fn dispose(&mut self) -> Result<()> {
+        self.lifecycle.disposing();
         let runtime = self.runtime.lock().await.clone();
         if let Some(runtime) = runtime {
             runtime.active_turn.store(false, Ordering::SeqCst);
@@ -672,6 +686,7 @@ impl BatonAdapter for OpenCodeAdapter {
                 }
             }
         }
+        self.lifecycle.disposed();
         Ok(())
     }
 }

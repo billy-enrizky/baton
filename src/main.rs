@@ -2,6 +2,7 @@ use baton::{adapters, checkpoints, cli, config, mcp, paths, process, resume, run
 
 use anyhow::Result;
 use clap::Parser;
+use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -1306,17 +1307,21 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: O
         .build()?;
 
     let adapters = build_all_adapters(&store, &home, &cwd);
-    let (interrupt_handles, steer_handles) = tokio_runtime.block_on(async {
+    let (interrupt_handles, steer_handles, adapter_lifecycles) = tokio_runtime.block_on(async {
         let mut handles = Vec::new();
         let mut steer_handles = Vec::new();
+        let mut lifecycles = HashMap::new();
         for adapter in &adapters {
             let adapter = adapter.lock().await;
             handles.push((adapter.id(), adapter.interrupt_handle()));
             if let Some(handle) = adapter.steer_handle() {
                 steer_handles.push((adapter.id(), handle));
             }
+            if let Some(lifecycle) = adapter.lifecycle() {
+                lifecycles.insert(adapter.id(), lifecycle);
+            }
         }
-        (handles, steer_handles)
+        (handles, steer_handles, lifecycles)
     });
 
     let (engine_command_sender, engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -1346,6 +1351,7 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: O
         store,
         home.clone(),
         thread,
+        adapter_lifecycles,
         engine_command_sender,
         engine_event_receiver,
         turn_event_receiver,

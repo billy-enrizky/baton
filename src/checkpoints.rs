@@ -8,6 +8,12 @@ pub fn checkpoint_ref(thread_id: &str, turn: i64) -> String {
     format!("refs/baton/checkpoints/{thread_id}/{turn}")
 }
 
+/// Worktree state as it was before a turn started; the matching
+/// `checkpoint_ref` holds the state after the turn ended.
+pub fn checkpoint_start_ref(thread_id: &str, turn: i64) -> String {
+    format!("refs/baton/checkpoints/{thread_id}/{turn}.start")
+}
+
 fn git(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
     let mut command = Command::new("git");
     command.args(args).current_dir(cwd);
@@ -30,18 +36,25 @@ fn resolve_head(cwd: &Path) -> Result<String> {
 }
 
 pub fn capture_checkpoint(cwd: &Path, thread_id: &str, turn: i64) -> Result<String> {
+    let reference = checkpoint_ref(thread_id, turn);
+    capture_checkpoint_at(cwd, &reference, &format!("baton checkpoint {thread_id} turn {turn}"))?;
+    Ok(reference)
+}
+
+/// Captures the current worktree state (tracked + untracked files) under the
+/// given reference without touching HEAD, the index, or the working tree.
+pub fn capture_checkpoint_at(cwd: &Path, reference: &str, message: &str) -> Result<()> {
     let head = resolve_head(cwd)?;
     let index_dir = std::env::temp_dir().join(format!("baton-index-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&index_dir)?;
     let index_path = index_dir.join("index");
     let index_file = index_path.to_string_lossy().to_string();
     let index_env: Vec<(&str, &str)> = vec![("GIT_INDEX_FILE", index_file.as_str())];
-    let result = (|| -> Result<String> {
+    let result = (|| -> Result<()> {
         git(cwd, &["read-tree", &head], &index_env)?;
         git(cwd, &["add", "-A", "--", "."], &index_env)?;
         let tree = git(cwd, &["write-tree"], &index_env)?.trim().to_string();
-        let message = format!("baton checkpoint {thread_id} turn {turn}");
-        let mut commit_args = vec!["commit-tree", &tree, "-m", &message];
+        let mut commit_args = vec!["commit-tree", &tree, "-m", message];
         if head != EMPTY_TREE {
             commit_args.push("-p");
             commit_args.push(&head);
@@ -57,9 +70,8 @@ pub fn capture_checkpoint(cwd: &Path, thread_id: &str, turn: i64) -> Result<Stri
             .map(|(key, value)| (*key, value.as_str()))
             .collect();
         let commit = git(cwd, &commit_args, &commit_env_refs)?.trim().to_string();
-        let reference = checkpoint_ref(thread_id, turn);
-        git(cwd, &["update-ref", &reference, &commit], &[])?;
-        Ok(reference)
+        git(cwd, &["update-ref", reference, &commit], &[])?;
+        Ok(())
     })();
     let _ = std::fs::remove_dir_all(&index_dir);
     result

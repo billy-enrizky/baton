@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::types::{ProviderId, TurnUsage};
+use crate::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
 
 #[derive(Debug, Clone)]
 pub struct ThreadRow {
@@ -12,8 +12,24 @@ pub struct ThreadRow {
     pub cwd: String,
     pub current_provider: ProviderId,
     pub current_model: Option<String>,
+    pub permission_mode: PermissionMode,
+    pub goal: Option<String>,
+    pub goal_paused: bool,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TurnRow {
+    pub thread_id: String,
+    pub turn: i64,
+    pub provider: ProviderId,
+    pub model: Option<String>,
+    pub phase: TurnPhase,
+    pub error: Option<String>,
+    pub provider_turn_id: Option<String>,
+    pub started_at: String,
+    pub ended_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -24,6 +40,33 @@ pub struct ProviderSessionRow {
     pub model: Option<String>,
     pub rollout_path: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewNoteRow {
+    pub id: i64,
+    pub thread_id: String,
+    pub turn: i64,
+    pub path: String,
+    pub line: usize,
+    pub added: bool,
+    pub body: String,
+    pub diff_fingerprint: String,
+    pub created_at: String,
+    pub sent_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MessageSearchRow {
+    pub message_id: i64,
+    pub thread_id: String,
+    pub title: String,
+    pub turn: i64,
+    pub role: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub text: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +87,18 @@ pub struct CheckpointRow {
     pub turn: i64,
     pub git_ref: String,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderProcessRow {
+    pub pid: u32,
+    pub provider: ProviderId,
+    pub port: Option<u16>,
+    pub command: String,
+    pub process_start: Option<String>,
+    pub cwd: String,
+    pub owner_pid: u32,
+    pub started_at: String,
 }
 
 #[derive(Debug, Clone)]
@@ -78,8 +133,23 @@ CREATE TABLE IF NOT EXISTS threads (
   cwd TEXT NOT NULL,
   current_provider TEXT NOT NULL,
   current_model TEXT,
+  permission_mode TEXT NOT NULL DEFAULT 'default',
+  goal TEXT,
+  goal_paused INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS turns (
+  thread_id TEXT NOT NULL,
+  turn INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT,
+  phase TEXT NOT NULL,
+  error TEXT,
+  provider_turn_id TEXT,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  PRIMARY KEY (thread_id, turn)
 );
 CREATE TABLE IF NOT EXISTS provider_sessions (
   thread_id TEXT NOT NULL,
@@ -101,6 +171,33 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS messages_thread_idx ON messages (thread_id, id);
+CREATE TABLE IF NOT EXISTS review_notes (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  turn INTEGER NOT NULL,
+  path TEXT NOT NULL,
+  line INTEGER NOT NULL,
+  added INTEGER NOT NULL,
+  body TEXT NOT NULL,
+  diff_fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  sent_at TEXT
+);
+CREATE INDEX IF NOT EXISTS review_notes_thread_turn_idx ON review_notes (thread_id, turn, sent_at);
+CREATE TABLE IF NOT EXISTS queued_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  text TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS queued_messages_thread_idx ON queued_messages (thread_id, id);
+CREATE TABLE IF NOT EXISTS prompt_history (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  cwd TEXT NOT NULL,
+  text TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS prompt_history_cwd_idx ON prompt_history (cwd, id);
 CREATE TABLE IF NOT EXISTS checkpoints (
   thread_id TEXT NOT NULL,
   turn INTEGER NOT NULL,
@@ -122,7 +219,42 @@ CREATE TABLE IF NOT EXISTS usage (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_thread_idx ON usage (thread_id, id);
+CREATE TABLE IF NOT EXISTS provider_processes (
+  pid INTEGER PRIMARY KEY,
+  provider TEXT NOT NULL,
+  port INTEGER,
+  command TEXT NOT NULL,
+  process_start TEXT,
+  cwd TEXT NOT NULL,
+  owner_pid INTEGER NOT NULL,
+  started_at TEXT NOT NULL
+);
 "#;
+
+fn ensure_column(db: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
+    let exists = db
+        .query_row(
+            "SELECT 1 FROM pragma_table_info(?) WHERE name = ?",
+            params![table, column],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !exists {
+        db.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+fn ensure_thread_columns(db: &Connection) -> Result<()> {
+    ensure_column(db, "threads", "permission_mode", "TEXT NOT NULL DEFAULT 'default'")?;
+    ensure_column(db, "threads", "goal", "TEXT")?;
+    ensure_column(db, "threads", "goal_paused", "INTEGER NOT NULL DEFAULT 0")?;
+    Ok(())
+}
 
 fn migrate_thread_model_nullable(db: &Connection) -> Result<()> {
     let not_null: Option<i64> = db
@@ -142,13 +274,16 @@ fn migrate_thread_model_nullable(db: &Connection) -> Result<()> {
                   cwd TEXT NOT NULL,
                   current_provider TEXT NOT NULL,
                   current_model TEXT,
+                  permission_mode TEXT NOT NULL DEFAULT 'default',
+                  goal TEXT,
+                  goal_paused INTEGER NOT NULL DEFAULT 0,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
-                INSERT INTO threads_migrated (id, title, cwd, current_provider, current_model, created_at, updated_at)
+                INSERT INTO threads_migrated (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, created_at, updated_at)
                   SELECT id, title, cwd, current_provider,
                     CASE WHEN current_model IN ('gpt-6.1-sol', 'claude-sonnet-4-5') THEN NULL ELSE current_model END,
-                    created_at, updated_at
+                    'default', NULL, 0, created_at, updated_at
                   FROM threads;
                 DROP TABLE threads;
                 ALTER TABLE threads_migrated RENAME TO threads;
@@ -160,20 +295,42 @@ fn migrate_thread_model_nullable(db: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn map_review_note(row: &rusqlite::Row) -> rusqlite::Result<ReviewNoteRow> {
+    Ok(ReviewNoteRow {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        turn: row.get(2)?,
+        path: row.get(3)?,
+        line: row.get::<_, i64>(4)?.max(0) as usize,
+        added: row.get::<_, i64>(5)? != 0,
+        body: row.get(6)?,
+        diff_fingerprint: row.get(7)?,
+        created_at: row.get(8)?,
+        sent_at: row.get(9)?,
+    })
+}
+
 fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
     let provider: String = row.get(3)?;
+    let permission_mode: String = row.get(7)?;
     Ok(ThreadRow {
         id: row.get(0)?,
         title: row.get(1)?,
         cwd: row.get(2)?,
         current_provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
         current_model: row.get(4)?,
+        permission_mode: PermissionMode::parse(&permission_mode).unwrap_or(PermissionMode::Default),
+        goal: row.get(8)?,
+        goal_paused: row.get::<_, i64>(9)? != 0,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
     })
 }
 
-const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at";
+const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused";
+
+/// Per-project prompt history cap, Claude Code style.
+pub const PROMPT_HISTORY_LIMIT: i64 = 100;
 
 impl BatonStore {
     pub fn open(path: &Path) -> Result<BatonStore> {
@@ -181,8 +338,14 @@ impl BatonStore {
             std::fs::create_dir_all(parent)?;
         }
         let db = Connection::open(path)?;
+        // Several baton processes can share the same store (for example two
+        // project windows). Wait for another writer instead of failing the
+        // command immediately with SQLITE_BUSY.
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.execute_batch(MIGRATIONS)?;
         migrate_thread_model_nullable(&db)?;
+        ensure_thread_columns(&db)?;
+        ensure_column(&db, "provider_processes", "process_start", "TEXT")?;
         Ok(BatonStore { db })
     }
 
@@ -199,7 +362,7 @@ impl BatonStore {
     pub fn create_thread_with_id(&self, input: NewThread, id: String) -> Result<ThreadRow> {
         let now = now_iso();
         self.db.execute(
-            "INSERT INTO threads (id, title, cwd, current_provider, current_model, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'default', NULL, 0, ?, ?)",
             params![id, input.title, input.cwd, input.current_provider.as_str(), input.current_model, now, now],
         )?;
         Ok(ThreadRow {
@@ -208,9 +371,103 @@ impl BatonStore {
             cwd: input.cwd,
             current_provider: input.current_provider,
             current_model: input.current_model,
+            permission_mode: PermissionMode::Default,
+            goal: None,
+            goal_paused: false,
             created_at: now.clone(),
             updated_at: now,
         })
+    }
+
+    /// Branches a thread's conversation into a new thread without copying
+    /// native provider sessions. The first turn in the fork therefore gets a
+    /// transcript handoff rather than sharing a live provider session.
+    pub fn fork_thread(&self, source_id: &str, title: &str) -> Result<ThreadRow> {
+        self.fork_thread_through_turn(source_id, title, None)
+    }
+
+    /// Branches a thread through a specific completed turn. Later turns,
+    /// including a currently open turn, are left in the source thread.
+    pub fn fork_thread_through_turn(
+        &self,
+        source_id: &str,
+        title: &str,
+        through_turn: Option<i64>,
+    ) -> Result<ThreadRow> {
+        let source = self
+            .get_thread(source_id)?
+            .ok_or_else(|| anyhow::anyhow!("thread not found: {source_id}"))?;
+        let mut messages = self.list_messages(source_id)?;
+        let mut turns = self.list_turn_records(source_id)?;
+        match through_turn {
+            Some(cutoff) => {
+                let turn = turns
+                    .iter()
+                    .find(|turn| turn.turn == cutoff)
+                    .ok_or_else(|| anyhow::anyhow!("turn {cutoff} not found in thread"))?;
+                if !turn.phase.is_terminal() {
+                    anyhow::bail!("turn {cutoff} is not terminal");
+                }
+                messages.retain(|message| message.turn <= cutoff);
+                turns.retain(|turn| turn.turn <= cutoff);
+            }
+            None => {
+                if turns.iter().any(|turn| !turn.phase.is_terminal()) {
+                    anyhow::bail!("cannot fork while a turn is open");
+                }
+            }
+        }
+        let id = Uuid::new_v4().to_string();
+        let now = now_iso();
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                id,
+                title,
+                source.cwd,
+                source.current_provider.as_str(),
+                source.current_model,
+                source.permission_mode.as_str(),
+                source.goal,
+                source.goal_paused as i64,
+                now,
+                now,
+            ],
+        )?;
+        for message in messages {
+            tx.execute(
+                "INSERT INTO messages (thread_id, turn, role, provider, model, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    id,
+                    message.turn,
+                    message.role,
+                    message.provider,
+                    message.model,
+                    message.text,
+                    message.created_at,
+                ],
+            )?;
+        }
+        for turn in turns {
+            tx.execute(
+                "INSERT INTO turns (thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                params![
+                    id,
+                    turn.turn,
+                    turn.provider.as_str(),
+                    turn.model,
+                    turn.phase.as_str(),
+                    turn.error,
+                    turn.provider_turn_id,
+                    turn.started_at,
+                    turn.ended_at,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        self.get_thread(&id)?
+            .ok_or_else(|| anyhow::anyhow!("forked thread disappeared: {id}"))
     }
 
     pub fn draft_thread(&self, input: NewThread) -> ThreadRow {
@@ -221,9 +478,41 @@ impl BatonStore {
             cwd: input.cwd,
             current_provider: input.current_provider,
             current_model: input.current_model,
+            permission_mode: PermissionMode::Default,
+            goal: None,
+            goal_paused: false,
             created_at: now.clone(),
             updated_at: now,
         }
+    }
+
+    /// Lists threads for a directory, accepting both the caller's path and its
+    /// canonical form. A symlinked invocation path must not hide threads that
+    /// were created through the real project path, or vice versa.
+    pub fn list_threads_for_path(&self, cwd: &Path) -> Result<Vec<ThreadRow>> {
+        let mut candidates = vec![cwd.to_path_buf()];
+        if let Ok(canonical) = cwd.canonicalize() {
+            if canonical != cwd {
+                candidates.push(canonical);
+            }
+        }
+        if let Ok(target) = cwd.read_link() {
+            let target = if target.is_absolute() {
+                target
+            } else {
+                cwd.parent().unwrap_or(Path::new(".")).join(target)
+            };
+            if !candidates.contains(&target) {
+                candidates.push(target);
+            }
+        }
+        for candidate in candidates {
+            let rows = self.list_threads(Some(candidate.to_string_lossy().as_ref()))?;
+            if !rows.is_empty() {
+                return Ok(rows);
+            }
+        }
+        Ok(Vec::new())
     }
 
     pub fn list_threads(&self, cwd: Option<&str>) -> Result<Vec<ThreadRow>> {
@@ -274,6 +563,132 @@ impl BatonStore {
             "UPDATE threads SET current_model = ?, updated_at = ? WHERE id = ?",
             params![model, now_iso(), id],
         )?;
+        Ok(())
+    }
+
+    pub fn set_thread_permission_mode(&self, id: &str, mode: PermissionMode) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET permission_mode = ?, updated_at = ? WHERE id = ?",
+            params![mode.as_str(), now_iso(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_goal(&self, id: &str, goal: Option<&str>, paused: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET goal = ?, goal_paused = ?, updated_at = ? WHERE id = ?",
+            params![goal, if paused { 1 } else { 0 }, now_iso(), id],
+        )?;
+        Ok(())
+    }
+
+    /// Records a submitted prompt for a project, keeping the newest
+    /// [PROMPT_HISTORY_LIMIT] entries and skipping consecutive repeats.
+    pub fn record_prompt(&self, cwd: &str, text: &str) -> Result<()> {
+        let latest: Option<String> = self
+            .db
+            .query_row(
+                "SELECT text FROM prompt_history WHERE cwd = ? ORDER BY id DESC LIMIT 1",
+                params![cwd],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest.as_deref() == Some(text) {
+            return Ok(());
+        }
+        self.db.execute(
+            "INSERT INTO prompt_history (cwd, text, created_at) VALUES (?, ?, ?)",
+            params![cwd, text, now_iso()],
+        )?;
+        self.db.execute(
+            "DELETE FROM prompt_history WHERE cwd = ? AND id NOT IN (
+                 SELECT id FROM prompt_history WHERE cwd = ? ORDER BY id DESC LIMIT ?
+             )",
+            params![cwd, cwd, PROMPT_HISTORY_LIMIT],
+        )?;
+        Ok(())
+    }
+
+    /// Project prompt history, oldest first.
+    pub fn list_prompt_history(&self, cwd: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT text FROM prompt_history WHERE cwd = ? ORDER BY id ASC")?;
+        let rows = statement
+            .query_map(params![cwd], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Saves a line-anchored review note before the user sends it. The diff
+    /// fingerprint prevents a reused turn number from attaching an old note to
+    /// a different diff after rewind.
+    pub fn add_review_note(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        path: &str,
+        line: usize,
+        added: bool,
+        body: &str,
+        diff_fingerprint: &str,
+    ) -> Result<i64> {
+        self.db.execute(
+            "INSERT INTO review_notes (thread_id, turn, path, line, added, body, diff_fingerprint, created_at, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
+            params![thread_id, turn, path, line as i64, if added { 1 } else { 0 }, body, diff_fingerprint, now_iso()],
+        )?;
+        Ok(self.db.last_insert_rowid())
+    }
+
+    /// Notes that are still waiting to be sent for this exact diff.
+    pub fn list_unsent_review_notes(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        diff_fingerprint: &str,
+    ) -> Result<Vec<ReviewNoteRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, thread_id, turn, path, line, added, body, diff_fingerprint, created_at, sent_at
+             FROM review_notes
+             WHERE thread_id = ? AND turn = ? AND diff_fingerprint = ? AND sent_at IS NULL
+             ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![thread_id, turn, diff_fingerprint], map_review_note)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Records delivery without deleting the note. The text itself becomes a
+    /// normal user message; this timestamp keeps a reopen from resending it.
+    pub fn mark_review_notes_sent(&self, thread_id: &str, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let sent_at = now_iso();
+        let tx = self.db.unchecked_transaction()?;
+        for id in ids {
+            tx.execute(
+                "UPDATE review_notes SET sent_at = ? WHERE thread_id = ? AND id = ? AND sent_at IS NULL",
+                params![sent_at, thread_id, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn delete_review_notes(&self, thread_id: &str, ids: &[i64]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self.db.unchecked_transaction()?;
+        for id in ids {
+            tx.execute(
+                "DELETE FROM review_notes WHERE thread_id = ? AND id = ?",
+                params![thread_id, id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -350,16 +765,21 @@ impl BatonStore {
     pub fn find_thread_by_native_session(&self, provider: ProviderId, native_session_id: &str) -> Result<Option<ThreadRow>> {
         self.db
             .query_row(
-                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
+                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
                 params![provider.as_str(), native_session_id],
                 |row| {
                     let provider: String = row.get(3)?;
+                    let permission_mode: String = row.get(7)?;
                     Ok(ThreadRow {
                         id: row.get(0)?,
                         title: row.get(1)?,
                         cwd: row.get(2)?,
                         current_provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
                         current_model: row.get(4)?,
+                        permission_mode: PermissionMode::parse(&permission_mode)
+                            .unwrap_or(PermissionMode::Default),
+                        goal: row.get(8)?,
+                        goal_paused: row.get::<_, i64>(9)? != 0,
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
                     })
@@ -381,6 +801,242 @@ impl BatonStore {
         Ok(max_turn + 1)
     }
 
+    fn map_turn(row: &rusqlite::Row) -> rusqlite::Result<TurnRow> {
+        let provider: String = row.get(2)?;
+        let phase: String = row.get(4)?;
+        Ok(TurnRow {
+            thread_id: row.get(0)?,
+            turn: row.get(1)?,
+            provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
+            model: row.get(3)?,
+            phase: TurnPhase::parse(&phase).unwrap_or(TurnPhase::Unverified),
+            error: row.get(5)?,
+            provider_turn_id: row.get(6)?,
+            started_at: row.get(7)?,
+            ended_at: row.get(8)?,
+        })
+    }
+
+    /// Starts or restarts the durable record for one turn.
+    pub fn start_turn_record(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        provider: ProviderId,
+        model: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute(
+            r#"INSERT INTO turns (thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at)
+               VALUES (?, ?, ?, ?, 'running', NULL, NULL, ?, NULL)
+               ON CONFLICT (thread_id, turn) DO UPDATE SET
+                 provider = excluded.provider,
+                 model = excluded.model,
+                 phase = 'running',
+                 error = NULL,
+                 provider_turn_id = NULL,
+                 started_at = excluded.started_at,
+                 ended_at = NULL"#,
+            params![thread_id, turn, provider.as_str(), model, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_turn_record(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        phase: TurnPhase,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute(
+            "UPDATE turns SET phase = ?, error = ?, ended_at = ? WHERE thread_id = ? AND turn = ?",
+            params![phase.as_str(), error, now_iso(), thread_id, turn],
+        )?;
+        Ok(())
+    }
+
+    /// Moves an open turn between queued and running without ending it.
+    pub fn set_turn_phase(&self, thread_id: &str, turn: i64, phase: TurnPhase) -> Result<()> {
+        self.db.execute(
+            "UPDATE turns SET phase = ?, error = NULL, ended_at = NULL WHERE thread_id = ? AND turn = ?",
+            params![phase.as_str(), thread_id, turn],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_turn_provider_id(&self, thread_id: &str, turn: i64, provider_turn_id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE turns SET provider_turn_id = ? WHERE thread_id = ? AND turn = ?",
+            params![provider_turn_id, thread_id, turn],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_turn_record(&self, thread_id: &str, turn: i64) -> Result<Option<TurnRow>> {
+        self.db
+            .query_row(
+                "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at FROM turns WHERE thread_id = ? AND turn = ?",
+                params![thread_id, turn],
+                Self::map_turn,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn list_turn_records(&self, thread_id: &str) -> Result<Vec<TurnRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at FROM turns WHERE thread_id = ? ORDER BY turn",
+        )?;
+        let rows = statement
+            .query_map(params![thread_id], Self::map_turn)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// A process that starts after a crash must not show a running turn as
+    /// live. Mark unfinished turns in this project as unverified.
+    pub fn reconcile_running_turns(&self, cwd: Option<&str>) -> Result<Vec<TurnRow>> {
+        let rows = match cwd {
+            Some(cwd) => {
+                let mut statement = self.db.prepare(
+                    "SELECT tu.thread_id, tu.turn, tu.provider, tu.model, tu.phase, tu.error, tu.provider_turn_id, tu.started_at, tu.ended_at
+                     FROM turns tu JOIN threads t ON t.id = tu.thread_id
+                     WHERE t.cwd = ? AND tu.phase IN ('queued', 'running', 'settling') ORDER BY tu.started_at",
+                )?;
+                let rows = statement
+                    .query_map(params![cwd], Self::map_turn)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+            None => {
+                let mut statement = self.db.prepare(
+                    "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at
+                     FROM turns WHERE phase IN ('queued', 'running', 'settling') ORDER BY started_at",
+                )?;
+                let rows = statement
+                    .query_map([], Self::map_turn)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                rows
+            }
+        };
+        for row in &rows {
+            self.db.execute(
+                "UPDATE turns SET phase = 'unverified', error = COALESCE(error, 'baton exited before the turn settled'), ended_at = ? WHERE thread_id = ? AND turn = ?",
+                params![now_iso(), row.thread_id, row.turn],
+            )?;
+        }
+        Ok(rows)
+    }
+
+    /// Records a provider child so a later baton process can identify and reap
+    /// it if this process exits without disposing it. The command line is the
+    /// identity check: a reused PID with a different command must never be
+    /// killed.
+    pub fn record_provider_process(
+        &self,
+        pid: u32,
+        provider: ProviderId,
+        port: Option<u16>,
+        command: &str,
+        process_start: Option<&str>,
+        cwd: &str,
+        owner_pid: u32,
+    ) -> Result<()> {
+        self.db.execute(
+            r#"INSERT INTO provider_processes (pid, provider, port, command, process_start, cwd, owner_pid, started_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(pid) DO UPDATE SET
+                 provider = excluded.provider,
+                 port = excluded.port,
+                 command = excluded.command,
+                 process_start = excluded.process_start,
+                 cwd = excluded.cwd,
+                 owner_pid = excluded.owner_pid,
+                 started_at = excluded.started_at"#,
+            params![pid, provider.as_str(), port, command, process_start, cwd, owner_pid, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_provider_process(&self, pid: u32) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM provider_processes WHERE pid = ?",
+            params![pid],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_provider_processes(&self) -> Result<Vec<ProviderProcessRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT pid, provider, port, command, process_start, cwd, owner_pid, started_at
+             FROM provider_processes ORDER BY started_at, pid",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                let provider: String = row.get(1)?;
+                Ok(ProviderProcessRow {
+                    pid: row.get::<_, i64>(0)?.max(0) as u32,
+                    provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
+                    port: row.get::<_, Option<i64>>(2)?.map(|port| port.clamp(0, u16::MAX as i64) as u16),
+                    command: row.get(3)?,
+                    process_start: row.get(4)?,
+                    cwd: row.get(5)?,
+                    owner_pid: row.get::<_, i64>(6)?.max(0) as u32,
+                    started_at: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn enqueue_message(&self, thread_id: &str, text: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO queued_messages (thread_id, text, created_at) VALUES (?, ?, ?)",
+            params![thread_id, text, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_queued_messages(&self, thread_id: &str) -> Result<Vec<String>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT text FROM queued_messages WHERE thread_id = ? ORDER BY id")?;
+        let rows = statement
+            .query_map(params![thread_id], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// Removes and returns the oldest queued message for a thread.
+    pub fn pop_queued_message(&self, thread_id: &str) -> Result<Option<String>> {
+        let tx = self.db.unchecked_transaction()?;
+        let text: Option<String> = tx
+            .query_row(
+                "SELECT text FROM queued_messages WHERE thread_id = ? ORDER BY id LIMIT 1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if text.is_some() {
+            tx.execute(
+                "DELETE FROM queued_messages WHERE id = (
+                    SELECT id FROM queued_messages WHERE thread_id = ? ORDER BY id LIMIT 1
+                 )",
+                params![thread_id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(text)
+    }
+
+    pub fn clear_queued_messages(&self, thread_id: &str) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM queued_messages WHERE thread_id = ?",
+            params![thread_id],
+        )?;
+        Ok(())
+    }
+
     pub fn add_message(
         &self,
         thread_id: &str,
@@ -397,6 +1053,29 @@ impl BatonStore {
         let id = self.db.last_insert_rowid();
         self.touch_thread(thread_id)?;
         Ok(id)
+    }
+
+    pub fn list_recent_messages(&self, thread_id: &str, limit: usize) -> Result<Vec<MessageRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, thread_id, turn, role, provider, model, text, created_at
+             FROM messages WHERE thread_id = ? ORDER BY id DESC LIMIT ?",
+        )?;
+        let mut rows = statement
+            .query_map(params![thread_id, limit as i64], |row| {
+                Ok(MessageRow {
+                    id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    turn: row.get(2)?,
+                    role: row.get(3)?,
+                    provider: row.get(4)?,
+                    model: row.get(5)?,
+                    text: row.get(6)?,
+                    created_at: row.get(7)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.reverse();
+        Ok(rows)
     }
 
     pub fn list_messages(&self, thread_id: &str) -> Result<Vec<MessageRow>> {
@@ -417,6 +1096,63 @@ impl BatonStore {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Substring search across conversation text and thread titles. A cwd
+    /// limits results to one project; None searches every durable thread.
+    pub fn search_messages(
+        &self,
+        cwd: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<MessageSearchRow>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let escaped = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+        let limit = limit.clamp(1, 500) as i64;
+        let mut statement = match cwd {
+            Some(_) => self.db.prepare(
+                "SELECT m.id, m.thread_id, t.title, m.turn, m.role, m.provider, m.model, m.text, m.created_at
+                 FROM messages m JOIN threads t ON t.id = m.thread_id
+                 WHERE t.cwd = ? AND (lower(m.text) LIKE ? ESCAPE '\\' OR lower(t.title) LIKE ? ESCAPE '\\')
+                 ORDER BY m.id DESC LIMIT ?",
+            )?,
+            None => self.db.prepare(
+                "SELECT m.id, m.thread_id, t.title, m.turn, m.role, m.provider, m.model, m.text, m.created_at
+                 FROM messages m JOIN threads t ON t.id = m.thread_id
+                 WHERE lower(m.text) LIKE ? ESCAPE '\\' OR lower(t.title) LIKE ? ESCAPE '\\'
+                 ORDER BY m.id DESC LIMIT ?",
+            )?,
+        };
+        let map = |row: &rusqlite::Row| {
+            Ok(MessageSearchRow {
+                message_id: row.get(0)?,
+                thread_id: row.get(1)?,
+                title: row.get(2)?,
+                turn: row.get(3)?,
+                role: row.get(4)?,
+                provider: row.get(5)?,
+                model: row.get(6)?,
+                text: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        };
+        let rows = match cwd {
+            Some(cwd) => statement
+                .query_map(params![cwd, pattern, pattern, limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+            None => statement
+                .query_map(params![pattern, pattern, limit], map)?
+                .collect::<rusqlite::Result<Vec<_>>>()?,
+        };
         Ok(rows)
     }
 
@@ -524,6 +1260,18 @@ impl BatonStore {
         )?;
         tx.execute(
             "DELETE FROM usage WHERE thread_id = ? AND turn >= ?",
+            params![thread_id, from_turn],
+        )?;
+        tx.execute(
+            "DELETE FROM turns WHERE thread_id = ? AND turn >= ?",
+            params![thread_id, from_turn],
+        )?;
+        tx.execute(
+            "DELETE FROM queued_messages WHERE thread_id = ?",
+            params![thread_id],
+        )?;
+        tx.execute(
+            "DELETE FROM review_notes WHERE thread_id = ? AND turn >= ?",
             params![thread_id, from_turn],
         )?;
         tx.execute("DELETE FROM provider_sessions WHERE thread_id = ?", params![thread_id])?;

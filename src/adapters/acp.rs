@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{BatonAdapter, LineReader, LineWriter, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, LineReader, LineWriter, ModelListInput, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
 
@@ -154,6 +154,48 @@ fn pick_permission_option(options: &[Value], decision: Option<ApprovalDecision>)
     find(wanted_kind).or_else(|| find(fallback_kind))
 }
 
+fn collect_model_values(value: &Value, models: &mut Vec<String>) {
+    if let Some(model) = value
+        .get("value")
+        .and_then(Value::as_str)
+        .filter(|model| !model.is_empty())
+    {
+        if !models.iter().any(|known| known == model) {
+            models.push(model.to_string());
+        }
+        return;
+    }
+    if let Some(options) = value.get("options").and_then(Value::as_array) {
+        for option in options {
+            collect_model_values(option, models);
+        }
+    }
+}
+
+fn model_options(setup: &Value) -> Vec<String> {
+    let mut models = Vec::new();
+    let Some(options) = setup.get("configOptions").and_then(Value::as_array) else {
+        return models;
+    };
+    for option in options {
+        let category = option.get("category").and_then(Value::as_str).unwrap_or("");
+        let id = option.get("id").and_then(Value::as_str).unwrap_or("");
+        let name = option.get("name").and_then(Value::as_str).unwrap_or("");
+        let is_model = category == "model"
+            || id.eq_ignore_ascii_case("model")
+            || name.to_ascii_lowercase().contains("model");
+        if !is_model || option.get("type").and_then(Value::as_str) != Some("select") {
+            continue;
+        }
+        if let Some(values) = option.get("options").and_then(Value::as_array) {
+            for value in values {
+                collect_model_values(value, &mut models);
+            }
+        }
+    }
+    models
+}
+
 fn parse_usage(usage: &Value) -> TurnUsage {
     TurnUsage {
         input_tokens: usage.get("inputTokens").and_then(Value::as_i64).unwrap_or(0),
@@ -209,13 +251,18 @@ fn handle_session_update(update: &Value, emit: &TurnEventSender, final_text: &mu
             match status {
                 "completed" | "failed" => {
                     let _ = emit.send(TurnEvent::ToolCompleted {
+                        id: (!tool_call_id.is_empty()).then_some(tool_call_id.clone()),
                         tool: title,
                         detail: Some(tool_call_id),
                         exit_code: if status == "failed" { Some(1) } else { Some(0) },
                     });
                 }
                 _ => {
-                    let _ = emit.send(TurnEvent::ToolStarted { tool: title, detail: Some(tool_call_id) });
+                    let _ = emit.send(TurnEvent::ToolStarted {
+                        id: (!tool_call_id.is_empty()).then_some(tool_call_id.clone()),
+                        tool: title,
+                        detail: Some(tool_call_id),
+                    });
                 }
             }
         }
@@ -276,13 +323,6 @@ impl AcpAdapter {
             Ok(Ok(Err(error))) => anyhow::bail!("acp error: {error}"),
             _ => anyhow::bail!("acp request timed out: {method}"),
         }
-    }
-
-    async fn notify(&self, runtime: &Arc<AcpRuntime>, method: &str, params: Value) -> Result<()> {
-        let frame = json!({ "jsonrpc": "2.0", "method": method, "params": params });
-        let mut writer = runtime.writer.lock().await;
-        writer.write_line(&serde_json::to_string(&frame)?).await?;
-        Ok(())
     }
 
     async fn ensure_initialized(&self, runtime: &Arc<AcpRuntime>) -> Result<()> {
@@ -350,6 +390,19 @@ impl BatonAdapter for AcpAdapter {
                 });
             }
         })
+    }
+
+    async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        self.ensure_initialized(&runtime).await?;
+        let created = self
+            .request(
+                &runtime,
+                "session/new",
+                json!({ "cwd": input.cwd, "mcpServers": [] }),
+            )
+            .await?;
+        Ok(model_options(&created))
     }
 
     async fn start_turn(
@@ -430,6 +483,8 @@ impl BatonAdapter for AcpAdapter {
                         _ => handle_session_update(&update, &emit, &mut final_text),
                     }
                 }
+                // The prompt RPC reply is the authoritative turn end. Every
+                // branch below breaks, so the oneshot is never polled again.
                 prompt_result = &mut prompt_receiver => {
                     match prompt_result {
                         Ok(Ok(result)) => {
@@ -438,6 +493,23 @@ impl BatonAdapter for AcpAdapter {
                                     usage = Some(parse_usage(result_usage));
                                 }
                             }
+                            // Drain updates the agent sent before the reply
+                            // (usage, trailing message chunks), then end.
+                            while let Ok((method, params)) = receiver.try_recv() {
+                                if method != "session/update" {
+                                    continue;
+                                }
+                                let update = params.get("update").cloned().unwrap_or(Value::Null);
+                                let variant = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
+                                if variant == "state_update" {
+                                    if let Some(state_usage) = update.get("usage") {
+                                        usage = Some(parse_usage(state_usage));
+                                    }
+                                } else {
+                                    handle_session_update(&update, &emit, &mut final_text);
+                                }
+                            }
+                            break Ok(());
                         }
                         Ok(Err(error)) => break Err(anyhow::anyhow!("acp error: {error}")),
                         Err(_) => break Err(anyhow::anyhow!("acp connection closed")),

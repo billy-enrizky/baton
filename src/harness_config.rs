@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -51,18 +52,7 @@ fn codex_approval_policy_map(value: &str) -> Option<PermissionMode> {
 }
 
 pub fn read_claude_harness_config(global_dir: &Path, project_root: Option<&Path>) -> HarnessProviderConfig {
-    let mut layers: Vec<Value> = Vec::new();
-    if let Some(value) = read_json_if_exists(&global_dir.join("settings.json")) {
-        layers.push(value);
-    }
-    if let Some(root) = project_root {
-        if let Some(value) = read_json_if_exists(&root.join(".claude").join("settings.json")) {
-            layers.push(value);
-        }
-        if let Some(value) = read_json_if_exists(&root.join(".claude").join("settings.local.json")) {
-            layers.push(value);
-        }
-    }
+    let layers = claude_settings_layers(global_dir, project_root);
     if layers.is_empty() {
         return HarnessProviderConfig::default();
     }
@@ -119,8 +109,145 @@ pub fn read_claude_harness_config(global_dir: &Path, project_root: Option<&Path>
     }
 }
 
-pub fn read_codex_harness_config(global_home: &Path, project_root: Option<&Path>) -> HarnessProviderConfig {
-    let global = read_toml_if_exists(&global_home.join("config.toml"));
+fn claude_settings_layers(global_dir: &Path, project_root: Option<&Path>) -> Vec<Value> {
+    let mut layers = Vec::new();
+    if let Some(value) = read_json_if_exists(&global_dir.join("settings.json")) {
+        layers.push(value);
+    }
+    if let Some(root) = project_root {
+        if let Some(value) = read_json_if_exists(&root.join(".claude").join("settings.json")) {
+            layers.push(value);
+        }
+        if let Some(value) = read_json_if_exists(&root.join(".claude").join("settings.local.json")) {
+            layers.push(value);
+        }
+    }
+    layers
+}
+
+fn claude_model_id(entry: &Value) -> Option<&str> {
+    entry
+        .as_str()
+        .or_else(|| entry.get("id").and_then(Value::as_str))
+        .or_else(|| entry.get("model").and_then(Value::as_str))
+        .or_else(|| entry.get("value").and_then(Value::as_str))
+        .or_else(|| entry.get("slug").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+}
+
+fn push_model(models: &mut Vec<String>, model: &str) {
+    if !models.iter().any(|known| known == model) {
+        models.push(model.to_string());
+    }
+}
+
+fn model_ids_from_value(value: &Value) -> Vec<String> {
+    let Some(entries) = value
+        .as_array()
+        .or_else(|| value.get("models").and_then(Value::as_array))
+    else {
+        return Vec::new();
+    };
+    let mut models = Vec::new();
+    for entry in entries {
+        if let Some(model) = claude_model_id(entry) {
+            push_model(&mut models, model);
+        }
+    }
+    models
+}
+
+fn model_ids_from_config(value: &Value) -> Vec<String> {
+    if let Some(configs) = value.as_array() {
+        for config in configs {
+            let models = model_ids_from_value(config);
+            if !models.is_empty() {
+                return models;
+            }
+        }
+        return Vec::new();
+    }
+    model_ids_from_value(value)
+}
+
+fn cached_catalog_models(value: &Value) -> Option<(i64, String, Vec<String>)> {
+    let catalog = value.get("catalog")?;
+    let surface = catalog.get("surface")?.as_str()?.to_string();
+    let models = model_ids_from_config(catalog.get("config")?);
+    if models.is_empty() {
+        return None;
+    }
+    let fetched_at = value.get("fetchedAt").and_then(Value::as_i64).unwrap_or(0);
+    Some((fetched_at, surface, models))
+}
+
+fn published_catalog_models(value: &Value) -> Option<(i64, Vec<String>)> {
+    let decoded;
+    let document = if value.get("document").is_some_and(Value::is_object) {
+        value.get("document")?
+    } else {
+        let encoded = value.get("documentBytes")?.as_str()?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+        decoded = serde_json::from_slice::<Value>(&bytes).ok()?;
+        &decoded
+    };
+    let config = document
+        .get("surfaces")?
+        .get("cc")?
+        .get("model_selector_config")?;
+    let models = model_ids_from_config(config);
+    if models.is_empty() {
+        return None;
+    }
+    let fetched_at = value.get("fetchedAt").and_then(Value::as_i64).unwrap_or(0);
+    Some((fetched_at, models))
+}
+
+/// Model ids from Claude Code's own cached catalog for the `cc` (CLI) surface.
+/// The cache is written by Claude Code itself, so baton does not need to guess
+/// the model list or call a private endpoint. Falls back to the published
+/// catalog document when no per-user `cc` entry exists; returns an empty list
+/// when neither cache shape is present so the picker keeps its static fallback.
+pub fn read_claude_model_catalog(claude_dir: &Path) -> Vec<String> {
+    let cache_dir = claude_dir.join("cache").join("model-catalog");
+    let Ok(entries) = std::fs::read_dir(&cache_dir) else {
+        return Vec::new();
+    };
+    let mut newest_cached: Option<(i64, Vec<String>)> = None;
+    let mut newest_published: Option<(i64, Vec<String>)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let Some(value) = read_json_if_exists(&path) else {
+            continue;
+        };
+        if let Some((fetched_at, surface, models)) = cached_catalog_models(&value) {
+            if surface == "cc"
+                && newest_cached
+                    .as_ref()
+                    .is_none_or(|(known, _)| fetched_at > *known)
+            {
+                newest_cached = Some((fetched_at, models));
+            }
+        } else if let Some((fetched_at, models)) = published_catalog_models(&value) {
+            if newest_published
+                .as_ref()
+                .is_none_or(|(known, _)| fetched_at > *known)
+            {
+                newest_published = Some((fetched_at, models));
+            }
+        }
+    }
+    newest_cached
+        .or(newest_published)
+        .map(|(_, models)| models)
+        .unwrap_or_default()
+}
+
+pub fn read_codex_harness_config(global_home: &Path, project_root: Option<&Path>) -> HarnessProviderConfig {    let global = read_toml_if_exists(&global_home.join("config.toml"));
     let project = project_root.and_then(|root| read_toml_if_exists(&root.join(".codex").join("config.toml")));
     if global.is_none() && project.is_none() {
         return HarnessProviderConfig::default();
@@ -194,11 +321,149 @@ pub fn read_codex_harness_config(global_home: &Path, project_root: Option<&Path>
     }
 }
 
+/// Strips // and /* */ comments from JSONC text without touching string literals.
+fn strip_jsonc_comments(contents: &str) -> String {
+    let mut output = String::with_capacity(contents.len());
+    let mut chars = contents.chars().peekable();
+    let mut in_string = false;
+    while let Some(ch) = chars.next() {
+        if in_string {
+            output.push(ch);
+            if ch == '\\' {
+                if let Some(escaped) = chars.next() {
+                    output.push(escaped);
+                }
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                in_string = true;
+                output.push(ch);
+            }
+            '/' => match chars.peek() {
+                Some('/') => {
+                    for skip in chars.by_ref() {
+                        if skip == '\n' {
+                            output.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut previous = '\0';
+                    for skip in chars.by_ref() {
+                        if previous == '*' && skip == '/' {
+                            break;
+                        }
+                        if skip == '\n' {
+                            output.push('\n');
+                        }
+                        previous = skip;
+                    }
+                }
+                _ => output.push(ch),
+            },
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+/// Removes commas followed only by whitespace and a closing brace or bracket.
+fn strip_jsonc_trailing_commas(contents: &str) -> String {
+    let chars: Vec<char> = contents.chars().collect();
+    let mut output = String::with_capacity(contents.len());
+    let mut in_string = false;
+    let mut index = 0;
+    while index < chars.len() {
+        let ch = chars[index];
+        if in_string {
+            output.push(ch);
+            if ch == '\\' && index + 1 < chars.len() {
+                index += 1;
+                output.push(chars[index]);
+            } else if ch == '"' {
+                in_string = false;
+            }
+            index += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            output.push(ch);
+            index += 1;
+            continue;
+        }
+        if ch == ',' {
+            let mut lookahead = index + 1;
+            while lookahead < chars.len() && chars[lookahead].is_whitespace() {
+                lookahead += 1;
+            }
+            if lookahead < chars.len() && (chars[lookahead] == '}' || chars[lookahead] == ']') {
+                index += 1;
+                continue;
+            }
+        }
+        output.push(ch);
+        index += 1;
+    }
+    output
+}
+
+fn parse_jsonc(contents: &str) -> Option<Value> {
+    if let Ok(value) = serde_json::from_str(contents) {
+        return Some(value);
+    }
+    let stripped = strip_jsonc_trailing_commas(&strip_jsonc_comments(contents));
+    serde_json::from_str(&stripped).ok()
+}
+
+fn read_opencode_config_file(path: &Path) -> Option<Value> {
+    if !path.is_file() {
+        return None;
+    }
+    let contents = std::fs::read_to_string(path).ok()?;
+    parse_jsonc(&contents)
+}
+
+/// Reads the opencode config (`opencode.json`/`opencode.jsonc`, global then
+/// project) for the default `model` slug, e.g. `myprovider/rits/zai-org/glm-5-3`.
+/// Auth stays opencode's own concern: provider API keys live inside its config,
+/// so baton neither injects keys nor overrides the billing mode.
+pub fn read_opencode_harness_config(global_dir: &Path, project_root: Option<&Path>) -> HarnessProviderConfig {
+    let global = read_opencode_config_file(&global_dir.join("opencode.json"))
+        .or_else(|| read_opencode_config_file(&global_dir.join("opencode.jsonc")));
+    let project = project_root.and_then(|root| {
+        read_opencode_config_file(&root.join("opencode.json"))
+            .or_else(|| read_opencode_config_file(&root.join("opencode.jsonc")))
+    });
+    let model = project
+        .as_ref()
+        .and_then(|layer| layer.get("model").and_then(Value::as_str))
+        .or_else(|| global.as_ref().and_then(|layer| layer.get("model").and_then(Value::as_str)))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    HarnessProviderConfig {
+        model,
+        auth_mode: None,
+        api_key: None,
+        api_key_env_name: None,
+        permission_mode: None,
+        model_provider: None,
+    }
+}
+
 pub fn read_harness_config(
     provider: ProviderId,
     project_root: Option<&Path>,
     claude_dir: Option<&Path>,
     codex_home: Option<&Path>,
+    opencode_dir: Option<&Path>,
 ) -> HarnessProviderConfig {
     match provider {
         ProviderId::Claude => read_claude_harness_config(
@@ -209,7 +474,11 @@ pub fn read_harness_config(
             codex_home.unwrap_or(&crate::paths::codex_global_home()),
             project_root,
         ),
-        ProviderId::Cursor | ProviderId::Grok | ProviderId::OpenCode | ProviderId::Antigravity => {
+        ProviderId::OpenCode => read_opencode_harness_config(
+            opencode_dir.unwrap_or(&crate::paths::opencode_global_config_dir()),
+            project_root,
+        ),
+        ProviderId::Cursor | ProviderId::Grok | ProviderId::Antigravity => {
             HarnessProviderConfig::default()
         }
     }

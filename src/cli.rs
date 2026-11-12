@@ -57,14 +57,33 @@ pub enum Commands {
     /// Run a prompt non-interactively and print the result
     Exec {
         prompt: Vec<String>,
+        /// Emit a JSON result object instead of plain text
+        #[arg(long)]
+        json: bool,
     },
     /// Update baton to the latest version
     Update,
     Chat,
+    /// Serve the local thread store over MCP stdio for coding agents
+    Mcp,
     #[command(visible_alias = "list")]
-    Threads,
+    Threads {
+        /// Emit a JSON array
+        #[arg(long)]
+        json: bool,
+    },
     New {
         title: Vec<String>,
+    },
+    /// Branch a thread's conversation into a new thread
+    Fork {
+        title: Vec<String>,
+        /// Copy only messages and turns through this completed turn
+        #[arg(long)]
+        turn: Option<i64>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
     },
     Import,
     Checkpoints {
@@ -91,5 +110,57 @@ pub enum Commands {
     /// Set the default provider (used by exec and new threads)
     Default {
         provider: String,
+    },
+    /// Open this thread in the provider's native CLI
+    Resume {
+        /// Fork the native session instead of resuming it in place
+        #[arg(long)]
+        fork: bool,
+        /// Print the command instead of running it
+        #[arg(long)]
+        print: bool,
+        /// Resume even if the thread has an open turn
+        #[arg(long)]
+        force: bool,
+    },
+    /// Show thread phase, goal, queue, and usage
+    Status {
+        thread_id: Option<String>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// Search thread titles and conversation text
+    Search {
+        query: Vec<String>,
+        /// Search every project instead of the current directory
+        #[arg(long)]
+        all: bool,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// List durable turn phases for a thread
+    Turns {
+        thread_id: Option<String>,
+        /// Emit a JSON array instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// List or clear durable queued follow-ups
+    Queue {
+        thread_id: Option<String>,
+        /// Remove every queued message
+        #[arg(long)]
+        clear: bool,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// List provider processes tracked by baton
+    Ps {
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
     },
 }

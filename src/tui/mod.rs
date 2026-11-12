@@ -16,12 +16,15 @@ use crate::handoff::git_branch_label;
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
-use crate::types::{ApprovalDecision, PermissionMode, ProviderId};
+use crate::types::{ApprovalDecision, PermissionMode, ProviderId, TurnPhase};
 use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 
 pub mod viewport;
 
-use viewport::{window_messages, wrapped_rows, ViewportItem};
+mod diff_render;
+mod markdown;
+
+use viewport::wrapped_rows;
 
 const COLORS: ColorConstants = ColorConstants {
     accent: Color::Rgb(240, 198, 116),
@@ -30,6 +33,7 @@ const COLORS: ColorConstants = ColorConstants {
     muted: Color::Rgb(148, 163, 184),
     border: Color::Rgb(59, 68, 80),
     user_bg: Color::Rgb(48, 54, 61),
+    code_bg: Color::Rgb(30, 36, 46),
     success: Color::Rgb(134, 239, 172),
     error: Color::Rgb(252, 165, 165),
     warning: Color::Rgb(251, 191, 36),
@@ -42,6 +46,7 @@ struct ColorConstants {
     muted: Color,
     border: Color,
     user_bg: Color,
+    code_bg: Color,
     success: Color,
     error: Color,
     warning: Color,
@@ -58,20 +63,25 @@ const LOGO_ROWS: [&str; 6] = [
 ];
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/switch", "switch harness: /switch <claude|codex> [model]"),
+    ("/switch", "switch harness: /switch <provider> [model]"),
     ("/model", "set model for this thread"),
     ("/mode", "permission mode: default|acceptEdits|bypassPermissions|plan"),
     ("/auth", "billing mode: /auth <provider> <subscription|api>"),
     ("/new", "start a new thread"),
+    ("/fork", "branch this conversation into a new thread"),
     ("/threads", "list threads in this directory"),
     ("/open", "open a thread by id prefix"),
     ("/usage", "token usage and cache hit rate"),
     ("/checkpoints", "list checkpoints for this thread"),
+    ("/review", "review the latest turn diff with line notes"),
     ("/diff", "diff a checkpoint against the working tree"),
     ("/rewind", "rewind to a previous message"),
     ("/goal", "set a multi-turn objective the agent works toward"),
     ("/find", "search the conversation"),
     ("/multi", "send the same prompt to multiple providers"),
+    ("/queue", "show or clear queued follow-ups"),
+    ("/turns", "list durable turn phases"),
+    ("/status", "show this thread's phase, goal, and queue"),
     ("/compact", "compact the conversation to free context"),
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),
@@ -79,12 +89,14 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/settings", "configure the current harness's settings"),
     ("/mcp", "manage MCP servers and sync across harnesses"),
     ("/skills", "list skills across harnesses"),
+    ("/copy", "copy the latest assistant reply to the clipboard"),
     ("/clear", "clear panels and notices"),
     ("/quit", "exit baton"),
 ];
 
 #[derive(Debug, Clone, PartialEq)]
 struct ToolLine {
+    id: Option<String>,
     label: String,
     status: ToolStatus,
 }
@@ -96,13 +108,67 @@ enum ToolStatus {
     Failed,
 }
 
+#[derive(Debug, Clone)]
+struct ReviewNote {
+    id: i64,
+    path: String,
+    line: usize,
+    added: bool,
+    body: String,
+}
+
+struct ReviewState {
+    turn: i64,
+    fingerprint: String,
+    rows: Vec<diff_render::DiffRowRef>,
+    selected: usize,
+    notes: Vec<ReviewNote>,
+    note_input: Option<String>,
+}
+
+struct ApprovalState {
+    thread_id: String,
+    summary: String,
+    respond: tokio::sync::oneshot::Sender<ApprovalDecision>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum MultiStatus {
+    Queued,
+    Running,
+    Done,
+    Failed,
+}
+
+struct MultiChild {
+    thread_id: String,
+    provider: ProviderId,
+    status: MultiStatus,
+    reply: String,
+    error: Option<String>,
+}
+
+struct MultiView {
+    prompt: String,
+    selected: usize,
+    children: Vec<MultiChild>,
+}
+
+#[derive(Debug, Clone)]
+struct InputRow {
+    screen_y: u16,
+    screen_x_start: u16,
+    char_start: usize,
+    line_len: usize,
+    scroll: usize,
+}
+
 enum Overlay {
     None,
-    Approval { summary: String, respond: tokio::sync::oneshot::Sender<ApprovalDecision> },
     RewindPicker { selected: usize },
     CodeConfirm { turn: i64, git_ref: String },
     SwitchPicker { selected: usize },
-    ModelPicker { provider: ProviderId, models: Vec<String>, selected: usize },
+    ModelPicker { provider: ProviderId, models: Vec<String>, selected: usize, filter: String },
     SettingsPicker { provider: ProviderId, categories: Vec<(String, Vec<String>)>, category_index: usize, value_index: usize },
     McpPicker { selected: usize },
     SkillsPicker { selected: usize, skills: Vec<(String, String)> },
@@ -127,18 +193,26 @@ pub struct TuiState {
     prompt_history_index: Option<usize>,
     queued_messages: Vec<String>,
     goal: Option<String>,
+    goal_paused: bool,
     custom_commands: Vec<(String, String)>,
     home: std::path::PathBuf,
     thread: ThreadRow,
     history: Vec<MessageRow>,
     input: String,
+    input_cursor: usize,
+    input_layout: std::cell::RefCell<Vec<InputRow>>,
     running: bool,
-    turn_started: Option<Instant>,
+    queued_provider: Option<ProviderId>,
     streaming_text: String,
     tool_lines: Vec<ToolLine>,
     overlay: Overlay,
+    approvals: Vec<ApprovalState>,
+    review: Option<ReviewState>,
+    multi: Option<MultiView>,
     notice: Option<String>,
     diff_output: Option<String>,
+    diff_cache: std::cell::RefCell<diff_render::DiffCache>,
+    markdown_cache: std::cell::RefCell<markdown::MarkdownCache>,
     permission_mode: PermissionMode,
     scroll_offset: usize,
     esc_primed: bool,
@@ -146,6 +220,9 @@ pub struct TuiState {
     branch_label: Option<String>,
     quit: bool,
     suggestion_index: usize,
+    selection_anchor: Option<usize>,
+    selection: Option<(usize, usize)>,
+    input_origin: std::cell::Cell<(u16, u16)>,
 }
 
 pub fn run_tui(
@@ -154,33 +231,54 @@ pub fn run_tui(
     thread: ThreadRow,
     engine_command_sender: tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     engine_event_receiver: std::sync::mpsc::Receiver<EngineEvent>,
-    turn_event_receiver: std::sync::mpsc::Receiver<TurnEvent>,
+    turn_event_receiver: std::sync::mpsc::Receiver<(String, TurnEvent)>,
     initial_prompt: Option<String>,
-    initial_permission_mode: PermissionMode,
+    permission_override: Option<PermissionMode>,
 ) -> Result<()> {
     let history = store.lock().unwrap().list_messages(&thread.id)?;
+    let queued_messages = store
+        .lock()
+        .unwrap()
+        .list_queued_messages(&thread.id)
+        .unwrap_or_default();
+    let prompt_history = store.lock().unwrap().list_prompt_history(&thread.cwd).unwrap_or_default();
     let branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
-    let permission_mode = initial_permission_mode;
+    let permission_mode = permission_override.unwrap_or(thread.permission_mode);
+    let goal = thread.goal.clone();
+    let goal_paused = thread.goal_paused;
+    let reconciled = store
+        .lock()
+        .unwrap()
+        .reconcile_running_turns(Some(thread.cwd.as_str()))
+        .unwrap_or_default();
 
     let custom_commands = discover_custom_commands(&thread.cwd);
     let mut state = TuiState {
         store: store.clone(),
-        prompt_history: Vec::new(),
+        prompt_history,
         prompt_history_index: None,
-        queued_messages: Vec::new(),
-        goal: None,
+        queued_messages,
+        goal,
+        goal_paused,
         custom_commands,
         home,
         thread,
         history,
         input: String::new(),
+        input_cursor: 0,
+        input_layout: std::cell::RefCell::new(Vec::new()),
         running: false,
-        turn_started: None,
+        queued_provider: None,
         streaming_text: String::new(),
         tool_lines: Vec::new(),
         overlay: Overlay::None,
+        approvals: Vec::new(),
+        review: None,
+        multi: None,
         notice: None,
         diff_output: None,
+        diff_cache: std::cell::RefCell::new(diff_render::DiffCache::default()),
+        markdown_cache: std::cell::RefCell::new(markdown::MarkdownCache::default()),
         permission_mode,
         scroll_offset: 0,
         esc_primed: false,
@@ -188,45 +286,87 @@ pub fn run_tui(
         branch_label,
         quit: false,
         suggestion_index: 0,
+        selection_anchor: None,
+        selection: None,
+        input_origin: std::cell::Cell::new((0, 0)),
     };
+
+    if !reconciled.is_empty() {
+        let turns = reconciled
+            .iter()
+            .map(|row| row.turn.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        state.notice = Some(format!(
+            "previous turn(s) {turns} did not finish and were marked unverified"
+        ));
+    }
 
     if let Some(prompt) = initial_prompt {
         state.prompt_history.push(prompt.clone());
         let thread_id = state.thread.id.clone();
         let result = {
-            let mut guard = store.lock().unwrap();
+            let guard = store.lock().unwrap();
             ensure_persisted(&guard, &mut state.thread)
         };
         if result.is_ok() {
+            {
+                let guard = store.lock().unwrap();
+                let _ = guard.set_thread_permission_mode(&thread_id, state.permission_mode);
+                let _ = guard.set_thread_goal(
+                    &thread_id,
+                    state.goal.as_deref(),
+                    state.goal_paused,
+                );
+            }
             let _ = engine_command_sender.send(EngineCommand::Submit {
                 thread_id,
                 text: prompt,
                 permission_mode: state.permission_mode,
             });
             state.running = true;
-            state.turn_started = Some(Instant::now());
         }
     }
 
     terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, crossterm::cursor::Hide)?;
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide,
+        crossterm::event::EnableMouseCapture
+    )?;
+    // Let terminals report Shift+Enter distinctly from Enter. Unsupported
+    // terminals ignore this and keep the Alt+Enter fallback.
+    let _ = execute!(
+        std::io::stdout(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    );
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let mut spinner_frame = 0usize;
     while !state.quit {
-        while let Ok(event) = turn_event_receiver.try_recv() {
-            apply_turn_event(&mut state, event);
+        while let Ok((event_thread, event)) = turn_event_receiver.try_recv() {
+            apply_turn_event_for_thread(&mut state, event_thread, event);
         }
         while let Ok(event) = engine_event_receiver.try_recv() {
             apply_engine_event(&mut state, &store, event, &engine_command_sender);
         }
         if crossterm::event::poll(Duration::from_millis(32))? {
-            if let Event::Key(key) = crossterm::event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    handle_key(&mut state, &store, &engine_command_sender, key);
+            match crossterm::event::read()? {
+                Event::Key(key) => {
+                    if key.kind == KeyEventKind::Press {
+                        if std::env::var_os("BATON_DEBUG_KEYS").is_some() {
+                            eprintln!("baton key: {:?} {:?}", key.code, key.modifiers);
+                        }
+                        handle_key(&mut state, &store, &engine_command_sender, key);
+                    }
                 }
+                Event::Mouse(mouse) => handle_mouse(&mut state, mouse),
+                _ => {}
             }
         }
         spinner_frame = (spinner_frame + 1) % SPINNER_FRAMES.len();
@@ -234,13 +374,44 @@ pub fn run_tui(
     }
 
     terminal::disable_raw_mode()?;
+    let _ = execute!(
+        terminal.backend_mut(),
+        crossterm::event::PopKeyboardEnhancementFlags
+    );
     execute!(
         terminal.backend_mut(),
         crossterm::cursor::Show,
-        terminal::LeaveAlternateScreen
+        terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture
     )?;
     let _ = engine_command_sender.send(EngineCommand::Quit);
     Ok(())
+}
+
+/// Mouse selection inside the composer input: click sets an anchor, drag
+/// extends an orange-highlighted range, and clicks outside the input clear it.
+fn handle_mouse(state: &mut TuiState, mouse: crossterm::event::MouseEvent) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let index = input_index_at(state, mouse.column, mouse.row);
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(index) = index {
+                state.selection_anchor = Some(index);
+                state.selection = Some((index, index));
+                state.input_cursor = index;
+            } else {
+                state.selection_anchor = None;
+                state.selection = None;
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let (Some(anchor), Some(index)) = (state.selection_anchor, index) {
+                state.selection = Some((anchor.min(index), anchor.max(index)));
+                state.input_cursor = index;
+            }
+        }
+        _ => {}
+    }
 }
 
 fn apply_engine_event(
@@ -265,40 +436,194 @@ fn apply_engine_event(
                 state.scroll_offset = 0;
             }
         }
-        EngineEvent::TurnStarted { thread_id } => {
-            if thread_id == state.thread.id {
-                state.running = true;
-                state.turn_started = Some(Instant::now());
-                state.streaming_text.clear();
-                state.tool_lines.clear();
-                state.notice = None;
-                state.diff_output = None;
+        EngineEvent::TurnQueued { thread_id, provider } => {
+            if let Some(child) = state
+                .multi
+                .as_mut()
+                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+            {
+                child.status = MultiStatus::Queued;
+                child.error = None;
             }
+            if thread_id != state.thread.id {
+                return;
+            }
+            state.running = true;
+            state.queued_provider = Some(provider);
+            state.streaming_text.clear();
+            state.tool_lines.clear();
+            state.notice = Some(format!(
+                "queued for {provider}; waiting for that provider's active turn to finish"
+            ));
         }
-        EngineEvent::TurnFinished { thread_id, ok, error } => {
-            if thread_id == state.thread.id {
-                state.running = false;
-                state.turn_started = None;
-                state.streaming_text.clear();
-                state.tool_lines.clear();
-                {
-                    let guard = store.lock().unwrap();
-                    state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
-                    if let Some(fresh) = guard.get_thread(&state.thread.id).unwrap_or(None) {
-                        state.thread = fresh;
+        EngineEvent::TurnStarted { thread_id } => {
+            state.approvals.retain(|approval| approval.thread_id != thread_id);
+            if let Some(child) = state
+                .multi
+                .as_mut()
+                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+            {
+                child.status = MultiStatus::Running;
+                child.error = None;
+            }
+            if thread_id != state.thread.id {
+                return;
+            }
+            state.running = true;
+            state.queued_provider = None;
+            state.streaming_text.clear();
+            state.tool_lines.clear();
+            state.notice = None;
+            state.diff_output = None;
+        }
+        EngineEvent::TurnFinished { thread_id, ok, error, phase } => {
+            state.approvals.retain(|approval| approval.thread_id != thread_id);
+            if let Some(child) = state
+                .multi
+                .as_mut()
+                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+            {
+                child.status = if ok { MultiStatus::Done } else { MultiStatus::Failed };
+                child.error = error.clone();
+                if ok {
+                    let reply = store
+                        .lock()
+                        .unwrap()
+                        .list_messages(&thread_id)
+                        .ok()
+                        .and_then(|messages| {
+                            messages
+                                .into_iter()
+                                .rev()
+                                .find(|message| message.role == "assistant")
+                                .map(|message| message.text)
+                        });
+                    if let Some(reply) = reply {
+                        child.reply = reply;
                     }
                 }
-                state.scroll_offset = 0;
-                if !ok {
-                    state.notice = Some(format!("turn failed: {}", error.unwrap_or_else(|| "unknown error".into())));
+            }
+            if thread_id != state.thread.id {
+                return;
+            }
+            state.running = false;
+            state.queued_provider = None;
+            state.streaming_text.clear();
+            state.tool_lines.clear();
+            {
+                let guard = store.lock().unwrap();
+                state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
+                if let Some(fresh) = guard.get_thread(&state.thread.id).unwrap_or(None) {
+                    state.thread = fresh;
                 }
-                if let Some(next) = state.queued_messages.first().cloned() {
-                    state.queued_messages.remove(0);
+            }
+            state.scroll_offset = 0;
+            if !ok {
+                let detail = error.unwrap_or_else(|| "unknown error".into());
+                state.notice = Some(match phase {
+                    TurnPhase::Interrupted => "turn interrupted".to_string(),
+                    TurnPhase::Unverified => format!("turn unverified: {detail}"),
+                    _ => format!("turn failed: {detail}"),
+                });
+            }
+            // Only advance the queue after a clean turn. A failure or an
+            // interrupt should not automatically fire the next prompt.
+            if ok {
+                let next = store
+                    .lock()
+                    .unwrap()
+                    .pop_queued_message(&state.thread.id)
+                    .unwrap_or(None);
+                if let Some(next) = next {
+                    state.queued_messages = store
+                        .lock()
+                        .unwrap()
+                        .list_queued_messages(&state.thread.id)
+                        .unwrap_or_default();
                     let remaining = state.queued_messages.len();
                     let preview: String = next.chars().take(60).collect();
                     state.notice = Some(format!("sending queued message ({remaining} remaining): {preview}"));
                     submit(state, store, engine_command_sender, next);
                 }
+            } else if !state.queued_messages.is_empty() {
+                let waiting = state.queued_messages.len();
+                let prefix = state.notice.take().unwrap_or_default();
+                state.notice = Some(format!("{prefix} · {waiting} queued message(s) kept; press enter to send"));
+            }
+        }
+        EngineEvent::ModelsLoaded { thread_id, provider, models, error } => {
+            if thread_id != state.thread.id {
+                return;
+            }
+            let picker_matches = matches!(
+                &state.overlay,
+                Overlay::ModelPicker { provider: current, .. } if *current == provider
+            );
+            if !picker_matches {
+                return;
+            }
+            if models.is_empty() {
+                if let Some(error) = error {
+                    state.notice = Some(format!(
+                        "live model catalog unavailable for {provider}: {error}"
+                    ));
+                }
+                return;
+            }
+            let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+            let default_model = resolved.for_provider(provider).model.clone();
+            let mut live = models;
+            if !default_model.is_empty() && !live.contains(&default_model) {
+                live.insert(0, default_model);
+            }
+            let count = live.len();
+            if let Overlay::ModelPicker {
+                models: current,
+                selected,
+                filter,
+                ..
+            } = &mut state.overlay
+            {
+                let previous = model_filter_indices(current, filter)
+                    .get(*selected)
+                    .and_then(|index| current.get(*index))
+                    .cloned();
+                *current = live;
+                let filtered = model_filter_indices(current, filter);
+                *selected = previous
+                    .and_then(|model| {
+                        filtered
+                            .iter()
+                            .position(|index| current[*index] == model)
+                    })
+                    .unwrap_or(0);
+            }
+            state.notice = Some(format!("loaded {count} live model(s) for {provider}"));
+        }
+        EngineEvent::TurnRejected { thread_id, text, reason } => {
+            if let Some(child) = state
+                .multi
+                .as_mut()
+                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+            {
+                child.status = MultiStatus::Failed;
+                child.error = Some(reason.clone());
+            }
+            if thread_id == state.thread.id {
+                enqueue_message(state, store, text);
+                state.notice = Some(format!(
+                    "{reason}; queued ({} waiting)",
+                    state.queued_messages.len()
+                ));
+            }
+        }
+        EngineEvent::SteerRejected { thread_id, text } => {
+            if thread_id == state.thread.id {
+                enqueue_message(state, store, text);
+                state.notice = Some(format!(
+                    "message queued for after this turn ({} waiting)",
+                    state.queued_messages.len()
+                ));
             }
         }
         EngineEvent::Turn(_) => {}
@@ -311,31 +636,138 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
             state.streaming_text.push_str(&text);
         }
         TurnEvent::AssistantText { .. } => {}
-        TurnEvent::ToolStarted { tool, detail } => {
+        TurnEvent::ToolStarted { id, tool, detail } => {
             let label = match detail {
                 Some(detail) => format!("{tool} {detail}"),
                 None => tool,
             };
-            state.tool_lines.push(ToolLine { label, status: ToolStatus::Running });
+            if let Some(id) = id.as_deref() {
+                if let Some(line) = state
+                    .tool_lines
+                    .iter_mut()
+                    .rev()
+                    .find(|line| line.status == ToolStatus::Running && line.id.as_deref() == Some(id))
+                {
+                    line.label = label;
+                    return;
+                }
+            }
+            state.tool_lines.push(ToolLine { id, label, status: ToolStatus::Running });
         }
-        TurnEvent::ToolCompleted { tool, detail, exit_code } => {
+        TurnEvent::ToolCompleted { id, tool, detail, exit_code } => {
             let label = match detail {
                 Some(detail) => format!("{tool} {detail}"),
                 None => tool,
             };
             let status = if exit_code.unwrap_or(0) != 0 { ToolStatus::Failed } else { ToolStatus::Done };
-            if let Some(line) = state.tool_lines.iter_mut().rev().find(|line| line.status == ToolStatus::Running) {
+            let matched = match id.as_deref() {
+                Some(id) => state
+                    .tool_lines
+                    .iter_mut()
+                    .rev()
+                    .find(|line| line.status == ToolStatus::Running && line.id.as_deref() == Some(id)),
+                None => state
+                    .tool_lines
+                    .iter_mut()
+                    .rev()
+                    .find(|line| line.status == ToolStatus::Running),
+            };
+            if let Some(line) = matched {
                 line.status = status;
             } else {
-                state.tool_lines.push(ToolLine { label, status });
+                state.tool_lines.push(ToolLine { id, label, status });
             }
         }
-        TurnEvent::ApprovalRequest { summary, respond, .. } => {
-            state.overlay = Overlay::Approval { summary, respond };
-        }
         TurnEvent::Usage { .. } => {}
-        TurnEvent::TurnCompleted { .. } | TurnEvent::TurnFailed { .. } => {}
+        // Approval requests need their thread id, so the run loop routes them
+        // through apply_turn_event_for_thread before calling this function.
+        TurnEvent::ApprovalRequest { .. } => {}
+        TurnEvent::TurnCompleted { .. }
+        | TurnEvent::TurnInterrupted { .. }
+        | TurnEvent::TurnFailed { .. } => {}
     }
+}
+
+fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: TurnEvent) {
+    if let Some(child) = state
+        .multi
+        .as_mut()
+        .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
+    {
+        match &event {
+            TurnEvent::TextDelta { text } => child.reply.push_str(text),
+            TurnEvent::TurnFailed { error } => {
+                child.status = MultiStatus::Failed;
+                child.error = Some(error.clone());
+            }
+            TurnEvent::TurnInterrupted { reason } => {
+                child.status = MultiStatus::Failed;
+                child.error = Some(reason.clone().unwrap_or_else(|| "interrupted".into()));
+            }
+            _ => {}
+        }
+    }
+    match event {
+        TurnEvent::ApprovalRequest {
+            summary, respond, ..
+        } => state.approvals.push(ApprovalState {
+            thread_id,
+            summary,
+            respond,
+        }),
+        event if thread_id == state.thread.id => apply_turn_event(state, event),
+        _ => {}
+    }
+}
+
+fn load_thread_state(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    thread: ThreadRow,
+) {
+    state.permission_mode = thread.permission_mode;
+    state.goal = thread.goal.clone();
+    state.goal_paused = thread.goal_paused;
+    state.thread = thread.clone();
+    let guard = store.lock().unwrap();
+    state.history = guard.list_messages(&thread.id).unwrap_or_default();
+    state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
+    state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
+    state.diff_output = None;
+    state.scroll_offset = 0;
+    state.notice = Some(format!("opened {}", thread.title));
+}
+
+fn input_index_at(state: &TuiState, column: u16, row: u16) -> Option<usize> {
+    let layout = state.input_layout.borrow();
+    let line = layout.iter().find(|line| line.screen_y == row)?;
+    let column = column.saturating_sub(line.screen_x_start) as usize;
+    Some((line.char_start + line.scroll + column).min(line.char_start + line.line_len))
+}
+
+fn char_to_byte(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map(|(byte, _)| byte)
+        .unwrap_or(text.len())
+}
+
+fn model_filter_indices(models: &[String], filter: &str) -> Vec<usize> {
+    let needle = filter.as_bytes();
+    if needle.is_empty() {
+        return (0..models.len()).collect();
+    }
+    models
+        .iter()
+        .enumerate()
+        .filter(|(_, model)| {
+            model
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
+        })
+        .map(|(index, _)| index)
+        .collect()
 }
 
 fn suggestions_for(input: &str) -> Vec<&'static (&'static str, &'static str)> {
@@ -357,7 +789,7 @@ fn handle_key(
 ) {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if state.running {
-            let _ = engine_command_sender.send(EngineCommand::Interrupt);
+            let _ = engine_command_sender.send(EngineCommand::Interrupt { thread_id: state.thread.id.clone() });
             state.notice = Some("interrupting...".into());
             return;
         }
@@ -373,21 +805,81 @@ fn handle_key(
         return;
     }
 
+    if !state.approvals.is_empty() {
+        let decision = match key.code {
+            KeyCode::Char('y') => Some(ApprovalDecision::Accept),
+            KeyCode::Char('a') => Some(ApprovalDecision::AcceptAlways),
+            KeyCode::Char('n') => Some(ApprovalDecision::Deny),
+            _ => None,
+        };
+        if let Some(decision) = decision {
+            let approval = state.approvals.pop().expect("approval checked above");
+            let label = match decision {
+                ApprovalDecision::Accept => "accepted once",
+                ApprovalDecision::AcceptAlways => "accepted for the session",
+                ApprovalDecision::Deny => "denied",
+            };
+            if approval.respond.send(decision).is_err() {
+                state.notice = Some("approval request expired".into());
+            } else if state.approvals.is_empty() {
+                state.notice = Some(format!("approval {label}"));
+            } else {
+                state.notice = Some(format!(
+                    "approval {label} · {} request(s) still waiting",
+                    state.approvals.len()
+                ));
+            }
+        }
+        return;
+    }
+
+    if let Some(mut multi) = state.multi.take() {
+        let mut open_thread = None;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Up | KeyCode::Char('k') => {
+                multi.selected = multi.selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !multi.children.is_empty() {
+                    multi.selected = (multi.selected + 1).min(multi.children.len() - 1);
+                }
+            }
+            KeyCode::PageUp => {
+                multi.selected = multi.selected.saturating_sub(5);
+            }
+            KeyCode::PageDown => {
+                if !multi.children.is_empty() {
+                    multi.selected = (multi.selected + 5).min(multi.children.len() - 1);
+                }
+            }
+            KeyCode::Enter => {
+                open_thread = multi
+                    .children
+                    .get(multi.selected)
+                    .map(|child| child.thread_id.clone());
+            }
+            _ => {}
+        }
+        if let Some(thread_id) = open_thread {
+            let thread = store.lock().unwrap().get_thread(&thread_id).unwrap_or(None);
+            if let Some(thread) = thread {
+                load_thread_state(state, store, thread);
+                state.multi = None;
+                return;
+            }
+            state.notice = Some(format!("parallel thread {thread_id} no longer exists"));
+        }
+        state.multi = Some(multi);
+        return;
+    }
+
+    if state.review.is_some() {
+        handle_review_key(state, store, engine_command_sender, key);
+        return;
+    }
+
     match std::mem::replace(&mut state.overlay, Overlay::None) {
-        Overlay::Approval { summary, respond } => match key.code {
-            KeyCode::Char('y') => {
-                let _ = respond.send(ApprovalDecision::Accept);
-            }
-            KeyCode::Char('a') => {
-                let _ = respond.send(ApprovalDecision::AcceptAlways);
-            }
-            KeyCode::Char('n') => {
-                let _ = respond.send(ApprovalDecision::Deny);
-            }
-            _ => {
-                state.overlay = Overlay::Approval { summary, respond };
-            }
-        },
         Overlay::RewindPicker { mut selected } => {
             let user_messages: Vec<(i64, String)> = state
                 .history
@@ -444,40 +936,86 @@ fn handle_key(
                     if !models.contains(&default_model) {
                         models.insert(0, default_model);
                     }
-                    state.overlay = Overlay::ModelPicker { provider, models, selected: 0 };
+                    let _ = engine_command_sender.send(EngineCommand::ListModels {
+                        thread_id: state.thread.id.clone(),
+                        provider,
+                    });
+                    state.overlay = Overlay::ModelPicker {
+                        provider,
+                        models,
+                        selected: 0,
+                        filter: String::new(),
+                    };
                 }
             }
             _ => {
                 state.overlay = Overlay::SwitchPicker { selected };
             }
         },
-        Overlay::ModelPicker { provider, models, mut selected } => match key.code {
-            KeyCode::Esc | KeyCode::Left => {
-                if key.code == KeyCode::Left {
+        Overlay::ModelPicker {
+            provider,
+            models,
+            mut selected,
+            mut filter,
+        } => {
+            let filtered = model_filter_indices(&models, &filter);
+            match key.code {
+                KeyCode::Esc => {
+                    if filter.is_empty() {
+                        return;
+                    }
+                    filter.clear();
+                    selected = 0;
+                }
+                KeyCode::Left => {
                     state.overlay = Overlay::SwitchPicker { selected: 0 };
+                    return;
                 }
-            }
-            KeyCode::Up => {
-                if !models.is_empty() {
-                    selected = (selected + models.len() - 1) % models.len();
+                KeyCode::Backspace => {
+                    filter.pop();
+                    selected = 0;
                 }
-                state.overlay = Overlay::ModelPicker { provider, models, selected };
-            }
-            KeyCode::Down => {
-                if !models.is_empty() {
-                    selected = (selected + 1) % models.len();
+                KeyCode::Char(character)
+                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    filter.push(character);
+                    selected = 0;
                 }
-                state.overlay = Overlay::ModelPicker { provider, models, selected };
-            }
-            KeyCode::Enter => {
-                if let Some(model) = models.get(selected).cloned() {
-                    perform_switch(state, store, provider, Some(model));
+                KeyCode::Up => {
+                    if !filtered.is_empty() {
+                        selected = (selected + filtered.len() - 1) % filtered.len();
+                    }
                 }
+                KeyCode::Down => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 1) % filtered.len();
+                    }
+                }
+                KeyCode::PageUp => {
+                    selected = selected.saturating_sub(10);
+                }
+                KeyCode::PageDown => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 10).min(filtered.len() - 1);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(index) = filtered.get(selected) {
+                        if let Some(model) = models.get(*index).cloned() {
+                            perform_switch(state, store, provider, Some(model));
+                            return;
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {
-                state.overlay = Overlay::ModelPicker { provider, models, selected };
-            }
-        },
+            state.overlay = Overlay::ModelPicker {
+                provider,
+                models,
+                selected,
+                filter,
+            };
+        }
         Overlay::SettingsPicker { provider, categories, mut category_index, mut value_index } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Left => {
@@ -595,7 +1133,7 @@ fn handle_key(
             KeyCode::Enter => {
                 let modes = [PermissionMode::Default, PermissionMode::AcceptEdits, PermissionMode::BypassPermissions, PermissionMode::Plan];
                 if let Some(mode) = modes.get(selected) {
-                    state.permission_mode = *mode;
+                    state.apply_permission_mode(store, *mode);
                     state.notice = Some(format!("permission mode: {mode}"));
                 }
             }
@@ -662,9 +1200,13 @@ fn handle_key(
                             .find(|thread| thread.id.starts_with(thread_id.as_str()))
                     };
                     if let Some(thread) = found {
+                        state.permission_mode = thread.permission_mode;
+                        state.goal = thread.goal.clone();
+                        state.goal_paused = thread.goal_paused;
                         state.thread = thread.clone();
                         let guard = store.lock().unwrap();
                         state.history = guard.list_messages(&thread.id).unwrap_or_default();
+                        state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
                         state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
                         state.diff_output = None;
                         state.scroll_offset = 0;
@@ -750,13 +1292,237 @@ fn apply_rewind(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, turn: i64,
                 }
             }
             state.scroll_offset = 0;
-            state.input = text;
+            state.queued_messages.clear();
+            state.set_input(text);
             state.notice = Some(format!("rewound to before turn {turn}; message restored to composer"));
         }
         Err(error) => {
             state.notice = Some(format!("rewind failed: {error}"));
         }
     }
+}
+
+fn enqueue_message(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, text: String) {
+    let _ = store
+        .lock()
+        .unwrap()
+        .enqueue_message(&state.thread.id, &text);
+    state.queued_messages.push(text);
+}
+
+fn dispatch_message(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    text: String,
+    allow_commands: bool,
+) {
+    if allow_commands && text.starts_with('/') {
+        handle_command(state, store, engine_command_sender, &text);
+    } else if state.running {
+        let _ = engine_command_sender.send(EngineCommand::Steer {
+            thread_id: state.thread.id.clone(),
+            text,
+        });
+        state.notice = Some("steering the current turn...".into());
+    } else {
+        submit(state, store, engine_command_sender, text);
+    }
+}
+
+fn escape_review_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn format_review_notes(turn: i64, notes: &[ReviewNote]) -> String {
+    let mut text = format!(
+        "Review the following line-anchored notes from turn {turn}:\n\n"
+    );
+    for note in notes {
+        text.push_str(&format!(
+            "File: {}\nLine: {}\nChange: {}\nUser comment: \"{}\"\n\n",
+            note.path,
+            note.line,
+            if note.added { "added" } else { "removed" },
+            escape_review_text(&note.body)
+        ));
+    }
+    text.trim_end().to_string()
+}
+
+fn previous_file_row(rows: &[diff_render::DiffRowRef], selected: usize) -> Option<usize> {
+    let current_path = rows.get(selected)?.path.as_str();
+    let change = rows[..selected]
+        .iter()
+        .rposition(|row| row.path != current_path)?;
+    let path = rows[change].path.as_str();
+    let mut start = change;
+    while start > 0 && rows[start - 1].path == path {
+        start -= 1;
+    }
+    Some(start)
+}
+
+fn next_file_row(rows: &[diff_render::DiffRowRef], selected: usize) -> Option<usize> {
+    let current_path = rows.get(selected)?.path.as_str();
+    rows.iter()
+        .enumerate()
+        .skip(selected + 1)
+        .find(|(_, row)| row.path != current_path)
+        .map(|(index, _)| index)
+}
+
+fn handle_review_key(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    key: KeyEvent,
+) {
+    let Some(mut review) = state.review.take() else {
+        return;
+    };
+
+    if let Some(input) = review.note_input.as_mut() {
+        match key.code {
+            KeyCode::Esc => review.note_input = None,
+            KeyCode::Enter => {
+                let body = input.trim().to_string();
+                if !body.is_empty() && !review.rows.is_empty() {
+                    let row = &review.rows[review.selected.min(review.rows.len() - 1)];
+                    let saved = store.lock().unwrap().add_review_note(
+                        &state.thread.id,
+                        review.turn,
+                        &row.path,
+                        row.line_number,
+                        row.added,
+                        &body,
+                        &review.fingerprint,
+                    );
+                    match saved {
+                        Ok(id) => review.notes.push(ReviewNote {
+                            id,
+                            path: row.path.clone(),
+                            line: row.line_number,
+                            added: row.added,
+                            body,
+                        }),
+                        Err(error) => {
+                            state.notice = Some(format!("cannot save review note: {error}"));
+                        }
+                    }
+                }
+                review.note_input = None;
+            }
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(character) => {
+                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                    input.push(character);
+                }
+            }
+            _ => {}
+        }
+        state.review = Some(review);
+        return;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => return,
+        KeyCode::Up | KeyCode::Char('k') => {
+            review.selected = review.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if !review.rows.is_empty() {
+                review.selected = (review.selected + 1).min(review.rows.len() - 1);
+            }
+        }
+        KeyCode::PageUp => {
+            review.selected = review.selected.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            if !review.rows.is_empty() {
+                review.selected = (review.selected + 10).min(review.rows.len() - 1);
+            }
+        }
+        KeyCode::Char('n') => {
+            if let Some(row) = review.rows.get(review.selected) {
+                if row.added || row.removed {
+                    review.note_input = Some(String::new());
+                } else {
+                    state.notice = Some("notes anchor added or removed lines only".into());
+                }
+            }
+        }
+        KeyCode::Char('[') => {
+            if let Some(index) = previous_file_row(&review.rows, review.selected) {
+                review.selected = index;
+            }
+        }
+        KeyCode::Char(']') => {
+            if let Some(index) = next_file_row(&review.rows, review.selected) {
+                review.selected = index;
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(row) = review.rows.get(review.selected) {
+                let ids: Vec<i64> = review
+                    .notes
+                    .iter()
+                    .filter(|note| {
+                        note.path == row.path
+                            && note.line == row.line_number
+                            && note.added == row.added
+                    })
+                    .map(|note| note.id)
+                    .collect();
+                if !ids.is_empty() {
+                    match store
+                        .lock()
+                        .unwrap()
+                        .delete_review_notes(&state.thread.id, &ids)
+                    {
+                        Ok(()) => review.notes.retain(|note| !ids.contains(&note.id)),
+                        Err(error) => {
+                            state.notice = Some(format!("cannot delete review note: {error}"));
+                        }
+                    }
+                }
+            }
+        }
+        KeyCode::Char('s') => {
+            if review.notes.is_empty() {
+                state.notice = Some("no review notes to send yet; press n on a changed line".into());
+                state.review = Some(review);
+                return;
+            }
+            let count = review.notes.len();
+            let ids: Vec<i64> = review.notes.iter().map(|note| note.id).collect();
+            let text = format_review_notes(review.turn, &review.notes);
+            let steering = state.running;
+            dispatch_message(state, store, engine_command_sender, text, false);
+            let marked = store
+                .lock()
+                .unwrap()
+                .mark_review_notes_sent(&state.thread.id, &ids);
+            state.notice = Some(match marked {
+                Ok(()) if steering => {
+                    format!("steering {count} review note(s) into the current turn")
+                }
+                Ok(()) => format!("sent {count} review note(s)"),
+                Err(error) => format!(
+                    "sent {count} review note(s), but could not mark them sent: {error}"
+                ),
+            });
+            return;
+        }
+        _ => {}
+    }
+
+    state.review = Some(review);
 }
 
 fn handle_composer_key(
@@ -767,6 +1533,18 @@ fn handle_composer_key(
 ) {
     let suggestions = suggestions_for(&state.input);
     let clamped = state.suggestion_index.min(suggestions.len().saturating_sub(1));
+    let force_newline = (key.code == KeyCode::Enter
+        && key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT))
+        || (key.code == KeyCode::Char('j') && key.modifiers.contains(KeyModifiers::CONTROL));
+    if force_newline {
+        state.insert_input_char('\n');
+        state.suggestion_index = 0;
+        state.esc_primed = false;
+        state.prompt_history_index = None;
+        return;
+    }
 
     if !suggestions.is_empty() {
         match key.code {
@@ -784,7 +1562,7 @@ fn handle_composer_key(
             }
             KeyCode::Tab => {
                 if let Some((command, _)) = suggestions.get(clamped) {
-                    state.input = format!("{command} ");
+                    state.set_input(format!("{command} "));
                     state.suggestion_index = 0;
                 }
                 return;
@@ -793,10 +1571,10 @@ fn handle_composer_key(
                 let typed = state.input.trim().to_string();
                 if let Some((command, _)) = suggestions.iter().find(|(command, _)| *command == typed) {
                     let command = command.to_string();
-                    state.input.clear();
+                    state.set_input(String::new());
                     handle_command(state, store, engine_command_sender, &command);
                 } else if let Some((command, _)) = suggestions.get(clamped) {
-                    state.input = format!("{command} ");
+                    state.set_input(format!("{command} "));
                     state.suggestion_index = 0;
                 }
                 return;
@@ -811,25 +1589,72 @@ fn handle_composer_key(
             if text.is_empty() {
                 return;
             }
-            state.input.clear();
+            state.set_input(String::new());
             state.suggestion_index = 0;
             state.esc_primed = false;
-            if text.starts_with('/') {
-                handle_command(state, store, engine_command_sender, &text);
-            } else if state.running {
-                state.queued_messages.push(text.clone());
-                state.notice = Some(format!(
-                    "queued ({} waiting) · sends after current turn · ctrl+c to interrupt instead",
-                    state.queued_messages.len()
-                ));
-            } else {
-                submit(state, store, engine_command_sender, text);
-            }
+            dispatch_message(state, store, engine_command_sender, text, true);
         }
         KeyCode::Backspace => {
-            state.input.pop();
+            state.backspace_input();
             state.suggestion_index = 0;
             state.esc_primed = false;
+            state.selection = None;
+            state.selection_anchor = None;
+            state.prompt_history_index = None;
+        }
+        KeyCode::Delete => {
+            state.delete_input();
+            state.suggestion_index = 0;
+            state.esc_primed = false;
+            state.prompt_history_index = None;
+        }
+        KeyCode::Left => {
+            state.input_cursor = state.input_cursor.saturating_sub(1);
+            state.selection = None;
+            state.selection_anchor = None;
+        }
+        KeyCode::Right => {
+            let length = state.input.chars().count();
+            state.input_cursor = (state.input_cursor + 1).min(length);
+            state.selection = None;
+            state.selection_anchor = None;
+        }
+        KeyCode::Home => {
+            let (start, _) = state.cursor_line_bounds();
+            state.input_cursor = start;
+            state.selection = None;
+            state.selection_anchor = None;
+        }
+        KeyCode::End => {
+            let (_, end) = state.cursor_line_bounds();
+            state.input_cursor = end;
+            state.selection = None;
+            state.selection_anchor = None;
+        }
+        // Claude Code style recall: with an empty input (or while already
+        // recalling), Up walks back through this project's prompt history
+        // and Down walks forward. Otherwise the arrows scroll the transcript.
+        KeyCode::Up if !state.prompt_history.is_empty() && (state.input.is_empty() || state.prompt_history_index.is_some()) => {
+            if !state.prompt_history.is_empty() {
+                let next = match state.prompt_history_index {
+                    None => state.prompt_history.len() - 1,
+                    Some(0) => 0,
+                    Some(index) => index - 1,
+                };
+                state.set_input(state.prompt_history[next].clone());
+                state.prompt_history_index = Some(next);
+                state.esc_primed = false;
+            }
+        }
+        KeyCode::Down if state.prompt_history_index.is_some() => {
+            let index = state.prompt_history_index.unwrap() + 1;
+            if index >= state.prompt_history.len() {
+                state.set_input(String::new());
+                state.prompt_history_index = None;
+            } else {
+                state.set_input(state.prompt_history[index].clone());
+                state.prompt_history_index = Some(index);
+            }
         }
         KeyCode::Up => {
             state.scroll_offset += 1;
@@ -843,12 +1668,9 @@ fn handle_composer_key(
         KeyCode::PageDown => {
             state.scroll_offset = state.scroll_offset.saturating_sub(10);
         }
-        KeyCode::End | KeyCode::Home => {
-            state.scroll_offset = 0;
-        }
         KeyCode::Esc => {
             if state.running {
-                let _ = engine_command_sender.send(EngineCommand::Interrupt);
+                let _ = engine_command_sender.send(EngineCommand::Interrupt { thread_id: state.thread.id.clone() });
                 state.notice = Some("interrupting...".into());
             } else if state.input.is_empty() {
                 if state.esc_primed {
@@ -858,15 +1680,19 @@ fn handle_composer_key(
                     state.esc_primed = true;
                 }
             } else {
-                state.input.clear();
+                state.set_input(String::new());
+                state.prompt_history_index = None;
                 state.notice = Some("composer cleared".into());
             }
         }
-        KeyCode::Char(char) => {
+        KeyCode::Char(character) => {
             if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
-                state.input.push(char);
+                state.insert_input_char(character);
                 state.suggestion_index = 0;
                 state.esc_primed = false;
+                state.selection = None;
+                state.selection_anchor = None;
+                state.prompt_history_index = None;
             }
         }
         _ => {}
@@ -881,8 +1707,19 @@ fn submit(
 ) {
     state.prompt_history.push(text.clone());
     state.prompt_history_index = None;
+    let recorded = {
+        let guard = store.lock().unwrap();
+        guard.record_prompt(&state.thread.cwd, &text)
+    };
+    if let Err(error) = recorded {
+        state.notice = Some(format!("cannot record prompt: {error}"));
+    }
     let text = if let Some(goal) = &state.goal {
-        format!("[goal: {goal}]\n{text}")
+        if state.goal_paused {
+            text
+        } else {
+            format!("[goal: {goal}]\n{text}")
+        }
     } else {
         text
     };
@@ -896,6 +1733,7 @@ fn submit(
     }
     let thread_id = state.thread.id.clone();
     let permission_mode = state.permission_mode;
+    state.persist_thread_state(store);
     let _ = engine_command_sender.send(EngineCommand::Submit { thread_id, text, permission_mode });
 }
 
@@ -911,13 +1749,15 @@ fn handle_command(
     match command {
         "/quit" | "/exit" => state.quit = true,
         "/help" => {
-            state.notice = Some(
-                SLASH_COMMANDS
-                    .iter()
-                    .map(|(name, description)| format!("{name:<14} {description}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
+            let mut help = SLASH_COMMANDS
+                .iter()
+                .map(|(name, description)| format!("{name:<14} {description}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            help.push_str(
+                "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll",
             );
+            state.notice = Some(help);
         }
         "/clear" => {
             state.diff_output = None;
@@ -927,24 +1767,38 @@ fn handle_command(
             if let Some(action) = args.first().map(String::as_str) {
                 match action {
                     "clear" => {
-                        state.goal = None;
+                        state.set_goal_state(store, None, false);
                         state.notice = Some("goal cleared".into());
                     }
                     "pause" => {
-                        state.notice = Some("goal paused (will not inject into next turns)".into());
+                        if state.goal.is_none() {
+                            state.notice = Some("no goal to pause; set one with /goal <criteria>".into());
+                        } else {
+                            let goal = state.goal.clone();
+                            state.set_goal_state(store, goal, true);
+                            state.notice = Some("goal paused (not injected into new turns)".into());
+                        }
                     }
                     "resume" => {
-                        state.notice = Some("goal resumed".into());
+                        if state.goal.is_none() {
+                            state.notice = Some("no goal to resume; set one with /goal <criteria>".into());
+                        } else {
+                            let goal = state.goal.clone();
+                            state.set_goal_state(store, goal, false);
+                            state.notice = Some("goal resumed".into());
+                        }
                     }
                     _ => {
-                        state.goal = Some(args.join(" "));
-                        state.notice = Some(format!("goal set: {}", args.join(" ")));
+                        let goal = args.join(" ");
+                        state.set_goal_state(store, Some(goal.clone()), false);
+                        state.notice = Some(format!("goal set: {goal}"));
                     }
                 }
             } else if let Some(goal) = &state.goal {
-                state.notice = Some(format!("current goal: {goal}"));
+                let suffix = if state.goal_paused { " (paused)" } else { "" };
+                state.notice = Some(format!("current goal{suffix}: {goal}"));
             } else {
-                state.notice = Some("usage: /goal <done criteria> · /goal clear".into());
+                state.notice = Some("usage: /goal <done criteria> · /goal pause|resume|clear".into());
             }
         }
         "/find" => {
@@ -977,19 +1831,56 @@ fn handle_command(
                 format!("found {} matches:\n{}", matches.len(), matches.join("\n"))
             });
         }
+        "/copy" => {
+            let index = args
+                .first()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(1)
+                .max(1);
+            let reply = state
+                .history
+                .iter()
+                .rev()
+                .filter(|message| message.role == "assistant")
+                .nth(index - 1);
+            match reply {
+                Some(reply) => match crate::clipboard::copy(&reply.text) {
+                    Ok(()) => {
+                        state.notice = Some(format!(
+                            "copied assistant reply {} ({} chars)",
+                            index,
+                            reply.text.chars().count()
+                        ));
+                    }
+                    Err(error) => state.notice = Some(format!("cannot copy reply: {error}")),
+                },
+                None => {
+                    state.notice = Some(format!("no assistant reply at position {index}"));
+                }
+            }
+        }
         "/multi" => {
             if args.len() < 2 {
-                state.notice = Some("usage: /multi <provider1> <provider2> ... <prompt>".into());
+                state.notice = Some("usage: /multi <provider> [<provider> ...] <prompt>".into());
                 return;
             }
-            let prompt = args.last().cloned().unwrap_or_default();
-            let providers: Vec<&str> = args[..args.len() - 1].iter().map(String::as_str).collect();
-            let valid_providers: Vec<ProviderId> = providers
-                .iter()
-                .filter_map(|provider| ProviderId::parse(provider))
-                .collect();
-            if valid_providers.is_empty() {
-                state.notice = Some("no valid providers. Use claude, codex, cursor, grok, opencode, or antigravity".into());
+            // Leading arguments that name providers; everything after them is
+            // the prompt, so multi-word prompts keep their words.
+            let mut valid_providers: Vec<ProviderId> = Vec::new();
+            let mut prompt_parts: Vec<String> = Vec::new();
+            for arg in &args {
+                match ProviderId::parse(arg) {
+                    Some(provider) if prompt_parts.is_empty() => {
+                        if !valid_providers.contains(&provider) {
+                            valid_providers.push(provider);
+                        }
+                    }
+                    _ => prompt_parts.push(arg.clone()),
+                }
+            }
+            let prompt = prompt_parts.join(" ");
+            if valid_providers.is_empty() || prompt.trim().is_empty() {
+                state.notice = Some("usage: /multi <provider> [<provider> ...] <prompt>".into());
                 return;
             }
             state.notice = Some(format!(
@@ -998,27 +1889,161 @@ fn handle_command(
                 valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
             ));
             let mut threads = Vec::new();
-            for provider in valid_providers {
+            for provider in valid_providers.clone() {
                 let thread = {
                     let guard = store.lock().unwrap();
                     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
                     let model = resolved.for_provider(provider).model.clone();
-                    guard.draft_thread(crate::store::NewThread {
+                    let mut thread = guard.draft_thread(crate::store::NewThread {
                         title: format!("[multi] {prompt}"),
                         cwd: state.thread.cwd.clone(),
                         current_provider: provider,
                         current_model: Some(model),
-                    })
+                    });
+                    // Draft threads are not persisted until a turn runs; the
+                    // engine looks the thread up immediately, so create it now.
+                    let _ = ensure_persisted(&guard, &mut thread);
+                    let _ = guard.set_thread_permission_mode(&thread.id, state.permission_mode);
+                    let _ = guard.set_thread_goal(
+                        &thread.id,
+                        state.goal.as_deref(),
+                        state.goal_paused,
+                    );
+                    thread
                 };
                 threads.push(thread);
             }
-            for thread in threads {
-                let thread_id = thread.id.clone();
+            let children = threads
+                .iter()
+                .map(|thread| MultiChild {
+                    thread_id: thread.id.clone(),
+                    provider: thread.current_provider,
+                    status: MultiStatus::Running,
+                    reply: String::new(),
+                    error: None,
+                })
+                .collect();
+            for thread in &threads {
                 let _ = engine_command_sender.send(EngineCommand::Submit {
-                    thread_id,
+                    thread_id: thread.id.clone(),
                     text: prompt.clone(),
                     permission_mode: state.permission_mode,
                 });
+            }
+            state.multi = Some(MultiView {
+                prompt: prompt.clone(),
+                selected: 0,
+                children,
+            });
+            state.notice = Some(format!(
+                "sent to {} providers in parallel: {} · esc closes the merged view",
+                valid_providers.len(),
+                valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        "/status" => {
+            let turns = store
+                .lock()
+                .unwrap()
+                .list_turn_records(&state.thread.id)
+                .unwrap_or_default();
+            let turn_count = turns.len();
+            let latest = turns.into_iter().last();
+            let mut text = format!(
+                "thread: {} {}\nprovider: {}/{}\nmode: {}",
+                &state.thread.id[..8.min(state.thread.id.len())],
+                state.thread.title,
+                state.thread.current_provider,
+                state.thread.current_model.as_deref().unwrap_or("-"),
+                state.permission_mode
+            );
+            match &state.goal {
+                Some(goal) => {
+                    let suffix = if state.goal_paused { " (paused)" } else { "" };
+                    text.push_str(&format!("\ngoal: {goal}{suffix}"));
+                }
+                None => text.push_str("\ngoal: none"),
+            }
+            let open_turn = latest
+                .as_ref()
+                .map(|turn| {
+                    !turn.phase.is_terminal()
+                })
+                .unwrap_or(false);
+            let latest_error = latest.as_ref().and_then(|turn| turn.error.clone());
+            text.push_str(&format!(
+                "\nturns: {}\nturn: {}\nqueue: {} waiting",
+                turn_count,
+                latest
+                    .map(|turn| format!("{} {}", turn.turn, turn.phase.as_str()))
+                    .unwrap_or_else(|| "none".into()),
+                state.queued_messages.len()
+            ));
+            if let Some(error) = latest_error {
+                let preview: String = error.chars().take(160).collect();
+                text.push_str(&format!("\nerror: {preview}"));
+            }
+            if open_turn {
+                text.push_str("\nnote: open turn may be stale; /turns shows history");
+            }
+            state.notice = Some(text);
+        }
+        "/turns" => {
+            let turns = store
+                .lock()
+                .unwrap()
+                .list_turn_records(&state.thread.id)
+                .unwrap_or_default();
+            if turns.is_empty() {
+                state.notice = Some("no turn records yet".into());
+            } else {
+                let mut text = format!("turns: {}", turns.len());
+                let mut has_open = false;
+                for turn in turns.iter().rev().take(12) {
+                    if !turn.phase.is_terminal() {
+                        has_open = true;
+                    }
+                    let ended = turn.ended_at.as_deref().unwrap_or("open");
+                    let error = turn
+                        .error
+                        .as_deref()
+                        .map(|error| format!(" · {error}"))
+                        .unwrap_or_default();
+                    text.push_str(&format!(
+                        "\n  {} {} · ended {}{}",
+                        turn.turn,
+                        turn.phase.as_str(),
+                        ended,
+                        error
+                    ));
+                }
+                if has_open {
+                    text.push_str("\n\nopen turn may be stale; /status shows the guard details");
+                }
+                state.notice = Some(text);
+            }
+        }
+        "/queue" => {
+            if args.first().map(String::as_str) == Some("clear") {
+                state.queued_messages.clear();
+                match store.lock().unwrap().clear_queued_messages(&state.thread.id) {
+                    Ok(()) => state.notice = Some("queue cleared".into()),
+                    Err(error) => state.notice = Some(format!("cannot clear queue: {error}")),
+                }
+            } else if args.is_empty() {
+                if state.queued_messages.is_empty() {
+                    state.notice = Some("queue: empty".into());
+                } else {
+                    let mut text = format!("queue: {} waiting", state.queued_messages.len());
+                    for (index, message) in state.queued_messages.iter().enumerate() {
+                        let preview: String = message.lines().next().unwrap_or("").chars().take(70).collect();
+                        text.push_str(&format!("\n  {}. {preview}", index + 1));
+                    }
+                    text.push_str("\n\n/queue clear to remove them");
+                    state.notice = Some(text);
+                }
+            } else {
+                state.notice = Some("usage: /queue · /queue clear".into());
             }
         }
         "/compact" => {
@@ -1034,7 +2059,7 @@ fn handle_command(
                 let thread_id = state.thread.id.clone();
                 let next_turn = store.lock().unwrap().next_turn_number(&thread_id).unwrap_or(1);
                 {
-                    let mut guard = store.lock().unwrap();
+                    let guard = store.lock().unwrap();
                     let _ = guard.rewind_thread(&thread_id, 1);
                     let _ = guard.add_message(&thread_id, next_turn, "user", None, None, "compact");
                     let _ = guard.add_message(&thread_id, next_turn, "assistant", None, None, &summary);
@@ -1118,12 +2143,7 @@ fn handle_command(
         }
         "/switch" => {
             let target = args.first().map(String::as_str);
-            let provider = match target {
-                Some("claude") => Some(ProviderId::Claude),
-                Some("codex") => Some(ProviderId::Codex),
-                _ => None,
-            };
-            match provider {
+            match target.and_then(ProviderId::parse) {
                 None => state.overlay = Overlay::SwitchPicker { selected: 0 },
                 Some(provider) => perform_switch(state, store, provider, args.get(1).cloned()),
             }
@@ -1149,15 +2169,19 @@ fn handle_command(
                         ensure_persisted(&guard, &mut state.thread)
                             .and_then(|()| guard.set_thread_model(&state.thread.id, model))
                     };
-                    if let Err(error) = result {
-                        state.notice = Some(format!("cannot set model: {error}"));
+                    match result {
+                        Ok(()) => {
+                            state.thread.current_model = Some(model.clone());
+                            state.notice = Some(format!("model set to {model}"));
+                        }
+                        Err(error) => state.notice = Some(format!("cannot set model: {error}")),
                     }
                 }
             }
         }
         "/mode" => {
             if let Some(mode) = args.first().map(String::as_str).and_then(PermissionMode::parse) {
-                state.permission_mode = mode;
+                state.apply_permission_mode(store, mode);
                 state.notice = Some(format!("permission mode: {mode}"));
             } else {
                 state.overlay = Overlay::ModePicker { selected: 0 };
@@ -1224,17 +2248,80 @@ fn handle_command(
                     current_model: None,
                 })
             };
+            state.thread.permission_mode = state.permission_mode;
             state.history.clear();
+            state.queued_messages.clear();
+            state.goal = None;
+            state.goal_paused = false;
+            state.thread.goal = None;
+            state.thread.goal_paused = false;
             state.branch_label = None;
             state.diff_output = None;
             state.scroll_offset = 0;
             state.notice = Some("new thread, unsaved until you send a message".into());
         }
+        "/fork" => {
+            let mut title_args = args.clone();
+            let through_turn = if title_args.first().map(String::as_str) == Some("--turn") {
+                let Some(turn) = title_args.get(1).and_then(|value| value.parse::<i64>().ok()) else {
+                    state.notice = Some("usage: /fork [--turn N] [title]".into());
+                    return;
+                };
+                title_args.drain(..2);
+                Some(turn)
+            } else {
+                None
+            };
+            if through_turn.is_none() {
+                let latest_phase = store
+                    .lock()
+                    .unwrap()
+                    .list_turn_records(&state.thread.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .last()
+                    .map(|turn| turn.phase);
+                if latest_phase
+                    .map(|phase| !phase.is_terminal())
+                    .unwrap_or(false)
+                {
+                    state.notice = Some("cannot fork while a turn is open".into());
+                    return;
+                }
+            }
+            let title = if title_args.is_empty() {
+                match through_turn {
+                    Some(turn) => format!("{} (fork at turn {turn})", state.thread.title),
+                    None => format!("{} (fork)", state.thread.title),
+                }
+            } else {
+                title_args.join(" ")
+            };
+            let source_title = state.thread.title.clone();
+            let result = store
+                .lock()
+                .unwrap()
+                .fork_thread_through_turn(&state.thread.id, &title, through_turn);
+            match result {
+                Ok(thread) => {
+                    load_thread_state(state, store, thread);
+                    state.notice = Some(match through_turn {
+                        Some(turn) => format!(
+                            "forked {source_title} through turn {turn}; both threads share this working tree"
+                        ),
+                        None => format!(
+                            "forked {source_title}; both threads share this working tree"
+                        ),
+                    });
+                }
+                Err(error) => state.notice = Some(format!("cannot fork: {error}")),
+            }
+        }
         "/threads" => {
             let threads: Vec<(String, String)> = {
                 let guard = store.lock().unwrap();
                 guard
-                    .list_threads(Some(state.thread.cwd.as_str()))
+                    .list_threads_for_path(std::path::Path::new(&state.thread.cwd))
                     .unwrap_or_default()
                     .into_iter()
                     .take(20)
@@ -1262,6 +2349,7 @@ fn handle_command(
                         state.thread = thread.clone();
                         let guard = store.lock().unwrap();
                         state.history = guard.list_messages(&thread.id).unwrap_or_default();
+                        state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
                         state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
                         state.diff_output = None;
                         state.scroll_offset = 0;
@@ -1313,6 +2401,67 @@ fn handle_command(
                 state.notice = Some("no checkpoints yet".into());
             } else {
                 state.overlay = Overlay::CheckpointPicker { selected: checkpoints.len().saturating_sub(1), checkpoints };
+            }
+        }
+        "/review" => {
+            let requested = args.first().and_then(|turn| turn.parse::<i64>().ok());
+            let message = match requested {
+                Some(turn) => state
+                    .history
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "diff" && message.turn == turn),
+                None => state.history.iter().rev().find(|message| message.role == "diff"),
+            };
+            match message {
+                Some(message) => {
+                    let rows = diff_render::review_rows(&message.text);
+                    let changed_count = rows.iter().filter(|row| row.added || row.removed).count();
+                    if changed_count == 0 {
+                        state.notice = Some("this turn has no changed lines to review".into());
+                    } else {
+                        let fingerprint = diff_render::fingerprint(&message.text);
+                        let saved = store.lock().unwrap().list_unsent_review_notes(
+                            &state.thread.id,
+                            message.turn,
+                            &fingerprint,
+                        );
+                        let (notes, load_error) = match saved {
+                            Ok(rows) => (
+                                rows.into_iter()
+                                    .map(|note| ReviewNote {
+                                        id: note.id,
+                                        path: note.path,
+                                        line: note.line,
+                                        added: note.added,
+                                        body: note.body,
+                                    })
+                                    .collect(),
+                                None,
+                            ),
+                            Err(error) => (Vec::new(), Some(error)),
+                        };
+                        let selected = rows
+                            .iter()
+                            .position(|row| row.added || row.removed)
+                            .unwrap_or(0);
+                        state.review = Some(ReviewState {
+                            turn: message.turn,
+                            fingerprint,
+                            rows,
+                            selected,
+                            notes,
+                            note_input: None,
+                        });
+                        state.notice = load_error
+                            .map(|error| format!("cannot restore review notes: {error}"));
+                    }
+                }
+                None => {
+                    state.notice = Some(
+                        "no turn diff yet; run a turn or use /review <turn>".into(),
+                    );
+                }
             }
         }
         "/diff" => {
@@ -1383,55 +2532,254 @@ fn handle_command(
     }
 }
 
+fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review: &ReviewState) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::styled(
+        format!(
+            "review turn {} · {} changed lines · ↑↓ move · [ ] file · n note · d delete · s send · esc close",
+            review.turn,
+            review.rows.iter().filter(|row| row.added || row.removed).count()
+        ),
+        Style::default().fg(COLORS.muted),
+    ));
+
+    let footer_rows = 1u16;
+    let available = inner.height.saturating_sub(1 + footer_rows) as usize;
+    let start = if available == 0 || review.rows.len() <= available {
+        0
+    } else {
+        review
+            .selected
+            .saturating_sub(available / 2)
+            .min(review.rows.len() - available)
+    };
+    let end = (start + available).min(review.rows.len());
+
+    for index in start..end {
+        let row = &review.rows[index];
+        let selected = index == review.selected;
+        let noted = (row.added || row.removed)
+            && review.notes.iter().any(|note| {
+                note.path == row.path && note.line == row.line_number && note.added == row.added
+            });
+        let path_label = format!("{}:{}", row.path, row.line_number);
+        let max_path = (inner.width as usize).saturating_sub(12).max(12);
+        let path_label = if path_label.chars().count() > max_path {
+            let tail: String = path_label
+                .chars()
+                .rev()
+                .take(max_path.saturating_sub(1))
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("…{tail}")
+        } else {
+            path_label
+        };
+        let marker = if selected { "›" } else { " " };
+        let note_marker = if noted { "•" } else { " " };
+        let (sign, row_color) = if row.added {
+            ("+", COLORS.success)
+        } else if row.removed {
+            ("-", COLORS.error)
+        } else {
+            (" ", COLORS.muted)
+        };
+        let used = path_label.chars().count() + 4;
+        let text_width = (inner.width as usize).saturating_sub(used).max(1);
+        let text: String = row.text.chars().take(text_width).collect();
+        let mut style = Style::default().fg(row_color);
+        if selected {
+            style = style.bg(COLORS.user_bg).add_modifier(Modifier::BOLD);
+        }
+        let prefix_style = if selected {
+            Style::default().fg(COLORS.accent).bg(COLORS.user_bg)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker}{note_marker} "), prefix_style),
+            Span::styled(path_label, prefix_style),
+            Span::styled(format!(" {sign} "), style),
+            Span::styled(text, style),
+        ]));
+    }
+
+    if let Some(input) = review.note_input.as_ref() {
+        let row = review.rows.get(review.selected);
+        let target = row
+            .map(|row| format!("{}:{}", row.path, row.line_number))
+            .unwrap_or_else(|| "no line".into());
+        lines.push(Line::from(vec![
+            Span::styled(format!("note {target} › "), Style::default().fg(COLORS.accent)),
+            Span::styled(input.clone(), Style::default().fg(COLORS.text)),
+            Span::styled("█", Style::default().fg(COLORS.accent)),
+        ]));
+    } else {
+        lines.push(Line::styled(
+            format!(
+                "notes: {} · {}",
+                review.notes.len(),
+                if review.notes.is_empty() {
+                    "press n on a changed line to add one"
+                } else {
+                    "press s to send them to the agent"
+                }
+            ),
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+
+    let _ = state;
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_multi(frame: &mut ratatui::Frame, area: Rect, multi: &MultiView) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = inner.width as usize;
+    let prompt: String = multi.prompt.chars().take(width.saturating_sub(14)).collect();
+    let mut lines: Vec<Line> = vec![
+        Line::styled(
+            format!("multi · {} provider(s) · {prompt}", multi.children.len()),
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "↑↓ select · enter opens the thread · esc closes this view",
+            Style::default().fg(COLORS.muted),
+        ),
+    ];
+    for (index, child) in multi.children.iter().enumerate() {
+        let selected = index == multi.selected;
+        let (marker, status_style) = match child.status {
+            MultiStatus::Queued => ("·", Style::default().fg(COLORS.muted)),
+            MultiStatus::Running => ("◐", Style::default().fg(COLORS.accent)),
+            MultiStatus::Done => ("✓", Style::default().fg(COLORS.success)),
+            MultiStatus::Failed => ("✗", Style::default().fg(COLORS.error)),
+        };
+        let preview = child
+            .error
+            .as_deref()
+            .or_else(|| child.reply.lines().find(|line| !line.trim().is_empty()))
+            .unwrap_or(match child.status {
+                MultiStatus::Queued => "queued behind another turn",
+                MultiStatus::Running => "waiting...",
+                _ => "no reply",
+            });
+        let provider = child.provider.as_str();
+        let used = provider.chars().count() + 8;
+        let preview: String = preview.chars().take(width.saturating_sub(used)).collect();
+        let pointer = if selected { "›" } else { " " };
+        let text_style = if selected {
+            Style::default().fg(COLORS.text).bg(COLORS.user_bg)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{pointer} {marker} "), status_style),
+            Span::styled(format!("{provider:<7} "), text_style),
+            Span::styled(preview, text_style),
+        ]));
+    }
+    let visible = inner.height.saturating_sub(2) as usize;
+    if lines.len() > visible {
+        lines.truncate(visible.max(1));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_floating_approval(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
+    let Some(approval) = state.approvals.last() else {
+        return;
+    };
+    if area.height < 4 {
+        return;
+    }
+    let approval_area = Rect {
+        y: area.y + area.height.saturating_sub(4),
+        height: 4,
+        ..area
+    };
+    draw_approval(frame, approval_area, state, approval);
+}
+
 fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     let area = frame.area();
+    if let Some(multi) = &state.multi {
+        draw_multi(frame, area, multi);
+        draw_floating_approval(frame, area, state);
+        return;
+    }
+    if let Some(review) = &state.review {
+        draw_review(frame, area, state, review);
+        draw_floating_approval(frame, area, state);
+        return;
+    }
     let suggestions = suggestions_for(&state.input);
-    let composer_rows = 4 + if suggestions.is_empty() { 0 } else { suggestions.len().min(6) + 2 };
+    let composer_rows = 4u16
+        + state.visible_input_lines().saturating_sub(1) as u16
+        + if suggestions.is_empty() {
+            0
+        } else {
+            (suggestions.len().min(6) + 2) as u16
+        };
     let notice_rows = state
         .notice
         .as_ref()
         .map(|notice| wrapped_rows(notice, area.width as usize))
         .unwrap_or(0);
-    let overlay_rows = match &state.overlay {
-        Overlay::None => 0,
-        Overlay::Approval { .. } => 4,
-        Overlay::RewindPicker { .. } => state
-            .history
-            .iter()
-            .filter(|message| message.role == "user")
-            .count()
-            .min(8)
-            + 4,
-        Overlay::CodeConfirm { .. } => 4,
-        Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
-        Overlay::ModelPicker { models, .. } => models.len().min(8) + 4,
-        Overlay::SettingsPicker { categories, category_index, .. } => {
-            categories.get(*category_index).map(|(_, values): &(String, Vec<String>)| values.len()).unwrap_or(0).min(6) + categories.len().min(4) + 4
-        },
-        Overlay::McpPicker { .. } => 8,
-        Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
-        Overlay::ModePicker { .. } => 7,
-        Overlay::AuthPicker { .. } => 9,
-        Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
-        Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
-    };
-    let live_tool_rows = state.tool_lines.len().min(5);
-    let streaming_cap = ((area.height as usize).saturating_sub(composer_rows + 6) * 3 / 5).max(3);
-    let streaming_rows = if state.streaming_text.is_empty() {
-        0
+    let overlay_rows = if !state.approvals.is_empty() {
+        4
     } else {
-        wrapped_rows(&state.streaming_text, area.width as usize).min(streaming_cap)
+        match &state.overlay {
+            Overlay::None => 0,
+            Overlay::RewindPicker { .. } => {
+                state
+                    .history
+                    .iter()
+                    .filter(|message| message.role == "user")
+                    .count()
+                    .min(8)
+                    + 4
+            }
+            Overlay::CodeConfirm { .. } => 4,
+            Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
+            Overlay::ModelPicker { models, filter, .. } => {
+                model_filter_indices(models, filter).len().min(8) + 4
+            }
+            Overlay::SettingsPicker {
+                categories,
+                category_index,
+                ..
+            } => {
+                categories
+                    .get(*category_index)
+                    .map(|(_, values): &(String, Vec<String>)| values.len())
+                    .unwrap_or(0)
+                    .min(6)
+                    + categories.len().min(4)
+                    + 4
+            }
+            Overlay::McpPicker { .. } => 8,
+            Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
+            Overlay::ModePicker { .. } => 7,
+            Overlay::AuthPicker { .. } => 9,
+            Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
+            Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
+        }
     };
-    let thinking = state.running && state.tool_lines.is_empty() && state.streaming_text.is_empty();
-    let live_rows = if thinking {
-        1
-    } else {
-        live_tool_rows + streaming_rows + if streaming_rows > 0 { 1 } else { 0 }
-    };
-
     let chunks = Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(live_rows as u16),
         Constraint::Length(overlay_rows as u16),
         Constraint::Length(notice_rows as u16),
         Constraint::Length(composer_rows as u16),
@@ -1439,41 +2787,71 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     ])
     .split(area);
 
-    draw_transcript(frame, state, chunks[0]);
-    if live_rows > 0 {
-        draw_live(frame, state, chunks[1], spinner_frame, thinking);
-    }
-    match &state.overlay {
-        Overlay::Approval { summary, .. } => draw_approval(frame, chunks[2], summary),
-        Overlay::RewindPicker { selected } => draw_rewind_picker(frame, chunks[2], state, *selected),
-        Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[2], *turn),
-        Overlay::SwitchPicker { selected } => draw_switch_picker(frame, chunks[2], state, *selected),
-        Overlay::ModelPicker { provider, models, selected } => {
-            draw_model_picker(frame, chunks[2], state, *provider, models, *selected)
+    draw_transcript(frame, state, chunks[0], spinner_frame);
+    if let Some(approval) = state.approvals.last() {
+        draw_approval(frame, chunks[1], state, approval);
+    } else {
+        match &state.overlay {
+            Overlay::RewindPicker { selected } => {
+                draw_rewind_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[1], *turn),
+            Overlay::SwitchPicker { selected } => {
+                draw_switch_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::ModelPicker {
+                provider,
+                models,
+                selected,
+                filter,
+            } => draw_model_picker(
+                frame,
+                chunks[1],
+                state,
+                *provider,
+                models,
+                *selected,
+                filter,
+            ),
+            Overlay::SettingsPicker {
+                provider,
+                categories,
+                category_index,
+                value_index,
+            } => draw_settings_picker(
+                frame,
+                chunks[1],
+                *provider,
+                categories,
+                *category_index,
+                *value_index,
+            ),
+            Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[1], *selected),
+            Overlay::SkillsPicker { selected, skills } => {
+                draw_skills_picker(frame, chunks[1], skills, *selected)
+            }
+            Overlay::ModePicker { selected } => {
+                draw_mode_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::AuthPicker { selected } => {
+                draw_auth_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::ThreadPicker { selected, threads } => {
+                draw_thread_picker(frame, chunks[1], threads, *selected)
+            }
+            Overlay::CheckpointPicker {
+                selected,
+                checkpoints,
+            } => draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected),
+            Overlay::None => {}
         }
-        Overlay::SettingsPicker { provider, categories, category_index, value_index } => {
-            draw_settings_picker(frame, chunks[2], *provider, categories, *category_index, *value_index)
-        }
-        Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[2], *selected),
-        Overlay::SkillsPicker { selected, skills } => {
-            draw_skills_picker(frame, chunks[2], skills, *selected)
-        }
-        Overlay::ModePicker { selected } => draw_mode_picker(frame, chunks[2], state, *selected),
-        Overlay::AuthPicker { selected } => draw_auth_picker(frame, chunks[2], state, *selected),
-        Overlay::ThreadPicker { selected, threads } => {
-            draw_thread_picker(frame, chunks[2], threads, *selected)
-        }
-        Overlay::CheckpointPicker { selected, checkpoints } => {
-            draw_checkpoint_picker(frame, chunks[2], checkpoints, *selected)
-        }
-        Overlay::None => {}
     }
     if let Some(notice) = &state.notice {
         let paragraph = Paragraph::new(notice.clone()).style(Style::default().fg(COLORS.warning)).wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, chunks[3]);
+        frame.render_widget(paragraph, chunks[2]);
     }
-    draw_composer(frame, state, chunks[4], &suggestions);
-    draw_status(frame, state, chunks[5], spinner_frame);
+    draw_composer(frame, state, chunks[3], &suggestions);
+    draw_status(frame, state, chunks[4]);
 }
 
 fn discover_custom_commands(cwd: &str) -> Vec<(String, String)> {
@@ -1577,10 +2955,12 @@ fn perform_switch(
     let result = {
         let guard = store.lock().unwrap();
         ensure_persisted(&guard, &mut state.thread)
-            .and_then(|()| guard.set_thread_provider(&state.thread.id, provider, model))
+            .and_then(|()| guard.set_thread_provider(&state.thread.id, provider, model.clone()))
     };
     match result {
         Ok(()) => {
+            state.thread.current_provider = provider;
+            state.thread.current_model = model.clone();
             state.permission_mode = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd))
                 .for_provider(provider)
                 .permission_mode;
@@ -1635,15 +3015,49 @@ fn draw_model_picker(
     provider: ProviderId,
     models: &[String],
     selected: usize,
+    filter: &str,
 ) {
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
-    let default_model = resolved.for_provider(provider).model.clone();
+    let selected_model = if state.thread.current_provider == provider {
+        state
+            .thread
+            .current_model
+            .clone()
+            .unwrap_or_else(|| resolved.for_provider(provider).model.clone())
+    } else {
+        resolved.for_provider(provider).model.clone()
+    };
+    let filtered = model_filter_indices(models, filter);
+    let visible = filtered.len().min(8);
+    let start = if visible == 0 || filtered.len() <= visible {
+        0
+    } else {
+        selected
+            .saturating_sub(visible / 2)
+            .min(filtered.len() - visible)
+    };
+    let end = (start + visible).min(filtered.len());
+    let filter_label = if filter.is_empty() {
+        "type to filter".to_string()
+    } else {
+        format!("filter \"{filter}\"")
+    };
+    let position = if filtered.is_empty() {
+        0
+    } else {
+        selected.min(filtered.len() - 1) + 1
+    };
     let mut lines: Vec<Line> = vec![Line::styled(
-        format!("{provider} models · enter select · esc cancel"),
+        format!(
+            "{provider} models · {position}/{} · {filter_label} · enter · esc",
+            filtered.len()
+        ),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, model) in models.iter().take(8).enumerate() {
-        let marker = if *model == default_model { "●" } else { " " };
+    for (offset, model_index) in filtered[start..end].iter().enumerate() {
+        let index = start + offset;
+        let model = &models[*model_index];
+        let marker = if *model == selected_model { "●" } else { " " };
         let style = if index == selected {
             Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
         } else {
@@ -1800,20 +3214,18 @@ fn draw_checkpoint_picker(frame: &mut ratatui::Frame, area: Rect, checkpoints: &
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize) {
     if let Some(diff) = &state.diff_output {
-        let lines: Vec<Line> = std::iter::once(Line::styled("diff · /clear to close", Style::default().fg(COLORS.muted)))
-            .chain(diff.lines().take(area.height.saturating_sub(1) as usize).map(|line| {
-                let style = if line.starts_with('+') {
-                    Style::default().fg(COLORS.success)
-                } else if line.starts_with('-') {
-                    Style::default().fg(COLORS.error)
-                } else {
-                    Style::default()
-                };
-                Line::styled(line.to_string(), style)
-            }))
-            .collect();
+        let rendered = state
+            .diff_cache
+            .borrow_mut()
+            .render(diff, area.width.saturating_sub(2) as usize);
+        let lines: Vec<Line> = std::iter::once(Line::styled(
+            "diff · /clear to close",
+            Style::default().fg(COLORS.muted),
+        ))
+        .chain(rendered.iter().cloned())
+        .collect();
         frame.render_widget(Paragraph::new(lines), area);
         return;
     }
@@ -1866,6 +3278,28 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     // Build all terminal lines (each element = exactly 1 rendered row)
     let mut all_lines: Vec<Line> = Vec::new();
     for message in &state.history {
+        if message.role == "tool" {
+            let style = if message.text.starts_with("✗") {
+                COLORS.error
+            } else if message.text.starts_with("✓") {
+                COLORS.success
+            } else {
+                COLORS.muted
+            };
+            for line in wrap(&message.text) {
+                all_lines.push(Line::styled(line, Style::default().fg(style)));
+            }
+            continue;
+        }
+        if message.role == "diff" {
+            let rendered = state
+                .diff_cache
+                .borrow_mut()
+                .render(&message.text, width.saturating_sub(2));
+            all_lines.extend(rendered.iter().cloned());
+            all_lines.push(Line::from(vec![Span::raw(" ")]));
+            continue;
+        }
         if message.role == "user" {
             for line in wrap(&message.text) {
                 all_lines.push(Line::styled(line, Style::default().fg(COLORS.text).bg(COLORS.user_bg)));
@@ -1879,10 +3313,54 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
                 ),
                 Style::default().fg(COLORS.muted),
             ));
-            for line in wrap(&message.text) {
-                all_lines.push(Line::styled(line, Style::default().fg(COLORS.text)));
-            }
+            let rendered = state
+                .markdown_cache
+                .borrow_mut()
+                .render(&message.text, width.saturating_sub(2));
+            all_lines.extend(rendered.iter().cloned());
         }
+        all_lines.push(Line::from(vec![Span::raw(" ")]));
+    }
+
+    // Live turn activity flows right after the newest message, in the
+    // transcript itself rather than a separate panel above the composer.
+    let mut live_lines = 0usize;
+    let spinner = SPINNER_FRAMES[spinner_frame];
+    if state.running && state.tool_lines.is_empty() && state.streaming_text.is_empty() {
+        if let Some(provider) = state.queued_provider {
+            all_lines.push(Line::from(vec![
+                Span::styled("·", Style::default().fg(COLORS.muted)),
+                Span::raw(" "),
+                Span::styled(format!("Queued for {provider}"), Style::default().fg(COLORS.muted)),
+            ]));
+        } else {
+            all_lines.push(Line::from(vec![
+                Span::styled(spinner, Style::default().fg(COLORS.accent)),
+                Span::raw(" "),
+                Span::styled("Thinking", Style::default().fg(COLORS.accent)),
+            ]));
+        }
+        live_lines += 1;
+    }
+    for tool_line in &state.tool_lines {
+        let line = match tool_line.status {
+            ToolStatus::Running => Line::from(vec![
+                Span::styled(spinner, Style::default().fg(COLORS.accent)),
+                Span::raw(" "),
+                Span::styled(tool_line.label.clone(), Style::default().fg(COLORS.accent)),
+            ]),
+            ToolStatus::Done => Line::styled(format!("✓ {}", tool_line.label), Style::default().fg(COLORS.success)),
+            ToolStatus::Failed => Line::styled(format!("✗ {}", tool_line.label), Style::default().fg(COLORS.error)),
+        };
+        all_lines.push(line);
+        live_lines += 1;
+    }
+    if !state.streaming_text.is_empty() {
+        let markdown_lines = markdown::render(&state.streaming_text, width.saturating_sub(2));
+        live_lines += markdown_lines.len();
+        all_lines.extend(markdown_lines);
+    }
+    if live_lines > 0 {
         all_lines.push(Line::from(vec![Span::raw(" ")]));
     }
 
@@ -1924,56 +3402,26 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     frame.render_widget(Paragraph::new(render_lines), area);
 }
 
-fn draw_live(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize, thinking: bool) {
-    let spinner = SPINNER_FRAMES[spinner_frame];
-    if thinking {
-        let line = Line::from(vec![
-            Span::styled(spinner, Style::default().fg(COLORS.accent)),
-            Span::raw(" "),
-            Span::styled("Thinking", Style::default().fg(COLORS.accent)),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
-        return;
-    }
-    let mut lines: Vec<Line> = Vec::new();
-    for tool_line in state.tool_lines.iter().rev().take(area.height as usize) {
-        let line = match tool_line.status {
-            ToolStatus::Running => Line::from(vec![
-                Span::styled(spinner, Style::default().fg(COLORS.accent)),
-                Span::raw(" "),
-                Span::styled(tool_line.label.clone(), Style::default().fg(COLORS.accent)),
-            ]),
-            ToolStatus::Done => Line::styled(format!("✓ {}", tool_line.label), Style::default().fg(COLORS.success)),
-            ToolStatus::Failed => Line::styled(format!("✗ {}", tool_line.label), Style::default().fg(COLORS.error)),
-        };
-        lines.push(line);
-    }
-    if !state.streaming_text.is_empty() {
-        let all_lines: Vec<&str> = state.streaming_text.lines().collect();
-        let tool_row_count = lines.len();
-        let available = (area.height as usize).saturating_sub(tool_row_count);
-        if all_lines.len() > available && available > 0 {
-            lines.push(Line::styled("…", Style::default().fg(COLORS.muted)));
-            let start = all_lines.len().saturating_sub(available.saturating_sub(1));
-            for line in &all_lines[start..] {
-                lines.push(Line::styled(*line, Style::default().fg(COLORS.text)));
-            }
-        } else {
-            for line in &all_lines {
-                lines.push(Line::styled(*line, Style::default().fg(COLORS.text)));
-            }
-        }
-    }
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-}
-
-fn draw_approval(frame: &mut ratatui::Frame, area: Rect, summary: &str) {
+fn draw_approval(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    approval: &ApprovalState,
+) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.warning))
         .border_style(Style::default().fg(COLORS.border));
+    let target = if approval.thread_id == state.thread.id {
+        String::new()
+    } else {
+        format!(" for thread {} ", &approval.thread_id[..approval.thread_id.len().min(8)])
+    };
     let lines = vec![
-        Line::styled(format!("approval needed: {summary}"), Style::default().fg(COLORS.warning)),
+        Line::styled(
+            format!("approval needed{target}: {}", approval.summary),
+            Style::default().fg(COLORS.warning),
+        ),
         Line::styled("[y] allow once · [a] allow for session · [n] deny", Style::default().fg(COLORS.muted)),
     ];
     frame.render_widget(
@@ -2051,12 +3499,89 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
         ));
         rows.push(Line::from(""));
     }
-    let display = if state.input.is_empty() {
-        Line::styled("Ask anything...", Style::default().fg(COLORS.muted))
+    let input_row_index = rows.len();
+    let input_width = area.width.saturating_sub(2).max(10) as usize;
+    let chars: Vec<char> = state.input.chars().collect();
+    let line_count = state.input.split('\n').count().max(1);
+    let (cursor_line, cursor_column) = state.cursor_line_column();
+    let visible_count = line_count.min(8);
+    let first_line = if line_count > visible_count {
+        cursor_line
+            .saturating_sub(visible_count.saturating_sub(1))
+            .min(line_count - visible_count)
     } else {
-        Line::styled(state.input.clone(), Style::default().fg(COLORS.text))
+        0
     };
-    rows.push(display);
+    let mut layout: Vec<InputRow> = Vec::new();
+    let mut line_char_start = 0usize;
+    for line_index in 0..line_count {
+        let line_end = chars[line_char_start..]
+            .iter()
+            .position(|character| *character == '\n')
+            .map(|offset| line_char_start + offset)
+            .unwrap_or(chars.len());
+        if line_index >= first_line && line_index < first_line + visible_count {
+            let line_len = line_end - line_char_start;
+            let scroll = if line_index == cursor_line {
+                cursor_column.saturating_sub(input_width.saturating_sub(1))
+            } else {
+                0
+            };
+            let start = line_char_start + scroll.min(line_len);
+            let end = (start + input_width).min(line_end);
+            let mut spans: Vec<Span> = Vec::new();
+            if state.input.is_empty() && line_index == 0 {
+                spans.push(Span::styled(
+                    "Ask anything...",
+                    Style::default().fg(COLORS.muted),
+                ));
+            } else {
+                for absolute in start..end {
+                    let mut style = Style::default().fg(COLORS.text);
+                    if let Some((selection_start, selection_end)) = state.selection {
+                        if selection_end > selection_start
+                            && absolute >= selection_start
+                            && absolute < selection_end
+                        {
+                            style = style.fg(Color::Black).bg(COLORS.accent);
+                        }
+                    }
+                    if absolute == state.input_cursor && state.selection.is_none() {
+                        style = style.fg(Color::Black).bg(COLORS.accent);
+                    }
+                    spans.push(Span::styled(chars[absolute].to_string(), style));
+                }
+                if state.input_cursor == line_end
+                    && line_index == cursor_line
+                    && state.selection.is_none()
+                {
+                    spans.push(Span::styled(
+                        " ",
+                        Style::default().fg(Color::Black).bg(COLORS.accent),
+                    ));
+                }
+            }
+            if spans.is_empty() {
+                spans.push(Span::raw(""));
+            }
+            rows.push(Line::from(spans));
+            layout.push(InputRow {
+                screen_y: area.y + 1 + (input_row_index + (line_index - first_line)) as u16,
+                screen_x_start: area.x + 1,
+                char_start: line_char_start,
+                line_len,
+                scroll,
+            });
+        }
+        if line_end >= chars.len() {
+            break;
+        }
+        line_char_start = line_end + 1;
+    }
+    if let Some(first) = layout.first() {
+        state.input_origin.set((first.screen_x_start, first.screen_y));
+    }
+    state.input_layout.replace(layout);
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
     let provider_config = resolved.for_provider(state.thread.current_provider);
     let effective_model = state
@@ -2088,20 +3613,8 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
     );
 }
 
-fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize) {
-    let left = if state.running {
-        let elapsed = state
-            .turn_started
-            .map(|started| started.elapsed().as_secs())
-            .unwrap_or(0);
-        Line::from(vec![
-            Span::styled(SPINNER_FRAMES[spinner_frame], Style::default().fg(COLORS.accent)),
-            Span::styled(
-                format!(" Working [{elapsed}s] · esc to interrupt"),
-                Style::default().fg(COLORS.accent),
-            ),
-        ])
-    } else if state.esc_primed {
+fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
+    let left = if state.esc_primed {
         Line::styled("esc again to edit previous message", Style::default().fg(COLORS.muted))
     } else {
         let home = std::env::var("HOME").unwrap_or_default();
@@ -2147,7 +3660,1709 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner
 }
 
 impl TuiState {
+    fn persist_thread_state(&self, store: &Arc<Mutex<BatonStore>>) {
+        let guard = store.lock().unwrap();
+        if guard.get_thread(&self.thread.id).ok().flatten().is_none() {
+            return;
+        }
+        let _ = guard.set_thread_permission_mode(&self.thread.id, self.permission_mode);
+        let _ = guard.set_thread_goal(
+            &self.thread.id,
+            self.goal.as_deref(),
+            self.goal_paused,
+        );
+    }
+
+    fn apply_permission_mode(&mut self, store: &Arc<Mutex<BatonStore>>, mode: PermissionMode) {
+        self.permission_mode = mode;
+        self.thread.permission_mode = mode;
+        self.persist_thread_state(store);
+    }
+
+    fn set_goal_state(
+        &mut self,
+        store: &Arc<Mutex<BatonStore>>,
+        goal: Option<String>,
+        paused: bool,
+    ) {
+        self.goal = goal;
+        self.goal_paused = paused;
+        self.thread.goal = self.goal.clone();
+        self.thread.goal_paused = paused;
+        self.persist_thread_state(store);
+    }
+
+    fn set_input(&mut self, text: String) {
+        self.input_cursor = text.chars().count();
+        self.input = text;
+        self.selection = None;
+        self.selection_anchor = None;
+    }
+
+    fn insert_input_char(&mut self, character: char) {
+        let byte = char_to_byte(&self.input, self.input_cursor);
+        self.input.insert(byte, character);
+        self.input_cursor += 1;
+    }
+
+    fn backspace_input(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let start = char_to_byte(&self.input, self.input_cursor - 1);
+        let end = char_to_byte(&self.input, self.input_cursor);
+        self.input.replace_range(start..end, "");
+        self.input_cursor -= 1;
+    }
+
+    fn delete_input(&mut self) {
+        let chars = self.input.chars().count();
+        if self.input_cursor >= chars {
+            return;
+        }
+        let start = char_to_byte(&self.input, self.input_cursor);
+        let end = char_to_byte(&self.input, self.input_cursor + 1);
+        self.input.replace_range(start..end, "");
+    }
+
+    fn cursor_line_bounds(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.input_cursor.min(chars.len());
+        let start = chars[..cursor]
+            .iter()
+            .rposition(|character| *character == '\n')
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        let end = chars[cursor..]
+            .iter()
+            .position(|character| *character == '\n')
+            .map(|index| cursor + index)
+            .unwrap_or(chars.len());
+        (start, end)
+    }
+
+    fn cursor_line_column(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.input_cursor.min(chars.len());
+        let line = chars[..cursor].iter().filter(|character| **character == '\n').count();
+        let column = chars[..cursor]
+            .iter()
+            .rposition(|character| *character == '\n')
+            .map(|index| cursor - index - 1)
+            .unwrap_or(cursor);
+        (line, column)
+    }
+
+    fn visible_input_lines(&self) -> usize {
+        self.input.split('\n').count().clamp(1, 8)
+    }
+
     fn store_rows(&self) -> Option<Vec<crate::store::UsageRow>> {
         self.store.lock().unwrap().list_usage(Some(&self.thread.id)).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    fn render_state(state: &TuiState, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, state, 0)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.get(x, y).symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn test_state(home: &std::path::Path, store: &Arc<Mutex<BatonStore>>, history: Vec<MessageRow>) -> TuiState {
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.to_string_lossy().to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        let queued_messages = store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&thread.id)
+            .unwrap_or_default();
+        TuiState {
+            store: store.clone(),
+            prompt_history: Vec::new(),
+            prompt_history_index: None,
+            queued_messages,
+            goal: None,
+            goal_paused: false,
+            custom_commands: Vec::new(),
+            home: home.to_path_buf(),
+            thread,
+            history,
+            input: String::new(),
+            input_cursor: 0,
+            input_layout: std::cell::RefCell::new(Vec::new()),
+            running: false,
+            queued_provider: None,
+            streaming_text: String::new(),
+            tool_lines: Vec::new(),
+            overlay: Overlay::None,
+            approvals: Vec::new(),
+            review: None,
+            multi: None,
+            notice: None,
+            diff_output: None,
+            diff_cache: std::cell::RefCell::new(diff_render::DiffCache::default()),
+            markdown_cache: std::cell::RefCell::new(markdown::MarkdownCache::default()),
+            permission_mode: PermissionMode::Default,
+            scroll_offset: 0,
+            esc_primed: false,
+            exit_armed: None,
+            branch_label: None,
+            quit: false,
+            suggestion_index: 0,
+            selection_anchor: None,
+            selection: None,
+            input_origin: std::cell::Cell::new((0, 0)),
+        }
+    }
+
+    fn history_message(thread_id: &str, index: usize) -> MessageRow {
+        MessageRow {
+            id: index as i64,
+            thread_id: thread_id.to_string(),
+            turn: index as i64,
+            role: "user".to_string(),
+            provider: None,
+            model: None,
+            text: format!("message {index:02}"),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn suggestion_window_follows_selection() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "/".to_string();
+        state.suggestion_index = 10;
+
+        let suggestions = suggestions_for(&state.input);
+        assert_eq!(suggestions.len(), 29);
+
+        let buffer = render_state(&state, 100, 30);
+        let text = buffer_lines(&buffer).join("\n");
+
+        assert!(text.contains("11/29"), "position indicator must reflect the selection");
+        let selected = suggestions[10].0;
+        assert!(text.contains(selected), "selected command {selected} must be visible");
+        assert!(!text.contains("/switch"), "commands above the window must be hidden");
+        assert!(!text.contains("/clear"), "commands below the window must be hidden");
+
+        let row = buffer_lines(&buffer)
+            .iter()
+            .position(|line| line.contains(selected))
+            .expect("selected row rendered");
+        let styled = (0..buffer.area.width).any(|x| {
+            let cell = buffer.get(x, row as u16);
+            cell.fg == COLORS.accent && cell.modifier.contains(Modifier::BOLD)
+        });
+        assert!(styled, "selected row must be highlighted");
+    }
+
+    #[test]
+    fn approvals_stack_over_pickers_without_losing_them() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::SwitchPicker { selected: 2 };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (first_sender, mut first_receiver) = tokio::sync::oneshot::channel();
+        let (second_sender, mut second_receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::ApprovalRequest {
+                id: "first".into(),
+                kind: "permissions".into(),
+                summary: "run first".into(),
+                respond: first_sender,
+            },
+        );
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::ApprovalRequest {
+                id: "second".into(),
+                kind: "permissions".into(),
+                summary: "run second".into(),
+                respond: second_sender,
+            },
+        );
+        assert_eq!(state.approvals.len(), 2);
+
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        assert_eq!(second_receiver.try_recv().unwrap(), ApprovalDecision::Deny);
+        assert_eq!(state.approvals.len(), 1, "the older approval stays queued");
+        assert!(
+            matches!(state.overlay, Overlay::SwitchPicker { selected: 2 }),
+            "answering a request must not destroy the picker underneath"
+        );
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('y')));
+        assert_eq!(first_receiver.try_recv().unwrap(), ApprovalDecision::Accept);
+        assert!(state.approvals.is_empty());
+        assert!(matches!(state.overlay, Overlay::SwitchPicker { selected: 2 }));
+        assert!(state.notice.as_deref().unwrap_or("").contains("accepted once"));
+    }
+
+    #[test]
+    fn child_approvals_are_cleared_by_the_child_turn_only() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let current_id = state.thread.id.clone();
+        let child_id = "child-thread".to_string();
+        let (current_sender, _current_receiver) = tokio::sync::oneshot::channel();
+        let (child_sender, _child_receiver) = tokio::sync::oneshot::channel();
+        apply_turn_event_for_thread(
+            &mut state,
+            current_id.clone(),
+            TurnEvent::ApprovalRequest {
+                id: "current".into(),
+                kind: "permissions".into(),
+                summary: "current request".into(),
+                respond: current_sender,
+            },
+        );
+        apply_turn_event_for_thread(
+            &mut state,
+            child_id.clone(),
+            TurnEvent::ApprovalRequest {
+                id: "child".into(),
+                kind: "permissions".into(),
+                summary: "child request".into(),
+                respond: child_sender,
+            },
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: child_id,
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+        assert_eq!(state.approvals.len(), 1);
+        assert_eq!(state.approvals[0].thread_id, current_id);
+        let current_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: current_id,
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+        assert!(state.approvals.is_empty());
+    }
+
+    #[test]
+    fn an_approval_can_be_answered_while_review_is_open() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        assert!(state.review.is_some());
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::ApprovalRequest {
+                id: "review-approval".into(),
+                kind: "permissions".into(),
+                summary: "edit file".into(),
+                respond: sender,
+            },
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Char('a'),
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::AcceptAlways);
+        assert!(state.approvals.is_empty());
+        assert!(state.review.is_some(), "review resumes after the approval");
+    }
+
+    #[test]
+    fn model_picker_window_follows_a_large_live_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::ModelPicker {
+            provider: ProviderId::Codex,
+            models: (0..20).map(|index| format!("model-{index:02}")).collect(),
+            selected: 15,
+            filter: String::new(),
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("16/20"), "position header: {text}");
+        assert!(text.contains("model-15"), "selected model: {text}");
+        assert!(!text.contains("model-00"), "first row should be outside the window");
+    }
+
+    #[test]
+    fn model_picker_can_filter_a_live_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::ModelPicker {
+            provider: ProviderId::Codex,
+            models: vec!["alpha-model".into(), "beta-model".into(), "gamma-model".into()],
+            selected: 0,
+            filter: String::new(),
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('b')));
+        let text = buffer_lines(&render_state(&state, 80, 30)).join("\n");
+        assert!(text.contains("beta-model"), "filtered row: {text}");
+        assert!(!text.contains("alpha-model"), "non-match hidden: {text}");
+        assert!(text.contains("filter \"b\""), "filter visible: {text}");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.thread.current_provider, ProviderId::Codex);
+        assert_eq!(state.thread.current_model.as_deref(), Some("beta-model"));
+    }
+
+    #[test]
+    fn live_model_catalog_updates_the_open_picker_without_losing_selection() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::ModelPicker {
+            provider: ProviderId::Codex,
+            models: vec!["selected-model".into()],
+            selected: 0,
+            filter: String::new(),
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::ModelsLoaded {
+                thread_id,
+                provider: ProviderId::Codex,
+                models: vec!["selected-model".into(), "live-model".into()],
+                error: None,
+            },
+            &engine_command_sender,
+        );
+        match &state.overlay {
+            Overlay::ModelPicker {
+                models, selected, ..
+            } => {
+                assert!(models.iter().any(|model| model == "live-model"));
+                assert_eq!(models.get(*selected).map(String::as_str), Some("selected-model"));
+            }
+            _ => panic!("model picker closed"),
+        }
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("live model"),
+            "notice: {:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn transcript_scroll_shows_older_lines() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        let history: Vec<MessageRow> = (1..=30).map(|index| history_message(&thread_id, index)).collect();
+        let mut state = test_state(home.path(), &store, history);
+
+        let bottom = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(bottom.contains("message 30"), "bottom view shows the newest message");
+        assert!(!bottom.contains("message 01"), "oldest message is off-screen");
+
+        state.scroll_offset = 8;
+        let scrolled = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(scrolled.contains("8 lines above"), "scroll indicator must render");
+        assert!(!scrolled.contains("message 30"), "scrolled view must move away from the bottom");
+        assert!(scrolled.contains("message 15"), "scrolled view must show older content");
+    }
+
+    #[test]
+    fn switch_updates_composer_immediately() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        assert_eq!(state.thread.current_provider, ProviderId::Claude);
+
+        perform_switch(&mut state, &store, ProviderId::Codex, Some("rits/zai-org/glm-5-3".to_string()));
+
+        assert_eq!(state.thread.current_provider, ProviderId::Codex, "in-memory thread must reflect the switch");
+        assert_eq!(state.thread.current_model.as_deref(), Some("rits/zai-org/glm-5-3"));
+        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(persisted.current_provider, ProviderId::Codex);
+
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        let composer_row = text
+            .lines()
+            .find(|line| line.contains("codex") || line.contains("claude"))
+            .expect("composer provider row rendered");
+        assert!(composer_row.contains("codex"), "composer must show the new provider: {composer_row}");
+        assert!(composer_row.contains("rits/zai-org/glm-5-3"), "composer must show the new model: {composer_row}");
+    }
+
+    #[test]
+    fn model_command_updates_composer_immediately() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/model claude-opus-5-5");
+
+        assert_eq!(state.thread.current_model.as_deref(), Some("claude-opus-5-5"));
+        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(persisted.current_model.as_deref(), Some("claude-opus-5-5"));
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("claude-opus-5-5"), "composer must show the new model immediately");
+    }
+
+    #[test]
+    fn input_selection_renders_orange_highlight() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "hello world".to_string();
+        state.selection = Some((0, 5));
+
+        let buffer = render_state(&state, 100, 30);
+        let (origin_x, origin_y) = state.input_origin.get();
+        assert!(origin_y > 0, "input origin must be recorded during draw");
+        let selected_cells_orange = (origin_x..origin_x + 5)
+            .filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent)
+            .count();
+        assert_eq!(selected_cells_orange, 5, "selected 'hello' must carry the orange background");
+        assert_ne!(buffer.get(origin_x + 6, origin_y).bg, COLORS.accent, "unselected text must not be highlighted");
+
+        state.selection = Some((6, 11));
+        let buffer = render_state(&state, 100, 30);
+        let world_orange = (origin_x + 6..origin_x + 11)
+            .filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent)
+            .count();
+        assert_eq!(world_orange, 5, "a later range highlights only that range");
+    }
+
+    #[test]
+    fn mouse_drag_builds_selection_from_input_origin() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "hello world".to_string();
+        render_state(&state, 100, 30);
+        let (origin_x, origin_y) = state.input_origin.get();
+
+        let mouse = |kind: crossterm::event::MouseEventKind, column: u16| crossterm::event::MouseEvent {
+            kind,
+            column,
+            row: origin_y,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_mouse(&mut state, mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), origin_x));
+        handle_mouse(&mut state, mouse(crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left), origin_x + 5));
+        assert_eq!(state.selection, Some((0, 5)), "drag from the first column selects 'hello'");
+
+        let buffer = render_state(&state, 100, 30);
+        let orange = (origin_x..origin_x + 5).filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent).count();
+        assert_eq!(orange, 5, "the dragged range renders with the orange background");
+    }
+
+    #[test]
+    fn live_activity_follows_last_message_in_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        let history = vec![history_message(&thread_id, 1)];
+        let mut state = test_state(home.path(), &store, history);
+
+        state.running = true;
+        let lines = buffer_lines(&render_state(&state, 100, 30));
+        let user_row = lines.iter().position(|line| line.contains("message 01")).expect("user message rendered");
+        let thinking_row = lines.iter().position(|line| line.contains("Thinking")).expect("thinking spinner in transcript");
+        assert!(thinking_row > user_row, "thinking renders after the user message, not above the composer");
+
+        state.tool_lines.push(ToolLine { id: None, label: "shell cargo test".into(), status: ToolStatus::Running });
+        state.streaming_text = "partial answer".into();
+        let lines = buffer_lines(&render_state(&state, 100, 30));
+        let user_row = lines.iter().position(|line| line.contains("message 01")).expect("user message rendered");
+        let tool_row = lines.iter().position(|line| line.contains("cargo test")).expect("tool line in transcript");
+        let stream_row = lines.iter().position(|line| line.contains("partial answer")).expect("streaming text in transcript");
+        assert!(user_row < tool_row && tool_row < stream_row, "tools and streaming follow the user message in order");
+        assert!(!lines.iter().any(|line| line.contains("Working [")), "the status bar no longer shows a Working spinner");
+    }
+
+    #[test]
+    fn queued_turn_renders_queued_status_instead_of_thinking() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let history = vec![history_message(&thread_id, 1)];
+        state.history = history;
+        let (command_sender, _command_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnQueued {
+                thread_id: thread_id.clone(),
+                provider: ProviderId::Codex,
+            },
+            &command_sender,
+        );
+        assert_eq!(state.queued_provider, Some(ProviderId::Codex));
+        assert!(state.running);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("queued for codex"));
+        let lines = buffer_lines(&render_state(&state, 100, 30));
+        assert!(lines.iter().any(|line| line.contains("Queued for codex")));
+        assert!(!lines.iter().any(|line| line.contains("Thinking")));
+
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnStarted { thread_id },
+            &command_sender,
+        );
+        assert_eq!(state.queued_provider, None);
+    }
+
+    #[test]
+    fn assistant_messages_render_basic_markdown() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![MessageRow {
+            id: 1,
+            thread_id: state.thread.id.clone(),
+            turn: 1,
+            role: "assistant".into(),
+            provider: Some("codex".into()),
+            model: Some("m".into()),
+            text: "# Title\n\n- **one** with `code`\n\n```rust\nlet x = 1;\n```".into(),
+            created_at: String::new(),
+        }];
+        let buffer = render_state(&state, 80, 30);
+        let lines = buffer_lines(&buffer);
+        let text = lines.join("\n");
+        assert!(text.contains("Title"), "heading stripped: {text}");
+        assert!(!text.contains('#' ), "heading marker removed: {text}");
+        assert!(text.contains("• one with code"), "inline markers stripped: {text}");
+        assert!(text.contains("let x = 1;"), "code body visible: {text}");
+        assert!(!text.contains("```"), "fence markers removed: {text}");
+        let code_row = lines
+            .iter()
+            .position(|line| line.contains("let x = 1;"))
+            .expect("code row");
+        assert!(
+            (0..buffer.area.width).any(|x| buffer.get(x, code_row as u16).bg == COLORS.code_bg),
+            "code row carries a tinted background"
+        );
+    }
+
+    #[test]
+    fn live_tool_detail_updates_the_existing_call_id_row() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        apply_turn_event(
+            &mut state,
+            TurnEvent::ToolStarted {
+                id: Some("call-1".into()),
+                tool: "read".into(),
+                detail: None,
+            },
+        );
+        apply_turn_event(
+            &mut state,
+            TurnEvent::ToolStarted {
+                id: Some("call-1".into()),
+                tool: "read".into(),
+                detail: Some("/work".into()),
+            },
+        );
+        assert_eq!(state.tool_lines.len(), 1);
+        assert_eq!(state.tool_lines[0].label, "read /work");
+    }
+
+    #[test]
+    fn persisted_tool_history_renders_in_conversation() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        {
+            let guard = store.lock().unwrap();
+            guard.add_message(&thread_id, 1, "user", None, None, "run the tests").unwrap();
+            guard.add_message(&thread_id, 1, "tool", Some("codex"), None, "✓ shell cargo test").unwrap();
+            guard.add_message(&thread_id, 1, "tool", Some("codex"), None, "✗ shell npm build").unwrap();
+            guard.add_message(&thread_id, 1, "assistant", Some("codex"), None, "tests pass").unwrap();
+        }
+        let history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        let state = test_state(home.path(), &store, history);
+
+        let buffer = render_state(&state, 100, 30);
+        let lines = buffer_lines(&buffer);
+        let user_row = lines.iter().position(|line| line.contains("run the tests")).expect("user message");
+        let ok_row = lines.iter().position(|line| line.contains("✓ shell cargo test")).expect("succeeded tool");
+        let fail_row = lines.iter().position(|line| line.contains("✗ shell npm build")).expect("failed tool");
+        let reply_row = lines.iter().position(|line| line.contains("tests pass")).expect("assistant reply");
+        assert!(user_row < ok_row && ok_row < fail_row && fail_row < reply_row, "tool history stays in conversation order");
+
+        let ok_line: Vec<(u16, u16)> = (0..buffer.area.width)
+            .filter(|&x| buffer.get(x, ok_row as u16).symbol() == "✓")
+            .map(|x| (x, ok_row as u16))
+            .collect();
+        assert!(!ok_line.is_empty());
+        assert_eq!(buffer.get(ok_line[0].0, ok_line[0].1).fg, COLORS.success, "succeeded tool renders green");
+        let fail_cell = (0..buffer.area.width).find(|&x| buffer.get(x, fail_row as u16).symbol() == "✗").expect("marker");
+        assert_eq!(buffer.get(fail_cell, fail_row as u16).fg, COLORS.error, "failed tool renders red");
+    }
+
+    #[test]
+    fn diff_messages_render_with_diff_colors() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        {
+            let guard = store.lock().unwrap();
+            guard.add_message(&thread_id, 1, "user", None, None, "edit the file").unwrap();
+            guard.add_message(&thread_id, 1, "assistant", Some("codex"), None, "edited").unwrap();
+            guard
+                .add_message(&thread_id, 1, "diff", None, None, "diff --git a/notes.txt b/notes.txt\nindex 123..456 100644\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old line\n+new line\n")
+                .unwrap();
+        }
+        let history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        let state = test_state(home.path(), &store, history);
+
+        let buffer = render_state(&state, 100, 30);
+        let lines = buffer_lines(&buffer);
+        let find_row = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap_or_else(|| panic!("{needle} rendered"));
+        let header_row = find_row("• Edited notes.txt (+1 -1)");
+        let added_row = find_row("+new line");
+        let removed_row = find_row("-old line");
+        let reply_row = find_row("edited");
+        assert!(reply_row < header_row && header_row < added_row, "the diff block renders after the reply, in conversation order");
+        let added_cell = (0..buffer.area.width).find(|&x| buffer.get(x, added_row as u16).symbol() == "+").unwrap();
+        let removed_cell = (0..buffer.area.width).find(|&x| buffer.get(x, removed_row as u16).symbol() == "-").unwrap();
+        assert_eq!(buffer.get(added_cell, added_row as u16).fg, COLORS.success, "added lines render green");
+        assert_eq!(buffer.get(removed_cell, removed_row as u16).fg, COLORS.error, "removed lines render red");
+        assert_eq!(buffer.get(0, added_row as u16).bg, ratatui::style::Color::Rgb(33, 58, 43), "added rows carry the tinted background");
+        assert_eq!(buffer.get(0, removed_row as u16).bg, ratatui::style::Color::Rgb(74, 34, 29), "removed rows carry the tinted background");
+    }
+
+    #[test]
+    fn multi_command_persists_parallel_threads() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.apply_permission_mode(&store, PermissionMode::Plan);
+
+        handle_command(&mut state, &store, &engine_command_sender, "/multi codex opencode compare notes");
+
+        let mut submitted = Vec::new();
+        while let Ok(command) = engine_command_receiver.try_recv() {
+            if let EngineCommand::Submit { thread_id, text, .. } = command {
+                submitted.push((thread_id, text));
+            }
+        }
+        assert_eq!(submitted.len(), 2, "one submit per provider");
+        assert!(submitted.iter().all(|(_, text)| text == "compare notes"));
+        let multi = state.multi.as_ref().expect("multi view opens");
+        assert_eq!(multi.children.len(), 2);
+        assert!(multi.children.iter().all(|child| child.status == MultiStatus::Running));
+        for (thread_id, _) in &submitted {
+            let thread = store.lock().unwrap().get_thread(thread_id).unwrap();
+            assert!(thread.is_some(), "parallel thread {thread_id} must be persisted before submit");
+            assert_eq!(
+                thread.unwrap().permission_mode,
+                PermissionMode::Plan,
+                "parallel threads inherit the active mode"
+            );
+        }
+    }
+
+    #[test]
+    fn copy_command_selects_the_requested_assistant_reply() {
+        std::env::set_var("BATON_CLIPBOARD_COMMAND", "cat");
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        state.history = vec![
+            MessageRow {
+                id: 1,
+                thread_id: thread_id.clone(),
+                turn: 1,
+                role: "assistant".into(),
+                provider: None,
+                model: None,
+                text: "older reply".into(),
+                created_at: String::new(),
+            },
+            MessageRow {
+                id: 2,
+                thread_id,
+                turn: 2,
+                role: "assistant".into(),
+                provider: None,
+                model: None,
+                text: "newer reply".into(),
+                created_at: String::new(),
+            },
+        ];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/copy 2");
+        assert!(state.notice.as_deref().unwrap_or("").contains("copied assistant reply 2"));
+        handle_command(&mut state, &store, &engine_command_sender, "/copy 3");
+        assert!(state.notice.as_deref().unwrap_or("").contains("no assistant reply at position 3"));
+        std::env::remove_var("BATON_CLIPBOARD_COMMAND");
+    }
+
+    #[test]
+    fn multi_view_tracks_children_and_opens_the_selected_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let child = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "parallel child".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        state.multi = Some(MultiView {
+            prompt: "compare notes".into(),
+            selected: 0,
+            children: vec![MultiChild {
+                thread_id: child.id.clone(),
+                provider: ProviderId::Codex,
+                status: MultiStatus::Running,
+                reply: String::new(),
+                error: None,
+            }],
+        });
+        apply_turn_event_for_thread(
+            &mut state,
+            child.id.clone(),
+            TurnEvent::TextDelta {
+                text: "partial".into(),
+            },
+        );
+        assert_eq!(state.multi.as_ref().unwrap().children[0].reply, "partial");
+        store
+            .lock()
+            .unwrap()
+            .add_message(&child.id, 1, "assistant", Some("codex"), None, "final answer")
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: child.id.clone(),
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+        let multi = state.multi.as_ref().unwrap();
+        assert_eq!(multi.children[0].status, MultiStatus::Done);
+        assert_eq!(multi.children[0].reply, "final answer");
+        let rendered = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(rendered.contains("multi"), "merged view: {rendered}");
+        assert!(rendered.contains("codex"), "provider row: {rendered}");
+        assert!(rendered.contains("final answer"), "reply preview: {rendered}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert!(state.multi.is_none());
+        assert_eq!(state.thread.id, child.id);
+        assert!(state.history.iter().any(|message| message.text == "final answer"));
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_instead_of_submitting() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode, modifiers: KeyModifiers| KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        state.set_input("first".into());
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        state.set_input(format!("{}second", state.input));
+        assert_eq!(state.input, "first\nsecond");
+        assert!(
+            engine_command_receiver.try_recv().is_err(),
+            "shift+enter must not submit"
+        );
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter, KeyModifiers::empty()));
+        assert_eq!(state.input, "", "plain enter still submits");
+        let command = engine_command_receiver.try_recv().expect("submit command");
+        match command {
+            EngineCommand::Submit { text, .. } => assert_eq!(text, "first\nsecond"),
+            _ => panic!("expected a submit command"),
+        }
+    }
+
+    #[test]
+    fn composer_cursor_moves_and_edits_mid_string() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        state.set_input("abc".into());
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Left));
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('X')));
+        assert_eq!(state.input, "abXc");
+        assert_eq!(state.input_cursor, 3);
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Home));
+        assert_eq!(state.input_cursor, 0);
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Delete));
+        assert_eq!(state.input, "bXc");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::End));
+        assert_eq!(state.input_cursor, 3);
+    }
+
+    #[test]
+    fn multiline_composer_renders_every_line_and_maps_mouse_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.set_input("line one\nline two".into());
+
+        let buffer = render_state(&state, 100, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains("line one"));
+        assert!(text.contains("line two"));
+
+        let layout = state.input_layout.borrow().clone();
+        assert_eq!(layout.len(), 2, "both logical lines register a mouse row");
+        let second = &layout[1];
+        let mouse = |kind: crossterm::event::MouseEventKind, column: u16, row: u16| {
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            }
+        };
+        handle_mouse(
+            &mut state,
+            mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                second.screen_x_start,
+                second.screen_y,
+            ),
+        );
+        handle_mouse(
+            &mut state,
+            mouse(
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                second.screen_x_start + 4,
+                second.screen_y,
+            ),
+        );
+        assert_eq!(
+            state.selection,
+            Some((9, 13)),
+            "the second line maps to the absolute char range"
+        );
+    }
+
+    fn review_diff_message(thread_id: &str) -> MessageRow {
+        MessageRow {
+            id: 90,
+            thread_id: thread_id.to_string(),
+            turn: 1,
+            role: "diff".to_string(),
+            provider: None,
+            model: None,
+            text: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,3 @@\n context\n-old line\n+new line\n+another line\n".to_string(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn review_mode_sends_line_anchored_notes() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let review = state.review.as_ref().expect("review opens");
+        assert_eq!(review.rows.len(), 4, "review keeps context and changed rows");
+        assert_eq!(review.rows.iter().filter(|row| row.added || row.removed).count(), 3);
+        assert_eq!(review.rows[review.selected].text, "old line", "selection starts on the first change");
+
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        for character in "fix this".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Char(character)),
+            );
+        }
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter));
+        let review = state.review.as_ref().expect("review stays open");
+        assert_eq!(review.notes.len(), 1);
+        assert_eq!(review.notes[0].path, "src/lib.rs");
+        assert_eq!(review.notes[0].line, 2);
+        assert!(review.notes[0].added);
+        assert_eq!(review.notes[0].body, "fix this");
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('s')));
+        assert!(state.review.is_none(), "sending closes review");
+        match engine_command_receiver.try_recv().expect("submit") {
+            EngineCommand::Submit { text, .. } => {
+                assert!(text.contains("File: src/lib.rs"));
+                assert!(text.contains("Line: 2"));
+                assert!(text.contains("Change: added"));
+                assert!(text.contains("User comment: \"fix this\""));
+            }
+            _ => panic!("expected submit"),
+        }
+        let fingerprint = diff_render::fingerprint(&review_diff_message(&state.thread.id).text);
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .list_unsent_review_notes(&state.thread.id, 1, &fingerprint)
+                .unwrap()
+                .is_empty(),
+            "sending marks notes delivered so reopen cannot resend them"
+        );
+    }
+
+    #[test]
+    fn review_notes_stay_anchored_to_changed_lines() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        assert!(!state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].added);
+        assert!(!state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].removed);
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        assert!(state.review.as_ref().unwrap().note_input.is_none());
+        assert!(state.notice.as_deref().unwrap_or("").contains("added or removed"));
+    }
+
+    #[test]
+    fn review_file_navigation_jumps_between_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![MessageRow {
+            id: 91,
+            thread_id: state.thread.id.clone(),
+            turn: 1,
+            role: "diff".into(),
+            provider: None,
+            model: None,
+            text: "diff --git a/src/a.rs b/src/a.rs\n--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old a\n+new a\ndiff --git a/src/b.rs b/src/b.rs\n--- a/src/b.rs\n+++ b/src/b.rs\n@@ -1 +1 @@\n-old b\n+new b\n".into(),
+            created_at: String::new(),
+        }];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let review = state.review.as_ref().unwrap();
+        assert_eq!(review.rows[review.selected].path, "src/a.rs");
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char(']')));
+        assert_eq!(state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].path, "src/b.rs");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('[')));
+        assert_eq!(state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].path, "src/a.rs");
+    }
+
+    #[test]
+    fn review_notes_restore_on_reopen_and_delete_persists() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let diff = review_diff_message(&state.thread.id);
+        state.history = vec![diff.clone()];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        for character in "persist me".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Char(character)),
+            );
+        }
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter));
+        let fingerprint = diff_render::fingerprint(&diff.text);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_unsent_review_notes(&state.thread.id, 1, &fingerprint)
+                .unwrap()
+                .len(),
+            1,
+            "adding a note persists it before sending"
+        );
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let review = state.review.as_ref().expect("review reopens");
+        assert_eq!(review.notes.len(), 1);
+        assert_eq!(review.notes[0].body, "persist me");
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('d')));
+        assert!(state.review.as_ref().unwrap().notes.is_empty());
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .list_unsent_review_notes(&state.thread.id, 1, &fingerprint)
+                .unwrap()
+                .is_empty(),
+            "deleting a note removes its persisted row"
+        );
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        assert!(
+            state.review.as_ref().unwrap().notes.is_empty(),
+            "deleted notes do not come back on the next reopen"
+        );
+    }
+
+    #[test]
+    fn review_notes_steer_when_a_turn_is_running() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        state.running = true;
+        let thread_id = state.thread.id.clone();
+        let review = state.review.as_mut().unwrap();
+        let id = store
+            .lock()
+            .unwrap()
+            .add_review_note(
+                &thread_id,
+                review.turn,
+                "src/lib.rs",
+                3,
+                true,
+                "tighten this",
+                &review.fingerprint,
+            )
+            .unwrap();
+        review.notes.push(ReviewNote {
+            id,
+            path: "src/lib.rs".into(),
+            line: 3,
+            added: true,
+            body: "tighten this".into(),
+        });
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        match engine_command_receiver.try_recv().expect("steer") {
+            EngineCommand::Steer { text, .. } => assert!(text.contains("Line: 3")),
+            _ => panic!("expected steer"),
+        }
+    }
+
+    #[test]
+    fn review_overlay_renders_rows_and_note_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/review");
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("review turn 1"), "header: {text}");
+        assert!(text.contains("src/lib.rs:2"), "anchored row: {text}");
+        assert!(text.contains("new line"));
+        assert!(text.contains("press n on a changed line"));
+    }
+
+    #[test]
+    fn a_message_while_running_steers_instead_of_queueing() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.running = true;
+        state.set_input("change direction".into());
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        match engine_command_receiver.try_recv().expect("steer command") {
+            EngineCommand::Steer { thread_id, text } => {
+                assert_eq!(thread_id, state.thread.id);
+                assert_eq!(text, "change direction");
+            }
+            _ => panic!("expected a steer command"),
+        }
+        assert!(state.queued_messages.is_empty(), "a steer is not a queued turn");
+    }
+
+    #[test]
+    fn rejected_steering_falls_back_to_the_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::SteerRejected {
+                thread_id,
+                text: "follow up".into(),
+            },
+            &engine_command_sender,
+        );
+        assert_eq!(state.queued_messages, vec!["follow up".to_string()]);
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            vec!["follow up".to_string()],
+            "a rejected steer is durable"
+        );
+        assert!(state.notice.as_deref().unwrap_or("").contains("queued"));
+    }
+
+    #[test]
+    fn a_second_submit_for_the_same_thread_falls_back_to_the_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnRejected {
+                thread_id,
+                text: "second".into(),
+                reason: "a turn is already running for this thread".into(),
+            },
+            &engine_command_sender,
+        );
+        assert_eq!(state.queued_messages, vec!["second".to_string()]);
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            vec!["second".to_string()]
+        );
+        assert!(state.notice.as_deref().unwrap_or("").contains("already running"));
+    }
+
+    #[test]
+    fn status_command_summarizes_phase_goal_and_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.apply_permission_mode(&store, PermissionMode::Plan);
+        state.set_goal_state(&store, Some("ship".into()), true);
+        enqueue_message(&mut state, &store, "later".into());
+        {
+            let guard = store.lock().unwrap();
+            guard.start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m")).unwrap();
+            guard.finish_turn_record(&state.thread.id, 1, TurnPhase::Failed, Some("boom")).unwrap();
+        }
+        handle_command(&mut state, &store, &engine_command_sender, "/status");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("provider: claude"));
+        assert!(notice.contains("mode: plan"));
+        assert!(notice.contains("goal: ship (paused)"));
+        assert!(notice.contains("turns: 1"));
+        assert!(notice.contains("turn: 1 failed"));
+        assert!(notice.contains("error: boom"));
+        assert!(notice.contains("queue: 1 waiting"));
+    }
+
+    #[test]
+    fn status_command_warns_about_open_turns() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        store
+            .lock()
+            .unwrap()
+            .start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m"))
+            .unwrap();
+        handle_command(&mut state, &store, &engine_command_sender, "/status");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("1 running"));
+        assert!(notice.contains("may be stale"));
+    }
+
+    #[test]
+    fn turns_command_lists_durable_phases() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let guard = store.lock().unwrap();
+            guard.start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m")).unwrap();
+            guard.finish_turn_record(&state.thread.id, 1, TurnPhase::Completed, None).unwrap();
+            guard.start_turn_record(&state.thread.id, 2, ProviderId::Codex, Some("m")).unwrap();
+        }
+        handle_command(&mut state, &store, &engine_command_sender, "/turns");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("turns: 2"));
+        assert!(notice.contains("2 running"));
+        assert!(notice.contains("1 completed"));
+        assert!(notice.contains("may be stale"));
+    }
+
+    #[test]
+    fn queue_command_lists_and_clears_persisted_messages() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        enqueue_message(&mut state, &store, "first".into());
+        enqueue_message(&mut state, &store, "second line\nrest".into());
+
+        handle_command(&mut state, &store, &engine_command_sender, "/queue");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("queue: 2 waiting"));
+        assert!(notice.contains("1. first"));
+        assert!(notice.contains("2. second line"));
+        assert!(!notice.contains("rest"), "previews stay on one line");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/queue clear");
+        assert!(state.queued_messages.is_empty());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn a_successful_turn_pops_the_persisted_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        enqueue_message(&mut state, &store, "follow up".into());
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            vec!["follow up".to_string()]
+        );
+
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id,
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+
+        assert!(state.queued_messages.is_empty());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap()
+            .is_empty());
+        match engine_command_receiver.try_recv().expect("queued message is sent") {
+            EngineCommand::Submit { text, .. } => assert_eq!(text, "follow up"),
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn permission_mode_and_goal_persist_and_paused_goals_are_not_injected() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/mode plan");
+        let saved = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(saved.permission_mode, PermissionMode::Plan, "mode persists on the thread");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/goal ship the fix");
+        let saved = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(saved.goal.as_deref(), Some("ship the fix"));
+        assert!(!saved.goal_paused);
+
+        handle_command(&mut state, &store, &engine_command_sender, "/goal pause");
+        let saved = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert!(saved.goal_paused, "pause is durable, not just a notice");
+        submit(&mut state, &store, &engine_command_sender, "while paused".into());
+        match engine_command_receiver.try_recv().expect("submit") {
+            EngineCommand::Submit { text, permission_mode, .. } => {
+                assert_eq!(text, "while paused", "a paused goal must not be injected");
+                assert_eq!(permission_mode, PermissionMode::Plan);
+            }
+            _ => panic!("expected submit"),
+        }
+
+        handle_command(&mut state, &store, &engine_command_sender, "/goal resume");
+        submit(&mut state, &store, &engine_command_sender, "after resume".into());
+        match engine_command_receiver.try_recv().expect("submit") {
+            EngineCommand::Submit { text, .. } => {
+                assert_eq!(text, "[goal: ship the fix]\nafter resume");
+            }
+            _ => panic!("expected submit"),
+        }
+    }
+
+    #[test]
+    fn opening_a_thread_restores_its_mode_and_goal() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "other".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        {
+            let guard = store.lock().unwrap();
+            guard.set_thread_permission_mode(&other.id, PermissionMode::BypassPermissions).unwrap();
+            guard
+                .set_thread_goal(&other.id, Some("other goal"), true)
+                .unwrap();
+        }
+        state.overlay = Overlay::ThreadPicker {
+            selected: 0,
+            threads: vec![(other.id.clone(), other.title.clone())],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert_eq!(state.thread.id, other.id);
+        assert_eq!(state.permission_mode, PermissionMode::BypassPermissions);
+        assert_eq!(state.goal.as_deref(), Some("other goal"));
+        assert!(state.goal_paused);
+    }
+
+    #[test]
+    fn fork_command_branches_the_conversation_and_opens_the_new_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let source_id = state.thread.id.clone();
+        {
+            let guard = store.lock().unwrap();
+            guard.set_thread_permission_mode(&source_id, PermissionMode::Plan).unwrap();
+            guard.set_thread_goal(&source_id, Some("fork goal"), false).unwrap();
+            guard
+                .add_message(&source_id, 1, "user", Some("claude"), None, "hello")
+                .unwrap();
+            guard
+                .add_message(&source_id, 1, "assistant", Some("claude"), None, "hi")
+                .unwrap();
+        }
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/fork branched",
+        );
+
+        assert_ne!(state.thread.id, source_id);
+        assert_eq!(state.thread.title, "branched");
+        assert_eq!(state.permission_mode, PermissionMode::Plan);
+        assert_eq!(state.goal.as_deref(), Some("fork goal"));
+        assert_eq!(state.history.len(), 2);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("forked"));
+        assert!(store.lock().unwrap().get_thread(&source_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn fork_command_can_stop_at_a_completed_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let source_id = state.thread.id.clone();
+        {
+            let guard = store.lock().unwrap();
+            for turn in 1..=2 {
+                guard
+                    .add_message(
+                        &source_id,
+                        turn,
+                        "user",
+                        Some("claude"),
+                        None,
+                        &format!("user {turn}"),
+                    )
+                    .unwrap();
+                guard
+                    .add_message(
+                        &source_id,
+                        turn,
+                        "assistant",
+                        Some("claude"),
+                        None,
+                        &format!("assistant {turn}"),
+                    )
+                    .unwrap();
+                guard
+                    .start_turn_record(&source_id, turn, ProviderId::Claude, None)
+                    .unwrap();
+                guard
+                    .finish_turn_record(&source_id, turn, TurnPhase::Completed, None)
+                    .unwrap();
+            }
+        }
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/fork --turn 1 branched one",
+        );
+
+        assert_ne!(state.thread.id, source_id);
+        assert_eq!(state.thread.title, "branched one");
+        assert_eq!(state.history.len(), 2);
+        assert!(state.history.iter().all(|message| message.turn == 1));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("through turn 1"));
+    }
+
+    #[test]
+    fn up_arrow_recalls_project_prompt_history() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        submit(&mut state, &store, &engine_command_sender, "first prompt".to_string());
+        submit(&mut state, &store, &engine_command_sender, "second prompt".to_string());
+        assert_eq!(
+            store.lock().unwrap().list_prompt_history(&state.thread.cwd).unwrap(),
+            vec!["first prompt", "second prompt"],
+            "submits persist to the project history"
+        );
+
+        let key = |code: KeyCode| KeyEvent { code, modifiers: KeyModifiers::empty(), kind: KeyEventKind::Press, state: crossterm::event::KeyEventState::empty() };
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        assert_eq!(state.input, "second prompt", "Up on an empty composer recalls the newest prompt");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        assert_eq!(state.input, "first prompt", "Up again walks back");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        assert_eq!(state.input, "second prompt", "Down walks forward");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        assert_eq!(state.input, "", "Down past the newest returns to an empty composer");
+
+        // editing exits recall mode; Up then scrolls instead
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('x')));
+        let scrolled = state.scroll_offset;
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
+        assert_eq!(state.scroll_offset, scrolled + 1, "Up with edited input scrolls the transcript");
     }
 }

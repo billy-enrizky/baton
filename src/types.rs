@@ -112,6 +112,54 @@ impl AuthMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnPhase {
+    Queued,
+    Running,
+    Settling,
+    Completed,
+    Failed,
+    Interrupted,
+    Unverified,
+}
+
+impl TurnPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            TurnPhase::Queued => "queued",
+            TurnPhase::Running => "running",
+            TurnPhase::Settling => "settling",
+            TurnPhase::Completed => "completed",
+            TurnPhase::Failed => "failed",
+            TurnPhase::Interrupted => "interrupted",
+            TurnPhase::Unverified => "unverified",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<TurnPhase> {
+        match value {
+            "queued" => Some(TurnPhase::Queued),
+            "running" => Some(TurnPhase::Running),
+            "settling" => Some(TurnPhase::Settling),
+            "completed" => Some(TurnPhase::Completed),
+            "failed" => Some(TurnPhase::Failed),
+            "interrupted" => Some(TurnPhase::Interrupted),
+            "unverified" => Some(TurnPhase::Unverified),
+            _ => None,
+        }
+    }
+
+    pub fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            TurnPhase::Completed
+                | TurnPhase::Failed
+                | TurnPhase::Interrupted
+                | TurnPhase::Unverified
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Accept,
     AcceptAlways,
@@ -131,4 +179,40 @@ pub struct TurnUsage {
 pub struct NativeSessionRef {
     pub native_session_id: String,
     pub rollout_path: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TurnPhase;
+
+    #[test]
+    fn only_terminal_phases_report_terminal() {
+        for phase in [TurnPhase::Queued, TurnPhase::Running, TurnPhase::Settling] {
+            assert!(!phase.is_terminal(), "{} must stay open", phase.as_str());
+        }
+        for phase in [
+            TurnPhase::Completed,
+            TurnPhase::Failed,
+            TurnPhase::Interrupted,
+            TurnPhase::Unverified,
+        ] {
+            assert!(phase.is_terminal(), "{} must be terminal", phase.as_str());
+        }
+    }
+
+    #[test]
+    fn phase_strings_round_trip() {
+        for phase in [
+            TurnPhase::Queued,
+            TurnPhase::Running,
+            TurnPhase::Settling,
+            TurnPhase::Completed,
+            TurnPhase::Failed,
+            TurnPhase::Interrupted,
+            TurnPhase::Unverified,
+        ] {
+            assert_eq!(TurnPhase::parse(phase.as_str()), Some(phase));
+        }
+        assert_eq!(TurnPhase::parse("unknown"), None);
+    }
 }

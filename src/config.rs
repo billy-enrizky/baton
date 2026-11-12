@@ -72,9 +72,10 @@ pub fn resolve_provider_config(
     cwd: &Path,
     claude_dir: Option<&Path>,
     codex_home: Option<&Path>,
+    opencode_dir: Option<&Path>,
 ) -> EffectiveProviderConfig {
     let file = load_config_file(home);
-    let harness = read_harness_config(provider, Some(cwd), claude_dir, codex_home);
+    let harness = read_harness_config(provider, Some(cwd), claude_dir, codex_home, opencode_dir);
     let env_key_name = harness
         .api_key_env_name
         .clone()
@@ -125,7 +126,7 @@ pub fn get_default_provider(home: &Path) -> Option<ProviderId> {
 }
 
 pub fn resolve_config(home: &Path, cwd: &Path) -> EffectiveConfig {
-    resolve_config_in(home, cwd, None, None)
+    resolve_config_in(home, cwd, None, None, None)
 }
 
 pub fn resolve_config_in(
@@ -133,12 +134,13 @@ pub fn resolve_config_in(
     cwd: &Path,
     claude_dir: Option<&Path>,
     codex_home: Option<&Path>,
+    opencode_dir: Option<&Path>,
 ) -> EffectiveConfig {
     let mut providers = BTreeMap::new();
     for provider in ProviderId::all() {
         providers.insert(
             *provider,
-            resolve_provider_config(*provider, home, cwd, claude_dir, codex_home),
+            resolve_provider_config(*provider, home, cwd, claude_dir, codex_home, opencode_dir),
         );
     }
     EffectiveConfig { providers }

@@ -1,6 +1,6 @@
 use baton::handoff::{build_handoff, wrap_prompt_with_handoff, HandoffMessage};
 use baton::store::{BatonStore, ImportedMessage, NewThread};
-use baton::types::{ProviderId, TurnUsage};
+use baton::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
 use baton::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 use baton::scanner::{parse_claude_transcript, parse_codex_transcript};
 use std::io::Write;
@@ -40,6 +40,150 @@ fn store_crud_and_thread_lifecycle() {
     store.add_message(&thread.id, 1, "assistant", Some("codex"), Some("gpt-6.1-sol"), "hi").unwrap();
     assert_eq!(store.next_turn_number(&thread.id).unwrap(), 2);
     assert_eq!(store.list_messages(&thread.id).unwrap().len(), 2);
+}
+
+#[test]
+fn store_fork_copies_conversation_and_config_but_not_sessions() {
+    let store = BatonStore::memory().unwrap();
+    let source = store
+        .create_thread(NewThread {
+            title: "source".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: Some("model-1".into()),
+        })
+        .unwrap();
+    store
+        .set_thread_permission_mode(&source.id, PermissionMode::Plan)
+        .unwrap();
+    store
+        .set_thread_goal(&source.id, Some("ship the fork"), true)
+        .unwrap();
+    store
+        .add_message(&source.id, 1, "user", Some("codex"), Some("model-1"), "hello")
+        .unwrap();
+    store
+        .add_message(&source.id, 1, "assistant", Some("codex"), Some("model-1"), "hi")
+        .unwrap();
+    store
+        .add_message(&source.id, 1, "tool", Some("codex"), None, "✓ shell ls")
+        .unwrap();
+    store
+        .start_turn_record(&source.id, 1, ProviderId::Codex, Some("model-1"))
+        .unwrap();
+    store
+        .finish_turn_record(&source.id, 1, TurnPhase::Completed, None)
+        .unwrap();
+    store
+        .upsert_provider_session(
+            &source.id,
+            ProviderId::Codex,
+            "native-source",
+            Some("model-1".into()),
+            None,
+        )
+        .unwrap();
+
+    let forked = store.fork_thread(&source.id, "branched").unwrap();
+
+    assert_ne!(forked.id, source.id);
+    assert_eq!(forked.title, "branched");
+    assert_eq!(forked.cwd, source.cwd);
+    assert_eq!(forked.current_provider, ProviderId::Codex);
+    assert_eq!(forked.current_model.as_deref(), Some("model-1"));
+    assert_eq!(forked.permission_mode, PermissionMode::Plan);
+    assert_eq!(forked.goal.as_deref(), Some("ship the fork"));
+    assert!(forked.goal_paused);
+    let source_messages = store.list_messages(&source.id).unwrap();
+    let forked_messages = store.list_messages(&forked.id).unwrap();
+    assert_eq!(forked_messages.len(), source_messages.len());
+    assert_eq!(
+        forked_messages
+            .iter()
+            .map(|message| (message.turn, message.role.as_str(), message.text.as_str()))
+            .collect::<Vec<_>>(),
+        source_messages
+            .iter()
+            .map(|message| (message.turn, message.role.as_str(), message.text.as_str()))
+            .collect::<Vec<_>>()
+    );
+    assert!(store
+        .get_provider_session(&forked.id, ProviderId::Codex)
+        .unwrap()
+        .is_none());
+    let forked_turns = store.list_turn_records(&forked.id).unwrap();
+    assert_eq!(forked_turns.len(), 1);
+    assert_eq!(forked_turns[0].phase, TurnPhase::Completed);
+    assert_eq!(store.next_turn_number(&forked.id).unwrap(), 2);
+    assert_eq!(store.list_messages(&source.id).unwrap().len(), source_messages.len());
+}
+
+#[test]
+fn store_fork_can_stop_at_a_completed_turn() {
+    let store = BatonStore::memory().unwrap();
+    let source = store
+        .create_thread(NewThread {
+            title: "source".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: Some("model-1".into()),
+        })
+        .unwrap();
+    for turn in 1..=2 {
+        store
+            .add_message(
+                &source.id,
+                turn,
+                "user",
+                Some("codex"),
+                Some("model-1"),
+                &format!("user {turn}"),
+            )
+            .unwrap();
+        store
+            .add_message(
+                &source.id,
+                turn,
+                "assistant",
+                Some("codex"),
+                Some("model-1"),
+                &format!("assistant {turn}"),
+            )
+            .unwrap();
+        store
+            .start_turn_record(&source.id, turn, ProviderId::Codex, Some("model-1"))
+            .unwrap();
+        store
+            .finish_turn_record(&source.id, turn, TurnPhase::Completed, None)
+            .unwrap();
+    }
+    store
+        .start_turn_record(&source.id, 3, ProviderId::Codex, Some("model-1"))
+        .unwrap();
+
+    let first = store
+        .fork_thread_through_turn(&source.id, "through one", Some(1))
+        .unwrap();
+    let first_messages = store.list_messages(&first.id).unwrap();
+    assert_eq!(first_messages.len(), 2);
+    assert!(first_messages.iter().all(|message| message.turn == 1));
+    assert_eq!(store.list_turn_records(&first.id).unwrap().len(), 1);
+    assert_eq!(store.next_turn_number(&first.id).unwrap(), 2);
+
+    let second = store
+        .fork_thread_through_turn(&source.id, "through two", Some(2))
+        .unwrap();
+    assert_eq!(store.list_messages(&second.id).unwrap().len(), 4);
+    assert_eq!(store.list_turn_records(&second.id).unwrap().len(), 2);
+    assert_eq!(store.next_turn_number(&second.id).unwrap(), 3);
+
+    assert!(store.fork_thread(&source.id, "whole").is_err());
+    assert!(store
+        .fork_thread_through_turn(&source.id, "open cutoff", Some(3))
+        .is_err());
+    assert!(store
+        .fork_thread_through_turn(&source.id, "missing cutoff", Some(99))
+        .is_err());
 }
 
 #[test]
@@ -99,6 +243,10 @@ fn store_rewind_truncates_and_clears_sessions() {
         .add_usage(&thread.id, 2, ProviderId::Claude, None, &TurnUsage { input_tokens: 2, output_tokens: 2, cache_read_tokens: 2, cache_creation_tokens: 2, cost_usd: None })
         .unwrap();
 
+    store.start_turn_record(&thread.id, 1, ProviderId::Claude, None).unwrap();
+    store.finish_turn_record(&thread.id, 1, TurnPhase::Completed, None).unwrap();
+    store.start_turn_record(&thread.id, 2, ProviderId::Claude, None).unwrap();
+
     store.rewind_thread(&thread.id, 2).unwrap();
     let messages = store.list_messages(&thread.id).unwrap();
     assert_eq!(messages.len(), 2);
@@ -106,6 +254,236 @@ fn store_rewind_truncates_and_clears_sessions() {
     assert!(store.get_provider_session(&thread.id, ProviderId::Claude).unwrap().is_none());
     assert_eq!(store.list_usage(Some(&thread.id)).unwrap().len(), 1);
     assert_eq!(store.next_turn_number(&thread.id).unwrap(), 2);
+    assert_eq!(store.list_turn_records(&thread.id).unwrap().len(), 1, "rewind removes turn records at or after the cutoff");
+}
+
+#[test]
+fn store_turn_records_and_reconcile() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "t".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: Some("m".into()),
+        })
+        .unwrap();
+    store.start_turn_record(&thread.id, 1, ProviderId::Codex, Some("m")).unwrap();
+    store.finish_turn_record(&thread.id, 1, TurnPhase::Completed, None).unwrap();
+    store.start_turn_record(&thread.id, 2, ProviderId::Codex, Some("m")).unwrap();
+
+    let running = store.get_turn_record(&thread.id, 2).unwrap().unwrap();
+    assert_eq!(running.phase, TurnPhase::Running);
+    assert!(running.ended_at.is_none());
+
+    let reconciled = store.reconcile_running_turns(Some("/tmp/project")).unwrap();
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(reconciled[0].turn, 2);
+
+    let turns = store.list_turn_records(&thread.id).unwrap();
+    assert_eq!(turns[0].phase, TurnPhase::Completed);
+    assert_eq!(turns[1].phase, TurnPhase::Unverified);
+    assert!(turns[1].ended_at.is_some());
+    assert_eq!(
+        store.reconcile_running_turns(Some("/tmp/project")).unwrap().len(),
+        0,
+        "reconcile is idempotent"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn store_thread_lookup_accepts_symlinked_project_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "linked".into(),
+            cwd: real.to_string_lossy().to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    let found = store.list_threads_for_path(&link).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, thread.id);
+}
+
+#[test]
+fn store_search_is_project_scoped_and_matches_titles_or_text() {
+    let store = BatonStore::memory().unwrap();
+    let first = store
+        .create_thread(NewThread {
+            title: "authentication refactor".into(),
+            cwd: "/tmp/one".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    let second = store
+        .create_thread(NewThread {
+            title: "other project".into(),
+            cwd: "/tmp/two".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    store
+        .add_message(&first.id, 1, "user", None, None, "Fix the LOGIN redirect")
+        .unwrap();
+    store
+        .add_message(&first.id, 2, "assistant", None, None, "coverage is 100% now")
+        .unwrap();
+    store
+        .add_message(&second.id, 1, "assistant", None, None, "login also appears here")
+        .unwrap();
+    let scoped = store.search_messages(Some("/tmp/one"), "login", 20).unwrap();
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].thread_id, first.id);
+    let by_title = store
+        .search_messages(Some("/tmp/one"), "AUTHENTICATION", 20)
+        .unwrap();
+    assert_eq!(by_title.len(), 2, "a title match returns each matching message");
+    assert!(by_title.iter().all(|result| result.title == "authentication refactor"));
+    let all = store.search_messages(None, "login", 20).unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(store.search_messages(None, "", 20).unwrap().len(), 0);
+    let literal_percent = store.search_messages(Some("/tmp/one"), "%", 20).unwrap();
+    assert_eq!(literal_percent.len(), 1, "LIKE wildcards are escaped");
+    assert!(literal_percent[0].text.contains("100%"));
+}
+
+#[test]
+fn store_review_notes_track_sent_state_and_rewind() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "review".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+
+    let first = store
+        .add_review_note(&thread.id, 1, "src/lib.rs", 2, true, "fix this", "diff-a")
+        .unwrap();
+    store
+        .add_review_note(&thread.id, 2, "src/main.rs", 7, false, "remove this", "diff-b")
+        .unwrap();
+    assert_eq!(
+        store
+            .list_unsent_review_notes(&thread.id, 1, "diff-a")
+            .unwrap()
+            .len(),
+        1,
+        "unsent notes are restored for their exact diff"
+    );
+    assert!(
+        store
+            .list_unsent_review_notes(&thread.id, 1, "other-diff")
+            .unwrap()
+            .is_empty(),
+        "a fingerprint mismatch must not attach stale notes"
+    );
+
+    store.mark_review_notes_sent(&thread.id, &[first]).unwrap();
+    assert!(
+        store
+            .list_unsent_review_notes(&thread.id, 1, "diff-a")
+            .unwrap()
+            .is_empty(),
+        "sent notes do not reappear on reopen"
+    );
+
+    let second = store
+        .add_review_note(&thread.id, 2, "src/main.rs", 8, true, "delete me", "diff-b")
+        .unwrap();
+    store.delete_review_notes(&thread.id, &[second]).unwrap();
+    assert_eq!(
+        store
+            .list_unsent_review_notes(&thread.id, 2, "diff-b")
+            .unwrap()
+            .len(),
+        1,
+        "deleting one note leaves the other note on the same turn"
+    );
+
+    let turn_one = store
+        .add_review_note(&thread.id, 1, "src/lib.rs", 3, true, "keep", "diff-a")
+        .unwrap();
+    store
+        .add_review_note(&thread.id, 2, "src/main.rs", 9, true, "drop", "diff-b")
+        .unwrap();
+    store.rewind_thread(&thread.id, 2).unwrap();
+    let remaining = store
+        .list_unsent_review_notes(&thread.id, 1, "diff-a")
+        .unwrap();
+    assert_eq!(remaining.len(), 1);
+    assert_eq!(remaining[0].id, turn_one);
+    assert!(
+        store
+            .list_unsent_review_notes(&thread.id, 2, "diff-b")
+            .unwrap()
+            .is_empty(),
+        "rewind removes review notes at the cutoff"
+    );
+}
+
+#[test]
+fn store_queue_is_fifo_and_cleared_on_rewind() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "t".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    store.enqueue_message(&thread.id, "first").unwrap();
+    store.enqueue_message(&thread.id, "second").unwrap();
+    assert_eq!(
+        store.list_queued_messages(&thread.id).unwrap(),
+        vec!["first", "second"]
+    );
+    assert_eq!(store.pop_queued_message(&thread.id).unwrap().as_deref(), Some("first"));
+    assert_eq!(
+        store.list_queued_messages(&thread.id).unwrap(),
+        vec!["second"]
+    );
+
+    store.rewind_thread(&thread.id, 1).unwrap();
+    assert!(store.list_queued_messages(&thread.id).unwrap().is_empty());
+}
+
+#[test]
+fn store_thread_mode_and_goal_persist() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "t".into(),
+            cwd: "/tmp/project".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    assert_eq!(thread.permission_mode, PermissionMode::Default);
+    assert_eq!(thread.goal, None);
+    assert!(!thread.goal_paused);
+
+    store.set_thread_permission_mode(&thread.id, PermissionMode::Plan).unwrap();
+    store
+        .set_thread_goal(&thread.id, Some("ship the fix"), true)
+        .unwrap();
+    let updated = store.get_thread(&thread.id).unwrap().unwrap();
+    assert_eq!(updated.permission_mode, PermissionMode::Plan);
+    assert_eq!(updated.goal.as_deref(), Some("ship the fix"));
+    assert!(updated.goal_paused);
 }
 
 #[test]
@@ -143,7 +521,11 @@ fn store_migration_resets_stale_defaults() {
             .unwrap();
     }
     let store = BatonStore::open(&path).unwrap();
-    assert_eq!(store.get_thread("stale-id").unwrap().unwrap().current_model, None);
+    let stale = store.get_thread("stale-id").unwrap().unwrap();
+    assert_eq!(stale.current_model, None);
+    assert_eq!(stale.permission_mode, PermissionMode::Default);
+    assert_eq!(stale.goal, None);
+    assert!(!stale.goal_paused);
     assert_eq!(
         store.get_thread("fresh-id").unwrap().unwrap().current_model.as_deref(),
         Some("claude-opus-5-5")
@@ -327,4 +709,24 @@ fn viewport_windowing() {
     assert!(partial.visible.len() >= 2);
     assert_eq!(partial.visible.first().unwrap().id, 2);
     assert_eq!(partial.visible.last().unwrap().id, 3);
+}
+
+#[test]
+fn prompt_history_is_project_scoped_capped_and_deduped() {
+    let store = BatonStore::memory().unwrap();
+    store.record_prompt("/proj-a", "first").unwrap();
+    store.record_prompt("/proj-a", "first").unwrap(); // consecutive repeat skipped
+    store.record_prompt("/proj-b", "other project").unwrap();
+    store.record_prompt("/proj-a", "second").unwrap();
+    assert_eq!(store.list_prompt_history("/proj-a").unwrap(), vec!["first", "second"]);
+    assert_eq!(store.list_prompt_history("/proj-b").unwrap(), vec!["other project"]);
+    assert!(store.list_prompt_history("/proj-c").unwrap().is_empty());
+
+    for index in 0..150 {
+        store.record_prompt("/proj-a", &format!("prompt {index}")).unwrap();
+    }
+    let history = store.list_prompt_history("/proj-a").unwrap();
+    assert_eq!(history.len(), 100, "history caps at 100 entries");
+    assert_eq!(history.first().unwrap(), "prompt 50", "oldest entries fall off");
+    assert_eq!(history.last().unwrap(), "prompt 149");
 }

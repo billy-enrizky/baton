@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{BatonAdapter, LineReader, LineWriter, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, LineReader, LineWriter, ModelListInput, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -17,10 +17,10 @@ struct CodexRuntime {
     notifications: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
     current_emit: AsyncMutex<Option<TurnEventSender>>,
     active_thread: AsyncMutex<Option<String>>,
+    active_turn: AsyncMutex<Option<String>>,
 }
 
 pub type HalvesSpawner = Arc<dyn Fn(&[(String, String)]) -> Result<TransportHalves> + Send + Sync>;
-type CumulativeMap = Arc<Mutex<HashMap<String, (i64, i64, i64, i64)>>>;
 
 pub struct CodexAdapter {
     spawner: HalvesSpawner,
@@ -28,7 +28,6 @@ pub struct CodexAdapter {
     notification_receiver: Option<tokio::sync::mpsc::UnboundedReceiver<(String, Value)>>,
     next_id: Arc<AtomicU32>,
     auth_signature: Arc<Mutex<Option<String>>>,
-    last_cumulative: CumulativeMap,
 }
 
 fn spawn_reader(runtime: Arc<CodexRuntime>) {
@@ -78,21 +77,67 @@ fn spawn_reader(runtime: Arc<CodexRuntime>) {
     });
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApprovalKind {
+    Command,
+    FileChange,
+    Permissions,
+}
+
+fn steer_debug(message: &str) {
+    if std::env::var_os("BATON_DEBUG_STEER").is_some() {
+        eprintln!("baton steer: {message}");
+    }
+}
+
+fn approval_kind(method: &str) -> Option<ApprovalKind> {
+    match method {
+        "item/commandExecution/requestApproval" => Some(ApprovalKind::Command),
+        "item/fileChange/requestApproval" => Some(ApprovalKind::FileChange),
+        "item/permissions/requestApproval" => Some(ApprovalKind::Permissions),
+        _ => None,
+    }
+}
+
+/// Builds the response payload for a Codex approval request.
+///
+/// The command and file-change unions use `accept`, `acceptForSession`,
+/// `decline`, and `cancel`. The permissions request is a different shape:
+/// it returns the granted profile plus the grant scope.
+fn approval_response(method: &str, params: &Value, decision: ApprovalDecision) -> Value {
+    match approval_kind(method) {
+        Some(ApprovalKind::Command) | Some(ApprovalKind::FileChange) => {
+            let decision = match decision {
+                ApprovalDecision::Accept => "accept",
+                ApprovalDecision::AcceptAlways => "acceptForSession",
+                ApprovalDecision::Deny => "decline",
+            };
+            json!({ "decision": decision })
+        }
+        Some(ApprovalKind::Permissions) => {
+            let granted = if matches!(decision, ApprovalDecision::Accept | ApprovalDecision::AcceptAlways) {
+                params.get("permissions").cloned().unwrap_or_else(|| json!({}))
+            } else {
+                json!({})
+            };
+            let scope = if decision == ApprovalDecision::AcceptAlways {
+                "session"
+            } else {
+                "turn"
+            };
+            json!({ "permissions": granted, "scope": scope })
+        }
+        None => json!({}),
+    }
+}
+
 async fn handle_server_request(
     runtime: &Arc<CodexRuntime>,
     id: Value,
     method: &str,
     params: Value,
 ) {
-    const APPROVAL_METHODS: &[(&str, &str)] = &[
-        ("item/commandExecution/requestApproval", "command"),
-        ("item/fileChange/requestApproval", "fileChange"),
-        ("item/permissions/requestApproval", "permissions"),
-    ];
-    let kind = APPROVAL_METHODS
-        .iter()
-        .find_map(|(candidate, kind)| (*candidate == method).then_some(*kind));
-    let kind = match kind {
+    let kind = match approval_kind(method) {
         Some(kind) => kind,
         None => {
             let response = json!({
@@ -132,7 +177,14 @@ async fn handle_server_request(
                 .map(str::to_string)
                 .filter(|value| !value.is_empty())
         })
-        .unwrap_or_else(|| format!("codex requests {kind} approval"));
+        .unwrap_or_else(|| {
+            let label = match kind {
+                ApprovalKind::Command => "command",
+                ApprovalKind::FileChange => "fileChange",
+                ApprovalKind::Permissions => "permissions",
+            };
+            format!("codex requests {label} approval")
+        });
     let request_id = format!(
         "{}:{}",
         method,
@@ -146,25 +198,28 @@ async fn handle_server_request(
     {
         let emit = runtime.current_emit.lock().await;
         if let Some(emit) = emit.as_ref() {
+            let label = match kind {
+                ApprovalKind::Command => "command",
+                ApprovalKind::FileChange => "fileChange",
+                ApprovalKind::Permissions => "permissions",
+            };
             let _ = emit.send(TurnEvent::ApprovalRequest {
                 id: request_id,
-                kind: kind.to_string(),
+                kind: label.to_string(),
                 summary,
                 respond,
             });
         }
     }
     let runtime = runtime.clone();
+    let method = method.to_string();
     tokio::spawn(async move {
-        let decision = match receiver.await {
-            Ok(ApprovalDecision::Accept) => "accept",
-            Ok(ApprovalDecision::AcceptAlways) => "acceptForSession",
-            Ok(ApprovalDecision::Deny) | Err(_) => "deny",
-        };
+        let decision = receiver.await.unwrap_or(ApprovalDecision::Deny);
+        let result = approval_response(&method, &params, decision);
         let response = json!({
             "jsonrpc": "2.0",
             "id": id,
-            "result": { "decision": decision }
+            "result": result
         });
         if let Ok(serialized) = serde_json::to_string(&response) {
             let mut writer = runtime.writer.lock().await;
@@ -181,11 +236,11 @@ impl CodexAdapter {
             notification_receiver: None,
             next_id: Arc::new(AtomicU32::new(1)),
             auth_signature: Arc::new(Mutex::new(None)),
-            last_cumulative: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     async fn ensure_runtime(&mut self, auth_env: &[(String, String)]) -> Result<Arc<CodexRuntime>> {
+        steer_debug(&format!("ensure adapter={:x} slot={:x}", self as *const Self as usize, Arc::as_ptr(&self.runtime) as usize));
         let signature = auth_signature(auth_env);
         let need_spawn = self.auth_signature.lock().unwrap().as_deref() != Some(signature.as_str());
         if need_spawn {
@@ -203,9 +258,11 @@ impl CodexAdapter {
                 notifications: notification_sender,
                 current_emit: AsyncMutex::new(None),
                 active_thread: AsyncMutex::new(None),
+                active_turn: AsyncMutex::new(None),
             });
             spawn_reader(runtime.clone());
             *slot = Some(runtime.clone());
+            steer_debug(&format!("runtime spawned adapter={:x} slot={:x} runtime={:p}", self as *const Self as usize, Arc::as_ptr(&self.runtime) as usize, Arc::as_ptr(&runtime)));
             self.notification_receiver = Some(notification_receiver);
             *self.auth_signature.lock().unwrap() = Some(signature);
         }
@@ -260,22 +317,17 @@ impl CodexAdapter {
     ) {
         let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
         if method == "thread/tokenUsage/updated" {
-            let usage = params.get("tokenUsage").cloned().unwrap_or(Value::Null);
-            let cumulative = (
-                usage.get("inputTokens").and_then(Value::as_i64).unwrap_or(0),
-                usage.get("cachedInputTokens").and_then(Value::as_i64).unwrap_or(0),
-                usage.get("cacheWriteInputTokens").and_then(Value::as_i64).unwrap_or(0),
-                usage.get("outputTokens").and_then(Value::as_i64).unwrap_or(0),
-            );
-            if !thread_id.is_empty() {
-                self.last_cumulative.lock().unwrap().insert(thread_id.to_string(), cumulative);
-            }
+            // v2 nests per-turn usage under `last` and cumulative thread usage
+            // under `total`. Older servers sent the breakdown at the top level.
+            let token_usage = params.get("tokenUsage").cloned().unwrap_or(Value::Null);
+            let breakdown = token_usage.get("last").unwrap_or(&token_usage);
+            let read = |key: &str| breakdown.get(key).and_then(Value::as_i64).unwrap_or(0);
             if thread_id == active_thread {
                 let usage = TurnUsage {
-                    input_tokens: cumulative.0,
-                    output_tokens: cumulative.3,
-                    cache_read_tokens: cumulative.1,
-                    cache_creation_tokens: cumulative.2,
+                    input_tokens: read("inputTokens"),
+                    output_tokens: read("outputTokens"),
+                    cache_read_tokens: read("cachedInputTokens"),
+                    cache_creation_tokens: read("cacheWriteInputTokens"),
                     cost_usd: None,
                 };
                 *turn_usage = Some(usage);
@@ -311,12 +363,14 @@ impl CodexAdapter {
                     }
                     "commandExecution" => {
                         let command = item.get("command").and_then(Value::as_str).unwrap_or("").to_string();
+                        let call_id = item.get("id").and_then(Value::as_str).map(str::to_string);
                         if !completed {
-                            let _ = emit.send(TurnEvent::ToolStarted { tool: "shell".into(), detail: Some(command) });
+                            let _ = emit.send(TurnEvent::ToolStarted { id: call_id, tool: "shell".into(), detail: Some(command) });
                         } else {
                             let status = item.get("status").and_then(Value::as_str).unwrap_or("");
                             if status == "completed" || status == "failed" {
                                 let _ = emit.send(TurnEvent::ToolCompleted {
+                                    id: call_id,
                                     tool: "shell".into(),
                                     detail: Some(command),
                                     exit_code: item.get("exitCode").and_then(Value::as_i64),
@@ -336,10 +390,11 @@ impl CodexAdapter {
                                     .join(", ")
                             })
                             .unwrap_or_default();
+                        let call_id = item.get("id").and_then(Value::as_str).map(str::to_string);
                         if !completed {
-                            let _ = emit.send(TurnEvent::ToolStarted { tool: "edit".into(), detail: Some(paths) });
+                            let _ = emit.send(TurnEvent::ToolStarted { id: call_id, tool: "edit".into(), detail: Some(paths) });
                         } else {
-                            let _ = emit.send(TurnEvent::ToolCompleted { tool: "edit".into(), detail: Some(paths), exit_code: None });
+                            let _ = emit.send(TurnEvent::ToolCompleted { id: call_id, tool: "edit".into(), detail: Some(paths), exit_code: None });
                         }
                     }
                     _ => {}
@@ -373,8 +428,18 @@ impl BatonAdapter for CodexAdapter {
                         Some(thread_id) => thread_id,
                         None => return,
                     };
+                    let turn_id = runtime.active_turn.lock().await.clone();
+                    let turn_id = match turn_id {
+                        Some(turn_id) => turn_id,
+                        None => return,
+                    };
                     let id = next_id.fetch_add(1, Ordering::SeqCst);
-                    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": "turn/interrupt", "params": { "threadId": thread_id } });
+                    let frame = json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "turn/interrupt",
+                        "params": { "threadId": thread_id, "turnId": turn_id }
+                    });
                     if let Ok(serialized) = serde_json::to_string(&frame) {
                         let mut writer = runtime.writer.lock().await;
                         let _ = writer.write_line(&serialized).await;
@@ -382,6 +447,113 @@ impl BatonAdapter for CodexAdapter {
                 });
             }
         })
+    }
+
+    fn steer_handle(&self) -> Option<SteerHandle> {
+        let runtime = self.runtime.clone();
+        let adapter_ptr = self as *const Self as usize;
+        let slot_ptr = Arc::as_ptr(&runtime) as usize;
+        steer_debug(&format!("handle adapter={adapter_ptr:x} slot={slot_ptr:x}"));
+        let next_id = self.next_id.clone();
+        Some(Arc::new(move |text: String| -> bool {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                steer_debug("no tokio runtime");
+                return false;
+            };
+            let runtime = match runtime.try_lock() {
+                Ok(slot) => slot.clone(),
+                Err(_) => {
+                    steer_debug("runtime slot busy");
+                    return false;
+                }
+            };
+            let runtime = match runtime {
+                Some(runtime) => runtime,
+                None => {
+                    steer_debug(&format!("runtime not spawned adapter={adapter_ptr:x} slot={slot_ptr:x}"));
+                    return false;
+                }
+            };
+            steer_debug(&format!("runtime found adapter={adapter_ptr:x} runtime={:p}", Arc::as_ptr(&runtime)));
+            let thread_id = match runtime.active_thread.try_lock() {
+                Ok(value) => value.clone(),
+                Err(_) => {
+                    steer_debug("active thread busy");
+                    return false;
+                }
+            };
+            let turn_id = match runtime.active_turn.try_lock() {
+                Ok(value) => value.clone(),
+                Err(_) => {
+                    steer_debug("active turn busy");
+                    return false;
+                }
+            };
+            let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) else {
+                steer_debug("no active thread or turn");
+                return false;
+            };
+            let id = next_id.fetch_add(1, Ordering::SeqCst);
+            steer_debug("accepted");
+            handle.spawn(async move {
+                let frame = json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": "turn/steer",
+                    "params": {
+                        "threadId": thread_id,
+                        "expectedTurnId": turn_id,
+                        "input": [ { "type": "text", "text": text } ]
+                    }
+                });
+                if let Ok(serialized) = serde_json::to_string(&frame) {
+                    let mut writer = runtime.writer.lock().await;
+                    let _ = writer.write_line(&serialized).await;
+                }
+            });
+            true
+        }))
+    }
+
+    async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        self.ensure_initialized(&runtime).await?;
+        let mut models: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        loop {
+            let mut params = json!({ "limit": 200 });
+            if let Some(cursor) = cursor.as_ref() {
+                params["cursor"] = json!(cursor);
+            }
+            let response = self.request(&runtime, "model/list", params).await?;
+            if let Some(data) = response.get("data").and_then(Value::as_array) {
+                for model in data {
+                    if model.get("hidden").and_then(Value::as_bool).unwrap_or(false) {
+                        continue;
+                    }
+                    let slug = model
+                        .get("model")
+                        .or_else(|| model.get("id"))
+                        .and_then(Value::as_str)
+                        .filter(|slug| !slug.is_empty());
+                    if let Some(slug) = slug {
+                        if !models.iter().any(|known| known == slug) {
+                            models.push(slug.to_string());
+                        }
+                    }
+                }
+            }
+            let next = response
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .filter(|next| !next.is_empty())
+                .map(str::to_string);
+            match next {
+                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(models)
     }
 
     async fn start_turn(
@@ -439,7 +611,16 @@ impl BatonAdapter for CodexAdapter {
             "approvalsReviewer": "user",
             "summary": "detailed"
         });
-        self.request(&runtime, "turn/start", turn_params).await?;
+        let started = self.request(&runtime, "turn/start", turn_params).await?;
+        let turn_id = started
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| started.get("turnId").and_then(Value::as_str).map(str::to_string));
+        if let Some(turn_id) = turn_id.as_ref() {
+            *runtime.active_turn.lock().await = Some(turn_id.clone());
+        }
 
         let mut receiver = match self.notification_receiver.take() {
             Some(receiver) => receiver,
@@ -453,36 +634,88 @@ impl BatonAdapter for CodexAdapter {
                 None => break Err(anyhow::anyhow!("codex app-server connection closed")),
             };
             match method.as_str() {
+                "turn/started" => {
+                    let started_thread = params.get("threadId").and_then(Value::as_str).unwrap_or("");
+                    if started_thread == thread_id {
+                        if let Some(id) = params
+                            .get("turn")
+                            .and_then(|turn| turn.get("id"))
+                            .and_then(Value::as_str)
+                        {
+                            *runtime.active_turn.lock().await = Some(id.to_string());
+                        }
+                    }
+                }
                 "turn/completed" => {
                     let completed_thread = params.get("threadId").and_then(Value::as_str).unwrap_or("");
                     if completed_thread == thread_id {
-                        let final_message = params
-                            .get("turn")
-                            .and_then(|turn| turn.get("items"))
-                            .and_then(Value::as_array)
-                            .and_then(|items| {
-                                items
-                                    .iter()
-                                    .rev()
-                                    .find(|item| item.get("type").and_then(Value::as_str) == Some("agentMessage"))
-                            })
-                            .and_then(|item| item.get("text"))
+                        let turn = params.get("turn").cloned().unwrap_or(Value::Null);
+                        let status = turn
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .unwrap_or("completed");
+                        let error = turn
+                            .get("error")
+                            .and_then(|error| error.get("message"))
                             .and_then(Value::as_str)
                             .map(str::to_string);
-                        let text = final_message.unwrap_or_else(|| final_text.clone());
-                        let _ = emit.send(TurnEvent::TurnCompleted {
-                            final_text: text,
-                            usage: turn_usage,
-                            native_session_id: Some(thread_id.clone()),
-                            rollout_path: rollout_path.clone(),
-                        });
-                        break Ok(());
+                        if let Some(id) = turn.get("id").and_then(Value::as_str) {
+                            *runtime.active_turn.lock().await = Some(id.to_string());
+                        }
+                        match status {
+                            "completed" => {
+                                let final_message = turn
+                                    .get("items")
+                                    .and_then(Value::as_array)
+                                    .and_then(|items| {
+                                        items.iter().rev().find(|item| {
+                                            item.get("type").and_then(Value::as_str)
+                                                == Some("agentMessage")
+                                        })
+                                    })
+                                    .and_then(|item| item.get("text"))
+                                    .and_then(Value::as_str)
+                                    .map(str::to_string);
+                                let text = final_message.unwrap_or_else(|| final_text.clone());
+                                let _ = emit.send(TurnEvent::TurnCompleted {
+                                    final_text: text,
+                                    usage: turn_usage,
+                                    native_session_id: Some(thread_id.clone()),
+                                    rollout_path: rollout_path.clone(),
+                                });
+                                break Ok(());
+                            }
+                            "interrupted" => {
+                                let reason = error;
+                                let message = reason
+                                    .clone()
+                                    .unwrap_or_else(|| "turn interrupted".to_string());
+                                let _ = emit.send(TurnEvent::TurnInterrupted { reason });
+                                break Err(anyhow::anyhow!(message));
+                            }
+                            "failed" => {
+                                let message = error.unwrap_or_else(|| "codex turn failed".to_string());
+                                let _ = emit.send(TurnEvent::TurnFailed { error: message.clone() });
+                                break Err(anyhow::anyhow!(message));
+                            }
+                            other => {
+                                let message = format!("codex turn ended with status {other}");
+                                let _ = emit.send(TurnEvent::TurnFailed { error: message.clone() });
+                                break Err(anyhow::anyhow!(message));
+                            }
+                        }
                     }
                 }
                 "turn/failed" => {
                     let failed_thread = params.get("threadId").and_then(Value::as_str).unwrap_or("");
                     if failed_thread == thread_id {
-                        let error = params.get("error").and_then(Value::as_str).unwrap_or("codex turn failed");
+                        let error = params
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                            .or_else(|| params.get("error").and_then(Value::as_str))
+                            .unwrap_or("codex turn failed");
+                        let _ = emit.send(TurnEvent::TurnFailed { error: error.to_string() });
                         break Err(anyhow::anyhow!("{error}"));
                     }
                 }
@@ -494,6 +727,7 @@ impl BatonAdapter for CodexAdapter {
         self.notification_receiver = Some(receiver);
         *runtime.current_emit.lock().await = None;
         *runtime.active_thread.lock().await = None;
+        *runtime.active_turn.lock().await = None;
         result
     }
 
@@ -504,5 +738,67 @@ impl BatonAdapter for CodexAdapter {
             let _ = writer.shutdown().await;
         }
         Ok(())
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_and_file_approvals_use_v2_decisions() {
+        let params = json!({ "command": "cargo test" });
+        let accept = approval_response(
+            "item/commandExecution/requestApproval",
+            &params,
+            ApprovalDecision::Accept,
+        );
+        assert_eq!(accept["decision"], "accept");
+        let always = approval_response(
+            "item/fileChange/requestApproval",
+            &params,
+            ApprovalDecision::AcceptAlways,
+        );
+        assert_eq!(always["decision"], "acceptForSession");
+        let deny = approval_response(
+            "item/commandExecution/requestApproval",
+            &params,
+            ApprovalDecision::Deny,
+        );
+        assert_eq!(deny["decision"], "decline", "deny is not a v2 decision value");
+    }
+
+    #[test]
+    fn permissions_approval_returns_granted_profile_and_scope() {
+        let params = json!({
+            "permissions": {
+                "network": { "enabled": true },
+                "fileSystem": { "read": ["/tmp"], "write": [] }
+            }
+        });
+        let accept = approval_response(
+            "item/permissions/requestApproval",
+            &params,
+            ApprovalDecision::Accept,
+        );
+        assert_eq!(accept["permissions"], params["permissions"]);
+        assert_eq!(accept["scope"], "turn");
+        assert!(accept.get("decision").is_none());
+
+        let always = approval_response(
+            "item/permissions/requestApproval",
+            &params,
+            ApprovalDecision::AcceptAlways,
+        );
+        assert_eq!(always["scope"], "session");
+
+        let deny = approval_response(
+            "item/permissions/requestApproval",
+            &params,
+            ApprovalDecision::Deny,
+        );
+        assert_eq!(deny["permissions"], json!({}));
+        assert_eq!(deny["scope"], "turn");
     }
 }

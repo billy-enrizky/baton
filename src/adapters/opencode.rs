@@ -3,13 +3,16 @@ use async_trait::async_trait;
 use base64::Engine;
 use futures::StreamExt;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
+use uuid::Uuid;
 
-use crate::adapters::{BatonAdapter, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
+use crate::process::ProcessRecorder;
 use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +38,9 @@ struct OpenCodeRuntime {
     child: Arc<AsyncMutex<Child>>,
     current_emit: AsyncMutex<Option<TurnEventSender>>,
     active_session: AsyncMutex<Option<String>>,
+    /// True only after the prompt request was accepted. Steering before that
+    /// would race session admission and can be rejected by opencode.
+    active_turn: AtomicBool,
 }
 
 pub struct OpenCodeAdapter {
@@ -42,6 +48,7 @@ pub struct OpenCodeAdapter {
     runtime: Arc<AsyncMutex<Option<Arc<OpenCodeRuntime>>>>,
     auth_signature: Arc<Mutex<Option<String>>>,
     current_model: AsyncMutex<Option<String>>,
+    recorder: ProcessRecorder,
 }
 
 fn parse_model_slug(slug: &str) -> Result<(String, String)> {
@@ -55,11 +62,16 @@ fn parse_model_slug(slug: &str) -> Result<(String, String)> {
 
 impl OpenCodeAdapter {
     pub fn new(spawner: OpenCodeSpawner) -> Self {
+        Self::with_recorder(spawner, ProcessRecorder::disabled())
+    }
+
+    pub fn with_recorder(spawner: OpenCodeSpawner, recorder: ProcessRecorder) -> Self {
         OpenCodeAdapter {
             spawner,
             runtime: Arc::new(AsyncMutex::new(None)),
             auth_signature: Arc::new(Mutex::new(None)),
             current_model: AsyncMutex::new(None),
+            recorder,
         }
     }
 
@@ -70,7 +82,12 @@ impl OpenCodeAdapter {
             let mut slot = self.runtime.lock().await;
             if let Some(runtime) = slot.as_ref() {
                 let mut child = runtime.child.lock().await;
-                let _ = child.start_kill();
+                let pid = child.id();
+                if child.start_kill().is_ok() {
+                    if let Some(pid) = pid {
+                        self.recorder.forget(pid);
+                    }
+                }
             }
             let mut spawned = (self.spawner)(auth_env)?;
             let auth_header = format!(
@@ -108,6 +125,7 @@ impl OpenCodeAdapter {
                 child: Arc::new(AsyncMutex::new(spawned.child)),
                 current_emit: AsyncMutex::new(None),
                 active_session: AsyncMutex::new(None),
+                active_turn: AtomicBool::new(false),
             });
             spawn_sse_reader(http, runtime_base_url.clone(), auth_header, event_sender);
             *slot = Some(runtime.clone());
@@ -130,19 +148,6 @@ impl OpenCodeAdapter {
             anyhow::bail!("opencode {path} failed ({status}): {text}");
         }
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
-    }
-
-    async fn post_empty(&self, runtime: &Arc<OpenCodeRuntime>, path: &str) -> Result<()> {
-        let response = runtime
-            .http
-            .post(format!("{}{}", runtime.base_url, path))
-            .header("Authorization", &runtime.auth_header)
-            .send()
-            .await?;
-        if !response.status().is_success() {
-            anyhow::bail!("opencode {path} failed ({})", response.status());
-        }
-        Ok(())
     }
 }
 
@@ -195,48 +200,146 @@ fn spawn_sse_reader(
     });
 }
 
-fn handle_event(event_type: &str, data: &Value, emit: &TurnEventSender, active_session: &str, final_text: &mut String, usage: &mut Option<TurnUsage>) -> bool {
+fn summarize_tool_input(input: &Value) -> Option<String> {
+    let input = input.get("input").unwrap_or(input);
+    for key in [
+        "command",
+        "path",
+        "filePath",
+        "file_path",
+        "pattern",
+        "query",
+        "url",
+        "description",
+        "agent",
+    ] {
+        let Some(value) = input.get(key) else {
+            continue;
+        };
+        let text = if let Some(text) = value.as_str() {
+            text.lines().next().unwrap_or("").trim().to_string()
+        } else if let Some(parts) = value.as_array() {
+            parts
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" ")
+        } else {
+            continue;
+        };
+        if !text.is_empty() {
+            return Some(text.chars().take(100).collect());
+        }
+    }
+    None
+}
+
+fn handle_event(
+    event_type: &str,
+    data: &Value,
+    emit: &TurnEventSender,
+    active_session: &str,
+    final_text: &mut String,
+    usage: &mut Option<TurnUsage>,
+    tool_names: &mut std::collections::HashMap<String, String>,
+) -> bool {
     let session_matches = data.get("sessionID").and_then(Value::as_str) == Some(active_session);
     match event_type {
-        "session.text.delta" if session_matches => {
+        "session.text.delta" | "session.next.text.delta" | "message.part.delta" if session_matches => {
+            if event_type == "message.part.delta" && data.get("field").and_then(Value::as_str) != Some("text") {
+                return false;
+            }
             if let Some(delta) = data.get("delta").and_then(Value::as_str) {
                 let _ = emit.send(TurnEvent::TextDelta { text: delta.to_string() });
             }
             false
         }
-        "message.part.delta" if session_matches => {
-            if data.get("field").and_then(Value::as_str) == Some("text") {
-                if let Some(delta) = data.get("delta").and_then(Value::as_str) {
-                    let _ = emit.send(TurnEvent::TextDelta { text: delta.to_string() });
+        "session.next.text.ended" if session_matches => {
+            if let Some(text) = data.get("text").and_then(Value::as_str) {
+                if !text.is_empty() {
+                    *final_text = text.to_string();
                 }
             }
             false
         }
-        "session.tool.input.started" if session_matches => {
+        "session.tool.input.started" | "session.next.tool.input.started" if session_matches => {
             let name = data.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
-            let _ = emit.send(TurnEvent::ToolStarted { tool: name, detail: None });
+            if let Some(call_id) = data.get("callID").and_then(Value::as_str) {
+                tool_names.insert(call_id.to_string(), name.clone());
+            }
+            let id = data.get("callID").and_then(Value::as_str).map(str::to_string);
+            let _ = emit.send(TurnEvent::ToolStarted { id, tool: name, detail: None });
             false
         }
-        "session.tool.success" | "session.tool.failed" if session_matches => {
-            let name = data.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
-            let _ = emit.send(TurnEvent::ToolCompleted {
-                tool: name,
-                detail: None,
-                exit_code: Some(if event_type == "session.tool.failed" { 1 } else { 0 }),
-            });
-            false
-        }
-        "session.step.ended" if session_matches => {
-            if let Some(tokens) = data.get("tokens") {
-                *usage = Some(TurnUsage {
-                    input_tokens: tokens.get("input").and_then(Value::as_i64).unwrap_or(0),
-                    output_tokens: tokens.get("output").and_then(Value::as_i64).unwrap_or(0),
-                    cache_read_tokens: tokens.get("cache").and_then(|cache| cache.get("read")).and_then(Value::as_i64).unwrap_or(0),
-                    cache_creation_tokens: tokens.get("cache").and_then(|cache| cache.get("write")).and_then(Value::as_i64).unwrap_or(0),
-                    cost_usd: None,
+        // The called frame carries the authoritative tool name and input. The
+        // earlier input.started frame gave the spinner a name immediately; this
+        // frame upgrades the same call id with the useful detail.
+        "session.next.tool.called" if session_matches => {
+            if let Some(call_id) = data.get("callID").and_then(Value::as_str) {
+                let tool = data
+                    .get("tool")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                tool_names.insert(call_id.to_string(), tool.clone());
+                let _ = emit.send(TurnEvent::ToolStarted {
+                    id: Some(call_id.to_string()),
+                    tool,
+                    detail: summarize_tool_input(data),
                 });
             }
             false
+        }
+        // Success/failure frames carry only the callID, not the name.
+        "session.tool.success" | "session.tool.failed" | "session.next.tool.success" | "session.next.tool.failed"
+            if session_matches =>
+        {
+            let fallback = data.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
+            let name = data
+                .get("callID")
+                .and_then(Value::as_str)
+                .and_then(|call_id| tool_names.get(call_id))
+                .cloned()
+                .unwrap_or(fallback);
+            let id = data.get("callID").and_then(Value::as_str).map(str::to_string);
+            let _ = emit.send(TurnEvent::ToolCompleted {
+                id,
+                tool: name,
+                detail: None,
+                exit_code: Some(if event_type.ends_with("failed") { 1 } else { 0 }),
+            });
+            false
+        }
+        // opencode >= 2 ends a turn with session.execution.*; 1.x "next" servers
+        // end each step instead: finish "tool-calls" means another step follows.
+        "session.next.step.ended" if session_matches => {
+            if let Some(tokens) = data.get("tokens") {
+                let step = TurnUsage {
+                    input_tokens: tokens.get("input").and_then(Value::as_i64).unwrap_or(0)
+                        + tokens.get("cache").and_then(|cache| cache.get("read")).and_then(Value::as_i64).unwrap_or(0)
+                        + tokens.get("cache").and_then(|cache| cache.get("write")).and_then(Value::as_i64).unwrap_or(0),
+                    output_tokens: tokens.get("output").and_then(Value::as_i64).unwrap_or(0)
+                        + tokens.get("reasoning").and_then(Value::as_i64).unwrap_or(0),
+                    cache_read_tokens: tokens.get("cache").and_then(|cache| cache.get("read")).and_then(Value::as_i64).unwrap_or(0),
+                    cache_creation_tokens: tokens.get("cache").and_then(|cache| cache.get("write")).and_then(Value::as_i64).unwrap_or(0),
+                    cost_usd: None,
+                };
+                let accumulated = usage.get_or_insert_with(TurnUsage::default);
+                accumulated.input_tokens += step.input_tokens;
+                accumulated.output_tokens += step.output_tokens;
+                accumulated.cache_read_tokens += step.cache_read_tokens;
+                accumulated.cache_creation_tokens += step.cache_creation_tokens;
+                accumulated.cost_usd = None;
+            }
+            data.get("finish").and_then(Value::as_str) != Some("tool-calls")
+        }
+        "session.next.step.failed" if session_matches => {
+            let message = data
+                .pointer("/error/message")
+                .and_then(Value::as_str)
+                .unwrap_or("opencode step failed");
+            let _ = emit.send(TurnEvent::TurnFailed { error: message.to_string() });
+            true
         }
         "session.execution.succeeded" | "session.execution.failed" | "session.execution.interrupted"
             if session_matches =>
@@ -313,6 +416,95 @@ impl BatonAdapter for OpenCodeAdapter {
         })
     }
 
+    fn steer_handle(&self) -> Option<SteerHandle> {
+        let runtime = self.runtime.clone();
+        Some(Arc::new(move |text: String| -> bool {
+            let Ok(handle) = tokio::runtime::Handle::try_current() else {
+                return false;
+            };
+            let runtime = match runtime.try_lock() {
+                Ok(slot) => slot.clone(),
+                Err(_) => return false,
+            };
+            let runtime = match runtime {
+                Some(runtime) => runtime,
+                None => return false,
+            };
+            if runtime.version != OpenCodeVersion::V2
+                || !runtime.active_turn.load(Ordering::SeqCst)
+            {
+                return false;
+            }
+            let session_id = match runtime.active_session.try_lock() {
+                Ok(session_id) => session_id.clone(),
+                Err(_) => return false,
+            };
+            let Some(session_id) = session_id else {
+                return false;
+            };
+            let id = format!("msg_baton_steer_{}", Uuid::new_v4().simple());
+            handle.spawn(async move {
+                let body = json!({
+                    "id": id,
+                    "prompt": { "text": text },
+                    "delivery": "steer"
+                });
+                let _ = runtime
+                    .http
+                    .post(format!(
+                        "{}/api/session/{session_id}/prompt",
+                        runtime.base_url
+                    ))
+                    .header("Authorization", &runtime.auth_header)
+                    .json(&body)
+                    .send()
+                    .await;
+            });
+            true
+        }))
+    }
+
+    async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        if runtime.version != OpenCodeVersion::V2 {
+            return Ok(Vec::new());
+        }
+        let response = runtime
+            .http
+            .get(format!("{}/api/model", runtime.base_url))
+            .header("Authorization", &runtime.auth_header)
+            .query(&[("location[directory]", input.cwd.as_str())])
+            .send()
+            .await?;
+        let status = response.status();
+        let text = response.text().await?;
+        if !status.is_success() {
+            anyhow::bail!("opencode /api/model failed ({status}): {text}");
+        }
+        let frame: Value = serde_json::from_str(&text)?;
+        let mut models: Vec<String> = Vec::new();
+        if let Some(data) = frame.get("data").and_then(Value::as_array) {
+            for model in data {
+                let provider = model
+                    .get("providerID")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                let id = model
+                    .get("id")
+                    .or_else(|| model.get("modelID"))
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty());
+                if let (Some(provider), Some(id)) = (provider, id) {
+                    let slug = format!("{provider}/{id}");
+                    if !models.contains(&slug) {
+                        models.push(slug);
+                    }
+                }
+            }
+        }
+        Ok(models)
+    }
+
     async fn start_turn(
         &mut self,
         input: TurnStartInput,
@@ -345,7 +537,11 @@ impl BatonAdapter for OpenCodeAdapter {
                 OpenCodeVersion::V1 => {
                     let body = json!({ "permission": [] });
                     let created = self.post(&runtime, "/session", body).await?;
-                    match created.pointer("/data/id").and_then(Value::as_str) {
+                    match created
+                        .pointer("/data/id")
+                        .or_else(|| created.get("id"))
+                        .and_then(Value::as_str)
+                    {
                         Some(session_id) => session_id.to_string(),
                         None => anyhow::bail!("opencode did not return a session id"),
                     }
@@ -361,7 +557,8 @@ impl BatonAdapter for OpenCodeAdapter {
                 let _ = self
                     .post(&runtime, &format!("/api/session/{session_id}/model"), body)
                     .await;
-                let prompt_body = json!({ "text": input.prompt });
+                // opencode >= 2 wraps the prompt text: {"prompt": {"text": ...}}.
+                let prompt_body = json!({ "prompt": { "text": input.prompt } });
                 self.post(&runtime, &format!("/api/session/{session_id}/prompt"), prompt_body)
                     .await?;
             }
@@ -376,11 +573,13 @@ impl BatonAdapter for OpenCodeAdapter {
                     .await;
             }
         }
+        runtime.active_turn.store(true, Ordering::SeqCst);
 
         let mut receiver = runtime.events.lock().await;
         let mut final_text = String::new();
+        let mut tool_names: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut usage: Option<TurnUsage> = None;
-        let mut pending_approvals: Vec<tokio::sync::oneshot::Receiver<ApprovalDecision>> = Vec::new();
+        let pending_approvals: Vec<tokio::sync::oneshot::Receiver<ApprovalDecision>> = Vec::new();
         let result: Result<()> = loop {
             let (event_type, data) = match receiver.recv().await {
                 Some(event) => event,
@@ -426,7 +625,10 @@ impl BatonAdapter for OpenCodeAdapter {
                     continue;
                 }
             }
-            let mut finished = handle_event(&event_type, &data, &emit, &session_id, &mut final_text, &mut usage);
+            let mut finished = handle_event(&event_type, &data, &emit, &session_id, &mut final_text, &mut usage, &mut tool_names);
+            if std::env::var("BATON_DEBUG_EVENTS").is_ok() {
+                eprintln!("[opencode] {event_type} finished={finished} data={}", serde_json::to_string(&data).unwrap_or_default());
+            }
             if event_type == "session.execution.failed"
                 && data.get("sessionID").and_then(Value::as_str) == Some(session_id.as_str())
             {
@@ -437,6 +639,7 @@ impl BatonAdapter for OpenCodeAdapter {
             }
         };
         drop(receiver);
+        runtime.active_turn.store(false, Ordering::SeqCst);
         *runtime.current_emit.lock().await = None;
         *runtime.active_session.lock().await = None;
 
@@ -460,8 +663,14 @@ impl BatonAdapter for OpenCodeAdapter {
     async fn dispose(&mut self) -> Result<()> {
         let runtime = self.runtime.lock().await.clone();
         if let Some(runtime) = runtime {
+            runtime.active_turn.store(false, Ordering::SeqCst);
             let mut child = runtime.child.lock().await;
-            let _ = child.start_kill();
+            let pid = child.id();
+            if child.start_kill().is_ok() {
+                if let Some(pid) = pid {
+                    self.recorder.forget(pid);
+                }
+            }
         }
         Ok(())
     }

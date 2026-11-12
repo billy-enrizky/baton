@@ -3,7 +3,7 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
-use crate::config::{get_default_provider, resolve_config};
+use crate::config::{get_default_provider, load_config_file, resolve_config};
 use crate::process::probe;
 use crate::store::BatonStore;
 use crate::types::ProviderId;
@@ -108,6 +108,12 @@ fn build_with_lookup(
         .collect::<Vec<_>>();
 
     let mut warnings = Vec::new();
+    if config_exists && load_config_file(home).is_none() {
+        warnings.push(format!(
+            "baton config {} exists but could not be parsed",
+            config_file.display()
+        ));
+    }
     if let Some(provider) = default_provider {
         if let Some(check) = providers.iter().find(|check| check.provider == provider) {
             if !check.installed() {

@@ -37,6 +37,7 @@ const COLORS: ColorConstants = ColorConstants {
     success: Color::Rgb(134, 239, 172),
     error: Color::Rgb(252, 165, 165),
     warning: Color::Rgb(251, 191, 36),
+    selection_bg: Color::Rgb(62, 80, 120),
 };
 
 struct ColorConstants {
@@ -50,6 +51,7 @@ struct ColorConstants {
     success: Color,
     error: Color,
     warning: Color,
+    selection_bg: Color,
 }
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -163,6 +165,17 @@ struct InputRow {
     scroll: usize,
 }
 
+/// The transcript's current rendered window, used to map mouse rows back to
+/// absolute transcript lines for selection and copy.
+struct TranscriptViewport {
+    area: Rect,
+    content_top: u16,
+    content_start: usize,
+    content_rows: usize,
+    total: usize,
+    plain: Vec<String>,
+}
+
 enum Overlay {
     None,
     RewindPicker { selected: usize },
@@ -223,6 +236,10 @@ pub struct TuiState {
     selection_anchor: Option<usize>,
     selection: Option<(usize, usize)>,
     input_origin: std::cell::Cell<(u16, u16)>,
+    transcript_view: std::cell::RefCell<Option<TranscriptViewport>>,
+    transcript_selection: std::cell::Cell<Option<(usize, usize)>>,
+    transcript_anchor: std::cell::Cell<Option<usize>>,
+    transcript_total: std::cell::Cell<usize>,
 }
 
 pub fn run_tui(
@@ -289,6 +306,10 @@ pub fn run_tui(
         selection_anchor: None,
         selection: None,
         input_origin: std::cell::Cell::new((0, 0)),
+        transcript_view: std::cell::RefCell::new(None),
+        transcript_selection: std::cell::Cell::new(None),
+        transcript_anchor: std::cell::Cell::new(None),
+        transcript_total: std::cell::Cell::new(0),
     };
 
     if !reconciled.is_empty() {
@@ -388,30 +409,137 @@ pub fn run_tui(
     Ok(())
 }
 
-/// Mouse selection inside the composer input: click sets an anchor, drag
-/// extends an orange-highlighted range, and clicks outside the input clear it.
+/// Mouse selection inside the composer and the transcript. A click sets an
+/// anchor, a drag extends the range, and releasing over the transcript copies
+/// the selected lines. The transcript uses absolute rendered-line indices so
+/// scrolling does not shift an existing selection.
 fn handle_mouse(state: &mut TuiState, mouse: crossterm::event::MouseEvent) {
     use crossterm::event::{MouseButton, MouseEventKind};
-    let index = input_index_at(state, mouse.column, mouse.row);
+    let input_index = input_index_at(state, mouse.column, mouse.row);
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(index) = index {
+            if let Some(index) = input_index {
+                clear_transcript_selection(state);
                 state.selection_anchor = Some(index);
                 state.selection = Some((index, index));
                 state.input_cursor = index;
+            } else if let Some(line) = transcript_line_at(state, mouse.column, mouse.row) {
+                state.selection_anchor = None;
+                state.selection = None;
+                state.transcript_anchor.set(Some(line));
+                state.transcript_selection.set(Some((line, line)));
             } else {
                 state.selection_anchor = None;
                 state.selection = None;
+                clear_transcript_selection(state);
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if let (Some(anchor), Some(index)) = (state.selection_anchor, index) {
+            if let (Some(anchor), Some(index)) = (state.selection_anchor, input_index) {
                 state.selection = Some((anchor.min(index), anchor.max(index)));
                 state.input_cursor = index;
+            } else if let (Some(anchor), Some(line)) = (
+                state.transcript_anchor.get(),
+                transcript_line_for_drag(state, mouse.row),
+            ) {
+                state.transcript_selection.set(Some((anchor.min(line), anchor.max(line))));
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if state.transcript_anchor.get().is_some() {
+                copy_transcript_selection(state);
             }
         }
         _ => {}
     }
+}
+
+fn clear_transcript_selection(state: &mut TuiState) {
+    state.transcript_selection.set(None);
+    state.transcript_anchor.set(None);
+}
+
+/// Maps a screen cell to an absolute rendered transcript line. Only the
+/// visible content rows count; the scroll indicator and composer are excluded.
+fn transcript_line_at(state: &TuiState, column: u16, row: u16) -> Option<usize> {
+    let view = state.transcript_view.borrow();
+    let view = view.as_ref()?;
+    let area = view.area;
+    if column < area.x
+        || column >= area.x.saturating_add(area.width)
+        || row < view.content_top
+        || row >= area.y.saturating_add(area.height)
+    {
+        return None;
+    }
+    let offset = row.saturating_sub(view.content_top) as usize;
+    if offset >= view.content_rows {
+        return None;
+    }
+    Some((view.content_start + offset).min(view.total.saturating_sub(1)))
+}
+
+/// Drag rows clamp to the nearest visible line, so dragging past the top or
+/// bottom of the transcript extends the selection instead of dropping it.
+fn transcript_line_for_drag(state: &TuiState, row: u16) -> Option<usize> {
+    let view = state.transcript_view.borrow();
+    let view = view.as_ref()?;
+    if view.content_rows == 0 || view.total == 0 {
+        return None;
+    }
+    let offset = (row.saturating_sub(view.content_top) as usize).min(view.content_rows - 1);
+    Some((view.content_start + offset).min(view.total - 1))
+}
+
+fn transcript_selection_text(state: &TuiState) -> Option<(String, usize)> {
+    let (start, end) = state.transcript_selection.get()?;
+    let view = state.transcript_view.borrow();
+    let view = view.as_ref()?;
+    if view.plain.is_empty() || view.total == 0 {
+        return None;
+    }
+    let start = start.min(view.total - 1);
+    let end = end.min(view.total - 1);
+    if start > end {
+        return None;
+    }
+    Some((view.plain[start..=end].join("\n"), end - start + 1))
+}
+
+fn copy_transcript_selection(state: &mut TuiState) {
+    let Some((text, lines)) = transcript_selection_text(state) else {
+        return;
+    };
+    match crate::clipboard::copy(&text) {
+        Ok(()) => {
+            state.notice = Some(format!(
+                "copied {lines} transcript line{}",
+                if lines == 1 { "" } else { "s" }
+            ))
+        }
+        Err(error) => state.notice = Some(format!("cannot copy transcript selection: {error}")),
+    }
+}
+
+fn hide_transcript_view(state: &TuiState) {
+    *state.transcript_view.borrow_mut() = None;
+    state.transcript_total.set(0);
+    state.transcript_selection.set(None);
+    state.transcript_anchor.set(None);
+}
+
+fn tint_line(line: &mut Line<'_>, background: Color) {
+    line.style = line.style.bg(background);
+    for span in &mut line.spans {
+        span.style = span.style.bg(background);
+    }
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 fn apply_engine_event(
@@ -1755,7 +1883,7 @@ fn handle_command(
                 .collect::<Vec<_>>()
                 .join("\n");
             help.push_str(
-                "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll",
+                "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · drag transcript to copy",
             );
             state.notice = Some(help);
         }
@@ -2721,6 +2849,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         return;
     }
     if let Some(review) = &state.review {
+        hide_transcript_view(state);
         draw_review(frame, area, state, review);
         draw_floating_approval(frame, area, state);
         return;
@@ -3216,6 +3345,7 @@ fn draw_checkpoint_picker(frame: &mut ratatui::Frame, area: Rect, checkpoints: &
 
 fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize) {
     if let Some(diff) = &state.diff_output {
+        hide_transcript_view(state);
         let rendered = state
             .diff_cache
             .borrow_mut()
@@ -3231,6 +3361,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
     }
 
     if state.history.is_empty() && !state.running && state.streaming_text.is_empty() && area.height >= 12 {
+        hide_transcript_view(state);
         let logo_height = LOGO_ROWS.len() as u16 + 2;
         let top = area.height.saturating_sub(logo_height) / 2;
         let logo_area = Rect { y: area.y + top, height: logo_height, ..area };
@@ -3366,39 +3497,76 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
 
     let total = all_lines.len();
     let viewport = area.height as usize;
+    let previous_total = state.transcript_total.replace(total);
+    if previous_total != total {
+        state.transcript_selection.set(None);
+        state.transcript_anchor.set(None);
+    }
+    if let Some((selection_start, selection_end)) = state.transcript_selection.get() {
+        if total > 0 {
+            let selection_start = selection_start.min(total - 1);
+            let selection_end = selection_end.min(total - 1);
+            for line in all_lines
+                .iter_mut()
+                .take(selection_end.saturating_add(1))
+                .skip(selection_start)
+            {
+                tint_line(line, COLORS.selection_bg);
+            }
+        }
+    }
+    let plain: Vec<String> = all_lines.iter().map(line_plain_text).collect();
 
     if total <= viewport {
-        // Everything fits - render all, no scrolling
+        *state.transcript_view.borrow_mut() = Some(TranscriptViewport {
+            area,
+            content_top: area.y,
+            content_start: 0,
+            content_rows: total,
+            total,
+            plain,
+        });
         frame.render_widget(Paragraph::new(all_lines), area);
         return;
     }
 
-    // Content is taller than viewport - compute which lines to show
+    // Content is taller than viewport - compute which lines to show.
     let scroll_offset = state.scroll_offset.min(total.saturating_sub(1));
-    let visible: Vec<Line> = if scroll_offset == 0 {
-        // Bottom-sticky: show the LAST viewport lines
-        all_lines[total.saturating_sub(viewport)..].to_vec()
+    let (start, visible) = if scroll_offset == 0 {
+        // Bottom-sticky: show the LAST viewport lines.
+        let start = total.saturating_sub(viewport);
+        (start, all_lines[start..].to_vec())
     } else {
-        // Scrolled up by scroll_offset lines from the bottom
+        // Scrolled up by scroll_offset lines from the bottom.
         let end = total.saturating_sub(scroll_offset);
         let start = end.saturating_sub(viewport);
-        all_lines[start..end].to_vec()
+        (start, all_lines[start..end].to_vec())
     };
 
-    // Add scroll indicator as the first line if scrolled
+    // Add scroll indicator as the first line if scrolled.
     let mut render_lines = Vec::new();
-    if scroll_offset > 0 {
+    let (content_start, content_rows) = if scroll_offset > 0 {
         render_lines.push(Line::styled(
-            format!("↑ {} lines above · ↓ or End for bottom", scroll_offset),
+            format!("↑ {scroll_offset} lines above · ↓ or End for bottom"),
             Style::default().fg(COLORS.muted),
         ));
-        // One less line for content since we used one for the indicator
         let content = visible[1.min(visible.len())..].to_vec();
+        let rows = content.len();
         render_lines.extend(content);
+        (start + 1, rows)
     } else {
+        let rows = visible.len();
         render_lines = visible;
-    }
-
+        (start, rows)
+    };
+    *state.transcript_view.borrow_mut() = Some(TranscriptViewport {
+        area,
+        content_top: if scroll_offset > 0 { area.y.saturating_add(1) } else { area.y },
+        content_start,
+        content_rows,
+        total,
+        plain,
+    });
     frame.render_widget(Paragraph::new(render_lines), area);
 }
 
@@ -3835,6 +4003,10 @@ mod tests {
             selection_anchor: None,
             selection: None,
             input_origin: std::cell::Cell::new((0, 0)),
+            transcript_view: std::cell::RefCell::new(None),
+            transcript_selection: std::cell::Cell::new(None),
+            transcript_anchor: std::cell::Cell::new(None),
+            transcript_total: std::cell::Cell::new(0),
         }
     }
 
@@ -4143,6 +4315,113 @@ mod tests {
         assert!(scrolled.contains("8 lines above"), "scroll indicator must render");
         assert!(!scrolled.contains("message 30"), "scrolled view must move away from the bottom");
         assert!(scrolled.contains("message 15"), "scrolled view must show older content");
+    }
+
+    #[test]
+    fn transcript_mouse_selection_maps_visible_rows_and_copies() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        let history: Vec<MessageRow> = (1..=30)
+            .map(|index| history_message(&thread_id, index))
+            .collect();
+        let mut state = test_state(home.path(), &store, history);
+        let _ = render_state(&state, 100, 30);
+        let (area, content_start, content_rows) = {
+            let view = state.transcript_view.borrow();
+            let view = view.as_ref().expect("transcript viewport recorded");
+            assert!(view.total > view.content_rows, "history must overflow the viewport");
+            assert!(view.content_rows >= 2);
+            (view.area, view.content_start, view.content_rows)
+        };
+        let mouse = |kind: crossterm::event::MouseEventKind, row: u16| crossterm::event::MouseEvent {
+            kind,
+            column: area.x + 1,
+            row,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_mouse(
+            &mut state,
+            mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                area.y,
+            ),
+        );
+        handle_mouse(
+            &mut state,
+            mouse(
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                area.y + 1,
+            ),
+        );
+        assert_eq!(
+            state.transcript_selection.get(),
+            Some((content_start, content_start + 1))
+        );
+        let (text, lines) = transcript_selection_text(&state).expect("selected text");
+        assert_eq!(lines, 2);
+        assert_eq!(text.lines().count(), 2);
+        assert!(text.contains("message"), "selection must copy transcript content");
+
+        handle_mouse(
+            &mut state,
+            mouse(
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                area.y + area.height + 10,
+            ),
+        );
+        assert_eq!(
+            state.transcript_selection.get(),
+            Some((content_start, content_start + content_rows - 1)),
+            "dragging past the bottom clamps to the last visible line"
+        );
+
+        let buffer = render_state(&state, 100, 30);
+        let highlighted = (0..100).any(|x| buffer.get(x, area.y).bg == COLORS.selection_bg);
+        assert!(highlighted, "selected transcript row must carry the selection background");
+    }
+
+    #[test]
+    fn transcript_scroll_indicator_is_not_selectable() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "test".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        let history: Vec<MessageRow> = (1..=30)
+            .map(|index| history_message(&thread_id, index))
+            .collect();
+        let mut state = test_state(home.path(), &store, history);
+        state.scroll_offset = 8;
+        let _ = render_state(&state, 100, 30);
+        let (area, content_start) = {
+            let view = state.transcript_view.borrow();
+            let view = view.as_ref().expect("transcript viewport recorded");
+            (view.area, view.content_start)
+        };
+        assert!(transcript_line_at(&state, area.x, area.y).is_none());
+        assert_eq!(
+            transcript_line_at(&state, area.x, area.y + 1),
+            Some(content_start)
+        );
     }
 
     #[test]

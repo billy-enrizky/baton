@@ -83,7 +83,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/multi", "send the same prompt to multiple providers"),
     ("/queue", "show or clear queued follow-ups"),
     ("/turns", "list durable turn phases"),
-    ("/status", "show this thread's phase, goal, and queue"),
+    ("/status", "show thread phase, goal, queue, and adapter states"),
     ("/compact", "compact the conversation to free context"),
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),

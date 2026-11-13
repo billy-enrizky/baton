@@ -151,7 +151,7 @@ Each provider keeps its own native session per baton thread. On every turn only 
 
 ## Storage
 
-`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, durable turns, queued follow-ups, review notes, checkpoints, usage, and verified provider process records) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything. A provider child left behind by a killed baton process is reaped on the next start only when its dead owner, PID, command line, and process start time still match the recorded process.
+`~/.baton/baton.sqlite` (threads, provider sessions, message mirror, durable turns, queued follow-ups, review notes, checkpoints, usage, and verified provider process records) and `~/.baton/config.json` (explicit overrides; harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents). `BATON_HOME` relocates everything. A provider child left behind by a killed baton process is reaped on the next start only when its dead owner, PID, command line, and process start time still match the recorded process. Each provider child also carries a small watchdog that terminates it within about two seconds when baton disappears, including after SIGKILL.
 
 ## Development
 

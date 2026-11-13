@@ -33,6 +33,7 @@ pub fn spawn_tracked_provider(
         &command_line,
         process_start.as_deref(),
     )?;
+    let _ = process::spawn_parent_watchdog(pid);
     let recorder = recorder.clone();
     crate::adapters::child_halves_with_cleanup(
         child,
@@ -117,6 +118,7 @@ pub fn build_opencode_adapter_with_recorder(
                 let _ = child.start_kill();
                 return Err(error);
             }
+            let _ = process::spawn_parent_watchdog(pid);
             Ok(OpenCodeChild {
                 port,
                 password,

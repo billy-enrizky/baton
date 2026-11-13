@@ -171,6 +171,15 @@ enum OrchestrationEvent {
     ShipFailed(String),
 }
 
+enum NativeRewindEvent {
+    Done {
+        turn: i64,
+        text: String,
+        provider_retry_skipped: bool,
+    },
+    Failed(String),
+}
+
 struct OrchestrationWorkerView {
     index: usize,
     title: String,
@@ -209,7 +218,7 @@ struct TranscriptPoint {
 
 enum Overlay {
     None,
-    RewindPicker { selected: usize },
+    RewindPicker { selected: usize, native: bool },
     CodeConfirm { turn: i64, git_ref: String },
     SwitchPicker { selected: usize },
     ModelPicker { provider: ProviderId, models: Vec<String>, selected: usize, filter: String },
@@ -289,6 +298,8 @@ pub struct TuiState {
     orchestration_confirm_ship: bool,
     orchestration_ship_report: Option<ShipReport>,
     orchestration_sender: std::sync::mpsc::Sender<OrchestrationEvent>,
+    native_rewind_sender: std::sync::mpsc::Sender<NativeRewindEvent>,
+    native_rewind_running: bool,
 }
 
 pub fn run_tui(
@@ -321,6 +332,7 @@ pub fn run_tui(
 
     let custom_commands = discover_custom_commands(&thread.cwd);
     let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
+    let (native_rewind_sender, native_rewind_receiver) = std::sync::mpsc::channel();
     let mut state = TuiState {
         store: store.clone(),
         prompt_history,
@@ -378,6 +390,8 @@ pub fn run_tui(
         orchestration_confirm_ship: false,
         orchestration_ship_report: None,
         orchestration_sender,
+        native_rewind_sender,
+        native_rewind_running: false,
     };
 
     if !reconciled.is_empty() {
@@ -440,6 +454,9 @@ pub fn run_tui(
         }
         while let Ok(event) = orchestration_receiver.try_recv() {
             apply_orchestration_event(&mut state, event);
+        }
+        while let Ok(event) = native_rewind_receiver.try_recv() {
+            apply_native_rewind_event(&mut state, &store, event);
         }
         if crossterm::event::poll(Duration::from_millis(32))? {
             match crossterm::event::read()? {
@@ -1763,7 +1780,7 @@ fn handle_key(
     }
 
     match std::mem::replace(&mut state.overlay, Overlay::None) {
-        Overlay::RewindPicker { mut selected } => {
+        Overlay::RewindPicker { mut selected, native } => {
             let user_messages: Vec<(i64, String)> = state
                 .history
                 .iter()
@@ -1775,26 +1792,30 @@ fn handle_key(
                 KeyCode::Up => {
                     if !user_messages.is_empty() {
                         selected = (selected + user_messages.len() - 1) % user_messages.len();
-                        state.overlay = Overlay::RewindPicker { selected };
+                        state.overlay = Overlay::RewindPicker { selected, native };
                     } else {
-                        state.overlay = Overlay::RewindPicker { selected };
+                        state.overlay = Overlay::RewindPicker { selected, native };
                     }
                 }
                 KeyCode::Down => {
                     if !user_messages.is_empty() {
                         selected = (selected + 1) % user_messages.len();
-                        state.overlay = Overlay::RewindPicker { selected };
+                        state.overlay = Overlay::RewindPicker { selected, native };
                     } else {
-                        state.overlay = Overlay::RewindPicker { selected };
+                        state.overlay = Overlay::RewindPicker { selected, native };
                     }
                 }
                 KeyCode::Enter => {
                     if let Some((turn, text)) = user_messages.get(selected).cloned() {
-                        apply_rewind(state, store, turn, text);
+                        if native {
+                            start_native_rewind(state, store, turn, text);
+                        } else {
+                            apply_rewind(state, store, turn, text);
+                        }
                     }
                 }
                 _ => {
-                    state.overlay = Overlay::RewindPicker { selected };
+                    state.overlay = Overlay::RewindPicker { selected, native };
                 }
             }
         }
@@ -2187,6 +2208,120 @@ fn handle_key(
         },
         Overlay::None => {
             handle_composer_key(state, store, engine_command_sender, key);
+        }
+    }
+}
+
+fn start_native_rewind(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    turn: i64,
+    text: String,
+) {
+    if state.native_rewind_running {
+        state.notice = Some("a native rewind is already running".into());
+        return;
+    }
+    if state.running {
+        state.notice = Some("interrupt the current turn before a native rewind".into());
+        return;
+    }
+    if state.thread.current_provider != ProviderId::Codex {
+        state.notice = Some("native rewind is Codex-only; use /rewind without --native".into());
+        return;
+    }
+    let persisted = {
+        let guard = store.lock().unwrap();
+        ensure_persisted(&guard, &mut state.thread)
+    };
+    if let Err(error) = persisted {
+        state.notice = Some(format!("cannot prepare native rewind: {error}"));
+        return;
+    }
+    state.native_rewind_running = true;
+    state.notice = Some("rewinding Codex session natively...".into());
+    let home = state.home.clone();
+    let source = state.thread.clone();
+    let sender = state.native_rewind_sender.clone();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<bool> {
+            let store = BatonStore::open(&home.join("baton.sqlite"))?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()?;
+            let recorder_store =
+                Arc::new(Mutex::new(BatonStore::open(&home.join("baton.sqlite"))?));
+            let recorder =
+                crate::process::ProcessRecorder::new(recorder_store, source.cwd.clone());
+            let outcome = runtime.block_on(crate::provider_runtime::rewind_to_turn(
+                &store,
+                &home,
+                &source,
+                turn,
+                recorder,
+            ))?;
+            Ok(outcome.provider_retry_skipped)
+        })();
+        let event = match result {
+            Ok(provider_retry_skipped) => NativeRewindEvent::Done {
+                turn,
+                text,
+                provider_retry_skipped,
+            },
+            Err(error) => NativeRewindEvent::Failed(error.to_string()),
+        };
+        let _ = sender.send(event);
+    });
+}
+
+fn apply_native_rewind_event(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    event: NativeRewindEvent,
+) {
+    match event {
+        NativeRewindEvent::Done {
+            turn,
+            text,
+            provider_retry_skipped,
+        } => {
+            state.native_rewind_running = false;
+            let checkpoint = {
+                let guard = store.lock().unwrap();
+                state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
+                state.queued_messages = guard
+                    .list_queued_messages(&state.thread.id)
+                    .unwrap_or_default();
+                guard
+                    .get_checkpoint(&state.thread.id, turn - 1)
+                    .unwrap_or(None)
+            };
+            state.scroll_offset = 0;
+            state.set_input(text);
+            state.overlay = match checkpoint {
+                Some(checkpoint) => Overlay::CodeConfirm {
+                    turn,
+                    git_ref: checkpoint.git_ref,
+                },
+                None => Overlay::None,
+            };
+            state.notice = Some(format!(
+                "rewound to before turn {turn} natively{}{}",
+                if provider_retry_skipped {
+                    " (completed pending store rewind)"
+                } else {
+                    ""
+                },
+                if state.overlay_is_code_confirm() {
+                    "; choose whether to restore code"
+                } else {
+                    ""
+                }
+            ));
+        }
+        NativeRewindEvent::Failed(error) => {
+            state.native_rewind_running = false;
+            state.notice = Some(format!("native rewind failed: {error}"));
         }
     }
 }
@@ -2820,7 +2955,7 @@ fn handle_composer_key(
             } else if state.input.is_empty() {
                 if state.esc_primed {
                     state.esc_primed = false;
-                    state.overlay = Overlay::RewindPicker { selected: 0 };
+                    state.overlay = Overlay::RewindPicker { selected: 0, native: false };
                 } else {
                     state.esc_primed = true;
                 }
@@ -4021,9 +4156,13 @@ fn handle_command(
             }
         }
         "/rewind" => {
+            let native = args.iter().any(|arg| arg == "--native");
             let has_user_messages = state.history.iter().any(|message| message.role == "user");
             if has_user_messages {
-                state.overlay = Overlay::RewindPicker { selected: 0 };
+                state.overlay = Overlay::RewindPicker {
+                    selected: 0,
+                    native,
+                };
             } else {
                 state.notice = Some("nothing to rewind to yet".into());
             }
@@ -4682,8 +4821,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         draw_approval(frame, chunks[1], state, approval);
     } else {
         match &state.overlay {
-            Overlay::RewindPicker { selected } => {
-                draw_rewind_picker(frame, chunks[1], state, *selected)
+            Overlay::RewindPicker { selected, native } => {
+                draw_rewind_picker(frame, chunks[1], state, *selected, *native)
             }
             Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[1], *turn),
             Overlay::SwitchPicker { selected } => {
@@ -5476,7 +5615,13 @@ fn draw_approval(
     );
 }
 
-fn draw_rewind_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
+fn draw_rewind_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    selected: usize,
+    native: bool,
+) {
     let user_messages: Vec<(&i64, &String)> = state
         .history
         .iter()
@@ -5485,7 +5630,11 @@ fn draw_rewind_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
         .collect();
     let newest_first: Vec<&(&i64, &String) > = user_messages.iter().rev().collect();
     let mut lines: Vec<Line> = vec![Line::styled(
-        "rewind to message · enter select · esc cancel",
+        if native {
+            "rewind to message · native Codex · enter select · esc cancel"
+        } else {
+            "rewind to message · enter select · esc cancel"
+        },
         Style::default().fg(COLORS.muted),
     )];
     for (index, (turn, text)) in newest_first.iter().take(8).enumerate() {
@@ -5881,6 +6030,10 @@ impl TuiState {
         lines
     }
 
+    fn overlay_is_code_confirm(&self) -> bool {
+        matches!(self.overlay, Overlay::CodeConfirm { .. })
+    }
+
     fn set_session_mode(&mut self, store: &Arc<Mutex<BatonStore>>, mode: SessionMode) {
         self.thread.session_mode = mode;
         let guard = store.lock().unwrap();
@@ -6064,6 +6217,8 @@ mod tests {
             orchestration_confirm_ship: false,
             orchestration_ship_report: None,
             orchestration_sender: std::sync::mpsc::channel().0,
+            native_rewind_sender: std::sync::mpsc::channel().0,
+            native_rewind_running: false,
         }
     }
 
@@ -8253,6 +8408,109 @@ mod tests {
         assert_eq!(state.thread.id, source_id);
         let worktrees = home.path().join("worktrees");
         assert!(!worktrees.exists() || std::fs::read_dir(worktrees).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn rewind_native_command_opens_the_native_picker() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread_id = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "rewind".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+            .id;
+        store
+            .lock()
+            .unwrap()
+            .add_message(&thread_id, 1, "user", None, None, "first prompt")
+            .unwrap();
+        let history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        let mut state = test_state(home.path(), &store, history);
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/rewind --native");
+        assert!(matches!(
+            state.overlay,
+            Overlay::RewindPicker { native: true, .. }
+        ));
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("native Codex"), "{text}");
+    }
+
+    #[test]
+    fn native_rewind_result_restores_the_composer_and_code_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        store
+            .lock()
+            .unwrap()
+            .add_message(&thread_id, 1, "user", None, None, "kept")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_checkpoint(&thread_id, 1, "refs/baton/checkpoints/test/1")
+            .unwrap();
+        state.native_rewind_running = true;
+        apply_native_rewind_event(
+            &mut state,
+            &store,
+            NativeRewindEvent::Done {
+                turn: 2,
+                text: "retry prompt".to_string(),
+                provider_retry_skipped: true,
+            },
+        );
+        assert!(!state.native_rewind_running);
+        assert_eq!(state.input, "retry prompt");
+        assert!(state.history.iter().any(|message| message.text == "kept"));
+        assert!(matches!(
+            state.overlay,
+            Overlay::CodeConfirm { turn: 2, .. }
+        ));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("natively"), "{notice}");
+        assert!(notice.contains("pending store rewind"), "{notice}");
+        assert!(notice.contains("restore code"), "{notice}");
+
+        state.native_rewind_running = true;
+        state.overlay = Overlay::None;
+        apply_native_rewind_event(
+            &mut state,
+            &store,
+            NativeRewindEvent::Failed("boom".to_string()),
+        );
+        assert!(!state.native_rewind_running);
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("native rewind failed: boom"),
+            "notice: {:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn native_rewind_refuses_non_codex_threads() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        start_native_rewind(&mut state, &store, 1, "prompt".to_string());
+        assert!(!state.native_rewind_running);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("Codex-only"),
+            "notice: {:?}",
+            state.notice
+        );
     }
 
     #[test]

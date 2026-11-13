@@ -68,6 +68,59 @@ pub fn build_codex_adapter_with_recorder(
     ))
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct NativeRewindOutcome {
+    pub provider_retry_skipped: bool,
+}
+
+/// Completes a Codex native rewind with a durable recovery marker. If a
+/// pending marker already exists for this turn, the provider call is skipped
+/// and only Baton's store rewind is retried.
+pub async fn rewind_to_turn(
+    store: &BatonStore,
+    home: &Path,
+    source: &ThreadRow,
+    turn: i64,
+    recorder: ProcessRecorder,
+) -> Result<NativeRewindOutcome> {
+    if source.current_provider != ProviderId::Codex {
+        anyhow::bail!("native rewind is implemented for codex only");
+    }
+    if let Some(pending) = store.native_rewind_pending(&source.id)? {
+        if pending.turn != turn {
+            anyhow::bail!(
+                "thread has a pending {} native rewind to turn {}; run `baton rewind -t {} --turn {}` without --native to finish it first",
+                pending.provider,
+                pending.turn,
+                &source.id[..8.min(source.id.len())],
+                pending.turn
+            );
+        }
+        store.rewind_thread_keeping_provider_sessions(&source.id, turn)?;
+        return Ok(NativeRewindOutcome {
+            provider_retry_skipped: true,
+        });
+    }
+    let reverted = revert_codex_session(store, home, source, turn, recorder).await?;
+    if !reverted {
+        anyhow::bail!("codex did not confirm native rewind");
+    }
+    if let Err(error) = store.set_native_rewind_pending(&source.id, ProviderId::Codex, turn) {
+        anyhow::bail!(
+            "codex history was reverted, but baton could not record the recovery marker: {error}. Rerun `baton rewind -t {} --turn {turn}` without --native to finish it.",
+            &source.id[..8.min(source.id.len())]
+        );
+    }
+    if let Err(error) = store.rewind_thread_keeping_provider_sessions(&source.id, turn) {
+        anyhow::bail!(
+            "codex history was reverted, but baton state was not: {error}. Rerun the same command to finish the store rewind."
+        );
+    }
+    Ok(NativeRewindOutcome {
+        provider_retry_skipped: false,
+    })
+}
+
 /// Revert the source Codex session before a completed provider turn. The
 /// caller must keep the provider session row when it rewinds Baton state.
 pub async fn revert_codex_session(
@@ -152,4 +205,53 @@ pub async fn fork_codex_session(
     let _ = adapter.dispose().await;
     let native = native?;
     Ok(native.map(|id| (id, model)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::NewThread;
+    use std::sync::Mutex;
+
+    #[test]
+    fn pending_native_rewind_finishes_the_store_without_the_provider() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "rewind".to_string(),
+                cwd: "/tmp/project".to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .add_message(&thread.id, 1, "user", None, None, "keep")
+            .unwrap();
+        store
+            .add_message(&thread.id, 2, "user", None, None, "remove")
+            .unwrap();
+        store
+            .set_native_rewind_pending(&thread.id, ProviderId::Codex, 2)
+            .unwrap();
+        let recorder_store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let recorder = ProcessRecorder::new(recorder_store, thread.cwd.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime
+            .block_on(rewind_to_turn(
+                &store,
+                Path::new("/tmp"),
+                &thread,
+                2,
+                recorder,
+            ))
+            .unwrap();
+        assert!(outcome.provider_retry_skipped);
+        assert!(store.native_rewind_pending(&thread.id).unwrap().is_none());
+        let messages = store.list_messages(&thread.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "keep");
+    }
 }

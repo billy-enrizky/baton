@@ -276,6 +276,37 @@ fn store_rewind_truncates_and_clears_sessions() {
 }
 
 #[test]
+fn rewind_can_keep_a_provider_session_for_native_rollback() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "native rewind".into(),
+            cwd: "/tmp/x".into(),
+            current_provider: ProviderId::Codex,
+            current_model: Some("m".into()),
+        })
+        .unwrap();
+    store
+        .add_message(&thread.id, 1, "user", Some("codex"), Some("m"), "one")
+        .unwrap();
+    store
+        .upsert_provider_session(&thread.id, ProviderId::Codex, "native-a", Some("m".into()), None)
+        .unwrap();
+    store
+        .rewind_thread_keeping_provider_sessions(&thread.id, 1)
+        .unwrap();
+    assert!(store.list_messages(&thread.id).unwrap().is_empty());
+    assert_eq!(
+        store
+            .get_provider_session(&thread.id, ProviderId::Codex)
+            .unwrap()
+            .unwrap()
+            .native_session_id,
+        "native-a"
+    );
+}
+
+#[test]
 fn store_turn_records_and_reconcile() {
     let store = BatonStore::memory().unwrap();
     let thread = store

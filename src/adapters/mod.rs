@@ -210,6 +210,13 @@ pub struct TurnStartInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct RevertSessionInput {
+    pub session: NativeSessionRef,
+    pub before_turn_id: String,
+    pub auth_env: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ForkSessionInput {
     pub cwd: String,
     pub model: String,
@@ -418,6 +425,11 @@ pub trait BatonAdapter: Send {
     /// has no native fork and the caller must keep the transcript fallback.
     async fn fork_session(&mut self, _input: ForkSessionInput) -> Result<Option<String>> {
         Ok(None)
+    }
+    /// Provider-native conversation rollback. Returning false means the
+    /// provider cannot revert its own history.
+    async fn revert_session(&mut self, _input: RevertSessionInput) -> Result<bool> {
+        Ok(false)
     }
     async fn start_turn(
         &mut self,

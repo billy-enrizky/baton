@@ -88,6 +88,19 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Rewind a thread to before a turn
+    Rewind {
+        thread_id: Option<String>,
+        /// Remove this turn and every later turn
+        #[arg(long)]
+        turn: i64,
+        /// Also revert the provider's native history when supported (currently Codex)
+        #[arg(long)]
+        native: bool,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     Import,
     Checkpoints {
         thread_id: String,

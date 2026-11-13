@@ -1,4 +1,4 @@
-use baton::adapters::{duplex_halves, BatonAdapter, ForkSessionInput, ModelListInput, TransportHalves};
+use baton::adapters::{duplex_halves, BatonAdapter, ForkSessionInput, ModelListInput, RevertSessionInput, TransportHalves};
 use baton::adapters::codex::CodexAdapter;
 use baton::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId};
 use serde_json::{json, Value};
@@ -201,6 +201,40 @@ async fn fake_server_fork(
     }
 }
 
+async fn fake_server_revert(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    params_sender: tokio::sync::mpsc::UnboundedSender<Value>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+            }
+            "thread/resume" => {
+                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+            }
+            "thread/revert" => {
+                let _ = params_sender.send(frame.get("params").cloned().unwrap_or(Value::Null));
+                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn fake_server_models(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
     let mut lines = BufReader::new(read);
     let mut line = String::new();
@@ -266,6 +300,39 @@ async fn codex_adapter_lists_visible_models_across_pages() {
     .expect("model list completes")
     .expect("model list succeeds");
     assert_eq!(models, vec!["alpha-model", "beta-model"]);
+    adapter.dispose().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_adapter_reverts_a_native_turn() {
+    let (params_sender, mut params_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let spawner = Arc::new(move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+        let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+        tokio::spawn(fake_server_revert(server_read, server_write, params_sender.clone()));
+        Ok(halves)
+    });
+    let mut adapter = CodexAdapter::new(spawner);
+    let reverted = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.revert_session(RevertSessionInput {
+            session: NativeSessionRef {
+                native_session_id: "native-source".into(),
+                rollout_path: None,
+            },
+            before_turn_id: "turn-remove".into(),
+            auth_env: vec![],
+        }),
+    )
+    .await
+    .expect("revert completes")
+    .expect("revert succeeds");
+    assert!(reverted);
+    let params = tokio::time::timeout(Duration::from_secs(2), params_receiver.recv())
+        .await
+        .expect("revert params arrive")
+        .expect("revert params channel");
+    assert_eq!(params["threadId"], "native-source");
+    assert_eq!(params["beforeTurnId"], "turn-remove");
     adapter.dispose().await.unwrap();
 }
 

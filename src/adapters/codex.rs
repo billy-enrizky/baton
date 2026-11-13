@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, LineReader, LineWriter, ModelListInput, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, LineReader, LineWriter, ModelListInput, RevertSessionInput, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -590,6 +590,32 @@ impl BatonAdapter for CodexAdapter {
             Some(id) if !id.is_empty() => Ok(Some(id)),
             _ => anyhow::bail!("codex thread/fork did not return a thread id"),
         }
+    }
+
+    async fn revert_session(&mut self, input: RevertSessionInput) -> Result<bool> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting("native-revert");
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        self.ensure_initialized(&runtime).await?;
+        self.request(
+            &runtime,
+            "thread/resume",
+            json!({
+                "threadId": input.session.native_session_id,
+                "excludeTurns": true
+            }),
+        )
+        .await?;
+        self.request(
+            &runtime,
+            "thread/revert",
+            json!({
+                "threadId": input.session.native_session_id,
+                "beforeTurnId": input.before_turn_id
+            }),
+        )
+        .await?;
+        Ok(true)
     }
 
     async fn start_turn(

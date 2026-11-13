@@ -300,6 +300,7 @@ pub fn clean_managed(
     home: &Path,
     run_filter: Option<&str>,
     force: bool,
+    shipped_branches: &[String],
 ) -> Result<WorktreeCleanup> {
     let mut cleanup = WorktreeCleanup {
         removed: Vec::new(),
@@ -344,11 +345,16 @@ pub fn clean_managed(
             });
             continue;
         }
-        if !entry.merged && !force {
+        let shipped = entry
+            .branch
+            .as_ref()
+            .map(|branch| shipped_branches.iter().any(|shipped| shipped == branch))
+            .unwrap_or(false);
+        if !entry.merged && !shipped && !force {
             cleanup.skipped.push(WorktreeSkip {
                 path: entry.path,
                 branch: entry.branch,
-                reason: "branch is not merged into the current branch".to_string(),
+                reason: "branch is not merged and has no opened PR".to_string(),
             });
             continue;
         }
@@ -375,7 +381,7 @@ pub fn clean_managed(
             continue;
         }
         if let Some(branch) = &entry.branch {
-            let flag = if force { "-D" } else { "-d" };
+            let flag = if force || !entry.merged { "-D" } else { "-d" };
             if let Err(error) = git(&repo_root, &["branch", flag, branch]) {
                 cleanup.warnings.push(format!(
                     "removed {} but could not delete branch {branch}: {error}",
@@ -524,7 +530,7 @@ mod tests {
         let dirty_entry = listed.iter().find(|entry| entry.run == "run-dirt").unwrap();
         assert!(dirty_entry.dirty);
 
-        let cleanup = clean_managed(home.path(), Some("run-merg-extra"), false).unwrap();
+        let cleanup = clean_managed(home.path(), Some("run-merg-extra"), false, &[]).unwrap();
         assert_eq!(cleanup.removed.len(), 1);
         assert!(cleanup.skipped.is_empty());
         assert!(!merged_wt.path.exists());
@@ -535,16 +541,51 @@ mod tests {
             "merged branch is deleted"
         );
 
-        let blocked = clean_managed(home.path(), Some("run-dirt"), false).unwrap();
+        let blocked = clean_managed(home.path(), Some("run-dirt"), false, &[]).unwrap();
         assert!(blocked.removed.is_empty());
         assert_eq!(blocked.skipped.len(), 1);
         assert_eq!(blocked.skipped[0].reason, "dirty");
         assert!(dirty_wt.path.exists());
 
-        let forced = clean_managed(home.path(), None, true).unwrap();
+        let forced = clean_managed(home.path(), None, true, &[]).unwrap();
         assert_eq!(forced.removed.len(), 1);
         assert!(!dirty_wt.path.exists());
         assert!(list_managed(home.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cleans_clean_unmerged_worktrees_only_when_the_branch_has_a_pr() {
+        let root = repo();
+        let home = tempfile::tempdir().unwrap();
+        let repo_root = repo_root(root.path()).unwrap();
+        let shipped = create(home.path(), &repo_root, "run-ship", "shipped task").unwrap();
+        std::fs::write(shipped.path.join("shipped.txt"), "x\n").unwrap();
+        commit_changes(&shipped.path, "worker commit").unwrap().unwrap();
+        let unshipped = create(home.path(), &repo_root, "run-keep", "unshipped task").unwrap();
+        std::fs::write(unshipped.path.join("unshipped.txt"), "x\n").unwrap();
+        commit_changes(&unshipped.path, "worker commit").unwrap().unwrap();
+
+        let cleanup = clean_managed(
+            home.path(),
+            None,
+            false,
+            std::slice::from_ref(&shipped.branch),
+        )
+        .unwrap();
+        assert_eq!(cleanup.removed.len(), 1);
+        assert_eq!(cleanup.removed[0].branch.as_deref(), Some(shipped.branch.as_str()));
+        assert!(!shipped.path.exists());
+        assert!(unshipped.path.exists(), "a branch without a PR is kept");
+        assert_eq!(cleanup.skipped.len(), 1);
+        assert_eq!(
+            cleanup.skipped[0].reason,
+            "branch is not merged and has no opened PR"
+        );
+        let shipped_ref = format!("refs/heads/{}", shipped.branch);
+        assert!(
+            git(root.path(), &["show-ref", "--verify", &shipped_ref]).is_err(),
+            "the local shipped branch is deleted after the worktree is removed"
+        );
     }
 
     #[test]

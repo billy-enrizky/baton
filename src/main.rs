@@ -703,6 +703,23 @@ fn main_result() -> Result<()> {
             Ok(())
         }
         cli::Commands::Worktrees { clean, force, run, json } => {
+            let (shipped_branches, store_warning) =
+                match BatonStore::open(&paths::baton_db_path())
+                    .and_then(|store| store.shipped_worktree_branches())
+                {
+                    Ok(branches) => (branches, None),
+                    Err(error) => (
+                        Vec::new(),
+                        Some(format!("could not read shipped PR markers: {error}")),
+                    ),
+                };
+            let is_shipped = |entry: &worktree::ManagedWorktree| {
+                entry
+                    .branch
+                    .as_ref()
+                    .map(|branch| shipped_branches.iter().any(|shipped| shipped == branch))
+                    .unwrap_or(false)
+            };
             let entries_json = |entries: &[worktree::ManagedWorktree]| {
                 entries
                     .iter()
@@ -716,13 +733,22 @@ fn main_result() -> Result<()> {
                             "head": entry.head,
                             "dirty": entry.dirty,
                             "merged": entry.merged,
+                            "shipped": is_shipped(entry),
                             "error": entry.error,
                         })
                     })
                     .collect::<Vec<_>>()
             };
             if clean {
-                let cleanup = worktree::clean_managed(&home, run.as_deref(), force)?;
+                let mut cleanup = worktree::clean_managed(
+                    &home,
+                    run.as_deref(),
+                    force,
+                    &shipped_branches,
+                )?;
+                if let Some(warning) = store_warning {
+                    cleanup.warnings.push(warning);
+                }
                 let remaining: Vec<_> = worktree::list_managed(&home)?
                     .into_iter()
                     .filter(|entry| {
@@ -801,6 +827,9 @@ fn main_result() -> Result<()> {
                             (Some(error), _, _) => format!("invalid: {error}"),
                             (None, true, _) => "dirty".to_string(),
                             (None, false, true) => "clean · merged".to_string(),
+                            (None, false, false) if is_shipped(entry) => {
+                                "clean · shipped".to_string()
+                            }
                             (None, false, false) => "clean · unmerged".to_string(),
                         };
                         println!(

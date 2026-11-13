@@ -510,7 +510,8 @@ pub fn run_tui(
         stdout,
         terminal::EnterAlternateScreen,
         crossterm::cursor::Hide,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
     )?;
     // Let terminals report Shift+Enter distinctly from Enter. Unsupported
     // terminals ignore this and keep the Alt+Enter fallback.
@@ -548,6 +549,7 @@ pub fn run_tui(
                     }
                 }
                 Event::Mouse(mouse) => handle_mouse(&mut state, mouse),
+                Event::Paste(text) => handle_paste(&mut state, &text),
                 _ => {}
             }
         }
@@ -564,7 +566,8 @@ pub fn run_tui(
         terminal.backend_mut(),
         crossterm::cursor::Show,
         terminal::LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
     )?;
     let _ = engine_command_sender.send(EngineCommand::Quit);
     Ok(())
@@ -624,6 +627,31 @@ fn handle_mouse(state: &mut TuiState, mouse: crossterm::event::MouseEvent) {
         }
         _ => {}
     }
+}
+
+/// Bracketed paste delivers the whole selection as one event. Keep it in the
+/// composer, including newlines, and never submit it. Review notes stay one
+/// line because Enter saves them.
+fn handle_paste(state: &mut TuiState, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    if let Some(review) = state.review.as_mut() {
+        if let Some(input) = review.note_input.as_mut() {
+            for character in normalized.chars() {
+                input.push(if character == '\n' { ' ' } else { character });
+            }
+        }
+        return;
+    }
+    if !matches!(state.overlay, Overlay::None) {
+        return;
+    }
+    state.insert_input_str(&normalized);
+    state.suggestion_index = 0;
+    state.esc_primed = false;
+    state.prompt_history_index = None;
 }
 
 fn clear_transcript_selection(state: &mut TuiState) {
@@ -6577,6 +6605,16 @@ impl TuiState {
         self.input_cursor += 1;
     }
 
+    /// Inserts pasted text at the caret as one edit. Newlines stay newlines so
+    /// a paste never submits a partial prompt.
+    fn insert_input_str(&mut self, text: &str) {
+        let byte = char_to_byte(&self.input, self.input_cursor);
+        self.input.insert_str(byte, text);
+        self.input_cursor += text.chars().count();
+        self.selection = None;
+        self.selection_anchor = None;
+    }
+
     fn backspace_input(&mut self) {
         if self.input_cursor == 0 {
             return;
@@ -8626,6 +8664,67 @@ mod tests {
             "a rejected steer is durable"
         );
         assert!(state.notice.as_deref().unwrap_or("").contains("queued"));
+    }
+
+    #[test]
+    fn pasting_multiline_text_stays_in_the_composer() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        handle_paste(&mut state, "line one\r\nline two");
+        assert_eq!(state.input, "line one\nline two");
+        assert_eq!(state.input_cursor, "line one\nline two".chars().count());
+        assert!(state.queued_messages.is_empty(), "a paste is not a submit");
+    }
+
+    #[test]
+    fn pasting_at_the_caret_inserts_in_place() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.set_input("hello world".into());
+        state.input_cursor = 5;
+        handle_paste(&mut state, ", there");
+        assert_eq!(state.input, "hello, there world");
+        assert_eq!(state.input_cursor, 12);
+    }
+
+    #[test]
+    fn pasting_a_file_path_keeps_spaces_intact() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        handle_paste(&mut state, "/tmp/a b/c d.txt");
+        assert_eq!(state.input, "/tmp/a b/c d.txt");
+    }
+
+    #[test]
+    fn pasting_into_a_review_note_stays_single_line() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.review = Some(ReviewState {
+            turn: 1,
+            fingerprint: String::new(),
+            rows: Vec::new(),
+            selected: 0,
+            notes: Vec::new(),
+            note_input: Some(String::new()),
+        });
+        handle_paste(&mut state, "first\nsecond");
+        assert!(state.input.is_empty(), "the note editor owns the paste");
+        let review = state.review.as_ref().unwrap();
+        assert_eq!(review.note_input.as_deref(), Some("first second"));
+    }
+
+    #[test]
+    fn paste_is_ignored_while_a_picker_is_open() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::SwitchPicker { selected: 0 };
+        handle_paste(&mut state, "not a provider");
+        assert!(state.input.is_empty());
     }
 
     #[test]

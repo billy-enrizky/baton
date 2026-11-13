@@ -219,6 +219,27 @@ pub fn process_start(_pid: u32) -> Option<String> {
     None
 }
 
+/// True only when the PID is live and its start time still matches the
+/// identity recorded by the original owner. Used to avoid reconciling a run
+/// whose orchestrator is still active in another Baton process.
+#[cfg(unix)]
+pub fn process_identity_alive(pid: u32, expected_start: Option<&str>) -> bool {
+    if !pid_alive(pid) {
+        return false;
+    }
+    match expected_start {
+        Some(expected) => process_start(pid).map_or(true, |actual| actual == expected),
+        None => true,
+    }
+}
+
+/// Without a process identity API, assume the owner is live so a running run
+/// is never clobbered by a different Baton process.
+#[cfg(not(unix))]
+pub fn process_identity_alive(pid: u32, _expected_start: Option<&str>) -> bool {
+    pid != 0
+}
+
 #[cfg(unix)]
 fn pid_alive(pid: u32) -> bool {
     if pid == 0 {

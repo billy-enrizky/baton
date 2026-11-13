@@ -56,6 +56,8 @@ pub struct OrchestrationRunRow {
     pub created_at: String,
     pub finished_at: Option<String>,
     pub archived_at: Option<String>,
+    pub owner_pid: Option<u32>,
+    pub owner_start: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -293,7 +295,9 @@ CREATE TABLE IF NOT EXISTS orchestration_runs (
   dirty_source INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   finished_at TEXT,
-  archived_at TEXT
+  archived_at TEXT,
+  owner_pid INTEGER,
+  owner_start TEXT
 );
 CREATE TABLE IF NOT EXISTS orchestration_tasks (
   id TEXT PRIMARY KEY,
@@ -431,6 +435,8 @@ fn map_orchestration_run(row: &rusqlite::Row) -> rusqlite::Result<OrchestrationR
         created_at: row.get(8)?,
         finished_at: row.get(9)?,
         archived_at: row.get(10)?,
+        owner_pid: row.get(11)?,
+        owner_start: row.get(12)?,
     })
 }
 
@@ -483,6 +489,8 @@ impl BatonStore {
         ensure_column(&db, "orchestration_tasks", "pr_url", "TEXT")?;
         ensure_column(&db, "orchestration_runs", "dirty_source", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&db, "orchestration_runs", "archived_at", "TEXT")?;
+        ensure_column(&db, "orchestration_runs", "owner_pid", "INTEGER")?;
+        ensure_column(&db, "orchestration_runs", "owner_start", "TEXT")?;
         Ok(BatonStore { db })
     }
 
@@ -1588,8 +1596,33 @@ impl BatonStore {
         plan_json: &str,
         dirty_source: bool,
     ) -> Result<()> {
+        self.create_orchestration_run_owned(
+            id,
+            goal,
+            coordinator_provider,
+            coordinator_model,
+            summary,
+            plan_json,
+            dirty_source,
+            None,
+            None,
+        )
+    }
+
+    pub fn create_orchestration_run_owned(
+        &self,
+        id: &str,
+        goal: &str,
+        coordinator_provider: ProviderId,
+        coordinator_model: &str,
+        summary: Option<&str>,
+        plan_json: &str,
+        dirty_source: bool,
+        owner_pid: Option<u32>,
+        owner_start: Option<&str>,
+    ) -> Result<()> {
         self.db.execute(
-            "INSERT INTO orchestration_runs (id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)",
+            "INSERT INTO orchestration_runs (id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, owner_pid, owner_start) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
             params![
                 id,
                 goal,
@@ -1599,6 +1632,8 @@ impl BatonStore {
                 plan_json,
                 dirty_source as i64,
                 now_iso(),
+                owner_pid,
+                owner_start,
             ],
         )?;
         Ok(())
@@ -1609,6 +1644,51 @@ impl BatonStore {
             "UPDATE orchestration_runs SET status = ?, finished_at = ? WHERE id = ?",
             params![status, now_iso(), id],
         )?;
+        Ok(())
+    }
+
+    /// Converts a run whose orchestrator process is gone into a terminal
+    /// verdict while preserving every worker that already completed.
+    pub fn abandon_orchestration_run(&self, run_id: &str, error: &str) -> Result<()> {
+        let now = now_iso();
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE orchestration_tasks SET status = 'failed', error = COALESCE(NULLIF(error, ''), ?), finished_at = COALESCE(finished_at, ?) WHERE run_id = ? AND status IN ('queued', 'running')",
+            params![error, now, run_id],
+        )?;
+        tx.execute(
+            "UPDATE turns SET phase = 'unverified', error = COALESCE(error, ?), ended_at = COALESCE(ended_at, ?) WHERE thread_id IN (SELECT thread_id FROM orchestration_tasks WHERE run_id = ? AND thread_id IS NOT NULL) AND phase IN ('queued', 'running', 'settling')",
+            params![error, now, run_id],
+        )?;
+        let total: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ?",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        let completed: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ? AND status = 'completed'",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        let cancelled: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ? AND status = 'cancelled'",
+            params![run_id],
+            |row| row.get(0),
+        )?;
+        let status = if cancelled > 0 {
+            "cancelled"
+        } else if total > 0 && completed == total {
+            "completed"
+        } else if completed > 0 {
+            "partial"
+        } else {
+            "failed"
+        };
+        tx.execute(
+            "UPDATE orchestration_runs SET status = ?, finished_at = ? WHERE id = ? AND status = 'running'",
+            params![status, now, run_id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1681,7 +1761,7 @@ impl BatonStore {
 
     pub fn list_orchestration_runs(&self, limit: usize) -> Result<Vec<OrchestrationRunRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at, archived_at FROM orchestration_runs ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at, archived_at, owner_pid, owner_start FROM orchestration_runs ORDER BY created_at DESC LIMIT ?",
         )?;
         let rows = statement
             .query_map(params![limit as i64], map_orchestration_run)?
@@ -1691,11 +1771,21 @@ impl BatonStore {
 
     pub fn find_orchestration_runs(&self, run_id: &str) -> Result<Vec<OrchestrationRunRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at, archived_at FROM orchestration_runs WHERE id = ? OR id LIKE ? ORDER BY created_at DESC LIMIT 3",
+            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at, archived_at, owner_pid, owner_start FROM orchestration_runs WHERE id = ? OR id LIKE ? ORDER BY created_at DESC LIMIT 3",
         )?;
         let pattern = format!("{run_id}%");
         let rows = statement
             .query_map(params![run_id, pattern], map_orchestration_run)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_running_orchestration_runs(&self) -> Result<Vec<OrchestrationRunRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at, archived_at, owner_pid, owner_start FROM orchestration_runs WHERE status = 'running' ORDER BY created_at",
+        )?;
+        let rows = statement
+            .query_map([], map_orchestration_run)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

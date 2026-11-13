@@ -1462,7 +1462,9 @@ fn run_with_worker_bin_and_progress(
     };
     let run_id = uuid::Uuid::new_v4().to_string();
     let summary = plan.summary.clone();
-    store.create_orchestration_run(
+    let owner_pid = std::process::id();
+    let owner_start = crate::process::process_start(owner_pid);
+    store.create_orchestration_run_owned(
         &run_id,
         goal,
         coordinator_provider,
@@ -1470,6 +1472,8 @@ fn run_with_worker_bin_and_progress(
         summary.as_deref(),
         &serde_json::to_string(&plan)?,
         dirty_source,
+        Some(owner_pid),
+        owner_start.as_deref(),
     )?;
     emit(
         progress,
@@ -1753,6 +1757,59 @@ pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<
         archived_at: run.archived_at,
         tasks,
     })
+}
+
+#[derive(Debug, Clone)]
+pub struct ReconciledRun {
+    pub run_id: String,
+    pub goal: String,
+    pub status: String,
+    pub completed_tasks: usize,
+    pub failed_tasks: usize,
+    pub cancelled_tasks: usize,
+}
+
+/// A run whose orchestrator process is gone can never finish on its own.
+/// Mark queued/running tasks failed, keep completed tasks, and settle the run
+/// verdict. Runs owned by a live, identity-matching Baton process are left
+/// alone. Ownerless rows from older builds are also left alone because their
+/// liveness cannot be proven.
+pub fn reconcile_abandoned_runs(store: &BatonStore) -> Result<Vec<ReconciledRun>> {
+    let mut reconciled = Vec::new();
+    for run in store.list_running_orchestration_runs()? {
+        let Some(owner_pid) = run.owner_pid else {
+            continue;
+        };
+        if crate::process::process_identity_alive(owner_pid, run.owner_start.as_deref()) {
+            continue;
+        }
+        let error = format!(
+            "orchestrator process {owner_pid} exited before the run finished"
+        );
+        store.abandon_orchestration_run(&run.id, &error)?;
+        let tasks = store.list_orchestration_tasks(&run.id)?;
+        let completed_tasks = tasks.iter().filter(|task| task.status == "completed").count();
+        let failed_tasks = tasks.iter().filter(|task| task.status == "failed").count();
+        let cancelled_tasks = tasks.iter().filter(|task| task.status == "cancelled").count();
+        let status = if cancelled_tasks > 0 {
+            "cancelled"
+        } else if !tasks.is_empty() && completed_tasks == tasks.len() {
+            "completed"
+        } else if completed_tasks > 0 {
+            "partial"
+        } else {
+            "failed"
+        };
+        reconciled.push(ReconciledRun {
+            run_id: run.id,
+            goal: run.goal,
+            status: status.to_string(),
+            completed_tasks,
+            failed_tasks,
+            cancelled_tasks,
+        });
+    }
+    Ok(reconciled)
 }
 
 pub fn run_rows(store: &BatonStore, limit: usize) -> Result<Vec<OrchestrationRunRow>> {

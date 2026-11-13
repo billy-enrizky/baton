@@ -329,6 +329,8 @@ pub fn run_tui(
         .unwrap()
         .reconcile_running_turns(Some(thread.cwd.as_str()))
         .unwrap_or_default();
+    let recovered_runs = orchestrate::reconcile_abandoned_runs(&store.lock().unwrap())
+        .unwrap_or_default();
 
     let custom_commands = discover_custom_commands(&thread.cwd);
     let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
@@ -394,15 +396,26 @@ pub fn run_tui(
         native_rewind_running: false,
     };
 
+    let mut startup_notes = Vec::new();
+    if let Some(run) = recovered_runs.last() {
+        startup_notes.push(format!(
+            "recovered abandoned orchestration {} ({})",
+            &run.run_id[..8.min(run.run_id.len())],
+            run.status
+        ));
+    }
     if !reconciled.is_empty() {
         let turns = reconciled
             .iter()
             .map(|row| row.turn.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        state.notice = Some(format!(
+        startup_notes.push(format!(
             "previous turn(s) {turns} did not finish and were marked unverified"
         ));
+    }
+    if !startup_notes.is_empty() {
+        state.notice = Some(startup_notes.join("\n"));
     }
 
     if let Some(prompt) = initial_prompt {

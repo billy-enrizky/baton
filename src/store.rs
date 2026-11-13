@@ -727,7 +727,19 @@ impl BatonStore {
                 return Ok(rows);
             }
         }
-        Ok(Vec::new())
+        // The stored cwd may be the symlinked form while the caller uses the
+        // real path. Compare canonical stored paths as the final fallback.
+        let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let rows = self.list_threads(None)?;
+        Ok(rows
+            .into_iter()
+            .filter(|thread| {
+                Path::new(&thread.cwd)
+                    .canonicalize()
+                    .map(|stored| stored == canonical)
+                    .unwrap_or(false)
+            })
+            .collect())
     }
 
     pub fn list_threads(&self, cwd: Option<&str>) -> Result<Vec<ThreadRow>> {

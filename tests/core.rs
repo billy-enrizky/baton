@@ -701,6 +701,28 @@ fn store_thread_lookup_accepts_symlinked_project_paths() {
     assert_eq!(found[0].id, thread.id);
 }
 
+#[cfg(unix)]
+#[test]
+fn store_thread_lookup_canonicalizes_the_stored_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let real = dir.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "stored through link".into(),
+            cwd: link.to_string_lossy().to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    let found = store.list_threads_for_path(&real).unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].id, thread.id);
+}
+
 #[test]
 fn store_search_is_project_scoped_and_matches_titles_or_text() {
     let store = BatonStore::memory().unwrap();

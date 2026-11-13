@@ -17,7 +17,7 @@
 
 ## How to get to it (user POV)
 
-New interactive sessions start in orchestrate mode: type the goal in the composer. If the source checkout is dirty, baton asks first: Enter orchestrates from HEAD, `s` runs a single harness, Esc cancels. The startup banner shows the version, cwd, mode, model, permissions, and billing. Exact greetings run one normal turn; a plan with no tasks falls back to one worker.
+New interactive sessions start in orchestrate mode: type the goal in the composer. If the source checkout is dirty, baton asks first: Enter orchestrates from HEAD, `s` runs a single harness, Esc cancels. The startup banner shows the version, cwd, mode, model, permissions, and billing. Exact greetings run one normal turn; a plan with no tasks falls back to one worker. `/orchestrate --plan-only <goal>` previews the resolved plan in an overlay without creating a run; Enter starts that exact plan, Esc returns the goal to the composer.
 `/orchestrate off` or `/switch` moves to a single harness; `/orchestrate on` moves back. `/runs` lists recent runs, `/runs --all` includes archived runs, and `/runs <id>` reopens a stored worker report. MCP exposes the same durable history through `baton_orchestration_runs` and `baton_orchestration_report`.
 `baton --mode single` starts a single-harness session; `baton --mode orchestrate`
 forces orchestration. Set `"defaultMode": "single"` in `~/.baton/config.json` to opt out.
@@ -89,7 +89,7 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 ## Gotchas
 - Worker worktrees branch from `HEAD`; uncommitted source changes are not in the worker checkout. The report sets `dirty_source`.
 - `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan. A task `model` overrides the provider config; omit it to use the configured default.
-- `--plan-only` resolves and prints the plan with effective models but creates no run, task rows, worktrees, or provider worker processes. Use it to review a coordinator plan or validate a plan file before spending worker turns.
+- `--plan-only` resolves and prints the plan with effective models but creates no run, task rows, worktrees, or provider worker processes. Use it to review a coordinator plan or validate a plan file before spending worker turns. In the TUI, the same flag opens a preview overlay; Enter writes that exact plan and starts the normal runner, while Esc restores the goal to the composer.
 - A run with one success and one failure is `partial`; all failures is `failed` and exits non-zero.
 - Worktrees are kept for review under `$BATON_HOME/worktrees/<run>/<task>`. Successful workers commit their changes as `baton worker: <title>`; the report and `--run --json` expose the SHA. `--integrate` merges completed branches into a clean source checkout, aborts on conflict, and skips already-merged workers. Use `baton worktrees` to list managed worktrees; JSON includes `shipped`, and the text state shows `clean · shipped` for a branch with a PR. `baton worktrees --clean` removes clean worktrees whose branch is merged or shipped; dirty worktrees, and unmerged branches without a recorded PR, require `--force`.
 - `baton.json` `worktree.sharedDirectories` symlinks existing, gitignored directories such as `node_modules` or `target` into each worker worktree. Shared paths appear in the report; edits inside them affect the primary checkout.

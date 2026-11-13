@@ -1,7 +1,6 @@
 use anyhow::Result;
 use async_trait::async_trait;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::oneshot;
@@ -34,39 +33,20 @@ impl AdapterState {
             AdapterState::Disposed => "disposed",
         }
     }
-
-    fn as_u8(self) -> u8 {
-        match self {
-            AdapterState::Unloaded => 0,
-            AdapterState::Starting => 1,
-            AdapterState::Ready => 2,
-            AdapterState::TurnRunning => 3,
-            AdapterState::Cancelling => 4,
-            AdapterState::Disposing => 5,
-            AdapterState::Disposed => 6,
-        }
-    }
-
-    fn from_u8(value: u8) -> Self {
-        match value {
-            1 => AdapterState::Starting,
-            2 => AdapterState::Ready,
-            3 => AdapterState::TurnRunning,
-            4 => AdapterState::Cancelling,
-            5 => AdapterState::Disposing,
-            6 => AdapterState::Disposed,
-            _ => AdapterState::Unloaded,
-        }
-    }
 }
 
-/// A cheap, cloneable handle to one adapter's lifecycle. Transitions only move
-/// forward from an allowed source state, so a late `ready()` cannot resurrect
-/// a disposing adapter and a cancellation cannot overwrite an idle adapter.
+#[derive(Debug)]
+struct AdapterLifecycleInner {
+    state: AdapterState,
+    thread_id: Option<String>,
+}
+
+/// A cheap, cloneable handle to one adapter's lifecycle. State and owner
+/// change together under one lock, so a reader never sees a running state
+/// with no thread or a ready state with a stale owner.
 #[derive(Debug, Clone)]
 pub struct AdapterLifecycle {
-    state: Arc<AtomicU8>,
-    thread_id: Arc<Mutex<Option<String>>>,
+    inner: Arc<Mutex<AdapterLifecycleInner>>,
 }
 
 impl Default for AdapterLifecycle {
@@ -78,38 +58,49 @@ impl Default for AdapterLifecycle {
 impl AdapterLifecycle {
     pub fn new() -> Self {
         Self {
-            state: Arc::new(AtomicU8::new(AdapterState::Unloaded.as_u8())),
-            thread_id: Arc::new(Mutex::new(None)),
+            inner: Arc::new(Mutex::new(AdapterLifecycleInner {
+                state: AdapterState::Unloaded,
+                thread_id: None,
+            })),
         }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, AdapterLifecycleInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     pub fn state(&self) -> AdapterState {
-        AdapterState::from_u8(self.state.load(Ordering::SeqCst))
+        self.lock().state
     }
 
     pub fn thread_id(&self) -> Option<String> {
-        self.thread_id
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.lock().thread_id.clone()
+    }
+
+    /// One consistent read for callers that render both fields together.
+    pub fn snapshot(&self) -> (AdapterState, Option<String>) {
+        let inner = self.lock();
+        (inner.state, inner.thread_id.clone())
     }
 
     fn transition(&self, from: &[AdapterState], to: AdapterState, thread: Option<&str>) -> bool {
-        let current = self.state.load(Ordering::SeqCst);
-        if !from.iter().any(|state| state.as_u8() == current) {
+        let mut inner = self.lock();
+        if !from.contains(&inner.state) {
             return false;
         }
-        if self
-            .state
-            .compare_exchange(current, to.as_u8(), Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        inner.state = to;
+        inner.thread_id = thread.map(str::to_string);
+        true
+    }
+
+    fn transition_keep_thread(&self, from: AdapterState, to: AdapterState) -> bool {
+        let mut inner = self.lock();
+        if inner.state != from {
             return false;
         }
-        *self
-            .thread_id
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = thread.map(str::to_string);
+        inner.state = to;
         true
     }
 
@@ -146,12 +137,7 @@ impl AdapterLifecycle {
     }
 
     pub fn cancelling(&self) {
-        let thread = self.thread_id();
-        self.transition(
-            &[AdapterState::TurnRunning],
-            AdapterState::Cancelling,
-            thread.as_deref(),
-        );
+        self.transition_keep_thread(AdapterState::TurnRunning, AdapterState::Cancelling);
     }
 
     pub fn disposing(&self) {
@@ -173,8 +159,9 @@ impl AdapterLifecycle {
     }
 
     pub fn describe(&self) -> String {
-        let state = self.state().as_str();
-        match self.thread_id() {
+        let (state, thread) = self.snapshot();
+        let state = state.as_str();
+        match thread {
             Some(thread) if !thread.is_empty() => {
                 format!("{state}({})", thread.chars().take(8).collect::<String>())
             }
@@ -474,6 +461,7 @@ mod tests {
         assert_eq!(lifecycle.state(), AdapterState::TurnRunning);
         lifecycle.cancelling();
         assert_eq!(lifecycle.state(), AdapterState::Cancelling);
+        assert_eq!(lifecycle.thread_id().as_deref(), Some("thread-1"));
         lifecycle.ready();
         assert_eq!(lifecycle.state(), AdapterState::Ready);
         assert_eq!(lifecycle.thread_id(), None);
@@ -484,6 +472,24 @@ mod tests {
         lifecycle.ready();
         lifecycle.starting("thread-2");
         assert_eq!(lifecycle.state(), AdapterState::Disposed);
+    }
+
+    #[test]
+    fn snapshot_keeps_state_and_owner_together() {
+        let lifecycle = AdapterLifecycle::new();
+        lifecycle.starting("thread-1");
+        assert_eq!(
+            lifecycle.snapshot(),
+            (AdapterState::Starting, Some("thread-1".to_string()))
+        );
+        lifecycle.ready();
+        assert_eq!(lifecycle.snapshot(), (AdapterState::Ready, None));
+        lifecycle.turn_running("thread-2");
+        lifecycle.cancelling();
+        assert_eq!(
+            lifecycle.snapshot(),
+            (AdapterState::Cancelling, Some("thread-2".to_string()))
+        );
     }
 
     #[test]

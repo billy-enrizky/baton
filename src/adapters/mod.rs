@@ -236,6 +236,12 @@ pub struct ModelListInput {
 #[derive(Debug)]
 pub enum TurnEvent {
     ProviderTurnId { id: String },
+    /// The provider session id as soon as the adapter knows it, even if the
+    /// turn later fails. The engine persists it for resume, fork, and rewind.
+    ProviderSession {
+        native_session_id: String,
+        rollout_path: Option<String>,
+    },
     TextDelta { text: String },
     AssistantText { text: String },
     ToolStarted { id: Option<String>, tool: String, detail: Option<String> },

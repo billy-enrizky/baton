@@ -204,8 +204,11 @@ pub async fn rewind_to_turn(
     turn: i64,
     recorder: ProcessRecorder,
 ) -> Result<NativeRewindOutcome> {
-    if source.current_provider != ProviderId::Codex {
-        anyhow::bail!("native rewind is implemented for codex only");
+    if !matches!(
+        source.current_provider,
+        ProviderId::Codex | ProviderId::OpenCode
+    ) {
+        anyhow::bail!("native rewind is implemented for codex and opencode");
     }
     if let Some(pending) = store.native_rewind_pending(&source.id)? {
         if pending.turn != turn {
@@ -222,23 +225,94 @@ pub async fn rewind_to_turn(
             provider_retry_skipped: true,
         });
     }
-    let reverted = revert_codex_session(store, home, source, turn, recorder).await?;
+    let provider = source.current_provider;
+    let reverted = revert_native_session(store, home, source, turn, recorder).await?;
     if !reverted {
-        anyhow::bail!("codex did not confirm native rewind");
+        anyhow::bail!("{provider} did not confirm native rewind");
     }
-    if let Err(error) = store.set_native_rewind_pending(&source.id, ProviderId::Codex, turn) {
+    if let Err(error) = store.set_native_rewind_pending(&source.id, provider, turn) {
         anyhow::bail!(
-            "codex history was reverted, but baton could not record the recovery marker: {error}. Rerun `baton rewind -t {} --turn {turn}` without --native to finish it.",
+            "{provider} history was reverted, but baton could not record the recovery marker: {error}. Rerun `baton rewind -t {} --turn {turn}` without --native to finish it.",
             &source.id[..8.min(source.id.len())]
         );
     }
     if let Err(error) = store.rewind_thread_keeping_provider_sessions(&source.id, turn) {
         anyhow::bail!(
-            "codex history was reverted, but baton state was not: {error}. Rerun the same command to finish the store rewind."
+            "{provider} history was reverted, but baton state was not: {error}. Rerun the same command to finish the store rewind."
         );
     }
     Ok(NativeRewindOutcome {
         provider_retry_skipped: false,
+    })
+}
+
+async fn revert_native_session(
+    store: &BatonStore,
+    home: &Path,
+    source: &ThreadRow,
+    from_turn: i64,
+    recorder: ProcessRecorder,
+) -> Result<bool> {
+    match source.current_provider {
+        ProviderId::Codex => revert_codex_session(store, home, source, from_turn, recorder).await,
+        ProviderId::OpenCode => {
+            revert_opencode_session(store, home, source, from_turn, recorder).await
+        }
+        other => anyhow::bail!("native rewind is implemented for codex and opencode, not {other}"),
+    }
+}
+
+/// Revert the source OpenCode session before a completed turn. OpenCode's
+/// revert stage cuts history at the user message id recorded as the turn's
+/// provider id, and `files: false` leaves the working tree to Baton
+/// checkpoints.
+pub async fn revert_opencode_session(
+    store: &BatonStore,
+    home: &Path,
+    source: &ThreadRow,
+    from_turn: i64,
+    recorder: ProcessRecorder,
+) -> Result<bool> {
+    if source.current_provider != ProviderId::OpenCode {
+        anyhow::bail!("opencode native rewind requires an opencode thread");
+    }
+    let session = store
+        .get_provider_session(&source.id, ProviderId::OpenCode)?
+        .ok_or_else(|| anyhow::anyhow!("source thread has no opencode session"))?;
+    let message_id = opencode_revert_message_id(store, &source.id, from_turn)?;
+    let resolved = resolve_config(home, Path::new(&source.cwd));
+    let adapter =
+        build_opencode_adapter_with_recorder(&PathBuf::from(&source.cwd), recorder);
+    let mut adapter = adapter.lock().await;
+    let result = adapter
+        .revert_session(RevertSessionInput {
+            session: NativeSessionRef {
+                native_session_id: session.native_session_id,
+                rollout_path: session.rollout_path,
+            },
+            before_turn_id: message_id,
+            auth_env: provider_auth_env(resolved.for_provider(ProviderId::OpenCode)),
+        })
+        .await;
+    let _ = adapter.dispose().await;
+    result
+}
+
+fn opencode_revert_message_id(
+    store: &BatonStore,
+    thread_id: &str,
+    from_turn: i64,
+) -> Result<String> {
+    let turn = store
+        .get_turn_record(thread_id, from_turn)?
+        .ok_or_else(|| anyhow::anyhow!("turn {from_turn} not found in thread"))?;
+    if !turn.phase.is_terminal() {
+        anyhow::bail!("turn {from_turn} is not terminal; interrupt it or use the transcript rewind");
+    }
+    turn.provider_turn_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "turn {from_turn} has no opencode message id; native rewind can only cut turns recorded after Baton captured OpenCode message ids"
+        )
     })
 }
 
@@ -374,6 +448,88 @@ mod tests {
         .await
         .unwrap_err();
         assert!(error.to_string().contains("source thread has no opencode session"));
+    }
+
+    #[test]
+    fn opencode_native_rewind_requires_the_turn_message_id() {
+        use crate::types::TurnPhase;
+
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "opencode".to_string(),
+                cwd: "/tmp/project".to_string(),
+                current_provider: ProviderId::OpenCode,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .start_turn_record(&thread.id, 1, ProviderId::OpenCode, Some("model"))
+            .unwrap();
+        store
+            .finish_turn_record(&thread.id, 1, TurnPhase::Completed, None)
+            .unwrap();
+        store.set_turn_provider_id(&thread.id, 1, "msg_1").unwrap();
+        assert_eq!(
+            opencode_revert_message_id(&store, &thread.id, 1).unwrap(),
+            "msg_1"
+        );
+
+        store
+            .start_turn_record(&thread.id, 2, ProviderId::OpenCode, Some("model"))
+            .unwrap();
+        store
+            .finish_turn_record(&thread.id, 2, TurnPhase::Completed, None)
+            .unwrap();
+        let error = opencode_revert_message_id(&store, &thread.id, 2).unwrap_err();
+        assert!(error.to_string().contains("no opencode message id"), "{error}");
+
+        store
+            .start_turn_record(&thread.id, 3, ProviderId::OpenCode, Some("model"))
+            .unwrap();
+        store.set_turn_provider_id(&thread.id, 3, "msg_3").unwrap();
+        let error = opencode_revert_message_id(&store, &thread.id, 3).unwrap_err();
+        assert!(error.to_string().contains("not terminal"), "{error}");
+    }
+
+    #[test]
+    fn pending_opencode_native_rewind_finishes_the_store_without_the_provider() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "rewind".to_string(),
+                cwd: "/tmp/project".to_string(),
+                current_provider: ProviderId::OpenCode,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .add_message(&thread.id, 1, "user", None, None, "keep")
+            .unwrap();
+        store
+            .add_message(&thread.id, 2, "user", None, None, "remove")
+            .unwrap();
+        store
+            .set_native_rewind_pending(&thread.id, ProviderId::OpenCode, 2)
+            .unwrap();
+        let recorder_store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let recorder = ProcessRecorder::new(recorder_store, thread.cwd.clone());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime
+            .block_on(rewind_to_turn(
+                &store,
+                Path::new("/tmp"),
+                &thread,
+                2,
+                recorder,
+            ))
+            .unwrap();
+        assert!(outcome.provider_retry_skipped);
+        assert!(store.native_rewind_pending(&thread.id).unwrap().is_none());
+        assert_eq!(store.list_messages(&thread.id).unwrap().len(), 1);
     }
 
     #[test]

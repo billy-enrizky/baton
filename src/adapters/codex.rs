@@ -657,6 +657,10 @@ impl BatonAdapter for CodexAdapter {
             }
         };
         *runtime.active_thread.lock().await = Some(thread_id.clone());
+        let _ = emit.send(TurnEvent::ProviderSession {
+            native_session_id: thread_id.clone(),
+            rollout_path: rollout_path.clone(),
+        });
 
         let (approval_policy, sandbox_policy) = match input.permission_mode {
             PermissionMode::BypassPermissions => ("never".to_string(), json!({ "type": "dangerFullAccess" })),

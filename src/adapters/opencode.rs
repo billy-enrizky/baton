@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::adapters::{
     AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, ModelListInput,
-    SteerHandle, TurnEvent, TurnEventSender, TurnStartInput,
+    RevertSessionInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput,
 };
 use crate::config::auth_signature;
 use crate::process::ProcessRecorder;
@@ -503,6 +503,74 @@ impl BatonAdapter for OpenCodeAdapter {
         }
     }
 
+    async fn revert_session(&mut self, input: RevertSessionInput) -> Result<bool> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting("native-revert");
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        if runtime.version != OpenCodeVersion::V2 {
+            anyhow::bail!(
+                "opencode native rewind requires the session.next API (opencode 2 or newer)"
+            );
+        }
+        let session_id = &input.session.native_session_id;
+        // Leave files to Baton checkpoints; native rewind truncates history only.
+        let stage = self
+            .post(
+                &runtime,
+                &format!("/api/session/{session_id}/revert/stage"),
+                json!({ "messageID": input.before_turn_id, "files": false }),
+            )
+            .await;
+        let stage = match stage {
+            Ok(stage) => stage,
+            Err(error) => {
+                let _ = self
+                    .post(
+                        &runtime,
+                        &format!("/api/session/{session_id}/revert/clear"),
+                        json!({}),
+                    )
+                    .await;
+                return Err(error);
+            }
+        };
+        let staged = stage
+            .pointer("/data/messageID")
+            .or_else(|| stage.get("messageID"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if staged.is_none() {
+            let _ = self
+                .post(
+                    &runtime,
+                    &format!("/api/session/{session_id}/revert/clear"),
+                    json!({}),
+                )
+                .await;
+            anyhow::bail!("opencode accepted the revert stage without a message id");
+        }
+        match self
+            .post(
+                &runtime,
+                &format!("/api/session/{session_id}/revert/commit"),
+                json!({}),
+            )
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(error) => {
+                let _ = self
+                    .post(
+                        &runtime,
+                        &format!("/api/session/{session_id}/revert/clear"),
+                        json!({}),
+                    )
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
     async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {
         let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
         self.lifecycle.starting("model-list");
@@ -595,6 +663,10 @@ impl BatonAdapter for OpenCodeAdapter {
             },
         };
         *runtime.active_session.lock().await = Some(session_id.clone());
+        let _ = emit.send(TurnEvent::ProviderSession {
+            native_session_id: session_id.clone(),
+            rollout_path: None,
+        });
 
         match runtime.version {
             OpenCodeVersion::V2 => {
@@ -605,8 +677,21 @@ impl BatonAdapter for OpenCodeAdapter {
                     .await;
                 // opencode >= 2 wraps the prompt text: {"prompt": {"text": ...}}.
                 let prompt_body = json!({ "prompt": { "text": input.prompt } });
-                self.post(&runtime, &format!("/api/session/{session_id}/prompt"), prompt_body)
+                let admitted = self
+                    .post(&runtime, &format!("/api/session/{session_id}/prompt"), prompt_body)
                     .await?;
+                // The admitted input id is the user message id; OpenCode's
+                // revert API cuts history at this message.
+                if let Some(message_id) = admitted
+                    .pointer("/data/id")
+                    .or_else(|| admitted.get("id"))
+                    .and_then(Value::as_str)
+                    .filter(|id| id.starts_with("msg_"))
+                {
+                    let _ = emit.send(TurnEvent::ProviderTurnId {
+                        id: message_id.to_string(),
+                    });
+                }
             }
             OpenCodeVersion::V1 => {
                 let (provider_id, model_id) = parse_model_slug(&input.model)?;

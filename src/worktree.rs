@@ -210,6 +210,10 @@ pub fn list_managed(home: &Path) -> Result<Vec<ManagedWorktree>> {
     Ok(entries)
 }
 
+pub fn run_matches(entry: &ManagedWorktree, filter: &str) -> bool {
+    entry.run.starts_with(filter) || filter.starts_with(&entry.run)
+}
+
 pub fn clean_managed(
     home: &Path,
     run_filter: Option<&str>,
@@ -222,7 +226,7 @@ pub fn clean_managed(
     };
     for entry in list_managed(home)? {
         if let Some(filter) = run_filter {
-            if !entry.run.starts_with(filter) {
+            if !run_matches(&entry, filter) {
                 continue;
             }
         }
@@ -403,7 +407,7 @@ mod tests {
         let dirty_entry = listed.iter().find(|entry| entry.run == "run-dirt").unwrap();
         assert!(dirty_entry.dirty);
 
-        let cleanup = clean_managed(home.path(), Some("run-merg"), false).unwrap();
+        let cleanup = clean_managed(home.path(), Some("run-merg-extra"), false).unwrap();
         assert_eq!(cleanup.removed.len(), 1);
         assert!(cleanup.skipped.is_empty());
         assert!(!merged_wt.path.exists());

@@ -72,6 +72,7 @@ pub struct OrchestrationTaskRow {
     pub thread_id: Option<String>,
     pub status: String,
     pub merged_at: Option<String>,
+    pub pr_url: Option<String>,
     pub text: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
@@ -295,7 +296,8 @@ CREATE TABLE IF NOT EXISTS orchestration_tasks (
   error TEXT,
   created_at TEXT NOT NULL,
   finished_at TEXT,
-  merged_at TEXT
+  merged_at TEXT,
+  pr_url TEXT
 );
 CREATE INDEX IF NOT EXISTS orchestration_tasks_run_idx ON orchestration_tasks (run_id, created_at);
 "#;
@@ -421,6 +423,7 @@ impl BatonStore {
         ensure_column(&db, "orchestration_tasks", "commit_sha", "TEXT")?;
         ensure_column(&db, "orchestration_tasks", "merged_at", "TEXT")?;
         ensure_column(&db, "orchestration_tasks", "position", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&db, "orchestration_tasks", "pr_url", "TEXT")?;
         ensure_column(&db, "orchestration_runs", "dirty_source", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(BatonStore { db })
     }
@@ -1535,6 +1538,14 @@ impl BatonStore {
         Ok(())
     }
 
+    pub fn mark_orchestration_task_pr(&self, id: &str, pr_url: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE orchestration_tasks SET pr_url = ? WHERE id = ?",
+            params![pr_url, id],
+        )?;
+        Ok(())
+    }
+
     pub fn list_orchestration_runs(&self, limit: usize) -> Result<Vec<OrchestrationRunRow>> {
         let mut statement = self.db.prepare(
             "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at FROM orchestration_runs ORDER BY created_at DESC LIMIT ?",
@@ -1561,7 +1572,7 @@ impl BatonStore {
 
     pub fn list_orchestration_tasks(&self, run_id: &str) -> Result<Vec<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
+            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
         )?;
         let rows = statement
             .query_map(params![run_id], |row| {
@@ -1584,6 +1595,7 @@ impl BatonStore {
                     created_at: row.get(14)?,
                     finished_at: row.get(15)?,
                     merged_at: row.get(16)?,
+                    pr_url: row.get(17)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

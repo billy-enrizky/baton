@@ -10,6 +10,7 @@
 - `--plan-file` for deterministic plans
 - Orchestrate mode as the default for new interactive sessions
 - Worker commits, `--integrate`, and `worktrees --clean`
+- Push worker branches and open PRs with `--open-prs` or `p` in the report
 - Live per-worker progress in the TUI and with `--progress`
 
 ## How to get to it (user POV)
@@ -25,6 +26,8 @@ baton orchestrate --list
 baton orchestrate --run <run-id> --json
 baton orchestrate --integrate <run-id> --json
 baton orchestrate --integrate <run-id> --task 2 --json
+baton orchestrate --open-prs <run-id> --json
+baton orchestrate --open-prs <run-id> --task 2 --json
 baton orchestrate --progress --json "Audit billing, add tests, update docs"
 ```
 
@@ -38,7 +41,9 @@ finishes, the full-screen report lists each worker. Up/Down selects a worker,
 Enter opens that worker's thread (with its worktree as cwd), PageUp/PageDown
 scrolls, and Esc closes the report. `/clear` also dismisses it. Press `i` to
 integrate completed worker branches: the report asks for confirmation, merges in
-the background, then shows the merged, skipped, and conflicted workers.
+the background, then shows the merged, skipped, and conflicted workers. Press `p`
+to push eligible worker branches and open one pull request per worker; the report
+asks for confirmation, shows the PR URLs, and keeps them durable across restarts.
 
 ## Driving it with the PTY/CLI harness
 Use a fresh git repo and a plan file for a cheap deterministic proof. This runs one real Codex worker.
@@ -77,5 +82,6 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 - A run with one success and one failure is `partial`; all failures is `failed` and exits non-zero.
 - Worktrees are kept for review under `$BATON_HOME/worktrees/<run>/<task>`. Successful workers commit their changes as `baton worker: <title>`; the report and `--run --json` expose the SHA. `--integrate` merges completed branches into a clean source checkout, aborts on conflict, and skips already-merged workers. Use `baton worktrees` to list managed worktrees and `baton worktrees --clean` to remove clean, merged ones; dirty or unmerged worktrees require `--force`.
 - `baton.json` `worktree.sharedDirectories` symlinks existing, gitignored directories such as `node_modules` or `target` into each worker worktree. Shared paths appear in the report; edits inside them affect the primary checkout.
+- `--open-prs` needs a git remote and `gh` on PATH. It uses `origin`, or the only remote when origin is absent, and bases each PR on the source checkout's current branch. Eligible tasks have a completed worker, a commit, a live branch, no merge marker, and no recorded PR. A retry skips recorded PRs and links an existing PR for the same head branch instead of creating a duplicate.
 - The coordinator retries once on invalid JSON. A second invalid plan fails the run before workers start.
 - The multi-harness path costs real provider turns; use `--plan-file` for smoke tests.

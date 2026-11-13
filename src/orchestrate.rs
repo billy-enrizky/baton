@@ -125,6 +125,7 @@ pub struct WorkerResult {
     pub status: String,
     pub text: Option<String>,
     pub error: Option<String>,
+    pub pr_url: Option<String>,
     pub created_at: String,
     pub finished_at: String,
 }
@@ -469,6 +470,7 @@ fn panicked_worker(fallback: &WorkerFallback) -> (usize, WorkerResult) {
             status: "failed".to_string(),
             text: None,
             error: Some("worker thread panicked".to_string()),
+            pr_url: None,
             created_at: now.clone(),
             finished_at: now,
         },
@@ -543,6 +545,7 @@ fn run_worker_inner(
                 status: "cancelled".to_string(),
                 text: None,
                 error: None,
+                pr_url: None,
                 created_at: created_at.clone(),
                 finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
             },
@@ -566,6 +569,7 @@ fn run_worker_inner(
                         status: "failed".to_string(),
                         text: None,
                         error: Some(format!("cannot create worktree: {error}")),
+                        pr_url: None,
                         created_at,
                         finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     },
@@ -659,6 +663,7 @@ fn run_worker_inner(
             status: status.to_string(),
             text,
             error,
+            pr_url: None,
             created_at,
             finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         },
@@ -696,6 +701,40 @@ pub struct IntegrateReport {
     pub merged: Vec<IntegratedTask>,
     pub skipped: Vec<SkippedTask>,
     pub conflict: Option<IntegrateConflict>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShippedTask {
+    pub index: usize,
+    pub title: String,
+    pub branch: String,
+    pub commit: String,
+    pub pr_url: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShipReport {
+    pub run_id: String,
+    pub repo_root: PathBuf,
+    pub remote: String,
+    pub base: String,
+    pub opened: Vec<ShippedTask>,
+    pub skipped: Vec<SkippedTask>,
+    pub failed: Vec<SkippedTask>,
+}
+
+fn ship_status(report: &ShipReport) -> &'static str {
+    if !report.failed.is_empty() {
+        if report.opened.is_empty() {
+            "failed"
+        } else {
+            "partial"
+        }
+    } else if report.opened.is_empty() {
+        "skipped"
+    } else {
+        "done"
+    }
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -740,13 +779,14 @@ pub fn integrate(
     run_id: &str,
     selection: &[usize],
 ) -> Result<IntegrateReport> {
+    let run_id = resolve_run_id(store, run_id)?;
     let repo_root = worktree::repo_root(cwd)?;
     if worktree::is_dirty(&repo_root)? {
         anyhow::bail!(
             "source checkout has uncommitted changes; commit or stash them before integrating"
         );
     }
-    let tasks = store.list_orchestration_tasks(run_id)?;
+    let tasks = store.list_orchestration_tasks(&run_id)?;
     if tasks.is_empty() {
         anyhow::bail!("run {} has no tasks", &run_id[..8.min(run_id.len())]);
     }
@@ -760,7 +800,7 @@ pub fn integrate(
     }
     let short_run = &run_id[..8.min(run_id.len())];
     let mut report = IntegrateReport {
-        run_id: run_id.to_string(),
+        run_id: run_id.clone(),
         repo_root: repo_root.clone(),
         merged: Vec::new(),
         skipped: Vec::new(),
@@ -850,6 +890,316 @@ pub fn integrate(
         break;
     }
     Ok(report)
+}
+
+pub fn resolve_run_id(store: &BatonStore, run_id: &str) -> Result<String> {
+    let runs = store.list_orchestration_runs(200)?;
+    if let Some(exact) = runs.iter().find(|run| run.id == run_id) {
+        return Ok(exact.id.clone());
+    }
+    let matches = runs
+        .iter()
+        .filter(|run| run.id.starts_with(run_id))
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => anyhow::bail!("no orchestration run matches {run_id}"),
+        [run] => Ok(run.id.clone()),
+        _ => anyhow::bail!("run id {run_id} is ambiguous; use more characters"),
+    }
+}
+
+fn current_branch(root: &Path) -> Result<String> {
+    let branch = git_stdout(root, &["branch", "--show-current"])?;
+    if branch.is_empty() {
+        anyhow::bail!("source checkout is not on a branch; check out the PR base branch first");
+    }
+    Ok(branch)
+}
+
+fn remote_name(root: &Path) -> Result<String> {
+    let remotes = git_stdout(root, &["remote"])?;
+    let remotes = remotes
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if remotes.iter().any(|remote| *remote == "origin") {
+        return Ok("origin".to_string());
+    }
+    match remotes.as_slice() {
+        [] => anyhow::bail!("source checkout has no git remote; add one before opening PRs"),
+        [remote] => Ok((*remote).to_string()),
+        _ => anyhow::bail!(
+            "source checkout has multiple remotes and no origin; add an origin remote or push the worker branch manually"
+        ),
+    }
+}
+
+fn gh_binary(override_path: Option<&Path>) -> PathBuf {
+    override_path
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::var_os("BATON_GH_BIN").map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("gh"))
+}
+
+fn extract_url(stdout: &[u8]) -> Option<String> {
+    String::from_utf8_lossy(stdout)
+        .split_whitespace()
+        .find(|token| token.starts_with("https://") || token.starts_with("http://"))
+        .map(|token| {
+            token
+                .trim_matches(|character: char| matches!(character, ')' | ',' | '.' | ';'))
+                .to_string()
+        })
+}
+
+fn existing_pr_url(gh: &Path, root: &Path, branch: &str) -> Option<String> {
+    let output = Command::new(gh)
+        .args([
+            "pr", "list", "--head", branch, "--state", "all", "--json", "url", "--limit", "1",
+        ])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    value
+        .as_array()?
+        .first()?
+        .get("url")?
+        .as_str()
+        .map(str::to_string)
+}
+
+pub fn open_prs(
+    store: &BatonStore,
+    cwd: &Path,
+    run_id: &str,
+    selection: &[usize],
+) -> Result<ShipReport> {
+    open_prs_with_gh(store, cwd, run_id, selection, None)
+}
+
+fn open_prs_with_gh(
+    store: &BatonStore,
+    cwd: &Path,
+    run_id: &str,
+    selection: &[usize],
+    gh_bin: Option<&Path>,
+) -> Result<ShipReport> {
+    let run_id = resolve_run_id(store, run_id)?;
+    let repo_root = worktree::repo_root(cwd)?;
+    let tasks = store.list_orchestration_tasks(&run_id)?;
+    if tasks.is_empty() {
+        anyhow::bail!("run {} has no tasks", &run_id[..8.min(run_id.len())]);
+    }
+    for index in selection {
+        if *index == 0 || *index > tasks.len() {
+            anyhow::bail!(
+                "--task {index} is out of range (the run has {} tasks)",
+                tasks.len()
+            );
+        }
+    }
+    let remote = remote_name(&repo_root)?;
+    let base = current_branch(&repo_root)?;
+    let gh = gh_binary(gh_bin);
+    let short_run = run_id.chars().take(8).collect::<String>();
+    let mut report = ShipReport {
+        run_id,
+        repo_root: repo_root.clone(),
+        remote: remote.clone(),
+        base: base.clone(),
+        opened: Vec::new(),
+        skipped: Vec::new(),
+        failed: Vec::new(),
+    };
+    for (offset, task) in tasks.iter().enumerate() {
+        let index = offset + 1;
+        if !selection.is_empty() && !selection.contains(&index) {
+            continue;
+        }
+        if task.status != "completed" {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: format!("worker status is {}", task.status),
+            });
+            continue;
+        }
+        if let Some(pr_url) = &task.pr_url {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: format!("PR already recorded: {pr_url}"),
+            });
+            continue;
+        }
+        if task.merged_at.is_some() {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: "already merged into the source checkout".to_string(),
+            });
+            continue;
+        }
+        let Some(commit) = task.commit_sha.as_deref() else {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: "worker produced no commit".to_string(),
+            });
+            continue;
+        };
+        let Some(branch) = task.branch.as_deref() else {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: "worker has no branch".to_string(),
+            });
+            continue;
+        };
+        if !branch_exists(&repo_root, branch) {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: format!("branch {branch} no longer exists"),
+            });
+            continue;
+        }
+        if let Err(error) = git_stdout(&repo_root, &["push", "-u", &remote, branch]) {
+            report.failed.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: format!("cannot push {branch}: {error}"),
+            });
+            continue;
+        }
+        if let Some(pr_url) = existing_pr_url(&gh, &repo_root, branch) {
+            store.mark_orchestration_task_pr(&task.id, &pr_url)?;
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: format!("PR already exists: {pr_url}"),
+            });
+            continue;
+        }
+        let title = format!("baton: {} ({short_run})", task.title);
+        let body = format!(
+            "Run: {short_run}
+Worker: [{index}] {}
+Harness: {}/{}
+
+Created by baton orchestration.",
+            task.title, task.provider, task.model
+        );
+        let output = Command::new(&gh)
+            .args([
+                "pr", "create", "--base", &base, "--head", branch, "--title", &title, "--body",
+                &body,
+            ])
+            .current_dir(&repo_root)
+            .output();
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                report.failed.push(SkippedTask {
+                    index,
+                    title: task.title.clone(),
+                    reason: format!("cannot run {}: {error}", gh.display()),
+                });
+                continue;
+            }
+        };
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            report.failed.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: if detail.is_empty() {
+                    format!("gh exited with {}", output.status)
+                } else {
+                    format!("gh failed: {detail}")
+                },
+            });
+            continue;
+        }
+        let Some(pr_url) = extract_url(&output.stdout) else {
+            report.failed.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: "gh created a PR but did not print a URL".to_string(),
+            });
+            continue;
+        };
+        store.mark_orchestration_task_pr(&task.id, &pr_url)?;
+        report.opened.push(ShippedTask {
+            index,
+            title: task.title.clone(),
+            branch: branch.to_string(),
+            commit: commit.to_string(),
+            pr_url,
+        });
+    }
+    Ok(report)
+}
+
+pub fn render_ship(report: &ShipReport) -> String {
+    let short_run = &report.run_id[..8.min(report.run_id.len())];
+    let mut lines = vec![
+        format!("ship: {short_run}  {}", ship_status(report)),
+        format!("source: {}", report.repo_root.display()),
+        format!("remote: {} -> {}", report.remote, report.base),
+    ];
+    for task in &report.opened {
+        lines.push(format!(
+            "  opened [{}] {} · {} -> {}",
+            task.index, task.title, task.branch, task.pr_url
+        ));
+    }
+    for task in &report.skipped {
+        lines.push(format!(
+            "  skipped [{}] {} · {}",
+            task.index, task.title, task.reason
+        ));
+    }
+    for task in &report.failed {
+        lines.push(format!(
+            "  failed [{}] {} · {}",
+            task.index, task.title, task.reason
+        ));
+    }
+    lines.join("\n")
+}
+
+pub fn ship_to_json(report: &ShipReport) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "run_id": report.run_id,
+        "repo_root": report.repo_root.display().to_string(),
+        "remote": report.remote,
+        "base": report.base,
+        "status": ship_status(report),
+        "opened": report.opened.iter().map(|task| serde_json::json!({
+            "task": task.index,
+            "title": task.title,
+            "branch": task.branch,
+            "commit": task.commit,
+            "pr_url": task.pr_url,
+        })).collect::<Vec<_>>(),
+        "skipped": report.skipped.iter().map(|task| serde_json::json!({
+            "task": task.index,
+            "title": task.title,
+            "reason": task.reason,
+        })).collect::<Vec<_>>(),
+        "failed": report.failed.iter().map(|task| serde_json::json!({
+            "task": task.index,
+            "title": task.title,
+            "reason": task.reason,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 pub fn render_integrate(report: &IntegrateReport) -> String {
@@ -1255,6 +1605,7 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
                     "base_ref": worktree.base_ref,
                     "shared_paths": worktree.shared_paths,
                 })),
+                "pr_url": task.pr_url,
             })
         })
         .collect::<Vec<_>>();
@@ -1312,6 +1663,7 @@ pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<
                 status: task.status,
                 text: task.text,
                 error: task.error,
+                pr_url: task.pr_url,
                 created_at: task.created_at,
                 finished_at: task.finished_at.unwrap_or_default(),
             }
@@ -1398,6 +1750,79 @@ mod tests {
     fn rejects_unknown_provider() {
         let text = r#"{"tasks":[{"title":"a","provider":"not-a-provider","prompt":"do a"}]}"#;
         assert!(parse_plan(text, 4).is_err());
+    }
+
+    fn fake_gh(root: &Path) -> PathBuf {
+        let path = root.join("fake-gh");
+        let log = root.join("gh.log");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+LOG='{log}'
+printf '%s\n' "$*" >> "$LOG"
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  head=""
+  prev=""
+  for arg in "$@"; do
+    if [ "$prev" = "--head" ]; then head="$arg"; fi
+    prev="$arg"
+  done
+  slug=$(printf '%s' "$head" | tr '/' '-')
+  printf 'https://github.com/example/repo/pull/%s\n' "$slug"
+  exit 0
+fi
+printf 'unexpected gh args: %s\n' "$*" >&2
+exit 1
+"#,
+            log = log.display()
+        );
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn fake_gh_with_existing_pr(root: &Path, url: &str) -> PathBuf {
+        let path = root.join("fake-gh-existing");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+if [ "$1" = "pr" ] && [ "$2" = "list" ]; then
+  printf '%s\n' '[{{"url":"{url}"}}]'
+  exit 0
+fi
+printf 'gh should not create a PR when one already exists\n' >&2
+exit 1
+"#
+        );
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn git_at(cwd: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?}: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
     fn fake_worker(root: &Path) -> PathBuf {
@@ -1800,5 +2225,207 @@ mod tests {
             "baton worker: worker one"
         );
         assert!(worktree.path.join("worker-output.txt").is_file());
+    }
+    #[test]
+    fn ships_completed_worker_branches_idempotently() {
+        let plan = r#"{"summary":"two workers","tasks":[{"title":"first task","provider":"codex","prompt":"do one"},{"title":"second task","provider":"codex","prompt":"do two"}]}"#;
+        let body = "if [ \"$(basename \"$PWD\")\" = \"first-task\" ]; then printf 'one\\n' > one.txt; else printf 'two\\n' > two.txt; fi";
+        let (repo, home, store, report) = run_fixture(plan, body);
+        assert_eq!(report.tasks.len(), 2);
+
+        let remote = home.path().join("remote.git");
+        let init = Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .unwrap();
+        assert!(init.success());
+        git_at(
+            repo.path(),
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        let gh = fake_gh(home.path());
+        let short_run = &report.run_id[..8];
+
+        let shipped = open_prs_with_gh(&store, repo.path(), short_run, &[], Some(&gh)).unwrap();
+        assert_eq!(ship_status(&shipped), "done");
+        assert_eq!(shipped.opened.len(), 2, "both worker branches open a PR");
+        assert_eq!(shipped.remote, "origin");
+        let tasks = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert!(tasks.iter().all(|task| task.pr_url.is_some()));
+        for task in &tasks {
+            let branch = task.branch.as_deref().unwrap();
+            let remote_head = git_at(
+                repo.path(),
+                &[
+                    "ls-remote",
+                    "--heads",
+                    remote.to_string_lossy().as_ref(),
+                    branch,
+                ],
+            );
+            assert!(
+                !remote_head.is_empty(),
+                "branch {branch} reached the remote"
+            );
+        }
+        let log = std::fs::read_to_string(home.path().join("gh.log")).unwrap();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("pr create"))
+                .count(),
+            2,
+            "one PR create per eligible worker: {log}"
+        );
+        assert!(
+            log.contains("--base"),
+            "the current branch is the PR base: {log}"
+        );
+
+        let again = open_prs_with_gh(&store, repo.path(), short_run, &[], Some(&gh)).unwrap();
+        assert!(again.opened.is_empty());
+        assert_eq!(again.skipped.len(), 2);
+        assert!(
+            again
+                .skipped
+                .iter()
+                .all(|task| task.reason.contains("PR already recorded")),
+            "retry is idempotent: {:?}",
+            again.skipped
+        );
+        let log = std::fs::read_to_string(home.path().join("gh.log")).unwrap();
+        assert_eq!(
+            log.lines()
+                .filter(|line| line.contains("pr create"))
+                .count(),
+            2,
+            "a retry must not create duplicate PRs"
+        );
+    }
+
+    #[test]
+    fn ship_skips_failed_and_changeless_workers() {
+        let plan = r#"{"summary":"three workers","tasks":[{"title":"first task","provider":"codex","prompt":"do one"},{"title":"second task","provider":"codex","prompt":"do two"},{"title":"third task","provider":"codex","prompt":"do three"}]}"#;
+        let body = "name=$(basename \"$PWD\"); if [ \"$name\" = \"third-task\" ]; then exit 1; fi; if [ \"$name\" = \"first-task\" ]; then printf 'one\\n' > one.txt; fi";
+        let (repo, home, store, report) = run_fixture(plan, body);
+        let remote = home.path().join("remote.git");
+        assert!(Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        git_at(
+            repo.path(),
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        let gh = fake_gh(home.path());
+        let shipped =
+            open_prs_with_gh(&store, repo.path(), &report.run_id, &[], Some(&gh)).unwrap();
+        assert_eq!(shipped.opened.len(), 1);
+        assert_eq!(shipped.skipped.len(), 2);
+        assert!(
+            shipped
+                .skipped
+                .iter()
+                .any(|task| task.reason == "worker produced no commit"),
+            "a completed worker with no changes is not shippable: {:?}",
+            shipped.skipped
+        );
+        assert!(
+            shipped
+                .skipped
+                .iter()
+                .any(|task| task.reason == "worker status is failed"),
+            "a failed worker is not shippable: {:?}",
+            shipped.skipped
+        );
+    }
+
+    #[test]
+    fn ship_reports_a_missing_branch_and_rejects_a_bad_selection() {
+        let plan = r#"{"summary":"one worker","tasks":[{"title":"first task","provider":"codex","prompt":"do one"}]}"#;
+        let (repo, home, store, report) = run_fixture(plan, "printf 'one\\n' > one.txt");
+        let remote = home.path().join("remote.git");
+        assert!(Command::new("git")
+            .args(["init", "--bare", "-q"])
+            .arg(&remote)
+            .status()
+            .unwrap()
+            .success());
+        git_at(
+            repo.path(),
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        let task = store
+            .list_orchestration_tasks(&report.run_id)
+            .unwrap()
+            .remove(0);
+        let branch = task.branch.clone().unwrap();
+        let worktree = task.worktree_path.clone().unwrap();
+        assert!(Command::new("git")
+            .args(["worktree", "remove", "--force", &worktree])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .args(["branch", "-D", &branch])
+            .current_dir(repo.path())
+            .status()
+            .unwrap()
+            .success());
+        let gh = fake_gh(home.path());
+        let shipped =
+            open_prs_with_gh(&store, repo.path(), &report.run_id, &[], Some(&gh)).unwrap();
+        assert!(shipped.opened.is_empty());
+        assert_eq!(shipped.skipped.len(), 1);
+        assert!(shipped.skipped[0].reason.contains("no longer exists"));
+        let error =
+            open_prs_with_gh(&store, repo.path(), &report.run_id, &[2], Some(&gh)).unwrap_err();
+        assert!(error.to_string().contains("out of range"), "{error}");
+    }
+
+    #[test]
+    fn ship_links_an_existing_pr_instead_of_creating_a_duplicate() {
+        let plan = r#"{"summary":"one worker","tasks":[{"title":"first task","provider":"codex","prompt":"do one"}]}"#;
+        let (repo, home, store, report) =
+            run_fixture(plan, "printf 'one\n' > one.txt");
+        let remote = home.path().join("remote.git");
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", "-q"])
+                .arg(&remote)
+                .status()
+                .unwrap()
+                .success()
+        );
+        git_at(
+            repo.path(),
+            &["remote", "add", "origin", &remote.to_string_lossy()],
+        );
+        let existing = "https://github.com/example/repo/pull/9";
+        let gh = fake_gh_with_existing_pr(home.path(), existing);
+        let shipped =
+            open_prs_with_gh(&store, repo.path(), &report.run_id, &[], Some(&gh)).unwrap();
+        assert!(shipped.opened.is_empty());
+        assert_eq!(shipped.skipped.len(), 1);
+        assert!(
+            shipped.skipped[0].reason.contains(existing),
+            "linked PR is reported: {:?}",
+            shipped.skipped
+        );
+        let tasks = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert_eq!(tasks[0].pr_url.as_deref(), Some(existing));
+    }
+
+    #[test]
+    fn ship_requires_a_remote() {
+        let plan = r#"{"summary":"one worker","tasks":[{"title":"first task","provider":"codex","prompt":"do one"}]}"#;
+        let (repo, home, store, report) = run_fixture(plan, "printf 'one\\n' > one.txt");
+        let gh = fake_gh(home.path());
+        let error =
+            open_prs_with_gh(&store, repo.path(), &report.run_id, &[], Some(&gh)).unwrap_err();
+        assert!(error.to_string().contains("no git remote"), "{error}");
     }
 }

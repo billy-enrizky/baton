@@ -14,7 +14,7 @@ use crate::adapters::{AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
 use crate::config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
-use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport};
+use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
@@ -166,6 +166,8 @@ enum OrchestrationEvent {
     Progress(OrchestrationProgress),
     Integrated(Box<IntegrateReport>),
     IntegrateFailed(String),
+    Shipped(Box<ShipReport>),
+    ShipFailed(String),
 }
 
 struct OrchestrationWorkerView {
@@ -276,6 +278,9 @@ pub struct TuiState {
     orchestration_integrating: bool,
     orchestration_confirm_integrate: bool,
     orchestration_integrate_report: Option<IntegrateReport>,
+    orchestration_shipping: bool,
+    orchestration_confirm_ship: bool,
+    orchestration_ship_report: Option<ShipReport>,
     orchestration_sender: std::sync::mpsc::Sender<OrchestrationEvent>,
 }
 
@@ -362,6 +367,9 @@ pub fn run_tui(
         orchestration_integrating: false,
         orchestration_confirm_integrate: false,
         orchestration_integrate_report: None,
+        orchestration_shipping: false,
+        orchestration_confirm_ship: false,
+        orchestration_ship_report: None,
         orchestration_sender,
     };
 
@@ -821,6 +829,8 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             state.orchestration_cancelling = false;
             state.orchestration_workers.clear();
             state.orchestration_scroll = 0;
+            state.orchestration_confirm_ship = false;
+            state.orchestration_ship_report = None;
             let mut summary = format!(
                 "run {} · {}\n{}",
                 &report.run_id[..8.min(report.run_id.len())],
@@ -861,6 +871,8 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             state.orchestration_report = None;
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
+            state.orchestration_confirm_ship = false;
+            state.orchestration_ship_report = None;
             if error == orchestrate::CANCELLED_ERROR {
                 record_orchestration_message(state, "run cancelled".to_string());
                 state.notice = Some("orchestration cancelled".into());
@@ -947,6 +959,41 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             record_orchestration_message(state, format!("integration failed · {error}"));
             state.notice = Some(format!("integration failed: {error}"));
         }
+        OrchestrationEvent::Shipped(report) => {
+            state.orchestration_shipping = false;
+            state.orchestration_confirm_ship = false;
+            if let Some(run) = state.orchestration_report.as_mut() {
+                for shipped in &report.opened {
+                    if let Some(task) = run.tasks.get_mut(shipped.index.saturating_sub(1)) {
+                        task.pr_url = Some(shipped.pr_url.clone());
+                    }
+                }
+            }
+            let notice = format!(
+                "ship done: {} PR(s), {} skipped, {} failed",
+                report.opened.len(),
+                report.skipped.len(),
+                report.failed.len()
+            );
+            let mut message = format!("ship · {notice}");
+            for task in &report.opened {
+                message.push_str(&format!("\n  [{}] {}", task.index, task.pr_url));
+            }
+            for task in &report.failed {
+                message.push_str(&format!(
+                    "\n  failed [{}] {} · {}",
+                    task.index, task.title, task.reason
+                ));
+            }
+            record_orchestration_message(state, message);
+            state.notice = Some(notice);
+            state.orchestration_ship_report = Some(*report);
+        }
+        OrchestrationEvent::ShipFailed(error) => {
+            state.orchestration_shipping = false;
+            record_orchestration_message(state, format!("ship failed · {error}"));
+            state.notice = Some(format!("ship failed: {error}"));
+        }
     }
 }
 
@@ -1000,6 +1047,35 @@ fn start_integration(state: &mut TuiState) {
         let event = match result {
             Ok(report) => OrchestrationEvent::Integrated(Box::new(report)),
             Err(error) => OrchestrationEvent::IntegrateFailed(error.to_string()),
+        };
+        let _ = sender.send(event);
+    });
+}
+
+fn start_shipping(state: &mut TuiState) {
+    let Some(report) = state.orchestration_report.as_ref() else {
+        return;
+    };
+    if state.orchestration_shipping {
+        return;
+    }
+    let run_id = report.run_id.clone();
+    let cwd = report
+        .repo_root
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(&state.thread.cwd));
+    let home = state.home.clone();
+    state.orchestration_shipping = true;
+    state.orchestration_confirm_ship = false;
+    state.orchestration_ship_report = None;
+    state.notice = Some("pushing worker branches and opening PRs...".into());
+    let sender = state.orchestration_sender.clone();
+    std::thread::spawn(move || {
+        let result = BatonStore::open(&home.join("baton.sqlite"))
+            .and_then(|store| orchestrate::open_prs(&store, &cwd, &run_id, &[]));
+        let event = match result {
+            Ok(report) => OrchestrationEvent::Shipped(Box::new(report)),
+            Err(error) => OrchestrationEvent::ShipFailed(error.to_string()),
         };
         let _ = sender.send(event);
     });
@@ -2218,7 +2294,7 @@ fn handle_orchestration_key(
     else {
         return;
     };
-    if state.orchestration_integrating {
+    if state.orchestration_integrating || state.orchestration_shipping {
         return;
     }
     if state.orchestration_confirm_integrate {
@@ -2232,12 +2308,24 @@ fn handle_orchestration_key(
         }
         return;
     }
+    if state.orchestration_confirm_ship {
+        match key.code {
+            KeyCode::Enter => start_shipping(state),
+            KeyCode::Esc => {
+                state.orchestration_confirm_ship = false;
+                state.notice = Some("ship cancelled".into());
+            }
+            _ => {}
+        }
+        return;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             state.orchestration_report = None;
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
             state.orchestration_confirm_integrate = false;
+            state.orchestration_confirm_ship = false;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.orchestration_selected = state.orchestration_selected.saturating_sub(1);
@@ -2272,6 +2360,31 @@ fn handle_orchestration_key(
                 state.orchestration_confirm_integrate = true;
                 state.notice = Some(format!(
                     "merge {integrable} worker branch(es) into the source checkout?"
+                ));
+            }
+        }
+        KeyCode::Char('p') => {
+            let shippable = state
+                .orchestration_report
+                .as_ref()
+                .map(|report| {
+                    report
+                        .tasks
+                        .iter()
+                        .filter(|task| {
+                            task.status == "completed"
+                                && task.commit.is_some()
+                                && task.pr_url.is_none()
+                        })
+                        .count()
+                })
+                .unwrap_or(0);
+            if shippable == 0 {
+                state.notice = Some("no completed worker commits to ship".into());
+            } else {
+                state.orchestration_confirm_ship = true;
+                state.notice = Some(format!(
+                    "push {shippable} worker branch(es) and open pull requests?"
                 ));
             }
         }
@@ -2768,6 +2881,8 @@ fn handle_command(
                         state.orchestration_scroll = 0;
                         state.orchestration_selected = 0;
                         state.orchestration_integrate_report = None;
+                        state.orchestration_confirm_ship = false;
+                        state.orchestration_ship_report = None;
                         state.notice = Some(format!(
                             "opened run {}",
                             &run_id[..8.min(run_id.len())]
@@ -3635,14 +3750,35 @@ fn draw_orchestration_report(
                 ),
                 Style::default().fg(COLORS.warning).add_modifier(Modifier::BOLD),
             )
+        } else if state.orchestration_confirm_ship {
+            Line::styled(
+                format!(
+                    "push worker branches and open PRs from {}? enter confirms · esc cancels",
+                    report
+                        .repo_root
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "the source checkout".to_string())
+                ),
+                Style::default()
+                    .fg(COLORS.warning)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else if state.orchestration_integrating {
             Line::styled(
                 "integrating worker branches...",
                 Style::default().fg(COLORS.secondary).add_modifier(Modifier::BOLD),
             )
+        } else if state.orchestration_shipping {
+            Line::styled(
+                "pushing worker branches and opening PRs...",
+                Style::default()
+                    .fg(COLORS.secondary)
+                    .add_modifier(Modifier::BOLD),
+            )
         } else {
             Line::styled(
-                "↑↓ select · enter opens worker thread · i integrate · pgup/pgdn scroll · esc closes",
+                "↑↓ select · enter opens worker thread · i integrate · p open PRs · pgup/pgdn scroll · esc closes",
                 Style::default().fg(COLORS.muted),
             )
         },
@@ -3746,6 +3882,12 @@ fn draw_orchestration_report(
                 Style::default().fg(COLORS.success),
             ));
         }
+        if let Some(pr_url) = &task.pr_url {
+            lines.push(Line::styled(
+                truncate_chars(&format!("    pr: {pr_url}"), width),
+                Style::default().fg(COLORS.accent),
+            ));
+        }
         if let Some(thread_id) = &task.thread_id {
             lines.push(Line::styled(
                 format!("    thread: {}", &thread_id[..8.min(thread_id.len())]),
@@ -3820,6 +3962,65 @@ fn draw_orchestration_report(
                         conflict.title,
                         conflict.files.join(", ")
                     ),
+                    width,
+                ),
+                Style::default().fg(COLORS.error),
+            ));
+        }
+    }
+
+    if let Some(ship) = &state.orchestration_ship_report {
+        lines.push(Line::from(vec![
+            Span::styled("ship: ", Style::default().fg(COLORS.muted)),
+            Span::styled(
+                if !ship.failed.is_empty() {
+                    if ship.opened.is_empty() {
+                        "failed"
+                    } else {
+                        "partial"
+                    }
+                } else if ship.opened.is_empty() {
+                    "skipped"
+                } else {
+                    "done"
+                },
+                Style::default()
+                    .fg(if ship.failed.is_empty() {
+                        COLORS.success
+                    } else {
+                        COLORS.error
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for task in &ship.opened {
+            lines.push(Line::styled(
+                truncate_chars(
+                    &format!(
+                        "  opened [{}] {} -> {}",
+                        task.index, task.title, task.pr_url
+                    ),
+                    width,
+                ),
+                Style::default().fg(COLORS.success),
+            ));
+        }
+        for task in &ship.skipped {
+            lines.push(Line::styled(
+                truncate_chars(
+                    &format!(
+                        "  skipped [{}] {} · {}",
+                        task.index, task.title, task.reason
+                    ),
+                    width,
+                ),
+                Style::default().fg(COLORS.muted),
+            ));
+        }
+        for task in &ship.failed {
+            lines.push(Line::styled(
+                truncate_chars(
+                    &format!("  failed [{}] {} · {}", task.index, task.title, task.reason),
                     width,
                 ),
                 Style::default().fg(COLORS.error),
@@ -5319,6 +5520,9 @@ mod tests {
             orchestration_integrating: false,
             orchestration_confirm_integrate: false,
             orchestration_integrate_report: None,
+            orchestration_shipping: false,
+            orchestration_confirm_ship: false,
+            orchestration_ship_report: None,
             orchestration_sender: std::sync::mpsc::channel().0,
         }
     }
@@ -7069,6 +7273,7 @@ mod tests {
                     status: "completed".to_string(),
                     text: Some("one is done".to_string()),
                     error: None,
+                    pr_url: None,
                     created_at: String::new(),
                     finished_at: String::new(),
                 },
@@ -7084,6 +7289,7 @@ mod tests {
                     status: "failed".to_string(),
                     text: None,
                     error: Some("boom".to_string()),
+                    pr_url: None,
                     created_at: String::new(),
                     finished_at: String::new(),
                 },
@@ -7104,6 +7310,24 @@ mod tests {
             }],
             skipped: Vec::new(),
             conflict: None,
+        }
+    }
+
+    fn sample_ship_report() -> ShipReport {
+        ShipReport {
+            run_id: "abcdef1234567890".to_string(),
+            repo_root: std::path::PathBuf::from("/tmp/repo"),
+            remote: "origin".to_string(),
+            base: "main".to_string(),
+            opened: vec![crate::orchestrate::ShippedTask {
+                index: 1,
+                title: "worker one".to_string(),
+                branch: "baton/run/worker-one".to_string(),
+                commit: "0123456789abcdef".to_string(),
+                pr_url: "https://github.com/example/repo/pull/1".to_string(),
+            }],
+            skipped: Vec::new(),
+            failed: Vec::new(),
         }
     }
 
@@ -7761,6 +7985,110 @@ mod tests {
         );
         assert!(!state.orchestration_integrating);
         assert!(state.notice.as_deref().unwrap_or("").contains("boom"));
+    }
+
+    #[test]
+    fn orchestration_report_p_confirms_before_shipping() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_report = Some(sample_report(None));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('p')),
+        );
+        assert!(state.orchestration_confirm_ship);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("open pull requests"),
+            "notice: {:?}",
+            state.notice
+        );
+        let buffer = render_state(&state, 120, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains("enter confirms"), "{text}");
+        assert!(text.contains("open PRs"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(!state.orchestration_confirm_ship);
+        assert!(
+            state.orchestration_report.is_some(),
+            "esc only cancels the ship prompt"
+        );
+        let buffer = render_state(&state, 120, 30);
+        assert!(buffer_lines(&buffer).join("\n").contains("p open PRs"));
+    }
+
+    #[test]
+    fn orchestration_ship_event_updates_pr_links_and_report() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_report = Some(sample_report(None));
+        state.orchestration_shipping = true;
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::Shipped(Box::new(sample_ship_report())),
+        );
+        assert!(!state.orchestration_shipping);
+        assert!(!state.orchestration_confirm_ship);
+        assert!(state.orchestration_ship_report.is_some());
+        assert_eq!(
+            state.orchestration_report.as_ref().unwrap().tasks[0]
+                .pr_url
+                .as_deref(),
+            Some("https://github.com/example/repo/pull/1")
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("ship done: 1 PR"),
+            "notice: {:?}",
+            state.notice
+        );
+        let buffer = render_state(&state, 120, 40);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(
+            text.contains("pr: https://github.com/example/repo/pull/1"),
+            "{text}"
+        );
+        assert!(text.contains("ship: done"), "{text}");
+
+        state.orchestration_shipping = true;
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::ShipFailed("no git remote".to_string()),
+        );
+        assert!(!state.orchestration_shipping);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("no git remote"),
+            "notice: {:?}",
+            state.notice
+        );
     }
 
     #[test]

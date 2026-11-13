@@ -120,6 +120,14 @@ pub struct MessageRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct NativeRewindPending {
+    pub thread_id: String,
+    pub provider: ProviderId,
+    pub turn: i64,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct CheckpointRow {
     pub thread_id: String,
     pub turn: i64,
@@ -243,6 +251,12 @@ CREATE TABLE IF NOT EXISTS checkpoints (
   git_ref TEXT NOT NULL,
   created_at TEXT NOT NULL,
   PRIMARY KEY (thread_id, turn)
+);
+CREATE TABLE IF NOT EXISTS native_rewinds (
+  thread_id TEXT PRIMARY KEY,
+  provider TEXT NOT NULL,
+  turn INTEGER NOT NULL,
+  created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS usage (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1453,6 +1467,50 @@ impl BatonStore {
         Ok(rows)
     }
 
+    pub fn set_native_rewind_pending(
+        &self,
+        thread_id: &str,
+        provider: ProviderId,
+        turn: i64,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO native_rewinds (thread_id, provider, turn, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET provider = excluded.provider, turn = excluded.turn, created_at = excluded.created_at",
+            params![thread_id, provider.as_str(), turn, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn native_rewind_pending(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<NativeRewindPending>> {
+        let row = self
+            .db
+            .query_row(
+                "SELECT thread_id, provider, turn, created_at FROM native_rewinds WHERE thread_id = ?",
+                params![thread_id],
+                |row| {
+                    let provider: String = row.get(1)?;
+                    Ok(NativeRewindPending {
+                        thread_id: row.get(0)?,
+                        provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Codex),
+                        turn: row.get(2)?,
+                        created_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn clear_native_rewind_pending(&self, thread_id: &str) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM native_rewinds WHERE thread_id = ?",
+            params![thread_id],
+        )?;
+        Ok(())
+    }
+
     pub fn rewind_thread(&self, thread_id: &str, from_turn: i64) -> Result<()> {
         self.rewind_thread_inner(thread_id, from_turn, false)
     }
@@ -1473,6 +1531,17 @@ impl BatonStore {
         from_turn: i64,
         keep_provider_sessions: bool,
     ) -> Result<()> {
+        if let Some(pending) = self.native_rewind_pending(thread_id)? {
+            if pending.turn != from_turn {
+                anyhow::bail!(
+                    "thread has a pending {} native rewind to turn {}; run `baton rewind -t {} --turn {}` without --native to finish it first",
+                    pending.provider,
+                    pending.turn,
+                    &thread_id[..8.min(thread_id.len())],
+                    pending.turn
+                );
+            }
+        }
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM messages WHERE thread_id = ? AND turn >= ?",
@@ -1500,6 +1569,10 @@ impl BatonStore {
         tx.execute(
             "UPDATE threads SET updated_at = ? WHERE id = ?",
             params![now_iso(), thread_id],
+        )?;
+        tx.execute(
+            "DELETE FROM native_rewinds WHERE thread_id = ?",
+            params![thread_id],
         )?;
         tx.commit()?;
         Ok(())

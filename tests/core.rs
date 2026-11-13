@@ -266,6 +266,48 @@ fn worker_failure_without_a_commit_updates_task_and_run_status() {
 }
 
 #[test]
+fn pending_native_rewind_blocks_other_turns_and_clears_on_retry() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "rewind".to_string(),
+            cwd: "/tmp/project".to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    store
+        .add_message(&thread.id, 1, "user", None, None, "one")
+        .unwrap();
+    store
+        .add_message(&thread.id, 2, "user", None, None, "two")
+        .unwrap();
+    store
+        .set_native_rewind_pending(&thread.id, ProviderId::Codex, 2)
+        .unwrap();
+    let error = store.rewind_thread(&thread.id, 3).unwrap_err();
+    assert!(
+        error.to_string().contains("pending codex native rewind to turn 2"),
+        "{error}"
+    );
+    assert_eq!(
+        store
+            .native_rewind_pending(&thread.id)
+            .unwrap()
+            .map(|pending| pending.turn),
+        Some(2)
+    );
+
+    store
+        .rewind_thread_keeping_provider_sessions(&thread.id, 2)
+        .unwrap();
+    assert!(store.native_rewind_pending(&thread.id).unwrap().is_none());
+    let messages = store.list_messages(&thread.id).unwrap();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].text, "one");
+}
+
+#[test]
 fn store_crud_and_thread_lifecycle() {
     let store = BatonStore::memory().unwrap();
     let thread = store

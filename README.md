@@ -67,7 +67,7 @@ baton usage              # token usage and cache hit rates
 baton auth [provider] [subscription|api]
 baton diff <id> [turn]   # checkpoint diff against the working tree
 baton restore <id> <turn>
-baton rewind [-t id] --turn N [--native] [--json]  # remove a turn and later turns; Codex can revert natively
+baton rewind [-t id] --turn N [--native] [--json]  # remove a turn and later turns; Codex can revert natively, with durable recovery
 baton orchestrate [--max-tasks N] [--plan-file path] [--progress] [--json] "goal"  # coordinator + workers in worktrees
 baton orchestrate --list [--all] [--json]
 baton orchestrate --run <run-id> [--json]

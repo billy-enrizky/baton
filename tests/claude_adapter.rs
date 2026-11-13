@@ -74,6 +74,7 @@ async fn claude_adapter_streams_deltas_before_turn_completion() {
         adapter
             .start_turn(
                 baton::adapters::TurnStartInput {
+                    turn: 1,
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "claude-sonnet-4-5".into(),
@@ -201,6 +202,7 @@ async fn claude_adapter_pairs_tool_use_with_tool_result() {
         Duration::from_secs(10),
         adapter.start_turn(
             baton::adapters::TurnStartInput {
+                turn: 1,
                 thread_id: "baton-thread".into(),
                 cwd: "/work".into(),
                 model: "claude-sonnet-4-5".into(),
@@ -295,6 +297,7 @@ async fn claude_steer_writes_a_user_message_into_the_live_turn() {
         adapter
             .start_turn(
                 baton::adapters::TurnStartInput {
+                    turn: 1,
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "claude-sonnet-4-5".into(),
@@ -320,7 +323,15 @@ async fn claude_steer_writes_a_user_message_into_the_live_turn() {
     .await
     .expect("turn is running");
 
-    assert!(steer("change direction".into()));
+    let request = |text: &str| baton::adapters::SteerRequest {
+        thread_id: "baton-thread".into(),
+        turn: 1,
+        text: text.into(),
+    };
+    assert_eq!(
+        steer(request("change direction")).await,
+        baton::adapters::SteerOutcome::Delivered
+    );
     let observed = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(text) = observed_receiver.try_recv() {
@@ -335,5 +346,9 @@ async fn claude_steer_writes_a_user_message_into_the_live_turn() {
 
     let result = tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap();
     assert!(result.is_ok());
-    assert!(!steer("too late".into()), "steering after completion is rejected");
+    assert_eq!(
+        steer(request("too late")).await,
+        baton::adapters::SteerOutcome::StaleTurn,
+        "steering after completion is rejected"
+    );
 }

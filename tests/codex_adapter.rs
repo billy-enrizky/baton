@@ -1,4 +1,4 @@
-use baton::adapters::{duplex_halves, BatonAdapter, ForkSessionInput, ModelListInput, RevertSessionInput, TransportHalves};
+use baton::adapters::{duplex_halves, BatonAdapter, ForkSessionInput, ModelListInput, RevertSessionInput, SteerOutcome, SteerRequest, TransportHalves};
 use baton::adapters::codex::CodexAdapter;
 use baton::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId};
 use serde_json::{json, Value};
@@ -395,6 +395,7 @@ async fn codex_adapter_runs_a_full_turn() {
     let (event_sender, event_receiver) = std::sync::mpsc::channel();
     let result = tokio::time::timeout(Duration::from_secs(10), adapter.start_turn(
         baton::adapters::TurnStartInput {
+            turn: 1,
             thread_id: "baton-thread".into(),
             cwd: "/work".into(),
             model: "gpt-6.1-sol".into(),
@@ -550,6 +551,7 @@ async fn codex_adapter_streams_deltas_before_turn_completion() {
         adapter
             .start_turn(
                 baton::adapters::TurnStartInput {
+                    turn: 1,
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "gpt-6.1-sol".into(),
@@ -616,6 +618,7 @@ async fn codex_adapter_resumes_sessions_and_maps_approvals() {
         adapter_for_interrupt
             .start_turn(
                 baton::adapters::TurnStartInput {
+                    turn: 1,
                     thread_id: "bt".into(),
                     cwd: "/work".into(),
                     model: "m".into(),
@@ -727,6 +730,7 @@ async fn codex_adapter_reports_failed_turn_status() {
         Duration::from_secs(10),
         adapter.start_turn(
             baton::adapters::TurnStartInput {
+                turn: 1,
                 thread_id: "baton-thread".into(),
                 cwd: "/work".into(),
                 model: "m".into(),
@@ -848,6 +852,7 @@ async fn codex_interrupt_sends_turn_id_and_reports_interruption() {
         adapter
             .start_turn(
                 baton::adapters::TurnStartInput {
+                    turn: 1,
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "m".into(),
@@ -1001,6 +1006,7 @@ async fn codex_steer_injects_into_the_active_turn() {
         adapter
             .start_turn(
                 baton::adapters::TurnStartInput {
+                    turn: 1,
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "m".into(),
@@ -1026,7 +1032,16 @@ async fn codex_steer_injects_into_the_active_turn() {
     .await
     .expect("turn is running");
 
-    assert!(steer("change direction".into()), "steer is accepted while the turn runs");
+    let request = |text: &str| SteerRequest {
+        thread_id: "baton-thread".into(),
+        turn: 1,
+        text: text.into(),
+    };
+    assert_eq!(
+        steer(request("change direction")).await,
+        SteerOutcome::Delivered,
+        "steer is delivered while the turn runs"
+    );
     let params = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Ok(params) = observed_receiver.try_recv() {
@@ -1043,5 +1058,19 @@ async fn codex_steer_injects_into_the_active_turn() {
 
     let result = tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap();
     assert!(result.is_ok());
-    assert!(!steer("too late".into()), "steering after the turn ends is rejected");
+    assert_eq!(
+        steer(request("too late")).await,
+        SteerOutcome::StaleTurn,
+        "steering after the turn ends is rejected"
+    );
+    assert_eq!(
+        steer(SteerRequest {
+            thread_id: "baton-thread".into(),
+            turn: 7,
+            text: "wrong turn".into(),
+        })
+        .await,
+        SteerOutcome::StaleTurn,
+        "a steer scoped to another baton turn is rejected"
+    );
 }

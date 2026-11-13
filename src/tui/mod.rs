@@ -1011,11 +1011,18 @@ fn apply_engine_event(
         }
         EngineEvent::SteerRejected { thread_id, text } => {
             if thread_id == state.thread.id {
-                enqueue_message(state, store, text);
-                state.notice = Some(format!(
-                    "message queued for after this turn ({} waiting)",
-                    state.queued_messages.len()
-                ));
+                if state.running {
+                    enqueue_message(state, store, text);
+                    state.notice = Some(format!(
+                        "message queued for after this turn ({} waiting)",
+                        state.queued_messages.len()
+                    ));
+                } else {
+                    // The turn ended before the harness took the steer. Run it
+                    // now instead of leaving it in a queue no turn will drain.
+                    submit(state, store, engine_command_sender, text);
+                    state.notice = Some("the turn ended; sending as a new message".into());
+                }
             }
         }
         EngineEvent::Turn(_) => {}
@@ -8569,6 +8576,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
+        state.running = true;
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let thread_id = state.thread.id.clone();
         apply_engine_event(
@@ -8587,6 +8595,39 @@ mod tests {
             "a rejected steer is durable"
         );
         assert!(state.notice.as_deref().unwrap_or("").contains("queued"));
+    }
+
+    #[test]
+    fn rejected_steering_after_the_turn_ends_sends_a_new_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::SteerRejected {
+                thread_id,
+                text: "follow up".into(),
+            },
+            &engine_command_sender,
+        );
+        match receiver.try_recv().expect("a new turn is submitted") {
+            EngineCommand::Submit { text, .. } => assert_eq!(text, "follow up"),
+            _ => panic!("expected a submit command"),
+        }
+        assert!(
+            state.queued_messages.is_empty(),
+            "a steer rejected after the turn ended must not sit in the queue"
+        );
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap()
+            .is_empty());
+        assert!(state.notice.as_deref().unwrap_or("").contains("new message"));
     }
 
     #[test]

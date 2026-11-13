@@ -3,7 +3,6 @@ use async_trait::async_trait;
 use base64::Engine;
 use futures::StreamExt;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncBufReadExt;
 use tokio::process::Child;
@@ -11,8 +10,9 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use uuid::Uuid;
 
 use crate::adapters::{
-    AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, ModelListInput,
-    RevertSessionInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput,
+    ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, ModelListInput,
+    RevertSessionInput, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TurnEvent,
+    TurnEventSender, TurnStartInput,
 };
 use crate::config::auth_signature;
 use crate::process::ProcessRecorder;
@@ -41,9 +41,9 @@ struct OpenCodeRuntime {
     child: Arc<AsyncMutex<Child>>,
     current_emit: AsyncMutex<Option<TurnEventSender>>,
     active_session: AsyncMutex<Option<String>>,
-    /// True only after the prompt request was accepted. Steering before that
-    /// would race session admission and can be rejected by opencode.
-    active_turn: AtomicBool,
+    /// Published only after the prompt request was accepted, as one value, so
+    /// a steer is scoped to the turn and session it was typed against.
+    active_turn: AsyncMutex<Option<ActiveTurn>>,
 }
 
 pub struct OpenCodeAdapter {
@@ -130,7 +130,7 @@ impl OpenCodeAdapter {
                 child: Arc::new(AsyncMutex::new(spawned.child)),
                 current_emit: AsyncMutex::new(None),
                 active_session: AsyncMutex::new(None),
-                active_turn: AtomicBool::new(false),
+                active_turn: AsyncMutex::new(None),
             });
             spawn_sse_reader(http, runtime_base_url.clone(), auth_header, event_sender);
             *slot = Some(runtime.clone());
@@ -429,49 +429,55 @@ impl BatonAdapter for OpenCodeAdapter {
 
     fn steer_handle(&self) -> Option<SteerHandle> {
         let runtime = self.runtime.clone();
-        Some(Arc::new(move |text: String| -> bool {
-            let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                return false;
-            };
-            let runtime = match runtime.try_lock() {
-                Ok(slot) => slot.clone(),
-                Err(_) => return false,
-            };
-            let runtime = match runtime {
-                Some(runtime) => runtime,
-                None => return false,
-            };
-            if runtime.version != OpenCodeVersion::V2
-                || !runtime.active_turn.load(Ordering::SeqCst)
-            {
-                return false;
-            }
-            let session_id = match runtime.active_session.try_lock() {
-                Ok(session_id) => session_id.clone(),
-                Err(_) => return false,
-            };
-            let Some(session_id) = session_id else {
-                return false;
-            };
-            let id = format!("msg_baton_steer_{}", Uuid::new_v4().simple());
-            handle.spawn(async move {
+        Some(Arc::new(move |request: SteerRequest| -> SteerFuture {
+            let runtime = runtime.clone();
+            Box::pin(async move {
+                let runtime = match runtime.try_lock() {
+                    Ok(slot) => slot.clone(),
+                    Err(_) => return SteerOutcome::Unavailable("opencode adapter is busy".into()),
+                };
+                let Some(runtime) = runtime else {
+                    return SteerOutcome::Unavailable("opencode is not running".into());
+                };
+                if runtime.version != OpenCodeVersion::V2 {
+                    return SteerOutcome::Unavailable("steering needs opencode 2 or newer".into());
+                }
+                let current = match runtime.active_turn.try_lock() {
+                    Ok(current) => current.clone(),
+                    Err(_) => return SteerOutcome::StaleTurn,
+                };
+                let Some(current) = current else {
+                    return SteerOutcome::StaleTurn;
+                };
+                if current.thread_id != request.thread_id || current.turn != request.turn {
+                    return SteerOutcome::StaleTurn;
+                }
+                let id = format!("msg_baton_steer_{}", Uuid::new_v4().simple());
                 let body = json!({
                     "id": id,
-                    "prompt": { "text": text },
+                    "prompt": { "text": request.text },
                     "delivery": "steer"
                 });
-                let _ = runtime
+                let response = runtime
                     .http
                     .post(format!(
-                        "{}/api/session/{session_id}/prompt",
-                        runtime.base_url
+                        "{}/api/session/{}/prompt",
+                        runtime.base_url, current.native_thread_id
                     ))
                     .header("Authorization", &runtime.auth_header)
+                    .timeout(std::time::Duration::from_secs(10))
                     .json(&body)
                     .send()
                     .await;
-            });
-            true
+                match response {
+                    Ok(response) if response.status().is_success() => SteerOutcome::Delivered,
+                    Ok(response) => SteerOutcome::Unavailable(format!(
+                        "opencode rejected the steer ({})",
+                        response.status()
+                    )),
+                    Err(error) => SteerOutcome::Unavailable(error.to_string()),
+                }
+            })
         }))
     }
 
@@ -685,6 +691,7 @@ impl BatonAdapter for OpenCodeAdapter {
                 .await;
         }
 
+        let mut native_turn_id = None;
         match runtime.version {
             OpenCodeVersion::V2 => {
                 let (provider_id, model_id) = parse_model_slug(&input.model)?;
@@ -708,6 +715,7 @@ impl BatonAdapter for OpenCodeAdapter {
                     let _ = emit.send(TurnEvent::ProviderTurnId {
                         id: message_id.to_string(),
                     });
+                    native_turn_id = Some(message_id.to_string());
                 }
             }
             OpenCodeVersion::V1 => {
@@ -721,7 +729,12 @@ impl BatonAdapter for OpenCodeAdapter {
                     .await;
             }
         }
-        runtime.active_turn.store(true, Ordering::SeqCst);
+        *runtime.active_turn.lock().await = Some(ActiveTurn {
+            thread_id: input.thread_id.clone(),
+            turn: input.turn,
+            native_thread_id: session_id.clone(),
+            native_turn_id,
+        });
         self.lifecycle.turn_running(&input.thread_id);
 
         let mut receiver = runtime.events.lock().await;
@@ -788,7 +801,7 @@ impl BatonAdapter for OpenCodeAdapter {
             }
         };
         drop(receiver);
-        runtime.active_turn.store(false, Ordering::SeqCst);
+        *runtime.active_turn.lock().await = None;
         *runtime.current_emit.lock().await = None;
         *runtime.active_session.lock().await = None;
 
@@ -813,7 +826,7 @@ impl BatonAdapter for OpenCodeAdapter {
         self.lifecycle.disposing();
         let runtime = self.runtime.lock().await.clone();
         if let Some(runtime) = runtime {
-            runtime.active_turn.store(false, Ordering::SeqCst);
+            *runtime.active_turn.lock().await = None;
             let mut child = runtime.child.lock().await;
             let pid = child.id();
             if child.start_kill().is_ok() {

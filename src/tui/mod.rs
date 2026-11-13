@@ -13,7 +13,7 @@ use crate::adapters::{AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
 use crate::config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
-use crate::orchestrate::{self, RunReport};
+use crate::orchestrate::{self, IntegrateReport, RunReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
@@ -161,6 +161,8 @@ struct MultiView {
 enum OrchestrationEvent {
     Done(Box<RunReport>),
     Failed(String),
+    Integrated(Box<IntegrateReport>),
+    IntegrateFailed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -253,6 +255,9 @@ pub struct TuiState {
     orchestration_report: Option<RunReport>,
     orchestration_scroll: usize,
     orchestration_selected: usize,
+    orchestration_integrating: bool,
+    orchestration_confirm_integrate: bool,
+    orchestration_integrate_report: Option<IntegrateReport>,
     orchestration_sender: std::sync::mpsc::Sender<OrchestrationEvent>,
 }
 
@@ -332,6 +337,9 @@ pub fn run_tui(
         orchestration_report: None,
         orchestration_scroll: 0,
         orchestration_selected: 0,
+        orchestration_integrating: false,
+        orchestration_confirm_integrate: false,
+        orchestration_integrate_report: None,
         orchestration_sender,
     };
 
@@ -809,7 +817,60 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             state.orchestration_selected = 0;
             state.notice = Some(format!("orchestration failed: {error}"));
         }
+        OrchestrationEvent::Integrated(report) => {
+            state.orchestration_integrating = false;
+            state.orchestration_confirm_integrate = false;
+            let notice = match &report.conflict {
+                Some(conflict) => format!(
+                    "integration conflict in task {}: {} · {} merged",
+                    conflict.index,
+                    conflict.files.join(", "),
+                    report.merged.len()
+                ),
+                None => format!(
+                    "integration done: {} merged, {} skipped",
+                    report.merged.len(),
+                    report.skipped.len()
+                ),
+            };
+            state.notice = Some(notice);
+            state.orchestration_integrate_report = Some(*report);
+        }
+        OrchestrationEvent::IntegrateFailed(error) => {
+            state.orchestration_integrating = false;
+            state.notice = Some(format!("integration failed: {error}"));
+        }
     }
+}
+
+fn start_integration(state: &mut TuiState) {
+    let Some(report) = state.orchestration_report.as_ref() else {
+        return;
+    };
+    if state.orchestration_integrating {
+        return;
+    }
+    let run_id = report.run_id.clone();
+    let cwd = report
+        .repo_root
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(&state.thread.cwd));
+    let home = state.home.clone();
+    state.orchestration_integrating = true;
+    state.orchestration_confirm_integrate = false;
+    state.orchestration_integrate_report = None;
+    state.notice = Some("integrating worker branches...".into());
+    let sender = state.orchestration_sender.clone();
+    std::thread::spawn(move || {
+        let result = BatonStore::open(&home.join("baton.sqlite")).and_then(|store| {
+            orchestrate::integrate(&store, &cwd, &run_id, &[])
+        });
+        let event = match result {
+            Ok(report) => OrchestrationEvent::Integrated(Box::new(report)),
+            Err(error) => OrchestrationEvent::IntegrateFailed(error.to_string()),
+        };
+        let _ = sender.send(event);
+    });
 }
 
 const ORCHESTRATE_USAGE: &str =
@@ -1832,11 +1893,26 @@ fn handle_orchestration_key(
     else {
         return;
     };
+    if state.orchestration_integrating {
+        return;
+    }
+    if state.orchestration_confirm_integrate {
+        match key.code {
+            KeyCode::Enter => start_integration(state),
+            KeyCode::Esc => {
+                state.orchestration_confirm_integrate = false;
+                state.notice = Some("integration cancelled".into());
+            }
+            _ => {}
+        }
+        return;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             state.orchestration_report = None;
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
+            state.orchestration_confirm_integrate = false;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.orchestration_selected = state.orchestration_selected.saturating_sub(1);
@@ -1852,6 +1928,27 @@ fn handle_orchestration_key(
         }
         KeyCode::PageDown => {
             state.orchestration_scroll = state.orchestration_scroll.saturating_add(10);
+        }
+        KeyCode::Char('i') => {
+            let integrable = state
+                .orchestration_report
+                .as_ref()
+                .map(|report| {
+                    report
+                        .tasks
+                        .iter()
+                        .filter(|task| task.status == "completed" && task.commit.is_some())
+                        .count()
+                })
+                .unwrap_or(0);
+            if integrable == 0 {
+                state.notice = Some("no completed worker commits to integrate".into());
+            } else {
+                state.orchestration_confirm_integrate = true;
+                state.notice = Some(format!(
+                    "merge {integrable} worker branch(es) into the source checkout?"
+                ));
+            }
         }
         KeyCode::Enter => {
             let thread_id = state
@@ -3130,10 +3227,29 @@ fn draw_orchestration_report(
                 Style::default().fg(COLORS.muted),
             ),
         ]),
-        Line::styled(
-            "↑↓ select · enter opens worker thread · pgup/pgdn scroll · esc closes",
-            Style::default().fg(COLORS.muted),
-        ),
+        if state.orchestration_confirm_integrate {
+            Line::styled(
+                format!(
+                    "merge worker branches into {}? enter confirms · esc cancels",
+                    report
+                        .repo_root
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "the source checkout".to_string())
+                ),
+                Style::default().fg(COLORS.warning).add_modifier(Modifier::BOLD),
+            )
+        } else if state.orchestration_integrating {
+            Line::styled(
+                "integrating worker branches...",
+                Style::default().fg(COLORS.secondary).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Line::styled(
+                "↑↓ select · enter opens worker thread · i integrate · pgup/pgdn scroll · esc closes",
+                Style::default().fg(COLORS.muted),
+            )
+        },
     ];
 
     let mut lines: Vec<Line> = Vec::new();
@@ -3260,6 +3376,58 @@ fn draw_orchestration_report(
             "no workers were planned",
             Style::default().fg(COLORS.muted),
         ));
+    }
+    if let Some(integrate) = &state.orchestration_integrate_report {
+        lines.push(Line::from(vec![
+            Span::styled("integration: ", Style::default().fg(COLORS.muted)),
+            Span::styled(
+                if integrate.conflict.is_some() { "conflict" } else { "done" },
+                Style::default()
+                    .fg(if integrate.conflict.is_some() {
+                        COLORS.error
+                    } else {
+                        COLORS.success
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        for task in &integrate.merged {
+            lines.push(Line::styled(
+                truncate_chars(
+                    &format!(
+                        "  merged [{}] {} -> {}",
+                        task.index,
+                        task.title,
+                        &task.merge_commit[..8.min(task.merge_commit.len())]
+                    ),
+                    width,
+                ),
+                Style::default().fg(COLORS.success),
+            ));
+        }
+        for task in &integrate.skipped {
+            lines.push(Line::styled(
+                truncate_chars(
+                    &format!("  skipped [{}] {} · {}", task.index, task.title, task.reason),
+                    width,
+                ),
+                Style::default().fg(COLORS.muted),
+            ));
+        }
+        if let Some(conflict) = &integrate.conflict {
+            lines.push(Line::styled(
+                truncate_chars(
+                    &format!(
+                        "  conflict [{}] {} · {}",
+                        conflict.index,
+                        conflict.title,
+                        conflict.files.join(", ")
+                    ),
+                    width,
+                ),
+                Style::default().fg(COLORS.error),
+            ));
+        }
     }
 
     let header_height = header_lines.len() as u16;
@@ -4498,6 +4666,9 @@ mod tests {
             orchestration_report: None,
             orchestration_scroll: 0,
             orchestration_selected: 0,
+            orchestration_integrating: false,
+            orchestration_confirm_integrate: false,
+            orchestration_integrate_report: None,
             orchestration_sender: std::sync::mpsc::channel().0,
         }
     }
@@ -6265,6 +6436,22 @@ mod tests {
         }
     }
 
+    fn sample_integrate_report() -> IntegrateReport {
+        IntegrateReport {
+            run_id: "abcdef1234567890".to_string(),
+            repo_root: std::path::PathBuf::from("/tmp/repo"),
+            merged: vec![crate::orchestrate::IntegratedTask {
+                index: 1,
+                title: "worker one".to_string(),
+                branch: "baton/run/worker-one".to_string(),
+                commit: "0123456789abcdef".to_string(),
+                merge_commit: "fedcba9876543210".to_string(),
+            }],
+            skipped: Vec::new(),
+            conflict: None,
+        }
+    }
+
     #[test]
     fn orchestrate_args_parse_goal_and_flags() {
         let parsed = parse_orchestrate_args(&[
@@ -6377,6 +6564,73 @@ mod tests {
         assert!(state.orchestration_report.is_none());
         assert_eq!(state.thread.id, worker.id, "enter switches to the worker thread");
         assert_eq!(state.thread.current_provider, ProviderId::Codex);
+    }
+
+    #[test]
+    fn orchestration_report_i_confirms_before_integrating() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_report = Some(sample_report(None));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('i')),
+        );
+        assert!(state.orchestration_confirm_integrate);
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("merge 1 worker"),
+            "notice: {:?}",
+            state.notice
+        );
+        let buffer = render_state(&state, 100, 30);
+        assert!(buffer_lines(&buffer).join("\n").contains("enter confirms"));
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
+        assert!(!state.orchestration_confirm_integrate);
+        assert!(state.orchestration_report.is_some(), "esc only cancels the merge");
+    }
+
+    #[test]
+    fn orchestration_integration_event_updates_state_and_renders() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_report = Some(sample_report(None));
+        state.orchestration_integrating = true;
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::Integrated(Box::new(sample_integrate_report())),
+        );
+        assert!(!state.orchestration_integrating);
+        assert!(!state.orchestration_confirm_integrate);
+        assert!(state.orchestration_integrate_report.is_some());
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("integration done"),
+            "notice: {:?}",
+            state.notice
+        );
+        let buffer = render_state(&state, 100, 40);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains("integration: done"), "{text}");
+        assert!(text.contains("merged [1] worker one -> fedcba98"), "{text}");
+
+        state.orchestration_integrating = true;
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::IntegrateFailed("boom".to_string()),
+        );
+        assert!(!state.orchestration_integrating);
+        assert!(state.notice.as_deref().unwrap_or("").contains("boom"));
     }
 
     #[test]

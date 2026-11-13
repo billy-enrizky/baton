@@ -263,6 +263,7 @@ impl McpServer {
                             "coordinator_model": run.coordinator_model,
                             "summary": run.summary,
                             "dirty_source": run.dirty_source,
+                            "worker_baseline": if run.dirty_source { "source snapshot" } else { "HEAD" },
                             "created_at": run.created_at,
                             "finished_at": run.finished_at,
                             "archived_at": run.archived_at,

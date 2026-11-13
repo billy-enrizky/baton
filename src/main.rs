@@ -542,6 +542,7 @@ fn main_result() -> Result<()> {
                                 "coordinator_model": run.coordinator_model,
                                 "summary": run.summary,
                                 "dirty_source": run.dirty_source,
+                                "worker_baseline": if run.dirty_source { "source snapshot" } else { "HEAD" },
                                 "archived_at": run.archived_at,
                                 "created_at": run.created_at,
                                 "finished_at": run.finished_at,
@@ -738,6 +739,7 @@ fn main_result() -> Result<()> {
                                 "model": model,
                             },
                             "dirty_source": dirty_source,
+                            "worker_baseline": if dirty_source { "source snapshot" } else { "HEAD" },
                             "summary": plan.summary,
                             "tasks": tasks,
                         }))?
@@ -750,7 +752,7 @@ fn main_result() -> Result<()> {
                         "source: {}{}",
                         cwd.display(),
                         if dirty_source {
-                            " (dirty; workers branch from HEAD)"
+                            " (dirty; workers will receive a snapshot)"
                         } else {
                             ""
                         }

@@ -1,8 +1,9 @@
 //! Git worktree lifecycle for isolated worker threads.
 
 use anyhow::Result;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeInfo {
@@ -92,8 +93,28 @@ fn share_directories(repo_root: &Path, worktree_path: &Path) -> Vec<String> {
     shared
 }
 
-fn git(cwd: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git").args(args).current_dir(cwd).output()?;
+fn git_raw(
+    cwd: &Path,
+    args: &[&str],
+    envs: &[(&str, String)],
+    stdin: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let mut command = Command::new("git");
+    command.args(args).current_dir(cwd);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    if stdin.is_some() {
+        command.stdin(Stdio::piped());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    if let Some(input) = stdin {
+        if let Some(mut pipe) = child.stdin.take() {
+            pipe.write_all(input)?;
+        }
+    }
+    let output = child.wait_with_output()?;
     if !output.status.success() {
         anyhow::bail!(
             "git {:?} failed: {}",
@@ -101,7 +122,13 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String> {
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    Ok(output.stdout)
+}
+
+fn git(cwd: &Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&git_raw(cwd, args, &[], None)?)
+        .trim()
+        .to_string())
 }
 
 pub fn repo_root(cwd: &Path) -> Result<PathBuf> {
@@ -123,6 +150,192 @@ pub fn commit_changes(path: &Path, message: &str) -> Result<Option<String>> {
     git(path, &["add", "-A"])?;
     git(path, &["commit", "-m", message])?;
     Ok(Some(git(path, &["rev-parse", "HEAD"])?))
+}
+
+/// A source checkout's dirty state captured without touching HEAD or the real
+/// index. `tree` is the snapshot's git tree; `patch` applies that tree to a
+/// worktree created at `base_ref`.
+#[derive(Debug, Clone)]
+pub struct RepoSnapshot {
+    pub base_ref: String,
+    pub tree: String,
+    pub patch: Vec<u8>,
+}
+
+fn temp_index_path(prefix: &str) -> PathBuf {
+    std::env::temp_dir().join(format!(
+        "baton-{prefix}-{}.index",
+        uuid::Uuid::new_v4()
+    ))
+}
+
+fn cleanup_index(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let lock = PathBuf::from(format!("{}.lock", path.display()));
+    let _ = std::fs::remove_file(lock);
+}
+
+fn reset_worktree(path: &Path, target: &str) -> Result<()> {
+    git(path, &["reset", "--hard", target])?;
+    // Snapshot-only untracked files are not removed by reset. Worker-added
+    // files are already in the commit, so a non-ignored clean removes exactly
+    // the leftover snapshot files and leaves shared ignored directories.
+    git(path, &["clean", "-fd"])?;
+    Ok(())
+}
+
+fn tree_from_worktree(path: &Path) -> Result<String> {
+    let index = temp_index_path("tree");
+    let index_text = index.to_string_lossy().to_string();
+    let envs = [("GIT_INDEX_FILE", index_text)];
+    let result = (|| -> Result<String> {
+        git_raw(path, &["read-tree", "HEAD"], &envs, None)?;
+        git_raw(path, &["add", "-A"], &envs, None)?;
+        let tree = git_raw(path, &["write-tree"], &envs, None)?;
+        Ok(String::from_utf8_lossy(&tree).trim().to_string())
+    })();
+    cleanup_index(&index);
+    result
+}
+
+/// Capture tracked and untracked non-ignored changes from a source checkout.
+pub fn snapshot(repo_root: &Path) -> Result<Option<RepoSnapshot>> {
+    if !is_dirty(repo_root)? {
+        return Ok(None);
+    }
+    let base_ref = git(repo_root, &["rev-parse", "HEAD"])?;
+    let index = temp_index_path("snapshot");
+    let index_text = index.to_string_lossy().to_string();
+    let envs = [("GIT_INDEX_FILE", index_text)];
+    let tree = (|| -> Result<String> {
+        git_raw(repo_root, &["read-tree", "HEAD"], &envs, None)?;
+        git_raw(repo_root, &["add", "-A"], &envs, None)?;
+        let tree = git_raw(repo_root, &["write-tree"], &envs, None)?;
+        Ok(String::from_utf8_lossy(&tree).trim().to_string())
+    })();
+    cleanup_index(&index);
+    let tree = tree?;
+    let patch = git_raw(
+        repo_root,
+        &["diff", "--binary", "--no-color", "--no-ext-diff", "--no-textconv", &base_ref, &tree],
+        &[],
+        None,
+    )?;
+    Ok(Some(RepoSnapshot {
+        base_ref,
+        tree,
+        patch,
+    }))
+}
+
+/// Apply a captured source snapshot to a worker worktree.
+pub fn apply_snapshot(worktree_path: &Path, snapshot: &RepoSnapshot) -> Result<()> {
+    if snapshot.patch.is_empty() {
+        return Ok(());
+    }
+    git_raw(
+        worktree_path,
+        &["apply", "--binary", "--whitespace=nowarn", "-"],
+        &[],
+        Some(&snapshot.patch),
+    )?;
+    Ok(())
+}
+
+/// Commit only paths the worker changed relative to the snapshot. Files that
+/// were dirty in the source but untouched by the worker stay out of the worker
+/// branch. For touched files, the final worktree content is committed so the
+/// branch contains the complete result.
+pub fn commit_changes_after_snapshot(
+    path: &Path,
+    snapshot_tree: &str,
+    message: &str,
+) -> Result<Option<String>> {
+    let final_tree = tree_from_worktree(path)?;
+    let changed = git_raw(
+        path,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--no-renames",
+            "-z",
+            snapshot_tree,
+            &final_tree,
+        ],
+        &[],
+        None,
+    )?;
+    if changed.is_empty() {
+        reset_worktree(path, "HEAD")?;
+        return Ok(None);
+    }
+
+    let head_tree = git(path, &["rev-parse", "HEAD^{tree}"])?;
+    let mut index_info = Vec::new();
+    for raw_path in changed.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let file = String::from_utf8_lossy(raw_path).to_string();
+        let entry = git_raw(
+            path,
+            &["ls-tree", "-z", &final_tree, "--", &file],
+            &[],
+            None,
+        )?;
+        let Some(record) = entry.split(|byte| *byte == 0).find(|part| !part.is_empty()) else {
+            let deletion = format!(
+                "0 0000000000000000000000000000000000000000\t{file}\0"
+            );
+            index_info.extend_from_slice(deletion.as_bytes());
+            continue;
+        };
+        let record = String::from_utf8_lossy(record);
+        let Some((meta, _)) = record.split_once('\t') else {
+            anyhow::bail!("cannot parse ls-tree entry for {file}");
+        };
+        let mut fields = meta.split_whitespace();
+        let mode = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing mode for {file}"))?;
+        let _kind = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing type for {file}"))?;
+        let object = fields
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("missing object for {file}"))?;
+        let line = format!("{mode} {object}\t{file}\0");
+        index_info.extend_from_slice(line.as_bytes());
+    }
+
+    let index = temp_index_path("worker");
+    let index_text = index.to_string_lossy().to_string();
+    let envs = [("GIT_INDEX_FILE", index_text)];
+    let worker_tree = (|| -> Result<String> {
+        git_raw(path, &["read-tree", "HEAD"], &envs, None)?;
+        git_raw(
+            path,
+            &["update-index", "-z", "--index-info"],
+            &envs,
+            Some(&index_info),
+        )?;
+        let tree = git_raw(path, &["write-tree"], &envs, None)?;
+        Ok(String::from_utf8_lossy(&tree).trim().to_string())
+    })();
+    cleanup_index(&index);
+    let worker_tree = worker_tree?;
+    if worker_tree == head_tree {
+        reset_worktree(path, "HEAD")?;
+        return Ok(None);
+    }
+    let commit = git(
+        path,
+        &["commit-tree", &worker_tree, "-p", "HEAD", "-m", message],
+    )?;
+    reset_worktree(path, &commit)?;
+    Ok(Some(commit))
 }
 
 pub fn slugify(title: &str) -> String {
@@ -156,6 +369,20 @@ pub fn create(
     run_id: &str,
     title: &str,
 ) -> Result<WorktreeInfo> {
+    let base_ref = git(repo_root, &["rev-parse", "HEAD"])?;
+    create_at(baton_home, repo_root, run_id, title, &base_ref)
+}
+
+/// Creates a worktree at an explicit commit. Source snapshots use the commit
+/// they were captured from so a concurrent source commit cannot desync the
+/// patch baseline.
+pub fn create_at(
+    baton_home: &Path,
+    repo_root: &Path,
+    run_id: &str,
+    title: &str,
+    base_ref: &str,
+) -> Result<WorktreeInfo> {
     let short = run_id.chars().take(8).collect::<String>();
     let slug = slugify(title);
     let branch = format!("baton/{short}/{slug}");
@@ -163,18 +390,17 @@ pub fn create(
     if path.exists() {
         anyhow::bail!("worktree path already exists: {}", path.display());
     }
-    let base_ref = git(repo_root, &["rev-parse", "HEAD"])?;
     let path_text = path.to_string_lossy().to_string();
     git(
         repo_root,
-        &["worktree", "add", "-b", &branch, &path_text, &base_ref],
+        &["worktree", "add", "-b", &branch, &path_text, base_ref],
     )?;
     let shared_paths = share_directories(repo_root, &path);
     Ok(WorktreeInfo {
         repo_root: repo_root.to_path_buf(),
         path,
         branch,
-        base_ref,
+        base_ref: base_ref.to_string(),
         shared_paths,
     })
 }
@@ -460,6 +686,132 @@ mod tests {
         );
         assert!(git(&wt.path, &["status", "--porcelain"]).unwrap().is_empty());
         assert_eq!(git(root.path(), &["rev-parse", &wt.branch]).unwrap(), sha);
+        remove(&wt).unwrap();
+    }
+
+    #[test]
+    fn snapshot_applies_dirty_tracked_and_untracked_files() {
+        let root = repo();
+        std::fs::write(root.path().join(".gitignore"), "ignored.log\n").unwrap();
+        git(root.path(), &["add", ".gitignore"]).unwrap();
+        git(root.path(), &["commit", "-q", "-m", "ignore"]).unwrap();
+        let head = git(root.path(), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(root.path().join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(root.path().join("b.txt"), "untracked\n").unwrap();
+        std::fs::write(root.path().join("bin.dat"), [0_u8, 1, 2, 255]).unwrap();
+        std::fs::write(root.path().join("ignored.log"), "ignored\n").unwrap();
+        let repo_root = repo_root(root.path()).unwrap();
+        let snapshot = snapshot(&repo_root).unwrap().expect("dirty source snapshots");
+        assert_eq!(snapshot.base_ref, head);
+        assert_eq!(git(root.path(), &["rev-parse", "HEAD"]).unwrap(), head);
+        assert!(!snapshot.patch.is_empty());
+
+        let home = tempfile::tempdir().unwrap();
+        let wt = create_at(
+            home.path(),
+            &repo_root,
+            "run-snapshot",
+            "snapshot check",
+            &snapshot.base_ref,
+        )
+        .unwrap();
+        apply_snapshot(&wt.path, &snapshot).unwrap();
+        assert_eq!(std::fs::read_to_string(wt.path.join("a.txt")).unwrap(), "dirty\n");
+        assert_eq!(
+            std::fs::read_to_string(wt.path.join("b.txt")).unwrap(),
+            "untracked\n"
+        );
+        assert_eq!(
+            std::fs::read(wt.path.join("bin.dat")).unwrap(),
+            vec![0_u8, 1, 2, 255]
+        );
+        assert!(!wt.path.join("ignored.log").exists());
+        assert!(git(&wt.path, &["status", "--porcelain"]).unwrap().contains("a.txt"));
+        assert_eq!(std::fs::read_to_string(root.path().join("a.txt")).unwrap(), "dirty\n");
+        assert!(root.path().join("b.txt").exists());
+        remove(&wt).unwrap();
+    }
+
+    #[test]
+    fn snapshot_worker_commit_excludes_untouched_source_changes() {
+        let root = repo();
+        let head = git(root.path(), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(root.path().join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(root.path().join("source-only.txt"), "source\n").unwrap();
+        let repo_root = repo_root(root.path()).unwrap();
+        let snapshot = snapshot(&repo_root).unwrap().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let wt = create_at(
+            home.path(),
+            &repo_root,
+            "run-worker-snapshot",
+            "worker snapshot",
+            &snapshot.base_ref,
+        )
+        .unwrap();
+        apply_snapshot(&wt.path, &snapshot).unwrap();
+
+        std::fs::write(wt.path.join("a.txt"), "worker final\n").unwrap();
+        std::fs::write(wt.path.join("worker-only.txt"), "worker\n").unwrap();
+        let commit = commit_changes_after_snapshot(
+            &wt.path,
+            &snapshot.tree,
+            "baton worker: snapshot check",
+        )
+        .unwrap()
+        .expect("worker changes commit");
+        assert_eq!(git(&wt.path, &["status", "--porcelain"]).unwrap(), "");
+        assert_eq!(
+            git(&wt.path, &["show", &format!("{}:a.txt", wt.branch)]).unwrap(),
+            "worker final"
+        );
+        assert_eq!(
+            git(&wt.path, &["show", &format!("{}:worker-only.txt", wt.branch)]).unwrap(),
+            "worker"
+        );
+        assert!(
+            git(&wt.path, &["show", &format!("{}:source-only.txt", wt.branch)]).is_err(),
+            "an untouched source-only file must not enter the worker branch"
+        );
+        assert!(
+            !wt.path.join("source-only.txt").exists(),
+            "snapshot-only files are cleared from the worker checkout after commit"
+        );
+        assert_eq!(
+            git(root.path(), &["rev-parse", &format!("{}^", wt.branch)]).unwrap(),
+            head,
+            "worker commit stays directly on the source base"
+        );
+        assert_eq!(commit, git(root.path(), &["rev-parse", &wt.branch]).unwrap());
+        assert!(root.path().join("source-only.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.path().join("a.txt")).unwrap(), "dirty\n");
+        remove(&wt).unwrap();
+    }
+
+    #[test]
+    fn snapshot_only_changes_do_not_create_a_worker_commit() {
+        let root = repo();
+        let head = git(root.path(), &["rev-parse", "HEAD"]).unwrap();
+        std::fs::write(root.path().join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(root.path().join("source-only.txt"), "source\n").unwrap();
+        let repo_root = repo_root(root.path()).unwrap();
+        let snapshot = snapshot(&repo_root).unwrap().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let wt = create_at(
+            home.path(),
+            &repo_root,
+            "run-no-worker",
+            "no worker changes",
+            &snapshot.base_ref,
+        )
+        .unwrap();
+        apply_snapshot(&wt.path, &snapshot).unwrap();
+        let commit =
+            commit_changes_after_snapshot(&wt.path, &snapshot.tree, "baton worker: noop").unwrap();
+        assert_eq!(commit, None);
+        assert_eq!(git(&wt.path, &["status", "--porcelain"]).unwrap(), "");
+        assert!(!wt.path.join("source-only.txt").exists());
+        assert_eq!(git(&wt.path, &["rev-parse", "HEAD"]).unwrap(), head);
         remove(&wt).unwrap();
     }
 

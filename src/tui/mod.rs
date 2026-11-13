@@ -200,6 +200,12 @@ struct TranscriptViewport {
     plain: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct TranscriptPoint {
+    line: usize,
+    column: usize,
+}
+
 enum Overlay {
     None,
     RewindPicker { selected: usize },
@@ -263,8 +269,8 @@ pub struct TuiState {
     selection: Option<(usize, usize)>,
     input_origin: std::cell::Cell<(u16, u16)>,
     transcript_view: std::cell::RefCell<Option<TranscriptViewport>>,
-    transcript_selection: std::cell::Cell<Option<(usize, usize)>>,
-    transcript_anchor: std::cell::Cell<Option<usize>>,
+    transcript_selection: std::cell::Cell<Option<(TranscriptPoint, TranscriptPoint)>>,
+    transcript_anchor: std::cell::Cell<Option<TranscriptPoint>>,
     transcript_total: std::cell::Cell<usize>,
     model_request_id: u64,
     banner_cache: std::cell::RefCell<Option<(String, Vec<Line<'static>>)>>,
@@ -481,11 +487,11 @@ fn handle_mouse(state: &mut TuiState, mouse: crossterm::event::MouseEvent) {
                 state.selection_anchor = Some(index);
                 state.selection = Some((index, index));
                 state.input_cursor = index;
-            } else if let Some(line) = transcript_line_at(state, mouse.column, mouse.row) {
+            } else if let Some(point) = transcript_point_at(state, mouse.column, mouse.row) {
                 state.selection_anchor = None;
                 state.selection = None;
-                state.transcript_anchor.set(Some(line));
-                state.transcript_selection.set(Some((line, line)));
+                state.transcript_anchor.set(Some(point));
+                state.transcript_selection.set(Some((point, point)));
             } else {
                 state.selection_anchor = None;
                 state.selection = None;
@@ -496,16 +502,27 @@ fn handle_mouse(state: &mut TuiState, mouse: crossterm::event::MouseEvent) {
             if let (Some(anchor), Some(index)) = (state.selection_anchor, input_index) {
                 state.selection = Some((anchor.min(index), anchor.max(index)));
                 state.input_cursor = index;
-            } else if let (Some(anchor), Some(line)) = (
+            } else if let (Some(anchor), Some(point)) = (
                 state.transcript_anchor.get(),
-                transcript_line_for_drag(state, mouse.row),
+                transcript_point_for_drag(state, mouse.column, mouse.row),
             ) {
-                state.transcript_selection.set(Some((anchor.min(line), anchor.max(line))));
+                state
+                    .transcript_selection
+                    .set(Some((anchor.min(point), anchor.max(point))));
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
             if state.transcript_anchor.get().is_some() {
-                copy_transcript_selection(state);
+                if state
+                    .transcript_selection
+                    .get()
+                    .map(|(start, end)| start != end)
+                    .unwrap_or(false)
+                {
+                    copy_transcript_selection(state);
+                } else {
+                    clear_transcript_selection(state);
+                }
             }
         }
         _ => {}
@@ -549,29 +566,87 @@ fn transcript_line_for_drag(state: &TuiState, row: u16) -> Option<usize> {
     Some((view.content_start + offset).min(view.total - 1))
 }
 
-fn transcript_selection_text(state: &TuiState) -> Option<(String, usize)> {
-    let (start, end) = state.transcript_selection.get()?;
+fn transcript_point_at(state: &TuiState, column: u16, row: u16) -> Option<TranscriptPoint> {
+    let line = transcript_line_at(state, column, row)?;
+    let view = state.transcript_view.borrow();
+    let view = view.as_ref()?;
+    let text = view.plain.get(line)?;
+    let max = text.chars().count();
+    let column = column.saturating_sub(view.area.x) as usize;
+    Some(TranscriptPoint {
+        line,
+        column: column.min(max),
+    })
+}
+
+fn transcript_point_for_drag(
+    state: &TuiState,
+    column: u16,
+    row: u16,
+) -> Option<TranscriptPoint> {
+    let line = transcript_line_for_drag(state, row)?;
+    let view = state.transcript_view.borrow();
+    let view = view.as_ref()?;
+    let text = view.plain.get(line)?;
+    let max = text.chars().count();
+    let column = column
+        .saturating_sub(view.area.x)
+        .min(view.area.width.saturating_sub(1)) as usize;
+    Some(TranscriptPoint {
+        line,
+        column: column.min(max),
+    })
+}
+
+fn transcript_selection_text(state: &TuiState) -> Option<(String, usize, usize)> {
+    let (mut start, mut end) = state.transcript_selection.get()?;
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
     let view = state.transcript_view.borrow();
     let view = view.as_ref()?;
     if view.plain.is_empty() || view.total == 0 {
         return None;
     }
-    let start = start.min(view.total - 1);
-    let end = end.min(view.total - 1);
-    if start > end {
+    let last_line = view.plain.len().saturating_sub(1);
+    start.line = start.line.min(last_line);
+    end.line = end.line.min(last_line);
+    let mut parts = Vec::new();
+    for line in start.line..=end.line {
+        let chars: Vec<char> = view.plain[line].chars().collect();
+        let from = if line == start.line {
+            start.column.min(chars.len())
+        } else {
+            0
+        };
+        let to = if line == end.line {
+            end.column.min(chars.len())
+        } else {
+            chars.len()
+        };
+        parts.push(if to > from {
+            chars[from..to].iter().collect::<String>()
+        } else {
+            String::new()
+        });
+    }
+    let text = parts.join("\n");
+    if text.is_empty() {
         return None;
     }
-    Some((view.plain[start..=end].join("\n"), end - start + 1))
+    let chars = text.chars().count();
+    Some((text, end.line - start.line + 1, chars))
 }
 
 fn copy_transcript_selection(state: &mut TuiState) {
-    let Some((text, lines)) = transcript_selection_text(state) else {
+    let Some((text, lines, chars)) = transcript_selection_text(state) else {
         return;
     };
     match crate::clipboard::copy(&text) {
         Ok(()) => {
             state.notice = Some(format!(
-                "copied {lines} transcript line{}",
+                "copied {chars} character{} from {lines} transcript line{}",
+                if chars == 1 { "" } else { "s" },
                 if lines == 1 { "" } else { "s" }
             ))
         }
@@ -586,11 +661,38 @@ fn hide_transcript_view(state: &TuiState) {
     state.transcript_anchor.set(None);
 }
 
-fn tint_line(line: &mut Line<'_>, background: Color) {
-    line.style = line.style.bg(background);
-    for span in &mut line.spans {
-        span.style = span.style.bg(background);
+fn tint_line_range(line: &mut Line<'_>, start: usize, end: usize, background: Color) {
+    if end <= start {
+        return;
     }
+    let mut offset = 0usize;
+    let mut spans = Vec::new();
+    for span in line.spans.drain(..) {
+        let chars: Vec<char> = span.content.chars().collect();
+        let length = chars.len();
+        let local_start = start.saturating_sub(offset).min(length);
+        let local_end = end.saturating_sub(offset).min(length);
+        if local_start > 0 {
+            spans.push(Span::styled(
+                chars[..local_start].iter().collect::<String>(),
+                span.style,
+            ));
+        }
+        if local_end > local_start {
+            spans.push(Span::styled(
+                chars[local_start..local_end].iter().collect::<String>(),
+                span.style.bg(background),
+            ));
+        }
+        if local_end < length {
+            spans.push(Span::styled(
+                chars[local_end..].iter().collect::<String>(),
+                span.style,
+            ));
+        }
+        offset = offset.saturating_add(length);
+    }
+    line.spans = spans;
 }
 
 fn line_plain_text(line: &Line<'_>) -> String {
@@ -4886,16 +4988,36 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         state.transcript_selection.set(None);
         state.transcript_anchor.set(None);
     }
-    if let Some((selection_start, selection_end)) = state.transcript_selection.get() {
+    if let Some((mut selection_start, mut selection_end)) = state.transcript_selection.get() {
+        if selection_start > selection_end {
+            std::mem::swap(&mut selection_start, &mut selection_end);
+        }
         if total > 0 {
-            let selection_start = selection_start.min(total - 1);
-            let selection_end = selection_end.min(total - 1);
-            for line in all_lines
+            let last_line = total - 1;
+            selection_start.line = selection_start.line.min(last_line);
+            selection_end.line = selection_end.line.min(last_line);
+            for (line_index, line) in all_lines
                 .iter_mut()
-                .take(selection_end.saturating_add(1))
-                .skip(selection_start)
+                .enumerate()
+                .take(selection_end.line.saturating_add(1))
+                .skip(selection_start.line)
             {
-                tint_line(line, COLORS.selection_bg);
+                let line_length = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.chars().count())
+                    .sum::<usize>();
+                let from = if line_index == selection_start.line {
+                    selection_start.column.min(line_length)
+                } else {
+                    0
+                };
+                let to = if line_index == selection_end.line {
+                    selection_end.column.min(line_length)
+                } else {
+                    line_length
+                };
+                tint_line_range(line, from, to, COLORS.selection_bg);
             }
         }
     }
@@ -5955,23 +6077,31 @@ mod tests {
             .collect();
         let mut state = test_state(home.path(), &store, history);
         let _ = render_state(&state, 100, 30);
-        let (area, content_start, content_rows) = {
+        let (area, content_start, content_rows, second_line_len) = {
             let view = state.transcript_view.borrow();
             let view = view.as_ref().expect("transcript viewport recorded");
             assert!(view.total > view.content_rows, "history must overflow the viewport");
             assert!(view.content_rows >= 2);
-            (view.area, view.content_start, view.content_rows)
+            let second_len = view
+                .plain
+                .get(view.content_start + 1)
+                .map(|line| line.chars().count())
+                .unwrap_or(0);
+            (view.area, view.content_start, view.content_rows, second_len)
         };
-        let mouse = |kind: crossterm::event::MouseEventKind, row: u16| crossterm::event::MouseEvent {
-            kind,
-            column: area.x + 1,
-            row,
-            modifiers: KeyModifiers::empty(),
+        let mouse = |kind: crossterm::event::MouseEventKind, column: u16, row: u16| {
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::empty(),
+            }
         };
         handle_mouse(
             &mut state,
             mouse(
                 crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                area.x,
                 area.y,
             ),
         );
@@ -5979,34 +6109,104 @@ mod tests {
             &mut state,
             mouse(
                 crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                area.x + area.width.saturating_sub(1),
                 area.y + 1,
             ),
         );
+        let (start, end) = state
+            .transcript_selection
+            .get()
+            .expect("drag creates a character range");
+        assert_eq!(start, TranscriptPoint { line: content_start, column: 0 });
         assert_eq!(
-            state.transcript_selection.get(),
-            Some((content_start, content_start + 1))
+            end,
+            TranscriptPoint {
+                line: content_start + 1,
+                column: (area.width.saturating_sub(1) as usize).min(second_line_len)
+            }
         );
-        let (text, lines) = transcript_selection_text(&state).expect("selected text");
-        assert_eq!(lines, 2);
-        assert_eq!(text.lines().count(), 2);
-        assert!(text.contains("message"), "selection must copy transcript content");
 
         handle_mouse(
             &mut state,
             mouse(
                 crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                area.x + area.width.saturating_sub(1),
                 area.y + area.height + 10,
             ),
         );
+        let (_, end) = state
+            .transcript_selection
+            .get()
+            .expect("dragging past the bottom keeps a range");
         assert_eq!(
-            state.transcript_selection.get(),
-            Some((content_start, content_start + content_rows - 1)),
+            end.line,
+            content_start + content_rows - 1,
             "dragging past the bottom clamps to the last visible line"
         );
 
         let buffer = render_state(&state, 100, 30);
         let highlighted = (0..100).any(|x| buffer.get(x, area.y).bg == COLORS.selection_bg);
         assert!(highlighted, "selected transcript row must carry the selection background");
+    }
+
+    #[test]
+    fn transcript_selection_copies_character_ranges() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let state = test_state(home.path(), &store, Vec::new());
+        *state.transcript_view.borrow_mut() = Some(TranscriptViewport {
+            area: Rect {
+                x: 0,
+                y: 0,
+                width: 20,
+                height: 2,
+            },
+            content_top: 0,
+            content_start: 0,
+            content_rows: 2,
+            total: 2,
+            plain: vec!["alpha beta".to_string(), "gamma delta".to_string()],
+        });
+        state.transcript_selection.set(Some((
+            TranscriptPoint {
+                line: 0,
+                column: 2,
+            },
+            TranscriptPoint {
+                line: 1,
+                column: 5,
+            },
+        )));
+        let (text, lines, chars) = transcript_selection_text(&state).expect("selected text");
+        assert_eq!(text, "pha beta\ngamma");
+        assert_eq!(lines, 2);
+        assert_eq!(chars, 14);
+
+        state.transcript_selection.set(Some((
+            TranscriptPoint {
+                line: 1,
+                column: 5,
+            },
+            TranscriptPoint {
+                line: 0,
+                column: 2,
+            },
+        )));
+        let (reversed, _, _) = transcript_selection_text(&state).expect("reversed selection");
+        assert_eq!(reversed, text, "a reverse drag copies the same range");
+    }
+
+    #[test]
+    fn transcript_selection_tints_only_the_selected_characters() {
+        let mut line = Line::from(vec![Span::raw("abcdef")]);
+        tint_line_range(&mut line, 2, 4, COLORS.selection_bg);
+        assert_eq!(line_plain_text(&line), "abcdef");
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[0].content.as_ref(), "ab");
+        assert_eq!(line.spans[1].content.as_ref(), "cd");
+        assert_eq!(line.spans[1].style.bg, Some(COLORS.selection_bg));
+        assert_eq!(line.spans[2].content.as_ref(), "ef");
+        assert_ne!(line.spans[2].style.bg, Some(COLORS.selection_bg));
     }
 
     #[test]

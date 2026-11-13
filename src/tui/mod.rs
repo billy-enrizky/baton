@@ -4088,6 +4088,8 @@ fn handle_command(
                             None,
                             &now,
                             Some(&now),
+                            None,
+                            None,
                         )
                     })
                     .and_then(|()| guard.finish_orchestration_run(&run_id, "completed"))
@@ -7390,6 +7392,8 @@ mod tests {
                     None,
                     "now",
                     Some("now"),
+                    None,
+                    None,
                 )
                 .unwrap();
             guard
@@ -7462,6 +7466,8 @@ mod tests {
                     None,
                     "now",
                     Some("now"),
+                    None,
+                    None,
                 )
                 .unwrap();
             guard
@@ -7564,6 +7570,8 @@ mod tests {
                     None,
                     "now",
                     Some("now"),
+                    None,
+                    None,
                 )
                 .unwrap();
             guard
@@ -8965,6 +8973,7 @@ mod tests {
                         shared_paths: Vec::new(),
                     }),
                     commit: Some("0123456789abcdef".to_string()),
+                    snapshot: None,
                     thread_id,
                     status: "completed".to_string(),
                     text: Some("one is done".to_string()),
@@ -8981,6 +8990,7 @@ mod tests {
                     prompt: "do two".to_string(),
                     worktree: None,
                     commit: None,
+                    snapshot: None,
                     thread_id: None,
                     status: "failed".to_string(),
                     text: None,
@@ -9140,6 +9150,8 @@ mod tests {
                     None,
                     now,
                     Some(now),
+                    None,
+                    None,
                 )
                 .unwrap();
             guard

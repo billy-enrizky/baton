@@ -273,23 +273,36 @@ pub fn commit_changes_after_snapshot(
     }
 
     let head_tree = git(path, &["rev-parse", "HEAD^{tree}"])?;
+    let worker_tree = overlay_tree_paths(path, &head_tree, &final_tree, &changed)?;
+    if worker_tree == head_tree {
+        reset_worktree(path, "HEAD")?;
+        return Ok(None);
+    }
+    let commit = git(
+        path,
+        &["commit-tree", &worker_tree, "-p", "HEAD", "-m", message],
+    )?;
+    reset_worktree(path, &commit)?;
+    Ok(Some(commit))
+}
+
+fn overlay_tree_paths(
+    cwd: &Path,
+    base_tree: &str,
+    source_tree: &str,
+    changed: &[u8],
+) -> Result<String> {
     let mut index_info = Vec::new();
     for raw_path in changed.split(|byte| *byte == 0) {
         if raw_path.is_empty() {
             continue;
         }
         let file = String::from_utf8_lossy(raw_path).to_string();
-        let entry = git_raw(
-            path,
-            &["ls-tree", "-z", &final_tree, "--", &file],
-            &[],
-            None,
-        )?;
+        let entry = git_raw(cwd, &["ls-tree", "-z", source_tree, "--", &file], &[], None)?;
         let Some(record) = entry.split(|byte| *byte == 0).find(|part| !part.is_empty()) else {
-            let deletion = format!(
-                "0 0000000000000000000000000000000000000000\t{file}\0"
+            index_info.extend_from_slice(
+                format!("0 0000000000000000000000000000000000000000\t{file}\0").as_bytes(),
             );
-            index_info.extend_from_slice(deletion.as_bytes());
             continue;
         };
         let record = String::from_utf8_lossy(record);
@@ -306,36 +319,54 @@ pub fn commit_changes_after_snapshot(
         let object = fields
             .next()
             .ok_or_else(|| anyhow::anyhow!("missing object for {file}"))?;
-        let line = format!("{mode} {object}\t{file}\0");
-        index_info.extend_from_slice(line.as_bytes());
+        index_info.extend_from_slice(format!("{mode} {object}\t{file}\0").as_bytes());
     }
 
-    let index = temp_index_path("worker");
+    let index = temp_index_path("overlay");
     let index_text = index.to_string_lossy().to_string();
     let envs = [("GIT_INDEX_FILE", index_text)];
-    let worker_tree = (|| -> Result<String> {
-        git_raw(path, &["read-tree", "HEAD"], &envs, None)?;
+    let tree = (|| -> Result<String> {
+        git_raw(cwd, &["read-tree", base_tree], &envs, None)?;
         git_raw(
-            path,
+            cwd,
             &["update-index", "-z", "--index-info"],
             &envs,
             Some(&index_info),
         )?;
-        let tree = git_raw(path, &["write-tree"], &envs, None)?;
+        let tree = git_raw(cwd, &["write-tree"], &envs, None)?;
         Ok(String::from_utf8_lossy(&tree).trim().to_string())
     })();
     cleanup_index(&index);
-    let worker_tree = worker_tree?;
-    if worker_tree == head_tree {
-        reset_worktree(path, "HEAD")?;
-        return Ok(None);
-    }
-    let commit = git(
-        path,
-        &["commit-tree", &worker_tree, "-p", "HEAD", "-m", message],
+    tree
+}
+
+/// Builds the tree a worker would have had if its branch commit contained the
+/// source snapshot. The worker branch intentionally excludes untouched dirty
+/// files, so a three-way merge must use this tree as "theirs", with the
+/// snapshot tree as the merge base.
+pub fn snapshot_result_tree(
+    repo_root: &Path,
+    base_ref: &str,
+    snapshot_tree: &str,
+    branch: &str,
+) -> Result<String> {
+    let branch_tree = git(repo_root, &["rev-parse", &format!("{branch}^{{tree}}")])?;
+    let changed = git_raw(
+        repo_root,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            "--no-renames",
+            "-z",
+            base_ref,
+            branch,
+        ],
+        &[],
+        None,
     )?;
-    reset_worktree(path, &commit)?;
-    Ok(Some(commit))
+    overlay_tree_paths(repo_root, snapshot_tree, &branch_tree, &changed)
 }
 
 pub fn slugify(title: &str) -> String {
@@ -777,12 +808,50 @@ mod tests {
             !wt.path.join("source-only.txt").exists(),
             "snapshot-only files are cleared from the worker checkout after commit"
         );
+        let result_tree = snapshot_result_tree(
+            &repo_root,
+            &snapshot.base_ref,
+            &snapshot.tree,
+            &wt.branch,
+        )
+        .unwrap();
+        assert_eq!(
+            git(root.path(), &["show", &format!("{result_tree}:a.txt")]).unwrap(),
+            "worker final"
+        );
+        assert_eq!(
+            git(root.path(), &["show", &format!("{result_tree}:source-only.txt")]).unwrap(),
+            "source",
+            "the merge result keeps untouched snapshot files"
+        );
+
         assert_eq!(
             git(root.path(), &["rev-parse", &format!("{}^", wt.branch)]).unwrap(),
             head,
-            "worker commit stays directly on the source base"
+            "the initial worker commit stays directly on the source base"
         );
         assert_eq!(commit, git(root.path(), &["rev-parse", &wt.branch]).unwrap());
+        std::fs::write(wt.path.join("follow-up.txt"), "later\n").unwrap();
+        commit_changes(&wt.path, "baton worker: follow-up")
+            .unwrap()
+            .expect("follow-up commits");
+        let result_tree = snapshot_result_tree(
+            &repo_root,
+            &snapshot.base_ref,
+            &snapshot.tree,
+            &wt.branch,
+        )
+        .unwrap();
+        assert_eq!(
+            git(root.path(), &["show", &format!("{result_tree}:follow-up.txt")]).unwrap(),
+            "later",
+            "the result tree follows the current branch tip after a follow-up commit"
+        );
+        assert_eq!(
+            git(root.path(), &["show", &format!("{result_tree}:source-only.txt")]).unwrap(),
+            "source",
+            "follow-up commits do not drop untouched snapshot files"
+        );
         assert!(root.path().join("source-only.txt").exists());
         assert_eq!(std::fs::read_to_string(root.path().join("a.txt")).unwrap(), "dirty\n");
         remove(&wt).unwrap();

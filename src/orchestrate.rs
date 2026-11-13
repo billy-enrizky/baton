@@ -115,6 +115,12 @@ pub struct Plan {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkerSnapshot {
+    pub base_ref: String,
+    pub tree: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct WorkerResult {
     pub id: String,
     pub title: String,
@@ -122,6 +128,7 @@ pub struct WorkerResult {
     pub model: String,
     pub prompt: String,
     pub worktree: Option<WorktreeInfo>,
+    pub snapshot: Option<WorkerSnapshot>,
     pub commit: Option<String>,
     pub thread_id: Option<String>,
     pub status: String,
@@ -529,6 +536,7 @@ fn panicked_worker(fallback: &WorkerFallback) -> (usize, WorkerResult) {
             pr_url: None,
             created_at: now.clone(),
             finished_at: now,
+            snapshot: None,
         },
     )
 }
@@ -613,6 +621,7 @@ fn run_worker_inner(
                 pr_url: None,
                 created_at: created_at.clone(),
                 finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                snapshot: None,
             },
         );
     }
@@ -648,6 +657,7 @@ fn run_worker_inner(
                             pr_url: None,
                             created_at,
                             finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            snapshot: None,
                         },
                     );
                 }
@@ -655,9 +665,12 @@ fn run_worker_inner(
         }
         None => None,
     };
-    let snapshot_tree = match (worktree.as_ref(), repo_snapshot) {
+    let worker_snapshot = match (worktree.as_ref(), repo_snapshot) {
         (Some(worktree), Some(snapshot)) => match worktree::apply_snapshot(&worktree.path, snapshot) {
-            Ok(()) => Some(snapshot.tree.clone()),
+            Ok(()) => Some(WorkerSnapshot {
+                base_ref: snapshot.base_ref.clone(),
+                tree: snapshot.tree.clone(),
+            }),
             Err(error) => {
                 return (
                     index,
@@ -676,6 +689,7 @@ fn run_worker_inner(
                         pr_url: None,
                         created_at,
                         finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        snapshot: None,
                     },
                 );
             }
@@ -740,10 +754,10 @@ fn run_worker_inner(
     if status == "completed" {
         if let Some(worktree) = worktree.as_ref() {
             let message = format!("baton worker: {}", task.title);
-            let committed = match snapshot_tree.as_deref() {
-                Some(tree) => worktree::commit_changes_after_snapshot(
+            let committed = match worker_snapshot.as_ref() {
+                Some(snapshot) => worktree::commit_changes_after_snapshot(
                     &worktree.path,
-                    tree,
+                    &snapshot.tree,
                     &message,
                 ),
                 None => worktree::commit_changes(&worktree.path, &message),
@@ -768,6 +782,7 @@ fn run_worker_inner(
             model,
             prompt: task.prompt.clone(),
             worktree,
+            snapshot: worker_snapshot,
             commit,
             thread_id,
             status: status.to_string(),
@@ -883,6 +898,109 @@ fn conflicted_files(root: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+enum BranchMergeOutcome {
+    Merged(String),
+    Conflict(Vec<String>),
+}
+
+fn merge_snapshot_branch(
+    root: &Path,
+    branch: &str,
+    snapshot: &WorkerSnapshot,
+    result_tree: &str,
+    message: &str,
+) -> Result<BranchMergeOutcome> {
+    let head = git_stdout(root, &["rev-parse", "HEAD"])?;
+    let merge_base = format!("--merge-base={}", snapshot.tree);
+    let output = Command::new("git")
+        .args([
+            "merge-tree",
+            "--write-tree",
+            "--name-only",
+            &merge_base,
+            "HEAD",
+            result_tree,
+        ])
+        .current_dir(root)
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut lines = stdout.lines();
+    let tree = lines.next().unwrap_or("").trim().to_string();
+    if tree.is_empty() {
+        anyhow::bail!(
+            "snapshot-aware merge failed before producing a tree: {}",
+            stderr.trim()
+        );
+    }
+    if output.status.success() {
+        let current = git_stdout(root, &["rev-parse", "HEAD"])?;
+        if current != head {
+            anyhow::bail!("source HEAD moved during snapshot integration; retry");
+        }
+        let merge_commit = git_stdout(
+            root,
+            &["commit-tree", &tree, "-p", &head, "-p", branch, "-m", message],
+        )?;
+        let fast_forward = Command::new("git")
+            .args(["merge", "--ff-only", &merge_commit])
+            .current_dir(root)
+            .output()?;
+        if !fast_forward.status.success() {
+            anyhow::bail!(
+                "snapshot merge commit {merge_commit} could not fast-forward the source: {}",
+                String::from_utf8_lossy(&fast_forward.stderr).trim()
+            );
+        }
+        return Ok(BranchMergeOutcome::Merged(merge_commit));
+    }
+    let files = lines
+        .take_while(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        anyhow::bail!("snapshot-aware merge failed: {}", stderr.trim());
+    }
+    Ok(BranchMergeOutcome::Conflict(files))
+}
+
+fn merge_branch(
+    root: &Path,
+    branch: &str,
+    snapshot: Option<&WorkerSnapshot>,
+    message: &str,
+) -> Result<BranchMergeOutcome> {
+    if let Some(snapshot) = snapshot {
+        let result_tree = worktree::snapshot_result_tree(
+            root,
+            &snapshot.base_ref,
+            &snapshot.tree,
+            branch,
+        )?;
+        return merge_snapshot_branch(root, branch, snapshot, &result_tree, message);
+    }
+    let output = Command::new("git")
+        .args(["merge", "--no-ff", branch, "-m", message])
+        .current_dir(root)
+        .output()?;
+    if output.status.success() {
+        return Ok(BranchMergeOutcome::Merged(git_stdout(
+            root,
+            &["rev-parse", "HEAD"],
+        )?));
+    }
+    let files = conflicted_files(root);
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let _ = Command::new("git")
+        .args(["merge", "--abort"])
+        .current_dir(root)
+        .output();
+    if files.is_empty() {
+        anyhow::bail!("git merge failed: {stderr}");
+    }
+    Ok(BranchMergeOutcome::Conflict(files))
+}
+
 pub fn integrate(
     store: &BatonStore,
     cwd: &Path,
@@ -962,42 +1080,36 @@ pub fn integrate(
             continue;
         }
         let message = format!("baton: merge {} ({short_run})", task.title);
-        let output = Command::new("git")
-            .args(["merge", "--no-ff", branch, "-m", &message])
-            .current_dir(&repo_root)
-            .output()?;
-        if output.status.success() {
-            let merge_commit = git_stdout(&repo_root, &["rev-parse", "HEAD"])?;
-            let merged_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
-            store.mark_orchestration_task_merged(&task.id, &merged_at)?;
-            report.merged.push(IntegratedTask {
-                index,
-                title: task.title.clone(),
-                branch: branch.to_string(),
-                commit: task.commit_sha.clone().unwrap_or_default(),
-                merge_commit,
-            });
-            continue;
+        let snapshot = match (task.snapshot_base.as_deref(), task.snapshot_tree.as_deref()) {
+            (Some(base_ref), Some(tree)) => Some(WorkerSnapshot {
+                base_ref: base_ref.to_string(),
+                tree: tree.to_string(),
+            }),
+            _ => None,
+        };
+        match merge_branch(&repo_root, branch, snapshot.as_ref(), &message)? {
+            BranchMergeOutcome::Merged(merge_commit) => {
+                let merged_at =
+                    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                store.mark_orchestration_task_merged(&task.id, &merged_at)?;
+                report.merged.push(IntegratedTask {
+                    index,
+                    title: task.title.clone(),
+                    branch: branch.to_string(),
+                    commit: task.commit_sha.clone().unwrap_or_default(),
+                    merge_commit,
+                });
+            }
+            BranchMergeOutcome::Conflict(files) => {
+                report.conflict = Some(IntegrateConflict {
+                    index,
+                    title: task.title.clone(),
+                    branch: branch.to_string(),
+                    files,
+                });
+                break;
+            }
         }
-        let files = conflicted_files(&repo_root);
-        let _ = Command::new("git")
-            .args(["merge", "--abort"])
-            .current_dir(&repo_root)
-            .output();
-        if files.is_empty() {
-            anyhow::bail!(
-                "git merge failed for task {index} ({}): {}",
-                task.title,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
-        }
-        report.conflict = Some(IntegrateConflict {
-            index,
-            title: task.title.clone(),
-            branch: branch.to_string(),
-            files,
-        });
-        break;
     }
     Ok(report)
 }
@@ -1660,6 +1772,8 @@ fn run_with_worker_bin_and_progress(
             task.error.as_deref(),
             &task.created_at,
             Some(&task.finished_at),
+            task.snapshot.as_ref().map(|snapshot| snapshot.base_ref.as_str()),
+            task.snapshot.as_ref().map(|snapshot| snapshot.tree.as_str()),
         )?;
         tasks.push(task);
     }
@@ -1769,6 +1883,10 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
                 "text": task.text,
                 "error": task.error,
                 "commit": task.commit,
+                "snapshot": task.snapshot.as_ref().map(|snapshot| serde_json::json!({
+                    "base_ref": snapshot.base_ref,
+                    "tree": snapshot.tree,
+                })),
                 "worktree": task.worktree.as_ref().map(|worktree| serde_json::json!({
                     "path": worktree.path.display().to_string(),
                     "branch": worktree.branch,
@@ -1831,6 +1949,10 @@ pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<
                 model: task.model,
                 prompt: task.prompt,
                 worktree,
+                snapshot: match (task.snapshot_base, task.snapshot_tree) {
+                    (Some(base_ref), Some(tree)) => Some(WorkerSnapshot { base_ref, tree }),
+                    _ => None,
+                },
                 commit: task.commit_sha,
                 thread_id: task.thread_id,
                 status: task.status,
@@ -2379,6 +2501,183 @@ exit 1
             "dirty b\n"
         );
         assert!(repo.path().join("source-only.txt").exists());
+    }
+
+    #[test]
+    fn integrates_worker_after_source_commits_snapshot_changes() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("a.txt"), "base\n").unwrap();
+        std::fs::write(repo.path().join("b.txt"), "base b\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.path().join("a.txt"), "source dirty\n").unwrap();
+        std::fs::write(repo.path().join("b.txt"), "source dirty b\n").unwrap();
+        std::fs::write(repo.path().join("source-only.txt"), "source\n").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let plan_path = repo.path().join("plan.json");
+        std::fs::write(
+            &plan_path,
+            r#"{"summary":"snapshot worker","tasks":[{"title":"worker","provider":"codex","prompt":"edit the snapshot"}]}"#,
+        )
+        .unwrap();
+        let store = BatonStore::memory().unwrap();
+        let worker = worker_script(
+            home.path(),
+            "snapshot-integrator",
+            "test \"$(cat b.txt)\" = \"source dirty b\"
+printf 'worker final\n' > a.txt
+printf 'worker\n' > worker.txt",
+        );
+        let report = run_with_worker_bin(
+            "test snapshot integration",
+            repo.path(),
+            home.path(),
+            ProviderId::Codex,
+            "test-model",
+            4,
+            Some(&plan_path),
+            &store,
+            Some(&worker),
+            PermissionMode::Default,
+        )
+        .unwrap();
+        assert_eq!(report.status, "completed");
+        assert!(report.dirty_source);
+
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "source snapshot committed"]);
+
+        let stored = report_from_rows(&store, repo.path(), &report.run_id).unwrap();
+        assert!(
+            stored.tasks[0].snapshot.is_some(),
+            "snapshot metadata survives a durable report reload"
+        );
+        assert!(
+            to_json(&stored)["tasks"][0]["snapshot"]["tree"].is_string(),
+            "the orchestration JSON exposes the persisted snapshot tree"
+        );
+
+        let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
+        assert!(integrated.conflict.is_none(), "snapshot-aware integration must not conflict");
+        assert_eq!(integrated.merged.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "worker final\n",
+            "the worker edit wins over the unchanged snapshot content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("b.txt")).unwrap(),
+            "source dirty b\n",
+            "an untouched snapshot file keeps the source commit's content"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("source-only.txt")).unwrap(),
+            "source\n",
+            "an untouched snapshot-only file survives integration"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("worker.txt")).unwrap(),
+            "worker\n"
+        );
+    }
+
+    #[test]
+    fn snapshot_integration_reports_conflict_without_dirtying_the_source() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.path().join("a.txt"), "source dirty\n").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let plan_path = repo.path().join("plan.json");
+        std::fs::write(
+            &plan_path,
+            r#"{"summary":"snapshot worker","tasks":[{"title":"worker","provider":"codex","prompt":"edit the snapshot"}]}"#,
+        )
+        .unwrap();
+        let store = BatonStore::memory().unwrap();
+        let worker = worker_script(
+            home.path(),
+            "snapshot-conflict",
+            "printf 'worker final\n' > a.txt",
+        );
+        let report = run_with_worker_bin(
+            "test snapshot conflict",
+            repo.path(),
+            home.path(),
+            ProviderId::Codex,
+            "test-model",
+            4,
+            Some(&plan_path),
+            &store,
+            Some(&worker),
+            PermissionMode::Default,
+        )
+        .unwrap();
+        assert_eq!(report.status, "completed");
+
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "source snapshot"]);
+        std::fs::write(repo.path().join("a.txt"), "source later\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "source later"]);
+        let head = git(&["rev-parse", "HEAD"]);
+
+        let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
+        assert!(integrated.merged.is_empty());
+        let conflict = integrated.conflict.expect("both sides changed a.txt");
+        assert_eq!(conflict.index, 1);
+        assert!(conflict.files.contains(&"a.txt".to_string()));
+        assert_eq!(
+            git(&["rev-parse", "HEAD"]),
+            head,
+            "a conflicted snapshot merge does not move the source HEAD"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "source later\n"
+        );
+        assert_eq!(
+            git(&["status", "--porcelain"]),
+            "",
+            "a conflicted snapshot merge leaves no merge state behind"
+        );
     }
 
     #[test]

@@ -840,6 +840,8 @@ mod tests {
                 None,
                 "2026-11-13T00:00:00Z",
                 Some("2026-11-13T00:00:01Z"),
+                None,
+                None,
             )
             .unwrap();
         server

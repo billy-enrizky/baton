@@ -87,7 +87,7 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 ```
 
 ## Gotchas
-- Worker worktrees branch from `HEAD`, then receive a snapshot of tracked and untracked non-ignored source changes. The worker commit contains only paths the worker changed relative to that snapshot, so untouched dirty files stay out of the branch. The report sets `dirty_source`.
+- Worker worktrees branch from `HEAD`, then receive a snapshot of tracked and untracked non-ignored source changes. The worker commit contains only paths the worker changed relative to that snapshot, so untouched dirty files stay out of the branch. The report sets `dirty_source` and exposes the snapshot base/tree per task. Integration rebuilds the worker result over the snapshot and uses it as a three-way merge against the source, so committing dirty source edits after the run does not produce a false same-file conflict.
 - `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan. A task `model` overrides the provider config; omit it to use the configured default.
 - `--plan-only` resolves and prints the plan with effective models but creates no run, task rows, worktrees, or provider worker processes. Use it to review a coordinator plan or validate a plan file before spending worker turns. In the TUI, the same flag opens a preview overlay; Enter writes that exact plan and starts the normal runner, while Esc restores the goal to the composer.
 - A run with one success and one failure is `partial`; all failures is `failed` and exits non-zero.

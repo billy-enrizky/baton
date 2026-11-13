@@ -76,6 +76,8 @@ pub struct OrchestrationTaskRow {
     pub status: String,
     pub merged_at: Option<String>,
     pub pr_url: Option<String>,
+    pub snapshot_base: Option<String>,
+    pub snapshot_tree: Option<String>,
     pub text: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
@@ -317,7 +319,9 @@ CREATE TABLE IF NOT EXISTS orchestration_tasks (
   created_at TEXT NOT NULL,
   finished_at TEXT,
   merged_at TEXT,
-  pr_url TEXT
+  pr_url TEXT,
+  snapshot_base TEXT,
+  snapshot_tree TEXT
 );
 CREATE INDEX IF NOT EXISTS orchestration_tasks_run_idx ON orchestration_tasks (run_id, created_at);
 "#;
@@ -461,6 +465,8 @@ fn map_orchestration_task(row: &rusqlite::Row) -> rusqlite::Result<Orchestration
         finished_at: row.get(15)?,
         merged_at: row.get(16)?,
         pr_url: row.get(17)?,
+        snapshot_base: row.get(18)?,
+        snapshot_tree: row.get(19)?,
     })
 }
 
@@ -487,6 +493,8 @@ impl BatonStore {
         ensure_column(&db, "orchestration_tasks", "merged_at", "TEXT")?;
         ensure_column(&db, "orchestration_tasks", "position", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&db, "orchestration_tasks", "pr_url", "TEXT")?;
+        ensure_column(&db, "orchestration_tasks", "snapshot_base", "TEXT")?;
+        ensure_column(&db, "orchestration_tasks", "snapshot_tree", "TEXT")?;
         ensure_column(&db, "orchestration_runs", "dirty_source", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&db, "orchestration_runs", "archived_at", "TEXT")?;
         ensure_column(&db, "orchestration_runs", "owner_pid", "INTEGER")?;
@@ -1718,9 +1726,11 @@ impl BatonStore {
         error: Option<&str>,
         created_at: &str,
         finished_at: Option<&str>,
+        snapshot_base: Option<&str>,
+        snapshot_tree: Option<&str>,
     ) -> Result<()> {
         self.db.execute(
-            "INSERT INTO orchestration_tasks (id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO orchestration_tasks (id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, snapshot_base, snapshot_tree) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 id,
                 run_id,
@@ -1738,6 +1748,8 @@ impl BatonStore {
                 error,
                 created_at,
                 finished_at,
+                snapshot_base,
+                snapshot_tree,
             ],
         )?;
         Ok(())
@@ -1802,7 +1814,7 @@ impl BatonStore {
 
     pub fn list_orchestration_tasks(&self, run_id: &str) -> Result<Vec<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
+            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
         )?;
         let rows = statement
             .query_map(params![run_id], map_orchestration_task)?
@@ -1815,7 +1827,7 @@ impl BatonStore {
         thread_id: &str,
     ) -> Result<Option<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url FROM orchestration_tasks WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree FROM orchestration_tasks WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
         )?;
         let row = statement
             .query_row(params![thread_id], map_orchestration_task)

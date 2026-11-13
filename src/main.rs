@@ -492,6 +492,8 @@ fn main_result() -> Result<()> {
             plan_file,
             list,
             run,
+            integrate,
+            tasks,
             json,
         } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
@@ -540,6 +542,7 @@ fn main_result() -> Result<()> {
                             "run_id": run_id,
                             "tasks": tasks.iter().map(|task| serde_json::json!({
                                 "id": task.id,
+                                "task": task.position,
                                 "title": task.title,
                                 "provider": task.provider.as_str(),
                                 "model": task.model,
@@ -580,9 +583,26 @@ fn main_result() -> Result<()> {
                 }
                 return Ok(());
             }
+            if let Some(run_id) = integrate {
+                let report = orchestrate::integrate(&store, &cwd, &run_id, &tasks)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&orchestrate::integrate_to_json(&report))?
+                    );
+                } else {
+                    println!("{}", orchestrate::render_integrate(&report));
+                }
+                if report.conflict.is_some() {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             let goal = goal.join(" ");
             if goal.trim().is_empty() {
-                anyhow::bail!("usage: baton orchestrate <goal> | --list | --run <id>");
+                anyhow::bail!(
+                    "usage: baton orchestrate <goal> | --list | --run <id> | --integrate <run-id>"
+                );
             }
             let provider = cli
                 .provider

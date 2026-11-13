@@ -331,6 +331,260 @@ fn run_worker(
     )
 }
 
+#[derive(Debug, Clone)]
+pub struct IntegratedTask {
+    pub index: usize,
+    pub title: String,
+    pub branch: String,
+    pub commit: String,
+    pub merge_commit: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkippedTask {
+    pub index: usize,
+    pub title: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntegrateConflict {
+    pub index: usize,
+    pub title: String,
+    pub branch: String,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IntegrateReport {
+    pub run_id: String,
+    pub repo_root: PathBuf,
+    pub merged: Vec<IntegratedTask>,
+    pub skipped: Vec<SkippedTask>,
+    pub conflict: Option<IntegrateConflict>,
+}
+
+fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git").args(args).current_dir(cwd).output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn branch_exists(root: &Path, branch: &str) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(root)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+fn conflicted_files(root: &Path) -> Vec<String> {
+    Command::new("git")
+        .args(["diff", "--name-only", "--diff-filter=U"])
+        .current_dir(root)
+        .output()
+        .map(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn integrate(
+    store: &BatonStore,
+    cwd: &Path,
+    run_id: &str,
+    selection: &[usize],
+) -> Result<IntegrateReport> {
+    let repo_root = worktree::repo_root(cwd)?;
+    if worktree::is_dirty(&repo_root)? {
+        anyhow::bail!(
+            "source checkout has uncommitted changes; commit or stash them before integrating"
+        );
+    }
+    let tasks = store.list_orchestration_tasks(run_id)?;
+    if tasks.is_empty() {
+        anyhow::bail!("run {} has no tasks", &run_id[..8.min(run_id.len())]);
+    }
+    for index in selection {
+        if *index == 0 || *index > tasks.len() {
+            anyhow::bail!(
+                "--task {index} is out of range (the run has {} tasks)",
+                tasks.len()
+            );
+        }
+    }
+    let short_run = &run_id[..8.min(run_id.len())];
+    let mut report = IntegrateReport {
+        run_id: run_id.to_string(),
+        repo_root: repo_root.clone(),
+        merged: Vec::new(),
+        skipped: Vec::new(),
+        conflict: None,
+    };
+    for (offset, task) in tasks.iter().enumerate() {
+        let index = offset + 1;
+        if !selection.is_empty() && !selection.contains(&index) {
+            continue;
+        }
+        if task.status != "completed" {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: format!("worker status is {}", task.status),
+            });
+            continue;
+        }
+        if task.merged_at.is_some() {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: "already merged".to_string(),
+            });
+            continue;
+        }
+        let Some(branch) = task.branch.as_deref() else {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: "worker has no branch".to_string(),
+            });
+            continue;
+        };
+        if task.commit_sha.is_none() {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: "worker produced no commit".to_string(),
+            });
+            continue;
+        }
+        if !branch_exists(&repo_root, branch) {
+            report.skipped.push(SkippedTask {
+                index,
+                title: task.title.clone(),
+                reason: format!("branch {branch} no longer exists"),
+            });
+            continue;
+        }
+        let message = format!("baton: merge {} ({short_run})", task.title);
+        let output = Command::new("git")
+            .args(["merge", "--no-ff", branch, "-m", &message])
+            .current_dir(&repo_root)
+            .output()?;
+        if output.status.success() {
+            let merge_commit = git_stdout(&repo_root, &["rev-parse", "HEAD"])?;
+            let merged_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            store.mark_orchestration_task_merged(&task.id, &merged_at)?;
+            report.merged.push(IntegratedTask {
+                index,
+                title: task.title.clone(),
+                branch: branch.to_string(),
+                commit: task.commit_sha.clone().unwrap_or_default(),
+                merge_commit,
+            });
+            continue;
+        }
+        let files = conflicted_files(&repo_root);
+        let _ = Command::new("git")
+            .args(["merge", "--abort"])
+            .current_dir(&repo_root)
+            .output();
+        if files.is_empty() {
+            anyhow::bail!(
+                "git merge failed for task {index} ({}): {}",
+                task.title,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        report.conflict = Some(IntegrateConflict {
+            index,
+            title: task.title.clone(),
+            branch: branch.to_string(),
+            files,
+        });
+        break;
+    }
+    Ok(report)
+}
+
+pub fn render_integrate(report: &IntegrateReport) -> String {
+    let short_run = &report.run_id[..8.min(report.run_id.len())];
+    let mut lines = vec![
+        format!(
+            "integrate: {short_run}  {}",
+            if report.conflict.is_some() {
+                "conflict"
+            } else {
+                "done"
+            }
+        ),
+        format!("source: {}", report.repo_root.display()),
+    ];
+    for task in &report.merged {
+        lines.push(format!(
+            "  merged [{}] {} · {} -> {}",
+            task.index,
+            task.title,
+            task.branch,
+            &task.merge_commit[..8.min(task.merge_commit.len())]
+        ));
+    }
+    for task in &report.skipped {
+        lines.push(format!(
+            "  skipped [{}] {} · {}",
+            task.index, task.title, task.reason
+        ));
+    }
+    if let Some(conflict) = &report.conflict {
+        lines.push(format!(
+            "  conflict [{}] {} · {}",
+            conflict.index, conflict.title, conflict.branch
+        ));
+        if !conflict.files.is_empty() {
+            lines.push(format!("      files: {}", conflict.files.join(", ")));
+        }
+    }
+    lines.join("\n")
+}
+
+pub fn integrate_to_json(report: &IntegrateReport) -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "run_id": report.run_id,
+        "repo_root": report.repo_root.display().to_string(),
+        "status": if report.conflict.is_some() { "conflict" } else { "done" },
+        "merged": report.merged.iter().map(|task| serde_json::json!({
+            "task": task.index,
+            "title": task.title,
+            "branch": task.branch,
+            "commit": task.commit,
+            "merge_commit": task.merge_commit,
+        })).collect::<Vec<_>>(),
+        "skipped": report.skipped.iter().map(|task| serde_json::json!({
+            "task": task.index,
+            "title": task.title,
+            "reason": task.reason,
+        })).collect::<Vec<_>>(),
+        "conflict": report.conflict.as_ref().map(|conflict| serde_json::json!({
+            "task": conflict.index,
+            "title": conflict.title,
+            "branch": conflict.branch,
+            "files": conflict.files,
+        })),
+    })
+}
+
 pub fn run(
     goal: &str,
     cwd: &Path,
@@ -450,11 +704,12 @@ fn run_with_worker_bin(
             .collect::<Vec<_>>()
     });
     results.sort_by_key(|(index, _)| *index);
-    let tasks = results.into_iter().map(|(_, result)| result).collect::<Vec<_>>();
-    for task in &tasks {
+    let mut tasks = Vec::new();
+    for (position, (_, task)) in results.into_iter().enumerate() {
         store.add_orchestration_task(
             &task.id,
             &run_id,
+            (position + 1) as i64,
             &task.title,
             task.provider,
             &task.model,
@@ -469,6 +724,7 @@ fn run_with_worker_bin(
             &task.created_at,
             Some(&task.finished_at),
         )?;
+        tasks.push(task);
     }
     let completed = tasks.iter().filter(|task| task.status == "completed").count();
     let status = if completed == tasks.len() {
@@ -633,6 +889,126 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         path
+    }
+
+    fn worker_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        let path = dir.join(name);
+        let json = "printf '%s\\n' '{\"schema_version\":1,\"thread_id\":\"fake-thread\",\"ok\":true,\"phase\":\"completed\",\"error\":null,\"text\":\"FAKE_OK\"}'\n";
+        let script = format!("#!/bin/sh\ncd \"$2\" || exit 1\n{body}\n{json}");
+        std::fs::write(&path, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    fn run_fixture(plan: &str, worker_body: &str) -> (tempfile::TempDir, tempfile::TempDir, BatonStore, RunReport) {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git").args(args).current_dir(repo.path()).output().unwrap();
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let home = tempfile::tempdir().unwrap();
+        let worker = worker_script(home.path(), "fake-worker", worker_body);
+        let plan_path = home.path().join("plan.json");
+        std::fs::write(&plan_path, plan).unwrap();
+        let store = BatonStore::memory().unwrap();
+        let report = run_with_worker_bin(
+            "test goal",
+            repo.path(),
+            home.path(),
+            ProviderId::Codex,
+            "test-model",
+            4,
+            Some(&plan_path),
+            &store,
+            Some(&worker),
+            PermissionMode::Default,
+        )
+        .unwrap();
+        (repo, home, store, report)
+    }
+
+    #[test]
+    fn integrates_worker_branches_with_selection_and_idempotency() {
+        let plan = r#"{"summary":"two workers","tasks":[{"title":"first task","provider":"codex","prompt":"do one"},{"title":"second task","provider":"codex","prompt":"do two"}]}"#;
+        let (repo, _home, store, report) =
+            run_fixture(plan, "printf 'edited by worker\\n' > worker-output.txt");
+        assert_eq!(report.tasks.len(), 2);
+
+        let selected = integrate(&store, repo.path(), &report.run_id, &[2]).unwrap();
+        assert!(selected.conflict.is_none());
+        assert_eq!(selected.merged.len(), 1);
+        assert_eq!(selected.merged[0].index, 2);
+
+        let rest = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
+        assert!(rest.conflict.is_none());
+        assert_eq!(rest.merged.len(), 1);
+        assert_eq!(rest.merged[0].index, 1);
+        assert_eq!(rest.skipped.len(), 1);
+        assert_eq!(rest.skipped[0].reason, "already merged");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("worker-output.txt")).unwrap(),
+            "edited by worker\n"
+        );
+
+        let tasks = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert!(tasks.iter().all(|task| task.merged_at.is_some()));
+
+        let again = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
+        assert!(again.merged.is_empty());
+        assert_eq!(again.skipped.len(), 2);
+    }
+
+    #[test]
+    fn aborts_on_conflict_and_records_which_task_stopped() {
+        let plan = r#"{"summary":"two workers","tasks":[{"title":"first task","provider":"codex","prompt":"do one"},{"title":"second task","provider":"codex","prompt":"do two"}]}"#;
+        let body = "if [ \"$(basename \"$PWD\")\" = \"second-task\" ]; then printf 'two\\n' > worker-output.txt; else printf 'one\\n' > worker-output.txt; fi";
+        let (repo, _home, store, report) = run_fixture(plan, body);
+
+        let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
+        assert_eq!(integrated.merged.len(), 1);
+        let conflict = integrated.conflict.expect("second merge conflicts");
+        assert_eq!(conflict.index, 2);
+        assert!(conflict.files.contains(&"worker-output.txt".to_string()));
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("worker-output.txt")).unwrap(),
+            "one\n",
+            "the successful merge stays and the conflicted merge is aborted"
+        );
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "merge --abort leaves a clean source checkout"
+        );
+        let tasks = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert!(tasks[0].merged_at.is_some());
+        assert!(tasks[1].merged_at.is_none());
+    }
+
+    #[test]
+    fn refuses_to_integrate_into_a_dirty_source() {
+        let plan = r#"{"summary":"one worker","tasks":[{"title":"first task","provider":"codex","prompt":"do one"}]}"#;
+        let (repo, _home, store, report) =
+            run_fixture(plan, "printf 'edited by worker\\n' > worker-output.txt");
+        std::fs::write(repo.path().join("dirty.txt"), "uncommitted\n").unwrap();
+        let error = integrate(&store, repo.path(), &report.run_id, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("uncommitted changes"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]

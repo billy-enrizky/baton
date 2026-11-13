@@ -59,6 +59,7 @@ pub struct OrchestrationRunRow {
 pub struct OrchestrationTaskRow {
     pub id: String,
     pub run_id: String,
+    pub position: i64,
     pub title: String,
     pub provider: ProviderId,
     pub model: String,
@@ -68,6 +69,7 @@ pub struct OrchestrationTaskRow {
     pub commit_sha: Option<String>,
     pub thread_id: Option<String>,
     pub status: String,
+    pub merged_at: Option<String>,
     pub text: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
@@ -275,6 +277,7 @@ CREATE TABLE IF NOT EXISTS orchestration_runs (
 CREATE TABLE IF NOT EXISTS orchestration_tasks (
   id TEXT PRIMARY KEY,
   run_id TEXT NOT NULL,
+  position INTEGER NOT NULL DEFAULT 0,
   title TEXT NOT NULL,
   provider TEXT NOT NULL,
   model TEXT NOT NULL,
@@ -287,7 +290,8 @@ CREATE TABLE IF NOT EXISTS orchestration_tasks (
   text TEXT,
   error TEXT,
   created_at TEXT NOT NULL,
-  finished_at TEXT
+  finished_at TEXT,
+  merged_at TEXT
 );
 CREATE INDEX IF NOT EXISTS orchestration_tasks_run_idx ON orchestration_tasks (run_id, created_at);
 "#;
@@ -408,6 +412,8 @@ impl BatonStore {
         ensure_thread_columns(&db)?;
         ensure_column(&db, "provider_processes", "process_start", "TEXT")?;
         ensure_column(&db, "orchestration_tasks", "commit_sha", "TEXT")?;
+        ensure_column(&db, "orchestration_tasks", "merged_at", "TEXT")?;
+        ensure_column(&db, "orchestration_tasks", "position", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(BatonStore { db })
     }
 
@@ -1433,6 +1439,7 @@ impl BatonStore {
         &self,
         id: &str,
         run_id: &str,
+        position: i64,
         title: &str,
         provider: ProviderId,
         model: &str,
@@ -1448,10 +1455,11 @@ impl BatonStore {
         finished_at: Option<&str>,
     ) -> Result<()> {
         self.db.execute(
-            "INSERT INTO orchestration_tasks (id, run_id, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO orchestration_tasks (id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 id,
                 run_id,
+                position,
                 title,
                 provider.as_str(),
                 model,
@@ -1466,6 +1474,14 @@ impl BatonStore {
                 created_at,
                 finished_at,
             ],
+        )?;
+        Ok(())
+    }
+
+    pub fn mark_orchestration_task_merged(&self, id: &str, merged_at: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE orchestration_tasks SET merged_at = ? WHERE id = ?",
+            params![merged_at, id],
         )?;
         Ok(())
     }
@@ -1495,27 +1511,29 @@ impl BatonStore {
 
     pub fn list_orchestration_tasks(&self, run_id: &str) -> Result<Vec<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, run_id, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at FROM orchestration_tasks WHERE run_id = ? ORDER BY created_at, id",
+            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
         )?;
         let rows = statement
             .query_map(params![run_id], |row| {
-                let provider: String = row.get(3)?;
+                let provider: String = row.get(4)?;
                 Ok(OrchestrationTaskRow {
                     id: row.get(0)?,
                     run_id: row.get(1)?,
-                    title: row.get(2)?,
+                    position: row.get(2)?,
+                    title: row.get(3)?,
                     provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Codex),
-                    model: row.get(4)?,
-                    prompt: row.get(5)?,
-                    worktree_path: row.get(6)?,
-                    branch: row.get(7)?,
-                    commit_sha: row.get(8)?,
-                    thread_id: row.get(9)?,
-                    status: row.get(10)?,
-                    text: row.get(11)?,
-                    error: row.get(12)?,
-                    created_at: row.get(13)?,
-                    finished_at: row.get(14)?,
+                    model: row.get(5)?,
+                    prompt: row.get(6)?,
+                    worktree_path: row.get(7)?,
+                    branch: row.get(8)?,
+                    commit_sha: row.get(9)?,
+                    thread_id: row.get(10)?,
+                    status: row.get(11)?,
+                    text: row.get(12)?,
+                    error: row.get(13)?,
+                    created_at: row.get(14)?,
+                    finished_at: row.get(15)?,
+                    merged_at: row.get(16)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

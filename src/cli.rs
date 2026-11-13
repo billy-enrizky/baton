@@ -104,6 +104,12 @@ pub enum Commands {
         /// Show tasks for an orchestration run id
         #[arg(long, conflicts_with = "list")]
         run: Option<String>,
+        /// Merge completed worker branches into the current repository
+        #[arg(long, value_name = "run-id", conflicts_with_all = ["list", "run"])]
+        integrate: Option<String>,
+        /// Worker number to integrate (repeatable, 1-based; default all completed)
+        #[arg(long = "task", value_name = "N")]
+        tasks: Vec<usize>,
         /// Emit a JSON object instead of lines
         #[arg(long)]
         json: bool,

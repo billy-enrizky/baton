@@ -235,6 +235,31 @@ fn main_result() -> Result<()> {
             let _ = engine_command_sender.send(EngineCommand::Quit);
             let _ = engine_task.join();
 
+            // A `-t` turn against an orchestration worker thread answers its
+            // question (or records a failed follow-up) through the same path
+            // the TUI uses, so `baton exec` can unblock a run.
+            let worker_followup = match result_phase {
+                Some(phase) => {
+                    let guard = store.lock().unwrap();
+                    match orchestrate::record_worker_followup(
+                        &guard,
+                        &thread.id,
+                        result_ok.unwrap_or(false),
+                        result_error.as_deref(),
+                        phase,
+                    ) {
+                        Ok(outcome) => outcome,
+                        Err(error) => {
+                            if !json {
+                                eprintln!("worker follow-up update failed: {error}");
+                            }
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+
             // Providers that do not emit deltas only deliver final text here.
             // If deltas were streamed, do not print the same answer twice.
             if streamed_text.is_empty() && !result_text.is_empty() {
@@ -281,10 +306,39 @@ fn main_result() -> Result<()> {
                         "phase": result_phase.map(|phase| phase.as_str()).unwrap_or("unverified"),
                         "error": result_error,
                         "text": text,
+                        "worker_followup": worker_followup.as_ref().map(|outcome| serde_json::json!({
+                            "run_id": outcome.run_id,
+                            "task_id": outcome.task_id,
+                            "status": outcome.status,
+                            "commit": outcome.commit,
+                            "question": outcome.question,
+                            "error": outcome.error,
+                        })),
                     }))?
                 );
             } else if result_ok && !saw_output {
                 eprintln!("no output from provider");
+            }
+            if !json {
+                if let Some(outcome) = &worker_followup {
+                    let run = &outcome.run_id[..8.min(outcome.run_id.len())];
+                    let label = if outcome.question.is_some() {
+                        "worker question recorded"
+                    } else {
+                        "worker follow-up recorded"
+                    };
+                    match (&outcome.error, &outcome.commit) {
+                        // A follow-up that fails after a committed turn leaves
+                        // the task untouched, so there is nothing to report.
+                        (Some(_), Some(_)) => {}
+                        (Some(error), None) => eprintln!("worker failure recorded in run {run} · {error}"),
+                        (None, Some(commit)) => eprintln!(
+                            "{label} in run {run} · commit {}",
+                            &commit[..8.min(commit.len())]
+                        ),
+                        (None, None) => eprintln!("{label} in run {run} · no file changes"),
+                    }
+                }
             }
             if !result_ok || !saw_output {
                 std::process::exit(1);

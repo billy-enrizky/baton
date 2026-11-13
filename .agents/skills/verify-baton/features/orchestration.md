@@ -13,6 +13,7 @@
 - Push worker branches and open PRs with `--open-prs` or `p` in the report
 - Live per-worker progress in the TUI and with `--progress`
 - Worker questions, `needs_input`, and integration/PR decision gates
+- Worker follow-ups from `baton exec -t`, with `worker_followup` in the JSON result
 - `/multi --worktrees` fan-out through a generated plan, one isolated worker per provider
 - `/worktree` conversation fork bound to a one-task orchestration run
 
@@ -35,6 +36,7 @@ baton orchestrate --integrate <run-id> --task 2 --json
 baton orchestrate --open-prs <run-id> --json
 baton orchestrate --open-prs <run-id> --task 2 --json
 baton orchestrate --progress --json "Audit billing, add tests, update docs"
+baton exec -t <worker-thread-id> --json "use blue"
 ```
 
 In the TUI:
@@ -95,6 +97,7 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 - A run with one success and one failure is `partial`; all failures is `failed` and exits non-zero.
 - Worktrees are kept for review under `$BATON_HOME/worktrees/<run>/<task>`. Successful workers commit their changes as `baton worker: <title>`; the report and `--run --json` expose the SHA. `--integrate` merges completed branches into a clean source checkout, aborts on conflict, and skips already-merged workers. Use `baton worktrees` to list managed worktrees; JSON includes `shipped`, and the text state shows `clean · shipped` for a branch with a PR. `baton worktrees --clean` removes clean worktrees whose branch is merged or shipped; dirty worktrees, and unmerged branches without a recorded PR, require `--force`.
 - `baton.json` `worktree.sharedDirectories` symlinks existing, gitignored directories such as `node_modules` or `target` into each worker worktree. Shared paths appear in the report; edits inside them affect the primary checkout.
+- Answer a waiting worker from the CLI or an agent with `baton exec -t <worker-thread-id> "answer"`. It records the follow-up through the same path as the TUI, so the task leaves `needs_input` and the integration gate releases. `--json` returns a `worker_followup` object with the run, task, status, commit, question, and error.
 - Open a worker from the report and send a follow-up to continue its worktree. A successful follow-up commits the new changes, updates the task text and commit, refreshes the run verdict, and clears `merged_at` and `pr_url` when a new commit exists. A follow-up with no file changes keeps the previous commit and markers. A failed follow-up marks the task failed when it has no commit. If it already has a successful commit, the last result and its merge/PR markers stay intact; the thread shows the failure.
 - `--open-prs` needs a git remote and `gh` on PATH. It uses `origin`, or the only remote when origin is absent, and bases each PR on the source checkout's current branch. Eligible tasks have a completed worker, a commit, a live branch, no merge marker, and no recorded PR. A retry skips recorded PRs and links an existing PR for the same head branch instead of creating a duplicate.
 - `--archive` is idempotent and refuses a run whose durable status is still `running`. Archived runs remain readable by id; they are hidden only from the default list, and `--list --all` includes them.

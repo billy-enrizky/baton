@@ -1342,123 +1342,46 @@ fn record_worker_followup(
     error: Option<&str>,
     phase: TurnPhase,
 ) {
-    let (task, text) = {
+    let outcome = {
         let guard = store.lock().unwrap();
-        let Some(task) = guard.orchestration_task_for_thread(thread_id).unwrap_or(None) else {
-            return;
-        };
-        let text = guard
-            .list_messages(thread_id)
-            .unwrap_or_default()
-            .into_iter()
-            .rev()
-            .find(|message| message.role == "assistant")
-            .map(|message| message.text);
-        (task, text)
+        orchestrate::record_worker_followup(&guard, thread_id, ok, error, phase)
     };
-    if !ok {
-        if task.commit_sha.is_some() {
-            return;
-        }
-        let status = if phase == TurnPhase::Interrupted {
-            "cancelled"
-        } else {
-            "failed"
-        };
-        let detail = error.unwrap_or("worker turn failed");
-        let result = {
-            let guard = store.lock().unwrap();
-            guard
-                .update_orchestration_task_failure(
-                    &task.id,
-                    status,
-                    text.as_deref(),
-                    detail,
-                )
-                .and_then(|()| guard.refresh_orchestration_run_status(&task.run_id))
-        };
-        if thread_id == state.thread.id {
-            state.notice = Some(match result {
-                Ok(()) => format!(
-                    "worker {} recorded in run {} · {detail}",
-                    if status == "cancelled" { "cancellation" } else { "failure" },
-                    &task.run_id[..8.min(task.run_id.len())]
-                ),
-                Err(error) => format!("worker failure recorded but run update failed: {error}"),
-            });
-        }
+    if thread_id != state.thread.id {
         return;
     }
-    let Some(worktree_path) = task.worktree_path.as_deref() else {
-        return;
-    };
-    let path = std::path::Path::new(worktree_path);
-    if !path.is_dir() {
-        return;
-    }
-    let commit = match crate::worktree::commit_changes(
-        path,
-        &format!("baton worker: {}", task.title),
-    ) {
-        Ok(commit) => commit,
-        Err(error) => {
-            if thread_id == state.thread.id {
-                state.notice = Some(format!("worker follow-up commit failed: {error}"));
-            }
-            return;
-        }
-    };
-    let clear_markers = commit.is_some();
-    let asked_again = text
-        .as_deref()
-        .and_then(orchestrate::worker_question)
-        .is_some();
-    let result = {
-        let guard = store.lock().unwrap();
-        if asked_again {
-            guard
-                .update_orchestration_task_needs_input(
-                    &task.id,
-                    text.as_deref(),
-                    commit.as_deref(),
-                    clear_markers,
-                )
-                .and_then(|()| guard.refresh_orchestration_run_status(&task.run_id))
-        } else {
-            guard
-                .update_orchestration_task_success(
-                    &task.id,
-                    text.as_deref(),
-                    commit.as_deref(),
-                    clear_markers,
-                )
-                .and_then(|()| guard.refresh_orchestration_run_status(&task.run_id))
-        }
-    };
-    if thread_id == state.thread.id {
-        match result {
-            Ok(()) => {
-                let label = if asked_again {
-                    "worker question recorded"
-                } else {
-                    "worker follow-up recorded"
-                };
-                state.notice = Some(match &commit {
+    match outcome {
+        Ok(Some(outcome)) => {
+            let run = &outcome.run_id[..8.min(outcome.run_id.len())];
+            if let Some(error) = &outcome.error {
+                // A failure after a prior commit does not roll the task back.
+                if outcome.commit.is_none() {
+                    let label = if outcome.status == "cancelled" {
+                        "cancellation"
+                    } else {
+                        "failure"
+                    };
+                    state.notice = Some(format!("worker {label} recorded in run {run} · {error}"));
+                }
+            } else if outcome.question.is_some() {
+                state.notice = Some(match &outcome.commit {
                     Some(commit) => format!(
-                        "{label} in run {} · commit {}",
-                        &task.run_id[..8.min(task.run_id.len())],
+                        "worker question recorded in run {run} · commit {}",
                         &commit[..8.min(commit.len())]
                     ),
-                    None => format!(
-                        "{label} in run {} · no file changes",
-                        &task.run_id[..8.min(task.run_id.len())]
+                    None => format!("worker question recorded in run {run} · no file changes"),
+                });
+            } else {
+                state.notice = Some(match &outcome.commit {
+                    Some(commit) => format!(
+                        "worker follow-up recorded in run {run} · commit {}",
+                        &commit[..8.min(commit.len())]
                     ),
+                    None => format!("worker follow-up recorded in run {run} · no file changes"),
                 });
             }
-            Err(error) => {
-                state.notice = Some(format!("worker follow-up recorded but run update failed: {error}"));
-            }
         }
+        Ok(None) => {}
+        Err(error) => state.notice = Some(error.to_string()),
     }
 }
 

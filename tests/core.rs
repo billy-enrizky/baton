@@ -1080,3 +1080,172 @@ fn prompt_history_is_project_scoped_capped_and_deduped() {
     assert_eq!(history.first().unwrap(), "prompt 50", "oldest entries fall off");
     assert_eq!(history.last().unwrap(), "prompt 149");
 }
+
+#[test]
+fn abandoned_orchestration_is_reconciled_without_losing_completed_tasks() {
+    let store = BatonStore::memory().unwrap();
+    store
+        .create_orchestration_run_owned(
+            "run-abandoned",
+            "finish the work",
+            ProviderId::Codex,
+            "model",
+            None,
+            "{}",
+            false,
+            Some(0),
+            None,
+        )
+        .unwrap();
+    store
+        .add_orchestration_task(
+            "task-done",
+            "run-abandoned",
+            1,
+            "completed worker",
+            ProviderId::Codex,
+            "model",
+            "done",
+            Some("/tmp/done"),
+            Some("baton/run/done"),
+            Some("abc123"),
+            Some("thread-done"),
+            "completed",
+            Some("finished"),
+            None,
+            "now",
+            Some("now"),
+        )
+        .unwrap();
+    store
+        .add_orchestration_task(
+            "task-running",
+            "run-abandoned",
+            2,
+            "running worker",
+            ProviderId::Codex,
+            "model",
+            "running",
+            Some("/tmp/running"),
+            Some("baton/run/running"),
+            None,
+            Some("thread-running"),
+            "running",
+            None,
+            None,
+            "now",
+            None,
+        )
+        .unwrap();
+    store
+        .start_turn_record("thread-done", 1, ProviderId::Codex, Some("model"))
+        .unwrap();
+    store
+        .finish_turn_record("thread-done", 1, TurnPhase::Completed, None)
+        .unwrap();
+    store
+        .start_turn_record("thread-running", 1, ProviderId::Codex, Some("model"))
+        .unwrap();
+
+    let reconciled = baton::orchestrate::reconcile_abandoned_runs(&store).unwrap();
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(reconciled[0].run_id, "run-abandoned");
+    assert_eq!(reconciled[0].status, "partial");
+    assert_eq!(reconciled[0].completed_tasks, 1);
+    assert_eq!(reconciled[0].failed_tasks, 1);
+
+    let run = &store.list_orchestration_runs(10).unwrap()[0];
+    assert_eq!(run.status, "partial");
+    assert!(run.finished_at.is_some());
+    let tasks = store.list_orchestration_tasks("run-abandoned").unwrap();
+    assert_eq!(tasks[0].status, "completed");
+    assert_eq!(tasks[0].commit_sha.as_deref(), Some("abc123"));
+    assert_eq!(tasks[1].status, "failed");
+    assert!(
+        tasks[1]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("exited before the run finished"),
+        "task error: {:?}",
+        tasks[1].error
+    );
+    assert_eq!(
+        store
+            .get_turn_record("thread-done", 1)
+            .unwrap()
+            .unwrap()
+            .phase,
+        TurnPhase::Completed
+    );
+    assert_eq!(
+        store
+            .get_turn_record("thread-running", 1)
+            .unwrap()
+            .unwrap()
+            .phase,
+        TurnPhase::Unverified
+    );
+}
+
+#[test]
+fn live_orchestration_owner_is_not_reconciled() {
+    let store = BatonStore::memory().unwrap();
+    let owner_pid = std::process::id();
+    let owner_start = baton::process::process_start(owner_pid);
+    store
+        .create_orchestration_run_owned(
+            "run-live",
+            "keep working",
+            ProviderId::Codex,
+            "model",
+            None,
+            "{}",
+            false,
+            Some(owner_pid),
+            owner_start.as_deref(),
+        )
+        .unwrap();
+    assert!(baton::orchestrate::reconcile_abandoned_runs(&store)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store.list_orchestration_runs(10).unwrap()[0].status,
+        "running"
+    );
+
+    store
+        .create_orchestration_run_owned(
+            "run-reused-pid",
+            "reused pid",
+            ProviderId::Codex,
+            "model",
+            None,
+            "{}",
+            false,
+            Some(owner_pid),
+            Some("different process start"),
+        )
+        .unwrap();
+    let reconciled = baton::orchestrate::reconcile_abandoned_runs(&store).unwrap();
+    assert_eq!(reconciled.len(), 1);
+    assert_eq!(reconciled[0].run_id, "run-reused-pid");
+
+    store
+        .create_orchestration_run(
+            "run-legacy",
+            "ownerless legacy row",
+            ProviderId::Codex,
+            "model",
+            None,
+            "{}",
+            false,
+        )
+        .unwrap();
+    assert!(
+        baton::orchestrate::reconcile_abandoned_runs(&store)
+            .unwrap()
+            .is_empty(),
+        "an ownerless run cannot be proven abandoned"
+    );
+}

@@ -34,6 +34,9 @@ fn main_result() -> Result<()> {
     let cli_prompt = cli.prompt.clone();
 
     reap_startup_processes();
+    if !matches!(&command, cli::Commands::Chat) {
+        reconcile_startup_orchestrations();
+    }
 
     let permission_override = if cli.yolo {
         Some(PermissionMode::BypassPermissions)
@@ -1542,6 +1545,31 @@ fn main_result() -> Result<()> {
                 }
             }
             Ok(())
+        }
+    }
+}
+
+fn reconcile_startup_orchestrations() {
+    let Ok(store) = BatonStore::open(&paths::baton_db_path()) else {
+        return;
+    };
+    match orchestrate::reconcile_abandoned_runs(&store) {
+        Ok(runs) => {
+            for run in runs {
+                eprintln!(
+                    "recovered abandoned orchestration {} ({}, {} completed, {} failed, {} cancelled)",
+                    &run.run_id[..8.min(run.run_id.len())],
+                    run.status,
+                    run.completed_tasks,
+                    run.failed_tasks,
+                    run.cancelled_tasks
+                );
+            }
+        }
+        Err(error) => {
+            if std::env::var_os("BATON_DEBUG_PROCESS").is_some() {
+                eprintln!("baton orchestration recovery failed: {error}");
+            }
         }
     }
 }

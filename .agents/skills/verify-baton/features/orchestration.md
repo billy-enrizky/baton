@@ -45,7 +45,7 @@ In the TUI:
 
 `/worktree [title]` forks the current conversation into an isolated worktree and binds the new thread to a completed one-task run. The first successful turn commits through the worker follow-up path; the report then exposes integrate, ship, archive, and cleanup. Dirty source checkouts are refused, and the original thread stays in the source checkout.
 
-The transcript shows a live per-worker list while the run is active: queued, running, completed with commit, failed with the error, or cancelled. Ctrl+C cancels the run and terminates the worker process groups. `--progress` prints the same lines to stderr. When it
+The transcript shows a live per-worker list while the run is active: queued, running, completed with commit, failed with the error, or cancelled. Ctrl+C cancels the run and terminates the worker process groups. If the orchestrator process dies, the next Baton start marks unfinished tasks failed, keeps completed tasks and commits, settles the run, and shows a recovery notice in the TUI. A run owned by another live Baton process is left alone. `--progress` prints the same lines to stderr. When it
 finishes, the full-screen report lists each worker. Up/Down selects a worker,
 Enter opens that worker's thread (with its worktree as cwd), PageUp/PageDown
 scrolls, and Esc closes the report. `/clear` also dismisses it. Press `i` to
@@ -95,4 +95,5 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 - `--open-prs` needs a git remote and `gh` on PATH. It uses `origin`, or the only remote when origin is absent, and bases each PR on the source checkout's current branch. Eligible tasks have a completed worker, a commit, a live branch, no merge marker, and no recorded PR. A retry skips recorded PRs and links an existing PR for the same head branch instead of creating a duplicate.
 - `--archive` is idempotent and refuses a run whose durable status is still `running`. Archived runs remain readable by id; they are hidden only from the default list, and `--list --all` includes them.
 - The coordinator retries once on invalid JSON. An empty plan, a second invalid plan, or an unusable coordinator response falls back to one direct worker instead of failing the run. Cancellation is the only pre-worker terminal outcome.
+- Orchestration runs record their owner PID and process start time. Startup recovery settles a run only when that owner identity is gone. Ownerless rows from older builds are left running because their liveness cannot be proven.
 - The multi-harness path costs real provider turns; use `--plan-file` for smoke tests. Exact greetings use a direct plan and do not call the coordinator; `/orchestrate hi` in the TUI routes to a single normal turn.

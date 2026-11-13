@@ -680,7 +680,14 @@ fn main_result() -> Result<()> {
             };
             if clean {
                 let cleanup = worktree::clean_managed(&home, run.as_deref(), force)?;
-                let remaining = worktree::list_managed(&home)?;
+                let remaining: Vec<_> = worktree::list_managed(&home)?
+                    .into_iter()
+                    .filter(|entry| {
+                        run.as_deref()
+                            .map(|filter| worktree::run_matches(entry, filter))
+                            .unwrap_or(true)
+                    })
+                    .collect();
                 if json {
                     println!(
                         "{}",
@@ -724,7 +731,14 @@ fn main_result() -> Result<()> {
                     }
                 }
             } else {
-                let entries = worktree::list_managed(&home)?;
+                let entries: Vec<_> = worktree::list_managed(&home)?
+                    .into_iter()
+                    .filter(|entry| {
+                        run.as_deref()
+                            .map(|filter| worktree::run_matches(entry, filter))
+                            .unwrap_or(true)
+                    })
+                    .collect();
                 if json {
                     println!(
                         "{}",

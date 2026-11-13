@@ -82,7 +82,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rewind", "rewind to a previous message"),
     ("/goal", "set a multi-turn objective the agent works toward"),
     ("/find", "search the conversation"),
-    ("/multi", "send the same prompt to multiple providers"),
+    ("/multi", "same prompt to multiple providers; --worktrees isolates them"),
     ("/orchestrate", "orchestrate mode or one-off: /orchestrate [on|off] [goal]"),
     ("/runs", "list or reopen orchestration runs"),
     ("/queue", "show or clear queued follow-ups"),
@@ -1355,7 +1355,11 @@ fn start_orchestration(
     state.orchestration_workers.clear();
     state.orchestration_report = None;
     state.orchestration_scroll = 0;
-    state.notice = Some("orchestrating: coordinator planning...".into());
+    state.notice = Some(if plan_path.is_some() {
+        "orchestrating: starting worker plan...".into()
+    } else {
+        "orchestrating: coordinator planning...".into()
+    });
     let sender = state.orchestration_sender.clone();
     std::thread::spawn(move || {
         let cancel_for_run = cancel.clone();
@@ -2730,6 +2734,72 @@ fn handle_composer_key(
     }
 }
 
+const MULTI_USAGE: &str =
+    "usage: /multi [--worktrees] <provider> [<provider> ...] <prompt>";
+
+#[derive(Debug, PartialEq, Eq)]
+struct MultiArgs {
+    worktrees: bool,
+    providers: Vec<ProviderId>,
+    prompt: String,
+}
+
+fn parse_multi_args(args: &[String]) -> std::result::Result<MultiArgs, String> {
+    let mut start = 0usize;
+    let worktrees = matches!(args.first().map(String::as_str), Some("--worktrees") | Some("--wt"));
+    if worktrees {
+        start = 1;
+    }
+    let mut providers: Vec<ProviderId> = Vec::new();
+    let mut prompt_parts: Vec<String> = Vec::new();
+    for arg in &args[start..] {
+        match ProviderId::parse(arg) {
+            Some(provider) if prompt_parts.is_empty() => {
+                if !providers.contains(&provider) {
+                    providers.push(provider);
+                }
+            }
+            _ => prompt_parts.push(arg.clone()),
+        }
+    }
+    let prompt = prompt_parts.join(" ");
+    if providers.is_empty() || prompt.trim().is_empty() {
+        return Err(MULTI_USAGE.to_string());
+    }
+    Ok(MultiArgs {
+        worktrees,
+        providers,
+        prompt,
+    })
+}
+
+fn multi_worktree_plan(providers: &[ProviderId], prompt: &str) -> orchestrate::Plan {
+    orchestrate::Plan {
+        summary: Some("multi fan-out across isolated worktrees".to_string()),
+        tasks: providers
+            .iter()
+            .map(|provider| orchestrate::PlanTask {
+                title: format!("multi {provider}"),
+                provider: provider.as_str().to_string(),
+                prompt: prompt.to_string(),
+            })
+            .collect(),
+    }
+}
+
+fn write_multi_worktree_plan(
+    providers: &[ProviderId],
+    prompt: &str,
+) -> Result<String> {
+    let path = std::env::temp_dir().join(format!(
+        "baton-multi-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    let plan = multi_worktree_plan(providers, prompt);
+    std::fs::write(&path, serde_json::to_string_pretty(&plan)?)?;
+    Ok(path.to_string_lossy().to_string())
+}
+
 fn submit(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -2894,29 +2964,37 @@ fn handle_command(
             }
         }
         "/multi" => {
-            if args.len() < 2 {
-                state.notice = Some("usage: /multi <provider> [<provider> ...] <prompt>".into());
-                return;
-            }
-            // Leading arguments that name providers; everything after them is
-            // the prompt, so multi-word prompts keep their words.
-            let mut valid_providers: Vec<ProviderId> = Vec::new();
-            let mut prompt_parts: Vec<String> = Vec::new();
-            for arg in &args {
-                match ProviderId::parse(arg) {
-                    Some(provider) if prompt_parts.is_empty() => {
-                        if !valid_providers.contains(&provider) {
-                            valid_providers.push(provider);
-                        }
-                    }
-                    _ => prompt_parts.push(arg.clone()),
+            let parsed = match parse_multi_args(&args) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    state.notice = Some(message);
+                    return;
                 }
-            }
-            let prompt = prompt_parts.join(" ");
-            if valid_providers.is_empty() || prompt.trim().is_empty() {
-                state.notice = Some("usage: /multi <provider> [<provider> ...] <prompt>".into());
+            };
+            if parsed.worktrees {
+                if let Err(error) = crate::worktree::repo_root(std::path::Path::new(&state.thread.cwd)) {
+                    state.notice = Some(format!(
+                        "/multi --worktrees needs a git repository: {error}"
+                    ));
+                    return;
+                }
+                let plan_file = match write_multi_worktree_plan(&parsed.providers, &parsed.prompt) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        state.notice = Some(format!("cannot write multi plan: {error}"));
+                        return;
+                    }
+                };
+                request_orchestration(
+                    state,
+                    parsed.prompt,
+                    parsed.providers.len(),
+                    Some(plan_file),
+                );
                 return;
             }
+            let valid_providers = parsed.providers;
+            let prompt = parsed.prompt;
             state.notice = Some(format!(
                 "sending to {} providers in parallel: {}",
                 valid_providers.len(),
@@ -6544,6 +6622,121 @@ mod tests {
         assert_eq!(buffer.get(removed_cell, removed_row as u16).fg, COLORS.error, "removed lines render red");
         assert_eq!(buffer.get(0, added_row as u16).bg, ratatui::style::Color::Rgb(33, 58, 43), "added rows carry the tinted background");
         assert_eq!(buffer.get(0, removed_row as u16).bg, ratatui::style::Color::Rgb(74, 34, 29), "removed rows carry the tinted background");
+    }
+
+    #[test]
+    fn multi_args_parse_worktree_flag_and_dedupe_providers() {
+        let parsed = parse_multi_args(&[
+            "--worktrees".to_string(),
+            "codex".to_string(),
+            "opencode".to_string(),
+            "codex".to_string(),
+            "compare".to_string(),
+            "notes".to_string(),
+        ])
+        .unwrap();
+        assert!(parsed.worktrees);
+        assert_eq!(parsed.providers, vec![ProviderId::Codex, ProviderId::OpenCode]);
+        assert_eq!(parsed.prompt, "compare notes");
+
+        let live = parse_multi_args(&[
+            "codex".to_string(),
+            "claude".to_string(),
+            "compare".to_string(),
+        ])
+        .unwrap();
+        assert!(!live.worktrees);
+        assert_eq!(live.providers, vec![ProviderId::Codex, ProviderId::Claude]);
+
+        assert!(parse_multi_args(&[]).is_err());
+        assert!(parse_multi_args(&["--worktrees".to_string()]).is_err());
+        assert!(parse_multi_args(&["codex".to_string()]).is_err());
+    }
+
+    #[test]
+    fn multi_worktree_plan_has_one_task_per_provider() {
+        let plan = multi_worktree_plan(
+            &[ProviderId::Codex, ProviderId::Claude],
+            "compare the API",
+        );
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].provider, "codex");
+        assert_eq!(plan.tasks[0].prompt, "compare the API");
+        assert_eq!(plan.tasks[1].provider, "claude");
+        assert_eq!(
+            plan.summary.as_deref(),
+            Some("multi fan-out across isolated worktrees")
+        );
+    }
+
+    #[test]
+    fn multi_worktree_plan_file_round_trips() {
+        let path = write_multi_worktree_plan(
+            &[ProviderId::Codex, ProviderId::OpenCode],
+            "compare the API",
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let plan = crate::orchestrate::parse_plan(&text, 4).unwrap();
+        assert_eq!(plan.tasks.len(), 2);
+        assert_eq!(plan.tasks[0].provider, "codex");
+        assert_eq!(plan.tasks[1].provider, "opencode");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn multi_worktrees_requires_git_and_uses_the_dirty_guard() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/multi --worktrees codex claude compare notes",
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("needs a git repository"),
+            "notice: {:?}",
+            state.notice
+        );
+        assert!(!state.orchestration_pending);
+        assert!(state.multi.is_none());
+
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/multi --worktrees codex claude compare notes",
+        );
+        assert!(
+            matches!(state.overlay, Overlay::DirtyConfirm { .. }),
+            "dirty source must ask before multi worktrees"
+        );
+        assert!(!state.orchestration_pending);
+        assert!(state.multi.is_none());
     }
 
     #[test]

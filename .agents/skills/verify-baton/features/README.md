@@ -8,6 +8,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | TUI status | TUI | `/status` shows thread, phase, queue, and adapter lifecycle |
 | Status next action | CLI | `baton status` and `--json` answer what to do now |
 | Provider readiness | CLI and TUI | doctor summarizes ready/missing; pickers mark missing harnesses |
+| Default provider | CLI and TUI | new work starts on an installed harness, with an explicit override |
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |
 | Native rewind | CLI | `baton rewind --native` truncates Codex or OpenCode history and keeps the session |

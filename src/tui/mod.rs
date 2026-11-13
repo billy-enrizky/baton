@@ -3227,6 +3227,12 @@ fn draw_orchestration_report(
                 Style::default().fg(COLORS.muted),
             ));
         }
+        if let Some(commit) = &task.commit {
+            lines.push(Line::styled(
+                format!("    commit: {}", &commit[..8.min(commit.len())]),
+                Style::default().fg(COLORS.success),
+            ));
+        }
         if let Some(thread_id) = &task.thread_id {
             lines.push(Line::styled(
                 format!("    thread: {}", &thread_id[..8.min(thread_id.len())]),
@@ -6232,6 +6238,7 @@ mod tests {
                         branch: "baton/run/worker-one".to_string(),
                         base_ref: "HEAD".to_string(),
                     }),
+                    commit: Some("0123456789abcdef".to_string()),
                     thread_id,
                     status: "completed".to_string(),
                     text: Some("one is done".to_string()),
@@ -6246,6 +6253,7 @@ mod tests {
                     model: "claude-test".to_string(),
                     prompt: "do two".to_string(),
                     worktree: None,
+                    commit: None,
                     thread_id: None,
                     status: "failed".to_string(),
                     text: None,
@@ -6382,6 +6390,7 @@ mod tests {
         assert!(text.contains("orchestration abcdef12 completed"), "{text}");
         assert!(text.contains("worker one"), "{text}");
         assert!(text.contains("worker two"), "{text}");
+        assert!(text.contains("commit: 01234567"), "{text}");
         assert!(text.contains("esc closes"), "{text}");
         assert!(text.contains("boom"), "{text}");
     }

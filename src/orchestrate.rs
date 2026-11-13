@@ -36,6 +36,7 @@ pub struct WorkerResult {
     pub model: String,
     pub prompt: String,
     pub worktree: Option<WorktreeInfo>,
+    pub commit: Option<String>,
     pub thread_id: Option<String>,
     pub status: String,
     pub text: Option<String>,
@@ -232,6 +233,7 @@ fn run_worker(
                         model,
                         prompt: task.prompt.clone(),
                         worktree: None,
+                        commit: None,
                         thread_id: None,
                         status: "failed".to_string(),
                         text: None,
@@ -286,11 +288,29 @@ fn run_worker(
         }
         Err(error) => (None, None, Some(format!("cannot run worker: {error}")), None),
     };
-    let status = if error.is_none() {
+    let mut status = if error.is_none() {
         "completed"
     } else {
         "failed"
     };
+    let mut error = error;
+    let mut commit = None;
+    if status == "completed" {
+        if let Some(worktree) = worktree.as_ref() {
+            match worktree::commit_changes(
+                &worktree.path,
+                &format!("baton worker: {}", task.title),
+            ) {
+                Ok(sha) => commit = sha,
+                Err(commit_error) => {
+                    status = "failed";
+                    error = Some(format!(
+                        "worker completed but its changes could not be committed: {commit_error}"
+                    ));
+                }
+            }
+        }
+    }
     (
         index,
         WorkerResult {
@@ -300,6 +320,7 @@ fn run_worker(
             model,
             prompt: task.prompt.clone(),
             worktree,
+            commit,
             thread_id,
             status: status.to_string(),
             text,
@@ -415,6 +436,7 @@ fn run_with_worker_bin(
                             model: coordinator_model.to_string(),
                             prompt: String::new(),
                             worktree: None,
+                            commit: None,
                             thread_id: None,
                             status: "failed".into(),
                             text: None,
@@ -439,6 +461,7 @@ fn run_with_worker_bin(
             &task.prompt,
             task.worktree.as_ref().map(|worktree| worktree.path.to_string_lossy().to_string()).as_deref(),
             task.worktree.as_ref().map(|worktree| worktree.branch.as_str()),
+            task.commit.as_deref(),
             task.thread_id.as_deref(),
             &task.status,
             task.text.as_deref(),
@@ -509,6 +532,12 @@ pub fn render(report: &RunReport) -> String {
                 worktree.branch
             ));
         }
+        if let Some(commit) = &task.commit {
+            lines.push(format!(
+                "      commit: {}",
+                &commit[..8.min(commit.len())]
+            ));
+        }
         if let Some(text) = &task.text {
             let preview: Vec<&str> = text.lines().take(3).collect();
             if !preview.is_empty() {
@@ -537,6 +566,7 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
                 "thread_id": task.thread_id,
                 "text": task.text,
                 "error": task.error,
+                "commit": task.commit,
                 "worktree": task.worktree.as_ref().map(|worktree| serde_json::json!({
                     "path": worktree.path.display().to_string(),
                     "branch": worktree.branch,
@@ -594,7 +624,7 @@ mod tests {
         let path = root.join("fake-baton");
         std::fs::write(
             &path,
-            "#!/bin/sh\nprintf '%s\\n' '{\"schema_version\":1,\"thread_id\":\"fake-thread\",\"ok\":true,\"phase\":\"completed\",\"error\":null,\"text\":\"FAKE_OK\"}'\n",
+            "#!/bin/sh\ncd \"$2\" || exit 1\nprintf 'edited by worker\\n' > worker-output.txt\nprintf '%s\\n' '{\"schema_version\":1,\"thread_id\":\"fake-thread\",\"ok\":true,\"phase\":\"completed\",\"error\":null,\"text\":\"FAKE_OK\"}'\n",
         )
         .unwrap();
         #[cfg(unix)]
@@ -649,5 +679,31 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, "completed");
         assert_eq!(tasks[0].thread_id.as_deref(), Some("fake-thread"));
+        let commit = report.tasks[0]
+            .commit
+            .as_ref()
+            .expect("worker changes are committed");
+        assert_eq!(commit.len(), 40);
+        assert_eq!(tasks[0].commit_sha.as_deref(), Some(commit.as_str()));
+        let worktree = report.tasks[0].worktree.as_ref().unwrap();
+        let status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&worktree.path)
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "worker changes are committed and the worktree is clean"
+        );
+        let log = Command::new("git")
+            .args(["log", "-1", "--pretty=%s"])
+            .current_dir(&worktree.path)
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&log.stdout).trim(),
+            "baton worker: worker one"
+        );
+        assert!(worktree.path.join("worker-output.txt").is_file());
     }
 }

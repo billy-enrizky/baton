@@ -1,10 +1,21 @@
 use clap::{Parser, Subcommand};
 
+const QUICK_START: &str = "\
+Start here:
+  baton                              open the interactive workspace
+  baton \"fix the failing test\"        start with a prompt
+  baton exec \"summarize this repo\"    one non-interactive turn
+  baton orchestrate \"split this task\" workers in isolated worktrees
+  baton doctor                       check installed harnesses and config
+
+Inside the workspace, type what you want to do, or /help for common paths.";
+
 #[derive(Parser, Clone)]
 #[command(
     name = "baton",
     version,
     about = "One terminal CLI for every coding agent harness. Same thread, any model, native prompt caching.",
+    after_help = QUICK_START,
     disable_help_subcommand = true
 )]
 pub struct Cli {
@@ -74,6 +85,7 @@ pub enum Commands {
     },
     /// Update baton to the latest version
     Update,
+    /// Open the interactive workspace (default)
     Chat,
     /// Serve the local thread store over MCP stdio for coding agents
     Mcp,
@@ -83,6 +95,7 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Start a new thread with a title
     New {
         title: Vec<String>,
     },
@@ -92,7 +105,7 @@ pub enum Commands {
         /// Copy only messages and turns through this completed turn
         #[arg(long)]
         turn: Option<i64>,
-        /// Fork the provider's native session when supported (currently Codex)
+        /// Fork the provider's native session when supported (Codex and OpenCode)
         #[arg(long)]
         native: bool,
         /// Emit a JSON object instead of lines
@@ -161,32 +174,39 @@ pub enum Commands {
         /// Remove this turn and every later turn
         #[arg(long)]
         turn: i64,
-        /// Also revert the provider's native history when supported (currently Codex)
+        /// Also revert the provider's native history when supported (Codex and OpenCode)
         #[arg(long)]
         native: bool,
         /// Emit a JSON object instead of lines
         #[arg(long)]
         json: bool,
     },
+    /// Import recent native provider sessions as threads
     Import,
+    /// List checkpoints for a thread
     Checkpoints {
         thread_id: String,
     },
+    /// Show a checkpoint diff against the working tree
     Diff {
         thread_id: String,
         turn: Option<i64>,
     },
+    /// Restore a checkpoint into the working tree
     Restore {
         thread_id: String,
         turn: i64,
     },
+    /// Show token usage and cache hit rates
     Usage {
         thread_id: Option<String>,
     },
+    /// Show or change a provider billing mode
     Auth {
         provider: Option<String>,
         mode: Option<String>,
     },
+    /// Sign in to a provider
     Login {
         provider: String,
     },
@@ -265,6 +285,18 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn help_includes_a_quick_start() {
+        let error = match Cli::try_parse_from(["baton", "--help"]) {
+            Ok(_) => panic!("--help should return a display error"),
+            Err(error) => error,
+        };
+        let text = error.to_string();
+        assert!(text.contains("Start here:"), "{text}");
+        assert!(text.contains("baton orchestrate"), "{text}");
+        assert!(text.contains("baton doctor"), "{text}");
     }
 
     #[test]

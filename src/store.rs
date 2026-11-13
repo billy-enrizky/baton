@@ -1570,6 +1570,16 @@ impl BatonStore {
         Ok(rows)
     }
 
+    pub fn shipped_worktree_branches(&self) -> Result<Vec<String>> {
+        let mut statement = self.db.prepare(
+            "SELECT DISTINCT branch FROM orchestration_tasks WHERE pr_url IS NOT NULL AND branch IS NOT NULL",
+        )?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn list_orchestration_tasks(&self, run_id: &str) -> Result<Vec<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
             "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",

@@ -47,6 +47,54 @@ fn default_session_mode_is_orchestrate_and_config_can_opt_out() {
 }
 
 #[test]
+fn shipped_worktree_branches_are_only_the_ones_with_pr_urls() {
+    let store = BatonStore::memory().unwrap();
+    store
+        .create_orchestration_run(
+            "run-1",
+            "goal",
+            ProviderId::Codex,
+            "model",
+            None,
+            "{}",
+            false,
+        )
+        .unwrap();
+    for (id, branch, pr) in [
+        ("task-1", "baton/run-1/one", Some("https://example.test/pr/1")),
+        ("task-2", "baton/run-1/two", None),
+    ] {
+        store
+            .add_orchestration_task(
+                id,
+                "run-1",
+                1,
+                id,
+                ProviderId::Codex,
+                "model",
+                "prompt",
+                Some("/tmp/worktree"),
+                Some(branch),
+                Some("commit"),
+                None,
+                "completed",
+                None,
+                None,
+                "now",
+                Some("now"),
+            )
+            .unwrap();
+        if let Some(pr) = pr {
+            store.mark_orchestration_task_pr(id, pr).unwrap();
+        }
+    }
+    assert_eq!(
+        store.shipped_worktree_branches().unwrap(),
+        vec!["baton/run-1/one".to_string()]
+    );
+}
+
+#[test]
 fn store_crud_and_thread_lifecycle() {
     let store = BatonStore::memory().unwrap();
     let thread = store

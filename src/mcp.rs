@@ -44,7 +44,7 @@ impl McpServer {
                     "version": env!("CARGO_PKG_VERSION"),
                     "title": "Baton thread state"
                 },
-                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. baton_fork creates a new thread from an existing conversation; set native=true for a Codex native fork."
+                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. baton_fork creates a new thread from an existing conversation; set native=true for a Codex or OpenCode native fork."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
@@ -341,7 +341,7 @@ impl McpServer {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()?;
-                    runtime.block_on(crate::provider_runtime::fork_codex_session(
+                    runtime.block_on(crate::provider_runtime::fork_native_session(
                         &self.store,
                         &self.home,
                         &thread,
@@ -354,10 +354,10 @@ impl McpServer {
                 let forked = self
                     .store
                     .fork_thread_through_turn(&thread.id, &title, turn)?;
-                if let Some((native_id, model)) = native_session.as_ref() {
+                if let Some((native_provider, native_id, model)) = native_session.as_ref() {
                     self.store.upsert_provider_session(
                         &forked.id,
-                        crate::types::ProviderId::Codex,
+                        *native_provider,
                         native_id,
                         Some(model.clone()),
                         None,
@@ -373,7 +373,10 @@ impl McpServer {
                     "model": forked.current_model,
                     "through_turn": turn,
                     "native": native,
-                    "native_session_id": native_session.as_ref().map(|(id, _)| id),
+                    "native_session_provider": native_session
+                        .as_ref()
+                        .map(|(provider, _, _)| provider.as_str()),
+                    "native_session_id": native_session.as_ref().map(|(_, id, _)| id),
                 }))
             }
             _ => anyhow::bail!("unknown baton tool {name}"),

@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::adapters::opencode::{OpenCodeAdapter, OpenCodeChild, OpenCodeSpawner};
 use crate::adapters::{
     BatonAdapter, CodexAdapter, ForkSessionInput, RevertSessionInput, TransportHalves,
 };
@@ -66,6 +67,126 @@ pub fn build_codex_adapter_with_recorder(
     Arc::new(tokio::sync::Mutex::new(
         Box::new(CodexAdapter::new(spawner)) as Box<dyn BatonAdapter>,
     ))
+}
+
+pub fn build_opencode_adapter(store: &SharedStore, cwd: &PathBuf) -> SharedAdapter {
+    let recorder = ProcessRecorder::new(store.clone(), cwd.to_string_lossy().to_string());
+    build_opencode_adapter_with_recorder(cwd, recorder)
+}
+
+pub fn build_opencode_adapter_with_recorder(
+    _cwd: &PathBuf,
+    recorder: ProcessRecorder,
+) -> SharedAdapter {
+    let recorder_for_spawner = recorder.clone();
+    let spawner: OpenCodeSpawner = Arc::new(
+        move |_auth_env: &[(String, String)]| -> Result<OpenCodeChild> {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+            let port = listener.local_addr()?.port();
+            drop(listener);
+            let password = format!(
+                "{}{}",
+                uuid::Uuid::new_v4().simple(),
+                uuid::Uuid::new_v4().simple()
+            );
+            let mut command = tokio::process::Command::new("opencode");
+            command.args(["serve", "--hostname=127.0.0.1", "--port", &port.to_string()]);
+            command.env("OPENCODE_PASSWORD", &password);
+            command.env("OPENCODE_SERVER_PASSWORD", &password);
+            command.env("OPENCODE_CONFIG_CONTENT", "{}");
+            command.stdin(std::process::Stdio::null());
+            command.stdout(std::process::Stdio::piped());
+            command.stderr(std::process::Stdio::null());
+            // The server never sees stdin EOF (it is null), so it must die with baton.
+            command.kill_on_drop(true);
+            let mut child = command.spawn()?;
+            let pid = child
+                .id()
+                .ok_or_else(|| anyhow::anyhow!("opencode did not expose a process id"))?;
+            let command_line = process::command_line(pid).unwrap_or_else(|| {
+                format!("opencode serve --hostname=127.0.0.1 --port {port}")
+            });
+            let process_start = process::process_start(pid);
+            if let Err(error) = recorder_for_spawner.record(
+                pid,
+                ProviderId::OpenCode,
+                Some(port),
+                &command_line,
+                process_start.as_deref(),
+            ) {
+                let _ = child.start_kill();
+                return Err(error);
+            }
+            Ok(OpenCodeChild {
+                port,
+                password,
+                child,
+            })
+        },
+    );
+    Arc::new(tokio::sync::Mutex::new(
+        Box::new(OpenCodeAdapter::with_recorder(spawner, recorder)) as Box<dyn BatonAdapter>,
+    ))
+}
+
+/// Fork a provider-native session when the provider supports it. Returns the
+/// provider, new native session id, and model used for the fork.
+pub async fn fork_native_session(
+    store: &BatonStore,
+    home: &Path,
+    source: &ThreadRow,
+    through_turn: Option<i64>,
+    recorder: ProcessRecorder,
+) -> Result<Option<(ProviderId, String, String)>> {
+    match source.current_provider {
+        ProviderId::Codex => Ok(fork_codex_session(store, home, source, through_turn, recorder)
+            .await?
+            .map(|(id, model)| (ProviderId::Codex, id, model))),
+        ProviderId::OpenCode => Ok(fork_opencode_session(store, home, source, through_turn, recorder)
+            .await?
+            .map(|(id, model)| (ProviderId::OpenCode, id, model))),
+        provider => anyhow::bail!(
+            "native fork is not implemented for {provider}; omit --native to fork this transcript"
+        ),
+    }
+}
+
+async fn fork_opencode_session(
+    store: &BatonStore,
+    home: &Path,
+    source: &ThreadRow,
+    through_turn: Option<i64>,
+    recorder: ProcessRecorder,
+) -> Result<Option<(String, String)>> {
+    if through_turn.is_some() {
+        anyhow::bail!("opencode native fork supports whole sessions only; omit --turn");
+    }
+    let session = store
+        .get_provider_session(&source.id, ProviderId::OpenCode)?
+        .ok_or_else(|| anyhow::anyhow!("source thread has no opencode session"))?;
+    let resolved = resolve_config(home, Path::new(&source.cwd));
+    let provider_config = resolved.for_provider(ProviderId::OpenCode);
+    let model = source
+        .current_model
+        .clone()
+        .unwrap_or_else(|| provider_config.model.clone());
+    let adapter = build_opencode_adapter_with_recorder(&PathBuf::from(&source.cwd), recorder);
+    let mut adapter = adapter.lock().await;
+    let native = adapter
+        .fork_session(ForkSessionInput {
+            cwd: source.cwd.clone(),
+            model: model.clone(),
+            session: NativeSessionRef {
+                native_session_id: session.native_session_id,
+                rollout_path: session.rollout_path,
+            },
+            auth_env: provider_auth_env(provider_config),
+            last_turn_id: None,
+        })
+        .await;
+    let _ = adapter.dispose().await;
+    let native = native?;
+    Ok(native.map(|id| (id, model)))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,6 +333,48 @@ mod tests {
     use super::*;
     use crate::store::NewThread;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn native_fork_rejects_unsupported_providers_and_missing_sessions() {
+        let store = BatonStore::memory().unwrap();
+        let cursor = store
+            .create_thread(NewThread {
+                title: "cursor".to_string(),
+                cwd: "/tmp/project".to_string(),
+                current_provider: ProviderId::Cursor,
+                current_model: None,
+            })
+            .unwrap();
+        let error = fork_native_session(
+            &store,
+            Path::new("/tmp"),
+            &cursor,
+            None,
+            ProcessRecorder::disabled(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("not implemented for cursor"));
+
+        let opencode = store
+            .create_thread(NewThread {
+                title: "opencode".to_string(),
+                cwd: "/tmp/project".to_string(),
+                current_provider: ProviderId::OpenCode,
+                current_model: None,
+            })
+            .unwrap();
+        let error = fork_native_session(
+            &store,
+            Path::new("/tmp"),
+            &opencode,
+            None,
+            ProcessRecorder::disabled(),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains("source thread has no opencode session"));
+    }
 
     #[test]
     fn pending_native_rewind_finishes_the_store_without_the_provider() {

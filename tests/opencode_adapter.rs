@@ -1,9 +1,9 @@
 use baton::adapters::opencode::{OpenCodeAdapter, OpenCodeChild, OpenCodeSpawner};
-use baton::adapters::{BatonAdapter, ModelListInput};
+use baton::adapters::{BatonAdapter, ForkSessionInput, ModelListInput};
 use baton::process::ProcessRecorder;
 use baton::store::BatonStore;
 use baton::types::PermissionMode;
-use baton::types::ProviderId;
+use baton::types::{NativeSessionRef, ProviderId};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -109,6 +109,13 @@ fn respond(
                 .push((path.to_string(), body.to_string()));
             respond_json(&mut stream, "204 No Content", "")
         }
+        "/session/ses_test/fork" => {
+            requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.to_string()));
+            respond_json(&mut stream, "200 OK", r#"{"id":"ses_fork"}"#)
+        }
         "/api/event" => {
             if release.lock().unwrap().is_none() {
                 respond_json(&mut stream, "503 Service Unavailable", "{\"error\":\"event stream disabled\"}");
@@ -138,6 +145,59 @@ fn respond(
         }
         _ => respond_json(&mut stream, "404 Not Found", "{}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_adapter_forks_a_whole_native_session() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_server = requests.clone();
+    std::thread::spawn(move || serve_opencode(listener, Arc::new(Mutex::new(None)), requests_for_server));
+
+    let spawner: OpenCodeSpawner = Arc::new(move |_auth_env: &[(String, String)]| {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        Ok(OpenCodeChild { port, password: "pw".to_string(), child })
+    });
+    let mut adapter = OpenCodeAdapter::new(spawner);
+    let forked = adapter
+        .fork_session(ForkSessionInput {
+            cwd: "/work".into(),
+            model: "myprovider/model-a".into(),
+            session: NativeSessionRef {
+                native_session_id: "ses_test".into(),
+                rollout_path: None,
+            },
+            auth_env: vec![],
+            last_turn_id: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(forked.as_deref(), Some("ses_fork"));
+    assert!(requests
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(path, _)| path == "/session/ses_test/fork"));
+
+    let error = adapter
+        .fork_session(ForkSessionInput {
+            cwd: "/work".into(),
+            model: "myprovider/model-a".into(),
+            session: NativeSessionRef {
+                native_session_id: "ses_test".into(),
+                rollout_path: None,
+            },
+            auth_env: vec![],
+            last_turn_id: Some("turn-1".into()),
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("whole sessions only"));
+    adapter.dispose().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

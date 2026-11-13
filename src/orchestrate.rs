@@ -46,6 +46,73 @@ pub struct WorkerResult {
 }
 
 #[derive(Debug, Clone)]
+pub enum OrchestrationProgress {
+    PlanReady {
+        summary: Option<String>,
+        tasks: Vec<PlanTask>,
+    },
+    WorkerStarted {
+        index: usize,
+        title: String,
+        provider: ProviderId,
+        model: String,
+        worktree: Option<PathBuf>,
+    },
+    WorkerFinished {
+        index: usize,
+        title: String,
+        status: String,
+        commit: Option<String>,
+        error: Option<String>,
+    },
+}
+
+pub type ProgressFn<'a> = dyn Fn(OrchestrationProgress) + Send + Sync + 'a;
+
+fn emit(progress: Option<&ProgressFn<'_>>, event: OrchestrationProgress) {
+    if let Some(progress) = progress {
+        progress(event);
+    }
+}
+
+pub fn render_progress(event: &OrchestrationProgress) -> String {
+    match event {
+        OrchestrationProgress::PlanReady { summary, tasks } => format!(
+            "plan: {} worker(s){}",
+            tasks.len(),
+            summary
+                .as_ref()
+                .map(|summary| format!(" · {summary}"))
+                .unwrap_or_default()
+        ),
+        OrchestrationProgress::WorkerStarted {
+            index,
+            title,
+            provider,
+            model,
+            ..
+        } => format!("[{index}] running {title} · {provider}/{model}"),
+        OrchestrationProgress::WorkerFinished {
+            index,
+            title,
+            status,
+            commit,
+            error,
+        } => format!(
+            "[{index}] {status} {title}{}{}",
+            commit
+                .as_ref()
+                .map(|commit| format!(" · commit {}", &commit[..8.min(commit.len())]))
+                .unwrap_or_default(),
+            error
+                .as_ref()
+                .map(|error| format!(" · {error}"))
+                .unwrap_or_default()
+        ),
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct RunReport {
     pub run_id: String,
     pub goal: String,
@@ -214,6 +281,42 @@ fn run_worker(
     cwd: &Path,
     repo_root: Option<&Path>,
     worker_bin: Option<&Path>,
+    progress: Option<&ProgressFn<'_>>,
+    permission_mode: PermissionMode,
+) -> (usize, WorkerResult) {
+    let (index, result) = run_worker_inner(
+        task,
+        index,
+        run_id,
+        home,
+        cwd,
+        repo_root,
+        worker_bin,
+        progress,
+        permission_mode,
+    );
+    emit(
+        progress,
+        OrchestrationProgress::WorkerFinished {
+            index: index + 1,
+            title: result.title.clone(),
+            status: result.status.clone(),
+            commit: result.commit.clone(),
+            error: result.error.clone(),
+        },
+    );
+    (index, result)
+}
+
+fn run_worker_inner(
+    task: &PlanTask,
+    index: usize,
+    run_id: &str,
+    home: &Path,
+    cwd: &Path,
+    repo_root: Option<&Path>,
+    worker_bin: Option<&Path>,
+    progress: Option<&ProgressFn<'_>>,
     permission_mode: PermissionMode,
 ) -> (usize, WorkerResult) {
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -255,6 +358,16 @@ fn run_worker(
         .or_else(|| std::env::current_exe().ok())
         .unwrap_or_else(|| PathBuf::from("baton"));
     let effective_prompt = format!("{WORKER_PREAMBLE}\n\n{}", task.prompt);
+    emit(
+        progress,
+        OrchestrationProgress::WorkerStarted {
+            index: index + 1,
+            title: task.title.clone(),
+            provider,
+            model: model.clone(),
+            worktree: worktree.as_ref().map(|worktree| worktree.path.clone()),
+        },
+    );
     let mut command = Command::new(binary);
     command
         .arg("-C")
@@ -596,7 +709,34 @@ pub fn run(
     store: &BatonStore,
     permission_mode: PermissionMode,
 ) -> Result<RunReport> {
-    run_with_worker_bin(
+    run_with_progress(
+        goal,
+        cwd,
+        home,
+        coordinator_provider,
+        coordinator_model,
+        max_tasks,
+        plan_path,
+        store,
+        permission_mode,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_progress(
+    goal: &str,
+    cwd: &Path,
+    home: &Path,
+    coordinator_provider: ProviderId,
+    coordinator_model: &str,
+    max_tasks: usize,
+    plan_path: Option<&Path>,
+    store: &BatonStore,
+    permission_mode: PermissionMode,
+    progress: Option<&ProgressFn<'_>>,
+) -> Result<RunReport> {
+    run_with_worker_bin_and_progress(
         goal,
         cwd,
         home,
@@ -606,11 +746,13 @@ pub fn run(
         plan_path,
         store,
         None,
+        progress,
         permission_mode,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 fn run_with_worker_bin(
     goal: &str,
     cwd: &Path,
@@ -621,6 +763,35 @@ fn run_with_worker_bin(
     plan_path: Option<&Path>,
     store: &BatonStore,
     worker_bin: Option<&Path>,
+    permission_mode: PermissionMode,
+) -> Result<RunReport> {
+    run_with_worker_bin_and_progress(
+        goal,
+        cwd,
+        home,
+        coordinator_provider,
+        coordinator_model,
+        max_tasks,
+        plan_path,
+        store,
+        worker_bin,
+        None,
+        permission_mode,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_with_worker_bin_and_progress(
+    goal: &str,
+    cwd: &Path,
+    home: &Path,
+    coordinator_provider: ProviderId,
+    coordinator_model: &str,
+    max_tasks: usize,
+    plan_path: Option<&Path>,
+    store: &BatonStore,
+    worker_bin: Option<&Path>,
+    progress: Option<&ProgressFn<'_>>,
     permission_mode: PermissionMode,
 ) -> Result<RunReport> {
     if max_tasks == 0 {
@@ -652,6 +823,13 @@ fn run_with_worker_bin(
         summary.as_deref(),
         &serde_json::to_string(&plan)?,
     )?;
+    emit(
+        progress,
+        OrchestrationProgress::PlanReady {
+            summary: summary.clone(),
+            tasks: plan.tasks.clone(),
+        },
+    );
     let mut results = std::thread::scope(|scope| {
         let handles = plan
             .tasks
@@ -672,6 +850,7 @@ fn run_with_worker_bin(
                         &cwd,
                         repo_root.as_deref(),
                         worker_bin.as_deref(),
+                        progress,
                         permission_mode,
                     )
                 })
@@ -905,6 +1084,14 @@ mod tests {
     }
 
     fn run_fixture(plan: &str, worker_body: &str) -> (tempfile::TempDir, tempfile::TempDir, BatonStore, RunReport) {
+        run_fixture_with_progress(plan, worker_body, None)
+    }
+
+    fn run_fixture_with_progress(
+        plan: &str,
+        worker_body: &str,
+        progress: Option<&ProgressFn<'_>>,
+    ) -> (tempfile::TempDir, tempfile::TempDir, BatonStore, RunReport) {
         let repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             let output = Command::new("git").args(args).current_dir(repo.path()).output().unwrap();
@@ -921,7 +1108,7 @@ mod tests {
         let plan_path = home.path().join("plan.json");
         std::fs::write(&plan_path, plan).unwrap();
         let store = BatonStore::memory().unwrap();
-        let report = run_with_worker_bin(
+        let report = run_with_worker_bin_and_progress(
             "test goal",
             repo.path(),
             home.path(),
@@ -931,10 +1118,89 @@ mod tests {
             Some(&plan_path),
             &store,
             Some(&worker),
+            progress,
             PermissionMode::Default,
         )
         .unwrap();
         (repo, home, store, report)
+    }
+
+    #[test]
+    fn progress_lines_are_readable() {
+        let plan = render_progress(&OrchestrationProgress::PlanReady {
+            summary: Some("two workers".to_string()),
+            tasks: vec![
+                PlanTask {
+                    title: "a".to_string(),
+                    provider: "codex".to_string(),
+                    prompt: "a".to_string(),
+                },
+                PlanTask {
+                    title: "b".to_string(),
+                    provider: "claude".to_string(),
+                    prompt: "b".to_string(),
+                },
+            ],
+        });
+        assert_eq!(plan, "plan: 2 worker(s) · two workers");
+        let started = render_progress(&OrchestrationProgress::WorkerStarted {
+            index: 1,
+            title: "first".to_string(),
+            provider: ProviderId::Codex,
+            model: "gpt-test".to_string(),
+            worktree: None,
+        });
+        assert_eq!(started, "[1] running first · codex/gpt-test");
+        let finished = render_progress(&OrchestrationProgress::WorkerFinished {
+            index: 1,
+            title: "first".to_string(),
+            status: "completed".to_string(),
+            commit: Some("0123456789abcdef".to_string()),
+            error: None,
+        });
+        assert_eq!(finished, "[1] completed first · commit 01234567");
+    }
+
+    #[test]
+    fn emits_plan_started_and_finished_progress() {
+        let plan = r#"{"summary":"two workers","tasks":[{"title":"first task","provider":"codex","prompt":"do one"},{"title":"second task","provider":"codex","prompt":"do two"}]}"#;
+        let events = std::sync::Mutex::new(Vec::new());
+        let progress = |event: OrchestrationProgress| {
+            events.lock().unwrap().push(event);
+        };
+        let (_repo, _home, _store, report) = run_fixture_with_progress(
+            plan,
+            "printf 'edited by worker\n' > worker-output.txt",
+            Some(&progress as &ProgressFn<'_>),
+        );
+        assert_eq!(report.tasks.len(), 2);
+        let events = events.into_inner().unwrap();
+        match &events[0] {
+            OrchestrationProgress::PlanReady { tasks, .. } => assert_eq!(tasks.len(), 2),
+            other => panic!("first progress event was {other:?}"),
+        }
+        let started: Vec<usize> = events
+            .iter()
+            .filter_map(|event| match event {
+                OrchestrationProgress::WorkerStarted { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        let finished: Vec<usize> = events
+            .iter()
+            .filter_map(|event| match event {
+                OrchestrationProgress::WorkerFinished { index, status, .. }
+                    if status == "completed" =>
+                {
+                    Some(*index)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started.len(), 2);
+        assert!(started.contains(&1) && started.contains(&2));
+        assert_eq!(finished.len(), 2);
+        assert!(finished.contains(&1) && finished.contains(&2));
     }
 
     #[test]

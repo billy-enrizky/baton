@@ -13,7 +13,7 @@ use crate::adapters::{AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
 use crate::config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
-use crate::orchestrate::{self, IntegrateReport, RunReport};
+use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
@@ -161,8 +161,19 @@ struct MultiView {
 enum OrchestrationEvent {
     Done(Box<RunReport>),
     Failed(String),
+    Progress(OrchestrationProgress),
     Integrated(Box<IntegrateReport>),
     IntegrateFailed(String),
+}
+
+struct OrchestrationWorkerView {
+    index: usize,
+    title: String,
+    provider: ProviderId,
+    model: String,
+    status: String,
+    worktree: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -252,6 +263,7 @@ pub struct TuiState {
     transcript_total: std::cell::Cell<usize>,
     model_request_id: u64,
     orchestration_pending: bool,
+    orchestration_workers: Vec<OrchestrationWorkerView>,
     orchestration_report: Option<RunReport>,
     orchestration_scroll: usize,
     orchestration_selected: usize,
@@ -334,6 +346,7 @@ pub fn run_tui(
         transcript_total: std::cell::Cell::new(0),
         model_request_id: 0,
         orchestration_pending: false,
+        orchestration_workers: Vec::new(),
         orchestration_report: None,
         orchestration_scroll: 0,
         orchestration_selected: 0,
@@ -802,6 +815,7 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
     match event {
         OrchestrationEvent::Done(report) => {
             state.orchestration_pending = false;
+            state.orchestration_workers.clear();
             state.orchestration_scroll = 0;
             state.notice = Some(format!(
                 "orchestration {}: {} worker(s)",
@@ -812,11 +826,65 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
         }
         OrchestrationEvent::Failed(error) => {
             state.orchestration_pending = false;
+            state.orchestration_workers.clear();
             state.orchestration_report = None;
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
             state.notice = Some(format!("orchestration failed: {error}"));
         }
+        OrchestrationEvent::Progress(progress) => match progress {
+            OrchestrationProgress::PlanReady { tasks, .. } => {
+                state.orchestration_workers = tasks
+                    .iter()
+                    .enumerate()
+                    .map(|(index, task)| OrchestrationWorkerView {
+                        index: index + 1,
+                        title: task.title.clone(),
+                        provider: ProviderId::parse(&task.provider)
+                            .unwrap_or(ProviderId::Codex),
+                        model: String::new(),
+                        status: "queued".to_string(),
+                        worktree: None,
+                        error: None,
+                    })
+                    .collect();
+                state.notice = Some(format!(
+                    "orchestrating: {} worker(s) planned",
+                    state.orchestration_workers.len()
+                ));
+            }
+            OrchestrationProgress::WorkerStarted {
+                index,
+                title,
+                provider,
+                model,
+                worktree,
+            } => {
+                let view = orchestration_worker(state, index, &title);
+                view.provider = provider;
+                view.model = model;
+                view.status = "running".to_string();
+                view.worktree = worktree.map(|path| path.display().to_string());
+            }
+            OrchestrationProgress::WorkerFinished {
+                index,
+                title,
+                status,
+                commit,
+                error,
+            } => {
+                let view = orchestration_worker(state, index, &title);
+                view.status = if status == "completed" {
+                    commit
+                        .as_ref()
+                        .map(|commit| format!("completed · {}", &commit[..8.min(commit.len())]))
+                        .unwrap_or_else(|| "completed".to_string())
+                } else {
+                    status
+                };
+                view.error = error;
+            }
+        },
         OrchestrationEvent::Integrated(report) => {
             state.orchestration_integrating = false;
             state.orchestration_confirm_integrate = false;
@@ -841,6 +909,31 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             state.notice = Some(format!("integration failed: {error}"));
         }
     }
+}
+
+fn orchestration_worker<'a>(
+    state: &'a mut TuiState,
+    index: usize,
+    title: &str,
+) -> &'a mut OrchestrationWorkerView {
+    if let Some(position) = state
+        .orchestration_workers
+        .iter()
+        .position(|worker| worker.index == index)
+    {
+        return &mut state.orchestration_workers[position];
+    }
+    state.orchestration_workers.push(OrchestrationWorkerView {
+        index,
+        title: title.to_string(),
+        provider: ProviderId::Codex,
+        model: String::new(),
+        status: "queued".to_string(),
+        worktree: None,
+        error: None,
+    });
+    let position = state.orchestration_workers.len() - 1;
+    &mut state.orchestration_workers[position]
 }
 
 fn start_integration(state: &mut TuiState) {
@@ -953,13 +1046,20 @@ fn start_orchestration(
         }
     });
     state.orchestration_pending = true;
+    state.orchestration_workers.clear();
     state.orchestration_report = None;
     state.orchestration_scroll = 0;
     state.notice = Some("orchestrating: coordinator planning...".into());
     let sender = state.orchestration_sender.clone();
     std::thread::spawn(move || {
+        let progress_sender = std::sync::Mutex::new(sender.clone());
+        let progress = move |event: OrchestrationProgress| {
+            if let Ok(sender) = progress_sender.lock() {
+                let _ = sender.send(OrchestrationEvent::Progress(event));
+            }
+        };
         let result = BatonStore::open(&home.join("baton.sqlite")).and_then(|store| {
-            orchestrate::run(
+            orchestrate::run_with_progress(
                 &goal,
                 std::path::Path::new(&cwd),
                 &home,
@@ -969,6 +1069,7 @@ fn start_orchestration(
                 plan_path.as_deref(),
                 &store,
                 permission_mode,
+                Some(&progress as &orchestrate::ProgressFn<'_>),
             )
         });
         let event = match result {
@@ -4002,7 +4103,12 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         return;
     }
 
-    if state.history.is_empty() && !state.running && state.streaming_text.is_empty() && area.height >= 12 {
+    if state.history.is_empty()
+        && !state.running
+        && state.streaming_text.is_empty()
+        && !state.orchestration_pending
+        && area.height >= 12
+    {
         hide_transcript_view(state);
         let logo_height = LOGO_ROWS.len() as u16 + 2;
         let top = area.height.saturating_sub(logo_height) / 2;
@@ -4137,12 +4243,43 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         all_lines.push(Line::from(vec![
             Span::styled(spinner, Style::default().fg(COLORS.secondary)),
             Span::raw(" "),
-            Span::styled(
-                "Orchestrating: coordinator planning and workers running",
-                Style::default().fg(COLORS.secondary),
-            ),
+            Span::styled("Orchestrating", Style::default().fg(COLORS.secondary)),
         ]));
         live_lines += 1;
+        for worker in &state.orchestration_workers {
+            let (marker, color) = if worker.status.starts_with("completed") {
+                ("✓", COLORS.success)
+            } else if worker.status == "failed" {
+                ("✗", COLORS.error)
+            } else if worker.status == "running" {
+                (spinner, COLORS.accent)
+            } else {
+                ("·", COLORS.muted)
+            };
+            let model = if worker.model.is_empty() {
+                worker.provider.to_string()
+            } else {
+                format!("{}/{}", worker.provider, worker.model)
+            };
+            let error = worker
+                .error
+                .as_deref()
+                .map(|error| format!(" · {error}"))
+                .unwrap_or_default();
+            all_lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(marker, Style::default().fg(color)),
+                Span::raw(" "),
+                Span::styled(
+                    format!(
+                        "[{}] {} · {} · {}{}",
+                        worker.index, worker.title, model, worker.status, error
+                    ),
+                    Style::default().fg(color),
+                ),
+            ]));
+            live_lines += 1;
+        }
     }
     if live_lines > 0 {
         all_lines.push(Line::from(vec![Span::raw(" ")]));
@@ -4663,6 +4800,7 @@ mod tests {
             transcript_total: std::cell::Cell::new(0),
             model_request_id: 0,
             orchestration_pending: false,
+            orchestration_workers: Vec::new(),
             orchestration_report: None,
             orchestration_scroll: 0,
             orchestration_selected: 0,
@@ -6564,6 +6702,62 @@ mod tests {
         assert!(state.orchestration_report.is_none());
         assert_eq!(state.thread.id, worker.id, "enter switches to the worker thread");
         assert_eq!(state.thread.current_provider, ProviderId::Codex);
+    }
+
+    #[test]
+    fn orchestration_progress_renders_worker_states() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_pending = true;
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::Progress(OrchestrationProgress::PlanReady {
+                summary: Some("two workers".to_string()),
+                tasks: vec![
+                    crate::orchestrate::PlanTask {
+                        title: "first task".to_string(),
+                        provider: "codex".to_string(),
+                        prompt: "one".to_string(),
+                    },
+                    crate::orchestrate::PlanTask {
+                        title: "second task".to_string(),
+                        provider: "claude".to_string(),
+                        prompt: "two".to_string(),
+                    },
+                ],
+            }),
+        );
+        assert_eq!(state.orchestration_workers.len(), 2);
+        assert_eq!(state.orchestration_workers[0].status, "queued");
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::Progress(OrchestrationProgress::WorkerStarted {
+                index: 1,
+                title: "first task".to_string(),
+                provider: ProviderId::Codex,
+                model: "gpt-test".to_string(),
+                worktree: Some(std::path::PathBuf::from("/tmp/worktree")),
+            }),
+        );
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::Progress(OrchestrationProgress::WorkerFinished {
+                index: 2,
+                title: "second task".to_string(),
+                status: "failed".to_string(),
+                commit: None,
+                error: Some("boom".to_string()),
+            }),
+        );
+        assert_eq!(state.orchestration_workers[0].status, "running");
+        assert_eq!(state.orchestration_workers[1].status, "failed");
+        let buffer = render_state(&state, 120, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains("Orchestrating"), "{text}");
+        assert!(text.contains("[1] first task · codex/gpt-test · running"), "{text}");
+        assert!(text.contains("[2] second task"), "{text}");
+        assert!(text.contains("failed · boom"), "{text}");
     }
 
     #[test]

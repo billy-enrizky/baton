@@ -84,6 +84,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/find", "search the conversation"),
     ("/multi", "send the same prompt to multiple providers"),
     ("/orchestrate", "orchestrate mode or one-off: /orchestrate [on|off] [goal]"),
+    ("/runs", "list or reopen orchestration runs"),
     ("/queue", "show or clear queued follow-ups"),
     ("/turns", "list durable turn phases"),
     ("/status", "show thread phase, goal, queue, and adapter states"),
@@ -2688,6 +2689,56 @@ fn handle_command(
                 Err(message) => state.notice = Some(message),
             }
         }
+        "/runs" => {
+            if let Some(run_id) = args.first() {
+                let result = {
+                    let guard = store.lock().unwrap();
+                    orchestrate::report_from_rows(
+                        &guard,
+                        std::path::Path::new(&state.thread.cwd),
+                        run_id,
+                    )
+                };
+                match result {
+                    Ok(report) => {
+                        state.orchestration_report = Some(report);
+                        state.orchestration_scroll = 0;
+                        state.orchestration_selected = 0;
+                        state.orchestration_integrate_report = None;
+                        state.notice = Some(format!(
+                            "opened run {}",
+                            &run_id[..8.min(run_id.len())]
+                        ));
+                    }
+                    Err(error) => state.notice = Some(format!("cannot open run: {error}")),
+                }
+            } else {
+                let runs = store
+                    .lock()
+                    .unwrap()
+                    .list_orchestration_runs(10)
+                    .unwrap_or_default();
+                if runs.is_empty() {
+                    state.notice = Some("no orchestration runs yet".into());
+                } else {
+                    let lines = runs
+                        .iter()
+                        .map(|run| {
+                            format!(
+                                "{}  {:<9}  {}",
+                                &run.id[..8.min(run.id.len())],
+                                run.status,
+                                run.summary.as_deref().unwrap_or(&run.goal)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    state.notice = Some(format!(
+                        "recent orchestration runs:\n{lines}\n\n/runs <id> opens a report"
+                    ));
+                }
+            }
+        }
         "/status" => {
             let turns = store
                 .lock()
@@ -5204,12 +5255,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 30);
+        assert_eq!(suggestions.len(), 31);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/30"), "position indicator must reflect the selection");
+        assert!(text.contains("11/31"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -6963,6 +7014,72 @@ mod tests {
             skipped: Vec::new(),
             conflict: None,
         }
+    }
+
+    #[test]
+    fn runs_command_lists_and_reopens_stored_runs() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let now = "2026-11-12T00:00:00.000Z";
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .create_orchestration_run(
+                    "run-12345678",
+                    "fix the bug",
+                    ProviderId::Codex,
+                    "model-1",
+                    Some("one worker"),
+                    r#"{"tasks":[]}"#,
+                    false,
+                )
+                .unwrap();
+            guard
+                .add_orchestration_task(
+                    "task-1",
+                    "run-12345678",
+                    1,
+                    "answer",
+                    ProviderId::Codex,
+                    "model-1",
+                    "fix it",
+                    None,
+                    None,
+                    None,
+                    None,
+                    "completed",
+                    Some("fixed"),
+                    None,
+                    now,
+                    Some(now),
+                )
+                .unwrap();
+            guard
+                .finish_orchestration_run("run-12345678", "completed")
+                .unwrap();
+        }
+
+        handle_command(&mut state, &store, &engine_command_sender, "/runs");
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("run-1234"),
+            "notice: {:?}",
+            state.notice
+        );
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/runs run-1234",
+        );
+        let report = state.orchestration_report.as_ref().expect("report opened");
+        assert_eq!(report.run_id, "run-12345678");
+        assert_eq!(report.status, "completed");
+        assert_eq!(report.tasks.len(), 1);
+        assert_eq!(report.tasks[0].title, "answer");
+        assert_eq!(report.tasks[0].text.as_deref(), Some("fixed"));
     }
 
     #[test]

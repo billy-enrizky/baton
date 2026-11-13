@@ -529,6 +529,7 @@ fn main_result() -> Result<()> {
                                 "coordinator_provider": run.coordinator_provider.as_str(),
                                 "coordinator_model": run.coordinator_model,
                                 "summary": run.summary,
+                                "dirty_source": run.dirty_source,
                                 "created_at": run.created_at,
                                 "finished_at": run.finished_at,
                             })).collect::<Vec<_>>(),

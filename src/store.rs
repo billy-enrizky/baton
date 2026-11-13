@@ -52,6 +52,7 @@ pub struct OrchestrationRunRow {
     pub summary: Option<String>,
     pub plan_json: String,
     pub status: String,
+    pub dirty_source: bool,
     pub created_at: String,
     pub finished_at: Option<String>,
 }
@@ -273,6 +274,7 @@ CREATE TABLE IF NOT EXISTS orchestration_runs (
   summary TEXT,
   plan_json TEXT NOT NULL,
   status TEXT NOT NULL,
+  dirty_source INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   finished_at TEXT
 );
@@ -419,6 +421,7 @@ impl BatonStore {
         ensure_column(&db, "orchestration_tasks", "commit_sha", "TEXT")?;
         ensure_column(&db, "orchestration_tasks", "merged_at", "TEXT")?;
         ensure_column(&db, "orchestration_tasks", "position", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&db, "orchestration_runs", "dirty_source", "INTEGER NOT NULL DEFAULT 0")?;
         Ok(BatonStore { db })
     }
 
@@ -1455,9 +1458,10 @@ impl BatonStore {
         coordinator_model: &str,
         summary: Option<&str>,
         plan_json: &str,
+        dirty_source: bool,
     ) -> Result<()> {
         self.db.execute(
-            "INSERT INTO orchestration_runs (id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
+            "INSERT INTO orchestration_runs (id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)",
             params![
                 id,
                 goal,
@@ -1465,6 +1469,7 @@ impl BatonStore {
                 coordinator_model,
                 summary,
                 plan_json,
+                dirty_source as i64,
                 now_iso(),
             ],
         )?;
@@ -1532,7 +1537,7 @@ impl BatonStore {
 
     pub fn list_orchestration_runs(&self, limit: usize) -> Result<Vec<OrchestrationRunRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, created_at, finished_at FROM orchestration_runs ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at FROM orchestration_runs ORDER BY created_at DESC LIMIT ?",
         )?;
         let rows = statement
             .query_map(params![limit as i64], |row| {
@@ -1545,8 +1550,9 @@ impl BatonStore {
                     summary: row.get(4)?,
                     plan_json: row.get(5)?,
                     status: row.get(6)?,
-                    created_at: row.get(7)?,
-                    finished_at: row.get(8)?,
+                    dirty_source: row.get::<_, i64>(7)? != 0,
+                    created_at: row.get(8)?,
+                    finished_at: row.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

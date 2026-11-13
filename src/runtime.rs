@@ -785,9 +785,20 @@ async fn execute_turn(
     let failure_for_thread = failure_slot.clone();
     let interrupted_for_thread = interrupted_slot.clone();
     let tools_for_thread = tools_slot.clone();
+    let store_for_forwarder = store.clone();
     let forwarder = std::thread::spawn(move || {
         for event in event_receiver {
             match &event {
+                TurnEvent::ProviderTurnId { id } => {
+                    if let Ok(store) = store_for_forwarder.lock() {
+                        let _ = store.set_turn_provider_id(
+                            &event_thread_id,
+                            turn,
+                            id,
+                        );
+                    }
+                    let _ = tui_sender.send((event_thread_id.clone(), event));
+                }
                 TurnEvent::TurnCompleted { final_text, usage, native_session_id, rollout_path } => {
                     *outcome_for_thread.lock().unwrap() = Some(TurnOutcome {
                         final_text: final_text.clone(),
@@ -974,6 +985,9 @@ mod tests {
             match self.mode {
                 AdapterMode::Silent => drop(emit),
                 AdapterMode::Complete => {
+                    let _ = emit.send(TurnEvent::ProviderTurnId {
+                        id: "provider-turn-1".into(),
+                    });
                     let _ = emit.send(TurnEvent::TurnCompleted {
                         final_text: "done".into(),
                         usage: None,
@@ -1975,6 +1989,7 @@ mod tests {
             .expect("turn record");
         assert_eq!(turn.phase, TurnPhase::Completed);
         assert!(turn.ended_at.is_some());
+        assert_eq!(turn.provider_turn_id.as_deref(), Some("provider-turn-1"));
         let messages = store.lock().unwrap().list_messages(&thread_id).unwrap();
         assert!(messages.iter().any(|message| message.role == "assistant" && message.text == "done"));
     }

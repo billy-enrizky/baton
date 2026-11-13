@@ -158,8 +158,26 @@ fn store_fork_can_stop_at_a_completed_turn() {
             .unwrap();
     }
     store
+        .set_turn_provider_id(&source.id, 1, "provider-turn-1")
+        .unwrap();
+    store
+        .set_turn_provider_id(&source.id, 2, "provider-turn-2")
+        .unwrap();
+    store
         .start_turn_record(&source.id, 3, ProviderId::Codex, Some("model-1"))
         .unwrap();
+
+    assert_eq!(
+        store.fork_provider_turn_id(&source.id, Some(1)).unwrap(),
+        Some("provider-turn-1".into())
+    );
+    assert_eq!(
+        store.fork_provider_turn_id(&source.id, Some(2)).unwrap(),
+        Some("provider-turn-2".into())
+    );
+    assert!(store.fork_provider_turn_id(&source.id, None).is_err());
+    assert!(store.fork_provider_turn_id(&source.id, Some(3)).is_err());
+    assert!(store.fork_provider_turn_id(&source.id, Some(99)).is_err());
 
     let first = store
         .fork_thread_through_turn(&source.id, "through one", Some(1))

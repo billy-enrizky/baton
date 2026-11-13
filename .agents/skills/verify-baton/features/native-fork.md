@@ -1,0 +1,40 @@
+# Native fork
+
+## Sub-features
+- Codex whole-thread native fork
+- Codex fork through a completed provider turn
+- New native session attached to the baton fork
+- Source thread remains unchanged
+- Unsupported provider or missing session fails with guidance
+
+## How to get to it (user POV)
+Create or select a Codex thread with a native session, then run:
+
+```sh
+baton fork -t <source> --native --json "branch"
+baton fork -t <source> --native --turn 1 --json "branch at turn 1"
+```
+
+## Driving it with the PTY/CLI harness
+A temp home has no native session. For a real proof, use a copied state directory or create one short Codex turn first:
+
+```sh
+tmp=$(mktemp -d)
+cwd=$(mktemp -d)
+BATON_HOME="$tmp" target/debug/baton -C "$cwd" exec -p codex "Reply with exactly NATIVE_FORK_OK"
+source=$(BATON_HOME="$tmp" target/debug/baton -C "$cwd" threads --json | jq -r '.[0].thread_id // .threads[0].thread_id')
+BATON_HOME="$tmp" target/debug/baton -C "$cwd" fork -t "$source" --turn 1 --native --json branch > /tmp/native-fork.json
+jq -e '.native == true and .native_session_id and .through_turn == 1' /tmp/native-fork.json
+fork=$(jq -r '.thread_id' /tmp/native-fork.json)
+BATON_HOME="$tmp" target/debug/baton -C "$cwd" -t "$fork" resume --print
+BATON_HOME="$tmp" target/debug/baton -C "$cwd" ps --json | jq -e '.processes == []'
+```
+
+The resume line must contain the same native session id returned in the fork JSON.
+
+## Gotchas
+- `--native` is Codex-only today. Claude and OpenCode fail loudly rather than silently falling back.
+- A source thread needs a Codex provider session and, for `--turn N`, a recorded provider turn id.
+- The provider fork runs before the baton thread is created. If baton creation fails, use the reported native id to avoid losing the provider work.
+- The source thread and its provider session are never changed.
+- The native fork helper disposes its Codex app-server; `baton ps --json` must be empty afterwards.

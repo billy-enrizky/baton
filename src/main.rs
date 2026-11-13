@@ -7,11 +7,11 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use adapters::{BatonAdapter, AcpAdapter, ClaudeAdapter, CodexAdapter, OpenCodeAdapter};
-use config::{describe_auth, load_config_file, resolve_config, save_config_file};
+use adapters::{AcpAdapter, BatonAdapter, ClaudeAdapter, CodexAdapter, ForkSessionInput, OpenCodeAdapter};
+use config::{describe_auth, load_config_file, provider_auth_env, resolve_config, save_config_file};
 use runtime::{run_engine, EngineCommand, EngineEvent, SharedAdapter, SharedStore};
 use store::{BatonStore, ImportedMessage, NewThread};
-use types::{PermissionMode, ProviderId, TurnPhase};
+use types::{NativeSessionRef, PermissionMode, ProviderId, TurnPhase};
 use adapters::TurnEvent;
 use usage::{cache_hit_rate, format_usage_line, sum_usage};
 
@@ -405,7 +405,7 @@ fn main_result() -> Result<()> {
             );
             Ok(())
         }
-        cli::Commands::Fork { title, turn, json } => {
+        cli::Commands::Fork { title, turn, native, json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let source = match cli.thread.as_deref() {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
@@ -423,7 +423,71 @@ fn main_result() -> Result<()> {
             } else {
                 title.join(" ")
             };
+            let mut native_session = None;
+            if native {
+                if source.current_provider != ProviderId::Codex {
+                    anyhow::bail!(
+                        "native fork is implemented for codex only; omit --native to fork this transcript"
+                    );
+                }
+                let session = store
+                    .get_provider_session(&source.id, ProviderId::Codex)?
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "source thread has no codex session; omit --native to fork the transcript"
+                    ))?;
+                let resolved = resolve_config(&home, std::path::Path::new(&source.cwd));
+                let provider_config = resolved.for_provider(ProviderId::Codex);
+                let model = source
+                    .current_model
+                    .clone()
+                    .unwrap_or_else(|| provider_config.model.clone());
+                let last_turn_id = store.fork_provider_turn_id(&source.id, turn)?;
+                if turn.is_some() && last_turn_id.is_none() {
+                    anyhow::bail!(
+                        "the selected turn has no codex provider turn id; omit --native to fork the transcript"
+                    );
+                }
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                let recorder_store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
+                let recorder = process::ProcessRecorder::new(recorder_store, source.cwd.clone());
+                let adapter = build_codex_adapter_with_recorder(
+                    &PathBuf::from(&source.cwd),
+                    recorder,
+                );
+                let native_id = runtime.block_on(async {
+                    let mut adapter = adapter.lock().await;
+                    let result = adapter
+                        .fork_session(ForkSessionInput {
+                            cwd: source.cwd.clone(),
+                            model: model.clone(),
+                            session: NativeSessionRef {
+                                native_session_id: session.native_session_id.clone(),
+                                rollout_path: session.rollout_path.clone(),
+                            },
+                            auth_env: provider_auth_env(provider_config),
+                            last_turn_id,
+                        })
+                        .await;
+                    let _ = adapter.dispose().await;
+                    result
+                })?;
+                native_session = Some((
+                    native_id.ok_or_else(|| anyhow::anyhow!("codex did not return a native fork id"))?,
+                    model,
+                ));
+            }
             let forked = store.fork_thread_through_turn(&source.id, &title, turn)?;
+            if let Some((native_id, model)) = native_session.as_ref() {
+                store.upsert_provider_session(
+                    &forked.id,
+                    ProviderId::Codex,
+                    native_id,
+                    Some(model.clone()),
+                    None,
+                )?;
+            }
             if json {
                 println!(
                     "{}",
@@ -436,17 +500,20 @@ fn main_result() -> Result<()> {
                         "cwd": forked.cwd,
                         "provider": forked.current_provider.as_str(),
                         "model": forked.current_model,
+                        "native": native,
+                        "native_session_id": native_session.as_ref().map(|(id, _)| id),
                     }))?
                 );
             } else {
                 println!(
-                    "forked {} -> {}{} ({}/{})",
+                    "forked {} -> {}{} ({}/{}){}",
                     &source.id[..8.min(source.id.len())],
                     &forked.id[..8.min(forked.id.len())],
                     turn.map(|turn| format!(" through turn {turn}"))
                         .unwrap_or_default(),
                     forked.current_provider,
                     forked.current_model.as_deref().unwrap_or("default"),
+                    if native_session.is_some() { " native" } else { "" },
                 );
             }
             Ok(())
@@ -1120,19 +1187,20 @@ fn spawn_tracked_provider(
 }
 
 
-fn build_all_adapters(
-    store: &SharedStore,
-    home: &PathBuf,
-    cwd: &PathBuf,
-) -> Vec<SharedAdapter> {
-    let process_recorder = process::ProcessRecorder::new(
+fn build_codex_adapter(store: &SharedStore, cwd: &PathBuf) -> SharedAdapter {
+    let recorder = process::ProcessRecorder::new(
         store.clone(),
         cwd.to_string_lossy().to_string(),
     );
-    let claude_recorder = process_recorder.clone();
-    let codex_recorder = process_recorder.clone();
+    build_codex_adapter_with_recorder(cwd, recorder)
+}
+
+fn build_codex_adapter_with_recorder(
+    cwd: &PathBuf,
+    recorder: process::ProcessRecorder,
+) -> SharedAdapter {
     let cwd_for_codex = cwd.clone();
-    let codex_spawner = Arc::new(
+    let spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
             let mut command = tokio::process::Command::new("codex");
             command.args(["app-server"]);
@@ -1143,9 +1211,24 @@ fn build_all_adapters(
             for (key, value) in auth_env {
                 command.env(key, value);
             }
-            spawn_tracked_provider(command, ProviderId::Codex, &codex_recorder)
+            spawn_tracked_provider(command, ProviderId::Codex, &recorder)
         },
     );
+    Arc::new(tokio::sync::Mutex::new(
+        Box::new(CodexAdapter::new(spawner)) as Box<dyn BatonAdapter>,
+    ))
+}
+
+fn build_all_adapters(
+    store: &SharedStore,
+    home: &PathBuf,
+    cwd: &PathBuf,
+) -> Vec<SharedAdapter> {
+    let process_recorder = process::ProcessRecorder::new(
+        store.clone(),
+        cwd.to_string_lossy().to_string(),
+    );
+    let claude_recorder = process_recorder.clone();
     let grok_recorder = process_recorder.clone();
     let cwd_for_grok = cwd.clone();
     let grok_spawner = Arc::new(
@@ -1241,7 +1324,7 @@ fn build_all_adapters(
 
     vec![
         Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner_with_recorder(claude_recorder))) as Box<dyn BatonAdapter>)),
-        Arc::new(tokio::sync::Mutex::new(Box::new(CodexAdapter::new(codex_spawner)) as Box<dyn BatonAdapter>)),
+        build_codex_adapter(store, cwd),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Cursor, cursor_spawner)) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Grok, grok_spawner)) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(OpenCodeAdapter::with_recorder(opencode_spawner, process_recorder)) as Box<dyn BatonAdapter>)),

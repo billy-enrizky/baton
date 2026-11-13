@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineReader, LineWriter, ModelListInput, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, LineReader, LineWriter, ModelListInput, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -566,6 +566,32 @@ impl BatonAdapter for CodexAdapter {
         Ok(models)
     }
 
+    async fn fork_session(&mut self, input: ForkSessionInput) -> Result<Option<String>> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting("native-fork");
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        self.ensure_initialized(&runtime).await?;
+        let mut params = json!({
+            "threadId": input.session.native_session_id,
+            "cwd": input.cwd,
+            "model": input.model,
+            "excludeTurns": true,
+        });
+        if let Some(last_turn_id) = input.last_turn_id {
+            params["lastTurnId"] = json!(last_turn_id);
+        }
+        let response = self.request(&runtime, "thread/fork", params).await?;
+        let forked = response
+            .pointer("/thread/id")
+            .or_else(|| response.get("threadId"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match forked {
+            Some(id) if !id.is_empty() => Ok(Some(id)),
+            _ => anyhow::bail!("codex thread/fork did not return a thread id"),
+        }
+    }
+
     async fn start_turn(
         &mut self,
         input: TurnStartInput,
@@ -632,6 +658,7 @@ impl BatonAdapter for CodexAdapter {
             .map(str::to_string)
             .or_else(|| started.get("turnId").and_then(Value::as_str).map(str::to_string));
         if let Some(turn_id) = turn_id.as_ref() {
+            let _ = emit.send(TurnEvent::ProviderTurnId { id: turn_id.clone() });
             *runtime.active_turn.lock().await = Some(turn_id.clone());
         }
 
@@ -655,6 +682,7 @@ impl BatonAdapter for CodexAdapter {
                             .and_then(|turn| turn.get("id"))
                             .and_then(Value::as_str)
                         {
+                            let _ = emit.send(TurnEvent::ProviderTurnId { id: id.to_string() });
                             *runtime.active_turn.lock().await = Some(id.to_string());
                         }
                     }

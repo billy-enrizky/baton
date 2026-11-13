@@ -5279,6 +5279,21 @@ fn perform_switch(
     }
 }
 
+fn provider_label_with(provider: ProviderId, installed: bool) -> String {
+    if installed {
+        provider.to_string()
+    } else {
+        format!("{provider} (not installed)")
+    }
+}
+
+fn provider_label(provider: ProviderId) -> String {
+    provider_label_with(
+        provider,
+        crate::doctor::find_executable(provider.binary_name()).is_some(),
+    )
+}
+
 fn draw_switch_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
     let mut lines: Vec<Line> = vec![Line::styled(
@@ -5295,7 +5310,8 @@ fn draw_switch_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
         let marker = if *provider == state.thread.current_provider { "●" } else { " " };
         lines.push(Line::styled(
             format!(
-                "❯ {marker} {provider} · {} · {}",
+                "❯ {marker} {} · {} · {}",
+                provider_label(*provider),
                 provider_config.model,
                 describe_auth(provider_config)
             ),
@@ -5471,7 +5487,10 @@ fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
             } else {
                 Style::default().fg(COLORS.muted)
             };
-            lines.push(Line::styled(format!("❯ {marker} {provider} {mode}"), style));
+            lines.push(Line::styled(
+                format!("❯ {marker} {} {mode}", provider_label(*provider)),
+                style,
+            ));
         }
     }
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
@@ -8880,6 +8899,15 @@ mod tests {
         assert_eq!(state.thread.id, source_id);
         let worktrees = home.path().join("worktrees");
         assert!(!worktrees.exists() || std::fs::read_dir(worktrees).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn missing_provider_label_is_explicit() {
+        assert_eq!(
+            provider_label_with(ProviderId::Cursor, false),
+            "cursor (not installed)"
+        );
+        assert_eq!(provider_label_with(ProviderId::Cursor, true), "cursor");
     }
 
     #[test]

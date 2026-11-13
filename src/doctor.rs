@@ -176,8 +176,28 @@ pub fn render(report: &DoctorReport) -> String {
                 .map(|provider| provider.to_string())
                 .unwrap_or_else(|| "none".to_string())
         ),
-        "providers:".to_string(),
     ];
+    let ready = report
+        .providers
+        .iter()
+        .filter(|provider| provider.installed())
+        .map(|provider| provider.provider.to_string())
+        .collect::<Vec<_>>();
+    let missing = report
+        .providers
+        .iter()
+        .filter(|provider| !provider.installed())
+        .map(|provider| provider.provider.to_string())
+        .collect::<Vec<_>>();
+    lines.push(if ready.is_empty() {
+        "ready: none; install a harness and run baton doctor again".to_string()
+    } else {
+        format!("ready: {}", ready.join(", "))
+    });
+    if !missing.is_empty() {
+        lines.push(format!("missing: {}", missing.join(", ")));
+    }
+    lines.push("providers:".to_string());
     for provider in &report.providers {
         let status = provider
             .executable
@@ -269,6 +289,8 @@ pub fn to_json(report: &DoctorReport) -> serde_json::Value {
             "default_provider": report.default_provider.map(|provider| provider.as_str()),
         },
         "providers": providers,
+        "ready": report.providers.iter().filter(|provider| provider.installed()).map(|provider| provider.provider.as_str()).collect::<Vec<_>>(),
+        "missing": report.providers.iter().filter(|provider| !provider.installed()).map(|provider| provider.provider.as_str()).collect::<Vec<_>>(),
         "processes": processes,
         "healthy": report.warnings.is_empty(),
         "warnings": report.warnings,
@@ -413,6 +435,8 @@ mod tests {
         let text = render(&report());
         assert!(text.contains("baton doctor"));
         assert!(text.contains("default provider: codex"));
+        assert!(text.contains("ready: codex"));
+        assert!(text.contains("missing: antigravity"));
         assert!(text.contains("codex: ready (/usr/local/bin/codex)"));
         assert!(text.contains("antigravity: missing"));
         assert!(text.contains("processes: 1 tracked"));
@@ -428,6 +452,8 @@ mod tests {
         assert_eq!(value["providers"][0]["provider"], "codex");
         assert_eq!(value["providers"][0]["installed"], true);
         assert_eq!(value["providers"][1]["installed"], false);
+        assert_eq!(value["ready"], serde_json::json!(["codex"]));
+        assert_eq!(value["missing"], serde_json::json!(["antigravity"]));
         assert_eq!(value["processes"][0]["pid"], 42);
         assert_eq!(value["healthy"], false);
     }

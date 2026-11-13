@@ -211,6 +211,7 @@ def main() -> int:
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=34)
     parser.add_argument("--ready", default="Ask anything")
+    parser.add_argument("--after-escape", action="store_true")
     parser.add_argument("--warmup", type=float, default=3.0)
     parser.add_argument("--timeout", type=float, default=12.0)
     parser.add_argument("--evidence-dir", default="local_docs/verification/evidence")
@@ -264,6 +265,9 @@ def main() -> int:
         (evidence / "screen.txt").write_text(joined + "\n")
         (evidence / "transcript.raw").write_bytes(bytes(transcript))
         debug("screen captured")
+        if args.after_escape:
+            os.write(master, b"\x1b")
+            pump(master, 0.4, transcript)
         os.write(master, b"/quit\r")
         pump(master, 0.5, transcript)
         exit_code = reap(pid, 5)

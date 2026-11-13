@@ -2611,6 +2611,23 @@ fn enqueue_message(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, text: S
     state.queued_messages.push(text);
 }
 
+/// Records a prompt the user typed, whichever path consumes it. A steered or
+/// queued message must be recallable too, and the consecutive duplicate rule
+/// matches the store so a later drain does not add it twice.
+fn remember_prompt(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, text: &str) {
+    if state.prompt_history.last().map(String::as_str) != Some(text) {
+        state.prompt_history.push(text.to_string());
+    }
+    state.prompt_history_index = None;
+    let recorded = {
+        let guard = store.lock().unwrap();
+        guard.record_prompt(&state.thread.cwd, text)
+    };
+    if let Err(error) = recorded {
+        state.notice = Some(format!("cannot record prompt: {error}"));
+    }
+}
+
 fn effective_permission_mode(
     selected: PermissionMode,
     provider_default: PermissionMode,
@@ -2637,6 +2654,7 @@ fn dispatch_message(
             // typed during a live turn must steer that turn instead of being
             // dropped. A running orchestration is not a single turn; its
             // messages are queued below.
+            remember_prompt(state, store, &text);
             let _ = engine_command_sender.send(EngineCommand::Steer {
                 thread_id: state.thread.id.clone(),
                 text,
@@ -2645,6 +2663,7 @@ fn dispatch_message(
             return;
         }
         if state.orchestration_pending {
+            remember_prompt(state, store, &text);
             enqueue_message(state, store, text);
             state.notice = Some(format!(
                 "queued; press enter after the orchestration finishes ({} waiting)",
@@ -2663,6 +2682,7 @@ fn dispatch_message(
             submit(state, store, engine_command_sender, text);
             return;
         }
+        remember_prompt(state, store, &text);
         let text = if let Some(goal) = &state.goal {
             if state.goal_paused {
                 text
@@ -2674,6 +2694,7 @@ fn dispatch_message(
         };
         request_orchestration(state, text, 4, None);
     } else if state.running {
+        remember_prompt(state, store, &text);
         let _ = engine_command_sender.send(EngineCommand::Steer {
             thread_id: state.thread.id.clone(),
             text,
@@ -3321,15 +3342,7 @@ fn submit(
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     text: String,
 ) {
-    state.prompt_history.push(text.clone());
-    state.prompt_history_index = None;
-    let recorded = {
-        let guard = store.lock().unwrap();
-        guard.record_prompt(&state.thread.cwd, &text)
-    };
-    if let Err(error) = recorded {
-        state.notice = Some(format!("cannot record prompt: {error}"));
-    }
+    remember_prompt(state, store, &text);
     let text = if let Some(goal) = &state.goal {
         if state.goal_paused {
             text
@@ -8731,6 +8744,58 @@ mod tests {
         state.overlay = Overlay::SwitchPicker { selected: 0 };
         handle_paste(&mut state, "not a provider");
         assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn a_steered_message_is_recallable() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.running = true;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "steer this".into(),
+            true,
+        );
+        assert_eq!(state.prompt_history.last().map(String::as_str), Some("steer this"));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_prompt_history(&state.thread.cwd)
+                .unwrap(),
+            vec!["steer this".to_string()],
+            "a steered prompt is durable"
+        );
+    }
+
+    #[test]
+    fn a_queued_orchestration_message_is_recallable() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.session_mode = SessionMode::Orchestrate;
+        state.orchestration_pending = true;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "after the run".into(),
+            true,
+        );
+        assert_eq!(state.prompt_history.last().map(String::as_str), Some("after the run"));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_prompt_history(&state.thread.cwd)
+                .unwrap(),
+            vec!["after the run".to_string()]
+        );
     }
 
     #[test]

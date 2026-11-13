@@ -26,7 +26,9 @@ In the TUI:
 The transcript shows a live orchestration line while the run is active. When it
 finishes, the full-screen report lists each worker. Up/Down selects a worker,
 Enter opens that worker's thread (with its worktree as cwd), PageUp/PageDown
-scrolls, and Esc closes the report. `/clear` also dismisses it.
+scrolls, and Esc closes the report. `/clear` also dismisses it. Press `i` to
+integrate completed worker branches: the report asks for confirmation, merges in
+the background, then shows the merged, skipped, and conflicted workers.
 
 ## Driving it with the PTY/CLI harness
 Use a fresh git repo and a plan file for a cheap deterministic proof. This runs one real Codex worker.

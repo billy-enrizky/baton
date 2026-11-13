@@ -153,9 +153,40 @@ fn build_with_lookup(
     })
 }
 
+/// One plain-language answer to "what should I do next?" for setup.
+pub fn next_action(report: &DoctorReport) -> String {
+    let ready = report
+        .providers
+        .iter()
+        .filter(|provider| provider.installed())
+        .collect::<Vec<_>>();
+    if ready.is_empty() {
+        return "install at least one harness, then run `baton doctor` again".to_string();
+    }
+    if let Some(default) = report.default_provider {
+        if let Some(provider) = report.providers.iter().find(|provider| provider.provider == default) {
+            if !provider.installed() {
+                let suggestion = ready[0].provider;
+                return format!(
+                    "default provider {default} is missing; set it to {suggestion} with `baton default {suggestion}`"
+                );
+            }
+        }
+    }
+    if report
+        .processes
+        .iter()
+        .any(|process| !process.process_alive || !process.owner_running)
+    {
+        return "run `baton ps` to inspect stale provider processes".to_string();
+    }
+    "ready; start with `baton` or `baton exec`".to_string()
+}
+
 pub fn render(report: &DoctorReport) -> String {
     let mut lines = vec![
         "baton doctor".to_string(),
+        format!("now: {}", next_action(report)),
         format!("home: {}", report.home.display()),
         format!("cwd: {}", report.cwd.display()),
         format!(
@@ -289,6 +320,7 @@ pub fn to_json(report: &DoctorReport) -> serde_json::Value {
             "default_provider": report.default_provider.map(|provider| provider.as_str()),
         },
         "providers": providers,
+        "next_action": next_action(report),
         "ready": report.providers.iter().filter(|provider| provider.installed()).map(|provider| provider.provider.as_str()).collect::<Vec<_>>(),
         "missing": report.providers.iter().filter(|provider| !provider.installed()).map(|provider| provider.provider.as_str()).collect::<Vec<_>>(),
         "processes": processes,
@@ -435,6 +467,7 @@ mod tests {
         let text = render(&report());
         assert!(text.contains("baton doctor"));
         assert!(text.contains("default provider: codex"));
+        assert!(text.contains("now: ready; start with"));
         assert!(text.contains("ready: codex"));
         assert!(text.contains("missing: antigravity"));
         assert!(text.contains("codex: ready (/usr/local/bin/codex)"));
@@ -452,10 +485,30 @@ mod tests {
         assert_eq!(value["providers"][0]["provider"], "codex");
         assert_eq!(value["providers"][0]["installed"], true);
         assert_eq!(value["providers"][1]["installed"], false);
+        assert_eq!(value["next_action"], "ready; start with `baton` or `baton exec`");
         assert_eq!(value["ready"], serde_json::json!(["codex"]));
         assert_eq!(value["missing"], serde_json::json!(["antigravity"]));
         assert_eq!(value["processes"][0]["pid"], 42);
         assert_eq!(value["healthy"], false);
+    }
+
+    #[test]
+    fn next_action_covers_setup_states() {
+        let mut no_harness = report();
+        for provider in &mut no_harness.providers {
+            provider.executable = None;
+        }
+        assert!(next_action(&no_harness).contains("install at least one harness"));
+
+        let mut missing_default = report();
+        missing_default.default_provider = Some(ProviderId::Antigravity);
+        assert!(next_action(&missing_default).contains("baton default codex"));
+
+        let mut stale_process = report();
+        stale_process.processes[0].owner_running = false;
+        assert!(next_action(&stale_process).contains("baton ps"));
+
+        assert!(next_action(&report()).starts_with("ready"));
     }
 
     #[cfg(unix)]

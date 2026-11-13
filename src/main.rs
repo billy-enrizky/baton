@@ -74,28 +74,61 @@ fn main_result() -> Result<()> {
             }
             let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
             let resolved = resolve_config(&home, &cwd);
-            let provider = cli
-                .provider
-                .as_deref()
-                .and_then(ProviderId::parse)
-                .unwrap_or_else(|| default_provider_from_configs(&home, &cwd));
-            let model = cli
-                .model
-                .clone()
-                .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
+            let requested_provider = cli.provider.as_deref().and_then(ProviderId::parse);
+            let is_new = cli.thread.is_none();
+            let mut thread = if let Some(thread_id) = cli.thread.as_deref() {
+                let guard = store.lock().unwrap();
+                resolve_thread(&guard, thread_id)?
+            } else {
+                let provider = requested_provider
+                    .unwrap_or_else(|| default_provider_from_configs(&home, &cwd));
+                let model = cli
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
+                let mut thread = store.lock().unwrap().draft_thread(crate::store::NewThread {
+                    title: baton::handoff::derive_title(&prompt),
+                    cwd: cwd.to_string_lossy().to_string(),
+                    current_provider: provider,
+                    current_model: Some(model),
+                });
+                thread.reasoning_effort = requested_effort.clone();
+                thread
+            };
+            if !is_new {
+                let guard = store.lock().unwrap();
+                if let Some(provider) = requested_provider {
+                    if provider != thread.current_provider {
+                        let model = cli
+                            .model
+                            .clone()
+                            .or_else(|| thread.current_model.clone());
+                        guard.set_thread_provider(&thread.id, provider, model.clone())?;
+                        thread.current_provider = provider;
+                        thread.current_model = model;
+                    } else if let Some(model) = cli.model.clone() {
+                        guard.set_thread_model(&thread.id, &model)?;
+                        thread.current_model = Some(model);
+                    }
+                } else if let Some(model) = cli.model.clone() {
+                    guard.set_thread_model(&thread.id, &model)?;
+                    thread.current_model = Some(model);
+                }
+                if cli.effort.is_some() {
+                    guard.set_thread_effort(&thread.id, requested_effort.as_deref())?;
+                    thread.reasoning_effort = requested_effort.clone();
+                }
+                if permission_override.is_some() {
+                    guard.set_thread_permission_mode(&thread.id, permission_mode)?;
+                }
+            }
+            let provider = thread.current_provider;
             if requested_effort.is_some() && !provider.supports_effort() {
                 anyhow::bail!("{provider} does not support --effort; use codex or claude");
             }
             let permission_mode = permission_override
                 .unwrap_or_else(|| resolved.for_provider(provider).permission_mode);
-            let mut thread = store.lock().unwrap().draft_thread(crate::store::NewThread {
-                title: baton::handoff::derive_title(&prompt),
-                cwd: cwd.to_string_lossy().to_string(),
-                current_provider: provider,
-                current_model: Some(model),
-            });
-            thread.reasoning_effort = requested_effort.clone();
-            {
+            if is_new {
                 let guard = store.lock().unwrap();
                 let persisted = guard.create_thread_with_id(
                     crate::store::NewThread {

@@ -2600,14 +2600,23 @@ fn dispatch_message(
         handle_command(state, store, engine_command_sender, &text);
     } else if state.thread.session_mode == SessionMode::Orchestrate {
         if state.running {
-            state.notice = Some(
-                "a single turn is still running; finish it before starting an orchestration"
-                    .into(),
-            );
+            // Orchestrate is the default mode for new threads, so a message
+            // typed during a live turn must steer that turn instead of being
+            // dropped. A running orchestration is not a single turn; its
+            // messages are queued below.
+            let _ = engine_command_sender.send(EngineCommand::Steer {
+                thread_id: state.thread.id.clone(),
+                text,
+            });
+            state.notice = Some("steering the current turn...".into());
             return;
         }
         if state.orchestration_pending {
-            state.notice = Some("an orchestration is already running".into());
+            enqueue_message(state, store, text);
+            state.notice = Some(format!(
+                "queued; press enter after the orchestration finishes ({} waiting)",
+                state.queued_messages.len()
+            ));
             return;
         }
         if orchestrate::is_conversational_greeting(&text) {
@@ -3071,6 +3080,28 @@ fn handle_composer_key(
         KeyCode::Enter => {
             let text = state.input.trim().to_string();
             if text.is_empty() {
+                if state.queued_messages.is_empty() {
+                    return;
+                }
+                if state.running || state.orchestration_pending {
+                    state.notice =
+                        Some("wait for the current work to finish before sending the queue".into());
+                    return;
+                }
+                let next = store
+                    .lock()
+                    .unwrap()
+                    .pop_queued_message(&state.thread.id)
+                    .unwrap_or(None);
+                let Some(next) = next else {
+                    return;
+                };
+                state.queued_messages = store
+                    .lock()
+                    .unwrap()
+                    .list_queued_messages(&state.thread.id)
+                    .unwrap_or_default();
+                dispatch_message(state, store, engine_command_sender, next, false);
                 return;
             }
             state.set_input(String::new());
@@ -8598,6 +8629,113 @@ mod tests {
     }
 
     #[test]
+    fn orchestrate_mode_steers_a_running_single_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.session_mode = SessionMode::Orchestrate;
+        state.running = true;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "change direction".into(),
+            true,
+        );
+        match receiver.try_recv().expect("steer command") {
+            EngineCommand::Steer { text, .. } => assert_eq!(text, "change direction"),
+            _ => panic!("expected a steer command"),
+        }
+        assert!(state.queued_messages.is_empty());
+        assert!(state.notice.as_deref().unwrap_or("").contains("steering"));
+    }
+
+    #[test]
+    fn orchestrate_mode_queues_a_message_during_a_run() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.session_mode = SessionMode::Orchestrate;
+        state.orchestration_pending = true;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "after the run".into(),
+            true,
+        );
+        assert!(receiver.try_recv().is_err(), "an orchestration is already live");
+        assert_eq!(state.queued_messages, vec!["after the run".to_string()]);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
+            vec!["after the run".to_string()],
+            "a message typed during a run is durable"
+        );
+        assert!(state.notice.as_deref().unwrap_or("").contains("queued"));
+    }
+
+    #[test]
+    fn enter_on_an_empty_composer_sends_the_next_queued_message() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        enqueue_message(&mut state, &store, "queued prompt".into());
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        match receiver.try_recv().expect("queued message is submitted") {
+            EngineCommand::Submit { text, .. } => assert_eq!(text, "queued prompt"),
+            _ => panic!("expected a submit command"),
+        }
+        assert!(state.queued_messages.is_empty());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn enter_on_an_empty_composer_waits_for_a_running_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        enqueue_message(&mut state, &store, "queued prompt".into());
+        state.running = true;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert!(receiver.try_recv().is_err(), "the queue waits for the turn");
+        assert_eq!(state.queued_messages, vec!["queued prompt".to_string()]);
+        assert!(state.notice.as_deref().unwrap_or("").contains("wait"));
+    }
+
+    #[test]
     fn rejected_steering_after_the_turn_ends_sends_a_new_turn() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -9704,14 +9842,11 @@ mod tests {
             false,
         );
         assert!(
-            state
-                .notice
-                .as_deref()
-                .unwrap_or("")
-                .contains("already running"),
+            state.notice.as_deref().unwrap_or("").contains("queued"),
             "notice: {:?}",
             state.notice
         );
+        assert_eq!(state.queued_messages, vec!["hello".to_string()]);
         assert!(
             receiver.try_recv().is_err(),
             "a git repository prompt must not fall through to the single-harness engine"

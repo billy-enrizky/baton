@@ -300,6 +300,18 @@ impl BatonAdapter for ClaudeAdapter {
                 Err(_) => continue,
             };
             let message_type = message.get("type").and_then(Value::as_str).unwrap_or("");
+            // Claude reports its session id on every stream-json frame. Persist
+            // it as soon as it appears so a failed turn still has a resumable
+            // native session.
+            if let Some(reported) = message.get("session_id").and_then(Value::as_str) {
+                if !reported.is_empty() && reported != session_id {
+                    session_id = reported.to_string();
+                    let _ = emit.send(TurnEvent::ProviderSession {
+                        native_session_id: session_id.clone(),
+                        rollout_path: None,
+                    });
+                }
+            }
             match message_type {
                 "stream_event" => {
                     let event = message.get("event").cloned().unwrap_or(Value::Null);

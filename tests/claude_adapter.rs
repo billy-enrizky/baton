@@ -28,6 +28,7 @@ async fn fake_claude_gated_streaming(
         &mut write,
         json!({
             "type": "stream_event",
+            "session_id": "claude-session-1",
             "event": { "type": "content_block_delta", "delta": { "type": "text_delta", "text": "streamed " } }
         }),
     )
@@ -90,11 +91,12 @@ async fn claude_adapter_streams_deltas_before_turn_completion() {
 
     // The fake claude holds the result frame until released, so any delta observed
     // here proves the adapter forwards partial-message deltas mid-turn.
+    let mut early_events = Vec::new();
     let first_delta = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match event_receiver.try_recv() {
                 Ok(baton::adapters::TurnEvent::TextDelta { text }) => break text,
-                Ok(_) => {}
+                Ok(event) => early_events.push(event),
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         }
@@ -107,7 +109,8 @@ async fn claude_adapter_streams_deltas_before_turn_completion() {
     let _ = release_sender.send(());
     tokio::time::timeout(Duration::from_secs(10), turn_task).await.unwrap().unwrap();
 
-    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    let events: Vec<baton::adapters::TurnEvent> =
+        early_events.into_iter().chain(event_receiver.iter()).collect();
     let deltas: String = std::iter::once(first_delta)
         .chain(events.iter().filter_map(|event| match event {
             baton::adapters::TurnEvent::TextDelta { text } => Some(text.clone()),
@@ -126,6 +129,14 @@ async fn claude_adapter_streams_deltas_before_turn_completion() {
         .expect("turn completed event");
     assert_eq!(completed.0, "streamed live");
     assert_eq!(completed.1.as_deref(), Some("claude-session-1"));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            baton::adapters::TurnEvent::ProviderSession { native_session_id, .. }
+                if native_session_id == "claude-session-1"
+        )),
+        "the reported session id is persisted before the turn completes"
+    );
 }
 
 

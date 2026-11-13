@@ -449,6 +449,10 @@ impl BatonAdapter for AcpAdapter {
             }
         };
         *runtime.active_session.lock().await = Some(session_id.clone());
+        let _ = emit.send(TurnEvent::ProviderSession {
+            native_session_id: session_id.clone(),
+            rollout_path: None,
+        });
         self.select_model(&runtime, &session_id, &input.model).await?;
 
         let prompt_params = json!({

@@ -261,6 +261,14 @@ async fn acp_adapter_runs_a_full_turn_with_streaming() {
         .collect();
     assert_eq!(deltas, "hello acp");
     assert!(events.iter().any(|event| matches!(event, baton::adapters::TurnEvent::ToolStarted { tool, .. } if tool == "bash ls")));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            baton::adapters::TurnEvent::ProviderSession { native_session_id, .. }
+                if native_session_id == "acp-session-1"
+        )),
+        "the ACP session id is persisted as soon as the session is established"
+    );
     adapter.dispose().await.unwrap();
 }
 

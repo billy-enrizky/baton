@@ -11,5 +11,6 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Native rewind | CLI | `baton rewind --native` truncates Codex or OpenCode history and keeps the session |
 | Process registry | CLI | `baton ps --json` returns a stable schema and no false live processes |
 | Orchestration | CLI | `baton orchestrate` creates worktrees, runs harnesses, and records runs |
+| Exec stream | CLI | `baton exec --stream-json` emits parseable JSONL and a final result row |
 
 Start with the feature touched by the change. One real journey is enough for a smoke proof; the map exists so a broader change can cover the rest.

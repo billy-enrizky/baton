@@ -1,4 +1,4 @@
-use baton::{adapters, checkpoints, cli, config, doctor, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, scanner, status, store, tui, types, usage, worktree};
+use baton::{adapters, checkpoints, cli, config, doctor, exec_events, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, scanner, status, store, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::Parser;
@@ -62,7 +62,7 @@ fn main_result() -> Result<()> {
     let permission_mode = permission_override.unwrap_or(PermissionMode::Default);
 
     match command {
-        cli::Commands::Exec { prompt, json } => {
+        cli::Commands::Exec { prompt, json, stream_json } => {
             if cli.mode.is_some() {
                 anyhow::bail!(
                     "--mode applies to the interactive TUI; use `baton orchestrate` for a non-interactive run"
@@ -196,14 +196,13 @@ fn main_result() -> Result<()> {
                 permission_mode,
             });
 
-            let mut result_text = String::new();
-            let mut streamed_text = String::new();
+            let mut stream = exec_events::TurnStreamState::default();
             let mut result_phase: Option<TurnPhase> = None;
             let mut result_error: Option<String> = None;
             let mut result_ok: Option<bool> = None;
             let mut timed_out = false;
-            let mut saw_output = false;
-            let show_progress = std::io::stderr().is_terminal() && !json;
+            let machine = json || stream_json;
+            let show_progress = std::io::stderr().is_terminal() && !machine;
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
             loop {
                 if std::time::Instant::now() > deadline {
@@ -214,15 +213,22 @@ fn main_result() -> Result<()> {
                     if event_thread != thread.id {
                         continue;
                     }
-                    match event {
-                        TurnEvent::TextDelta { text } => {
+                    exec_events::apply_turn_event(&mut stream, &event);
+                    if stream_json {
+                        println!(
+                            "{}",
+                            serde_json::to_string(&exec_events::turn_event_json(
+                                &event_thread,
+                                &event
+                            ))?
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+                    match &event {
+                        TurnEvent::TextDelta { text } if !machine => {
                             if !text.is_empty() {
-                                if !json {
-                                    print!("{text}");
-                                    let _ = std::io::stdout().flush();
-                                }
-                                streamed_text.push_str(&text);
-                                saw_output = true;
+                                print!("{text}");
+                                let _ = std::io::stdout().flush();
                             }
                         }
                         TurnEvent::ToolStarted { tool, detail, .. } if show_progress => {
@@ -246,7 +252,7 @@ fn main_result() -> Result<()> {
                         result_ok = Some(ok);
                         result_phase = Some(phase);
                         result_error = error.clone();
-                        if !ok {
+                        if !ok && !stream_json {
                             if let Some(error) = error {
                                 let label = match phase {
                                     TurnPhase::Interrupted => "turn interrupted",
@@ -258,8 +264,8 @@ fn main_result() -> Result<()> {
                         }
                         break;
                     }
-                    Ok(EngineEvent::Turn(TurnEvent::TurnCompleted { final_text, .. })) => {
-                        result_text = final_text;
+                    Ok(EngineEvent::Turn(event)) => {
+                        exec_events::apply_turn_event(&mut stream, &event);
                     }
                     Ok(_) => {}
                     Err(_) => {}
@@ -267,6 +273,27 @@ fn main_result() -> Result<()> {
             }
             let _ = engine_command_sender.send(EngineCommand::Quit);
             let _ = engine_task.join();
+
+            // Drain events that raced the terminal engine event, so the final
+            // text is present and stream-json rows precede the result row.
+            while let Ok((event_thread, event)) = turn_event_receiver.try_recv() {
+                if event_thread != thread.id {
+                    continue;
+                }
+                exec_events::apply_turn_event(&mut stream, &event);
+                if stream_json {
+                    println!(
+                        "{}",
+                        serde_json::to_string(&exec_events::turn_event_json(
+                            &event_thread,
+                            &event
+                        ))?
+                    );
+                }
+            }
+            if stream_json {
+                let _ = std::io::stdout().flush();
+            }
 
             // A `-t` turn against an orchestration worker thread answers its
             // question (or records a failed follow-up) through the same path
@@ -283,7 +310,7 @@ fn main_result() -> Result<()> {
                     ) {
                         Ok(outcome) => outcome,
                         Err(error) => {
-                            if !json {
+                            if !machine {
                                 eprintln!("worker follow-up update failed: {error}");
                             }
                             None
@@ -295,64 +322,70 @@ fn main_result() -> Result<()> {
 
             // Providers that do not emit deltas only deliver final text here.
             // If deltas were streamed, do not print the same answer twice.
-            if streamed_text.is_empty() && !result_text.is_empty() {
-                if !json {
-                    println!("{result_text}");
+            if stream.streamed_text.is_empty() && !stream.final_text.is_empty() {
+                if !machine {
+                    println!("{}", stream.final_text);
                 }
-                saw_output = true;
-            } else if !streamed_text.is_empty() && !json {
+                stream.saw_output = true;
+            } else if !stream.streamed_text.is_empty() && !machine {
                 println!();
             }
             if timed_out {
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "schema_version": status::SCHEMA_VERSION,
-                            "thread_id": thread.id,
-                            "effort": requested_effort,
-                            "ok": false,
-                            "phase": "unverified",
-                            "error": "exec timed out after 300s",
-                            "text": "",
-                        }))?
-                    );
+                let mut value = exec_events::result_json(&exec_events::ExecResult {
+                    thread_id: &thread.id,
+                    effort: requested_effort.as_deref(),
+                    ok: false,
+                    phase: "unverified",
+                    error: Some("exec timed out after 300s"),
+                    text: "",
+                    worker_followup: None,
+                });
+                if stream_json {
+                    value["type"] = serde_json::json!("result");
+                    println!("{}", serde_json::to_string(&value)?);
+                } else if json {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
                 } else {
                     eprintln!("exec timed out after 300s");
                 }
                 std::process::exit(1);
             }
             let result_ok = result_ok.unwrap_or(false);
-            if json {
-                let text = if result_text.is_empty() {
-                    streamed_text
+            let machine_ok = if stream_json {
+                result_ok && stream.saw_output
+            } else {
+                result_ok
+            };
+            let machine_error = if stream_json && result_ok && !stream.saw_output {
+                Some("no output from provider".to_string())
+            } else {
+                result_error.clone()
+            };
+            if machine {
+                let text = if stream.final_text.is_empty() {
+                    stream.streamed_text.as_str()
                 } else {
-                    result_text
+                    stream.final_text.as_str()
                 };
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "schema_version": status::SCHEMA_VERSION,
-                        "thread_id": thread.id,
-                        "effort": requested_effort,
-                        "ok": result_ok,
-                        "phase": result_phase.map(|phase| phase.as_str()).unwrap_or("unverified"),
-                        "error": result_error,
-                        "text": text,
-                        "worker_followup": worker_followup.as_ref().map(|outcome| serde_json::json!({
-                            "run_id": outcome.run_id,
-                            "task_id": outcome.task_id,
-                            "status": outcome.status,
-                            "commit": outcome.commit,
-                            "question": outcome.question,
-                            "error": outcome.error,
-                        })),
-                    }))?
-                );
-            } else if result_ok && !saw_output {
+                let mut value = exec_events::result_json(&exec_events::ExecResult {
+                    thread_id: &thread.id,
+                    effort: requested_effort.as_deref(),
+                    ok: machine_ok,
+                    phase: result_phase.map(|phase| phase.as_str()).unwrap_or("unverified"),
+                    error: machine_error.as_deref(),
+                    text,
+                    worker_followup: worker_followup.as_ref(),
+                });
+                if stream_json {
+                    value["type"] = serde_json::json!("result");
+                    println!("{}", serde_json::to_string(&value)?);
+                } else {
+                    println!("{}", serde_json::to_string_pretty(&value)?);
+                }
+            } else if result_ok && !stream.saw_output {
                 eprintln!("no output from provider");
             }
-            if !json {
+            if !machine {
                 if let Some(outcome) = &worker_followup {
                     let run = &outcome.run_id[..8.min(outcome.run_id.len())];
                     let label = if outcome.question.is_some() {
@@ -373,7 +406,7 @@ fn main_result() -> Result<()> {
                     }
                 }
             }
-            if !result_ok || !saw_output {
+            if !result_ok || !stream.saw_output {
                 std::process::exit(1);
             }
             return Ok(());

@@ -68,6 +68,9 @@ pub enum Commands {
         /// Emit a JSON result object instead of plain text
         #[arg(long)]
         json: bool,
+        /// Emit one JSON event per line, then the final result object
+        #[arg(long, conflicts_with = "json")]
+        stream_json: bool,
     },
     /// Update baton to the latest version
     Update,
@@ -249,4 +252,30 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exec_conflicts_json_and_stream_json() {
+        let error = match Cli::try_parse_from(["baton", "exec", "--json", "--stream-json", "hi"]) {
+            Ok(_) => panic!("the two machine formats cannot mix"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn exec_accepts_stream_json_alone() {
+        let cli = Cli::try_parse_from(["baton", "exec", "--stream-json", "hi"]).unwrap();
+        match cli.command {
+            Some(Commands::Exec { json, stream_json, .. }) => {
+                assert!(stream_json);
+                assert!(!json);
+            }
+            _ => panic!("expected the exec command"),
+        }
+    }
 }

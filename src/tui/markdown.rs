@@ -168,17 +168,229 @@ fn horizontal_rule(line: &str) -> bool {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColumnAlign {
+    Left,
+    Center,
+    Right,
+}
+
+fn table_cells(line: &str) -> Option<Vec<String>> {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') {
+        return None;
+    }
+    let trimmed = trimmed.strip_prefix('|').unwrap_or(trimmed);
+    let trimmed = trimmed.strip_suffix('|').unwrap_or(trimmed);
+    let cells = trimmed
+        .split('|')
+        .map(|cell| cell.trim().to_string())
+        .collect::<Vec<_>>();
+    if cells.len() < 2 || cells.iter().all(|cell| cell.is_empty()) {
+        return None;
+    }
+    Some(cells)
+}
+
+fn table_separator(cells: &[String]) -> bool {
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let cell = cell.trim();
+            let unsigned = cell.strip_prefix(':').unwrap_or(cell);
+            let unsigned = unsigned.strip_suffix(':').unwrap_or(unsigned);
+            unsigned.len() >= 3 && unsigned.chars().all(|character| character == '-')
+        })
+}
+
+fn column_align(cell: &str) -> ColumnAlign {
+    let trimmed = cell.trim();
+    match (trimmed.starts_with(':'), trimmed.ends_with(':')) {
+        (true, true) => ColumnAlign::Center,
+        (false, true) => ColumnAlign::Right,
+        _ => ColumnAlign::Left,
+    }
+}
+
+fn cell_lines(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let push_word = |word: &str, lines: &mut Vec<String>, current: &mut String| {
+        let word_len = word.chars().count();
+        if current.is_empty() {
+            if word_len <= width {
+                current.push_str(word);
+            } else {
+                let mut chunk = String::new();
+                for character in word.chars() {
+                    if chunk.chars().count() == width {
+                        lines.push(std::mem::take(&mut chunk));
+                    }
+                    chunk.push(character);
+                }
+                *current = chunk;
+            }
+            return;
+        }
+        if current.chars().count() + 1 + word_len <= width {
+            current.push(' ');
+            current.push_str(word);
+            return;
+        }
+        lines.push(std::mem::take(current));
+        if word_len <= width {
+            current.push_str(word);
+        } else {
+            let mut chunk = String::new();
+            for character in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(character);
+            }
+            *current = chunk;
+        }
+    };
+    for word in text.split_whitespace() {
+        push_word(word, &mut lines, &mut current);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+fn pad_cell(text: &str, width: usize, align: ColumnAlign) -> String {
+    let length = text.chars().count();
+    if length >= width {
+        return text.to_string();
+    }
+    let padding = width - length;
+    match align {
+        ColumnAlign::Left => format!("{text}{}", " ".repeat(padding)),
+        ColumnAlign::Right => format!("{}{text}", " ".repeat(padding)),
+        ColumnAlign::Center => {
+            let left = padding / 2;
+            let right = padding - left;
+            format!("{}{text}{}", " ".repeat(left), " ".repeat(right))
+        }
+    }
+}
+
+fn table_row(
+    cells: &[String],
+    widths: &[usize],
+    aligns: &[ColumnAlign],
+    style: Style,
+) -> Vec<Line<'static>> {
+    let wrapped = widths
+        .iter()
+        .enumerate()
+        .map(|(index, width)| {
+            cell_lines(
+                cells.get(index).map(String::as_str).unwrap_or(""),
+                *width,
+            )
+        })
+        .collect::<Vec<_>>();
+    let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+    let mut lines = Vec::new();
+    for row in 0..height {
+        let mut spans = Vec::new();
+        for (column, width) in widths.iter().enumerate() {
+            if column > 0 {
+                spans.push(Span::styled(" │ ", Style::default().fg(COLORS.border)));
+            }
+            let text = wrapped[column]
+                .get(row)
+                .map(String::as_str)
+                .unwrap_or("");
+            spans.push(Span::styled(
+                pad_cell(text, *width, aligns[column]),
+                style,
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn render_table(
+    header: &[String],
+    aligns: &[ColumnAlign],
+    rows: &[Vec<String>],
+    width: usize,
+) -> Option<Vec<Line<'static>>> {
+    let columns = header.len();
+    if columns == 0 {
+        return None;
+    }
+    let fixed = 3 * (columns - 1);
+    if width <= fixed + columns {
+        return None;
+    }
+    let available = width - fixed;
+    let mut widths = vec![3usize; columns];
+    for row in std::iter::once(header).chain(rows.iter().map(Vec::as_slice)) {
+        for (index, cell) in row.iter().enumerate().take(columns) {
+            widths[index] = widths[index].max(cell.chars().count());
+        }
+    }
+    while widths.iter().sum::<usize>() > available {
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, width)| **width > 3)
+            .max_by_key(|(_, width)| **width)
+        else {
+            return None;
+        };
+        widths[index] -= 1;
+    }
+    let mut lines = table_row(
+        header,
+        &widths,
+        aligns,
+        Style::default()
+            .fg(COLORS.accent)
+            .add_modifier(Modifier::BOLD),
+    );
+    let mut separator = String::new();
+    for (index, width) in widths.iter().enumerate() {
+        if index > 0 {
+            separator.push('─');
+            separator.push('┼');
+            separator.push('─');
+        }
+        separator.push_str(&"─".repeat(*width));
+    }
+    lines.push(Line::styled(separator, Style::default().fg(COLORS.border)));
+    for row in rows {
+        lines.extend(table_row(row, &widths, aligns, Style::default().fg(COLORS.text)));
+    }
+    Some(lines)
+}
+
 /// Renders Markdown into terminal lines. Fence markers are removed, code keeps
 /// its own tinted background, and every returned row is at most `width` cells.
 pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
     let width = width.max(1);
+    let raw_lines = text
+        .split('\n')
+        .map(|raw| raw.strip_suffix('\r').unwrap_or(raw))
+        .collect::<Vec<_>>();
     let mut lines = Vec::new();
     let mut in_code = false;
-    for raw in text.split('\n') {
-        let line = raw.strip_suffix('\r').unwrap_or(raw);
+    let mut index = 0usize;
+    while index < raw_lines.len() {
+        let line = raw_lines[index];
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
             in_code = !in_code;
+            index += 1;
             continue;
         }
         if in_code {
@@ -187,17 +399,52 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
                 vec![Span::styled(format!("  {expanded}"), code_style())],
                 width,
             ));
+            index += 1;
             continue;
         }
         if line.trim().is_empty() {
             lines.push(Line::default());
+            index += 1;
             continue;
+        }
+        if let Some(header) = table_cells(line) {
+            if let Some(separator) = raw_lines.get(index + 1).and_then(|line| table_cells(*line)) {
+                if table_separator(&separator) {
+                    let columns = header.len();
+                    let aligns = (0..columns)
+                        .map(|column| {
+                            separator
+                                .get(column)
+                                .map(|cell| column_align(cell))
+                                .unwrap_or(ColumnAlign::Left)
+                        })
+                        .collect::<Vec<_>>();
+                    let mut rows = Vec::new();
+                    let mut cursor = index + 2;
+                    while cursor < raw_lines.len() {
+                        let Some(cells) = table_cells(raw_lines[cursor]) else {
+                            break;
+                        };
+                        if table_separator(&cells) {
+                            break;
+                        }
+                        rows.push(cells);
+                        cursor += 1;
+                    }
+                    if let Some(table) = render_table(&header, &aligns, &rows, width) {
+                        lines.extend(table);
+                        index = cursor;
+                        continue;
+                    }
+                }
+            }
         }
         if horizontal_rule(line) {
             lines.push(Line::styled(
                 "─".repeat(width),
                 Style::default().fg(COLORS.border),
             ));
+            index += 1;
             continue;
         }
         if let Some(content) = heading(line) {
@@ -210,24 +457,28 @@ pub fn render(text: &str, width: usize) -> Vec<Line<'static>> {
                 )],
                 width,
             ));
+            index += 1;
             continue;
         }
         if let Some(content) = trimmed.strip_prefix("> ") {
             let mut spans = vec![Span::styled("│ ", Style::default().fg(COLORS.border))];
             spans.extend(inline_spans(content, Style::default().fg(COLORS.muted)));
             lines.extend(wrap_spans(spans, width));
+            index += 1;
             continue;
         }
         if let Some((prefix, content)) = list_prefix(line) {
             let mut spans = vec![Span::styled(prefix, Style::default().fg(COLORS.accent))];
             spans.extend(inline_spans(content, Style::default().fg(COLORS.text)));
             lines.extend(wrap_spans(spans, width));
+            index += 1;
             continue;
         }
         lines.extend(wrap_spans(
             inline_spans(line, Style::default().fg(COLORS.text)),
             width,
         ));
+        index += 1;
     }
     if lines.is_empty() {
         lines.push(Line::default());
@@ -312,6 +563,52 @@ mod tests {
             line.spans.iter().map(|span| span.content.chars().count()).sum::<usize>() <= 8
         }));
         assert_eq!(text(&lines).replace('\n', ""), "alpha beta gamma delta");
+    }
+
+    #[test]
+    fn renders_tables_with_alignment_and_removes_markdown_pipes() {
+        let lines = render(
+            "| Name | Value |\n| --- | ---: |\n| alpha | 1 |\n| beta | 22 |\n\nafter",
+            40,
+        );
+        let rendered = text(&lines);
+        assert!(rendered.contains("Name"), "{rendered}");
+        assert!(rendered.contains("alpha"), "{rendered}");
+        assert!(rendered.contains("beta"), "{rendered}");
+        assert!(rendered.contains("alpha │     1"), "right alignment: {rendered}");
+        assert!(rendered.contains("│"), "{rendered}");
+        assert!(rendered.contains("┼"), "{rendered}");
+        assert!(!rendered.contains("| ---"), "{rendered}");
+        assert!(rendered.contains("after"), "{rendered}");
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.spans.iter().map(|span| span.content.chars().count()).sum::<usize>() <= 40),
+            "every table row stays within the width"
+        );
+    }
+
+    #[test]
+    fn narrow_tables_wrap_cells_without_exceeding_the_width() {
+        let lines = render(
+            "| Key | Detail |\n| --- | --- |\n| alpha | one two three four five |",
+            24,
+        );
+        let rendered = text(&lines);
+        assert!(rendered.contains("alpha"), "{rendered}");
+        assert!(rendered.contains("one two"), "{rendered}");
+        assert!(rendered.contains("three"), "{rendered}");
+        assert!(lines.iter().all(|line| {
+            line.spans.iter().map(|span| span.content.chars().count()).sum::<usize>() <= 24
+        }));
+    }
+
+    #[test]
+    fn plain_pipe_text_is_not_mistaken_for_a_table() {
+        let rendered = text(&render("cmd | grep x\nnot a table", 80));
+        assert!(rendered.contains("cmd | grep x"), "{rendered}");
+        assert!(rendered.contains("not a table"), "{rendered}");
+        assert!(!rendered.contains("┼"), "{rendered}");
     }
 
     #[test]

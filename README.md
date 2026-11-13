@@ -21,7 +21,7 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 - **Queued by provider.** If two threads target the same provider at once, the second waits in a durable `queued` phase and starts when the adapter is free instead of failing.
 - **Agent-readable state.** `status`, `threads`, `turns`, `queue`, and `exec` have versioned JSON output. `baton mcp` exposes the same durable state over MCP stdio.
 - **Subscription or API billing.** Each provider runs on its harness login or an API key, switchable per provider (`baton auth <provider> api`).
-- **codex-style keys.** Esc interrupts, Esc-Esc backtracks to a previous prompt, streaming Markdown, tinted diffs, and per-tool activity rows.
+- **codex-style keys.** Esc interrupts, Esc-Esc backtracks to a previous prompt, streaming Markdown with tables and aligned columns, tinted diffs, and per-tool activity rows.
 
 ## Install
 

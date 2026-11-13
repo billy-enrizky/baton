@@ -7,7 +7,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use adapters::{AcpAdapter, BatonAdapter, ClaudeAdapter, OpenCodeAdapter};
+use adapters::{AcpAdapter, BatonAdapter, ClaudeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use runtime::{run_engine, EngineCommand, EngineEvent, SharedAdapter, SharedStore};
 use store::{BatonStore, ImportedMessage, NewThread};
@@ -496,17 +496,12 @@ fn main_result() -> Result<()> {
             };
             let mut native_session = None;
             if native {
-                if source.current_provider != ProviderId::Codex {
-                    anyhow::bail!(
-                        "native fork is implemented for codex only; omit --native to fork this transcript"
-                    );
-                }
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
                 let recorder_store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
                 let recorder = process::ProcessRecorder::new(recorder_store, source.cwd.clone());
-                native_session = runtime.block_on(provider_runtime::fork_codex_session(
+                native_session = runtime.block_on(provider_runtime::fork_native_session(
                     &store,
                     &home,
                     &source,
@@ -514,14 +509,17 @@ fn main_result() -> Result<()> {
                     recorder,
                 ))?;
                 if native_session.is_none() {
-                    anyhow::bail!("codex did not return a native fork id");
+                    anyhow::bail!(
+                        "{} did not return a native fork id",
+                        source.current_provider
+                    );
                 }
             }
             let forked = store.fork_thread_through_turn(&source.id, &title, turn)?;
-            if let Some((native_id, model)) = native_session.as_ref() {
+            if let Some((native_provider, native_id, model)) = native_session.as_ref() {
                 store.upsert_provider_session(
                     &forked.id,
-                    ProviderId::Codex,
+                    *native_provider,
                     native_id,
                     Some(model.clone()),
                     None,
@@ -540,7 +538,10 @@ fn main_result() -> Result<()> {
                         "provider": forked.current_provider.as_str(),
                         "model": forked.current_model,
                         "native": native,
-                        "native_session_id": native_session.as_ref().map(|(id, _)| id),
+                        "native_session_provider": native_session
+                            .as_ref()
+                            .map(|(provider, _, _)| provider.as_str()),
+                        "native_session_id": native_session.as_ref().map(|(_, id, _)| id),
                     }))?
                 );
             } else {
@@ -1812,50 +1813,12 @@ fn build_all_adapters(
             provider_runtime::spawn_tracked_provider(command, ProviderId::Cursor, &cursor_recorder)
         },
     );
-    let opencode_recorder = process_recorder.clone();
-    let opencode_spawner = Arc::new(
-        move |_auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::opencode::OpenCodeChild> {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-            let port = listener.local_addr()?.port();
-            drop(listener);
-            let password = format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple());
-            let mut command = tokio::process::Command::new("opencode");
-            command.args(["serve", "--hostname=127.0.0.1", "--port", &port.to_string()]);
-            command.env("OPENCODE_PASSWORD", &password);
-            command.env("OPENCODE_SERVER_PASSWORD", &password);
-            command.env("OPENCODE_CONFIG_CONTENT", "{}");
-            command.stdin(std::process::Stdio::null());
-            command.stdout(std::process::Stdio::piped());
-            command.stderr(std::process::Stdio::null());
-            // The server never sees stdin EOF (it is null), so it must die with baton.
-            command.kill_on_drop(true);
-            let mut child = command.spawn()?;
-            let pid = child
-                .id()
-                .ok_or_else(|| anyhow::anyhow!("opencode did not expose a process id"))?;
-            let command_line = process::command_line(pid)
-                .unwrap_or_else(|| format!("opencode serve --hostname=127.0.0.1 --port {port}"));
-            let process_start = process::process_start(pid);
-            if let Err(error) = opencode_recorder.record(
-                pid,
-                ProviderId::OpenCode,
-                Some(port),
-                &command_line,
-                process_start.as_deref(),
-            ) {
-                let _ = child.start_kill();
-                return Err(error);
-            }
-            Ok(baton::adapters::opencode::OpenCodeChild { port, password, child })
-        },
-    );
-
     vec![
         Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner_with_recorder(claude_recorder))) as Box<dyn BatonAdapter>)),
         provider_runtime::build_codex_adapter(store, cwd),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Cursor, cursor_spawner)) as Box<dyn BatonAdapter>)),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Grok, grok_spawner)) as Box<dyn BatonAdapter>)),
-        Arc::new(tokio::sync::Mutex::new(Box::new(OpenCodeAdapter::with_recorder(opencode_spawner, process_recorder)) as Box<dyn BatonAdapter>)),
+        provider_runtime::build_opencode_adapter(store, cwd),
         Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Antigravity, antigravity_spawner)) as Box<dyn BatonAdapter>)),
     ]
 }

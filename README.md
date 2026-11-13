@@ -61,7 +61,7 @@ baton doctor [--json]    # provider binaries, configs, database, and process hea
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
 baton exec -p <provider> [--effort level] [--json] "prompt"  # one non-interactive turn
 baton mcp                # MCP stdio server for agent access to the thread store
-baton fork [-t id] [--turn n] [--native] [--json] [title]  # branch a thread; Codex can fork natively
+baton fork [-t id] [--turn n] [--native] [--json] [title]  # branch a thread; Codex and OpenCode can fork natively
 baton import [--dry-run] # import recent native sessions as threads
 baton usage              # token usage and cache hit rates
 baton auth [provider] [subscription|api]
@@ -80,7 +80,7 @@ baton worktrees --clean [--force] [--run <id>]  # remove clean, merged worktrees
 
 In the TUI: `/help /status /switch /model /effort /mode /auth /new /fork /worktree /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /orchestrate /runs /queue /turns /copy /clear /quit`. New threads start in orchestrate mode; `/orchestrate off` switches the current thread to a single harness, `/orchestrate on` switches back, and `/switch` also returns to single-harness mode. In orchestrate mode a composer prompt launches a coordinator run instead of a single turn. `/orchestrate --plan-only <goal>` opens a plan preview with effective models and waits for Enter to run or Esc to edit. `/runs` lists recent durable runs, `/runs --all` includes archived runs, and `/runs <id>` reopens a stored worker report even after it is archived. Press `i` in a report to merge completed worker branches, `p` to push them and open pull requests, or `a` to archive the run. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn or cancels an active orchestration, including its worker process groups; press twice to exit when idle. Drag in the transcript to select character ranges across wrapped rows; `/copy` copies the latest assistant reply. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably. `/fork [--turn N] [title]` branches the conversation into a new thread; both threads share the same working tree, and the fork starts with a transcript handoff instead of the source provider session. `/worktree [title]` forks the conversation into a new thread whose cwd is an isolated git worktree, binds that thread to a one-task orchestration run, and switches to it. The next successful turn commits there, after which the run report can integrate or ship the work. `/rewind --native` opens the rewind picker and uses Codex's native rollback with the durable recovery marker; plain `/rewind` keeps the transcript-only path.
 
-For Codex, `baton fork --native` asks the Codex app-server for a native `thread/fork`, then attaches the new provider session to the baton fork. The source thread is unchanged, and `--turn N` forks through that completed provider turn. Without `--native`, baton copies the transcript and starts the fork with a handoff.
+For Codex, `baton fork --native` asks the Codex app-server for a native `thread/fork`, then attaches the new provider session to the baton fork. The source thread is unchanged, and `--turn N` forks through that completed provider turn. For OpenCode, `--native` forks the whole native session through `/session/<id>/fork`; `--turn` is refused until Baton can map a turn to an OpenCode message boundary. Without `--native`, baton copies the transcript and starts the fork with a handoff.
 
 ## Orchestration
 
@@ -137,7 +137,7 @@ Tools:
 - `baton_processes`: provider server processes tracked by baton, including PID, owner, port, command-line, and process-start verification
 - `baton_orchestration_runs`: durable orchestration runs with status, coordinator, task counts, and timestamps; `all=true` includes archived runs
 - `baton_orchestration_report`: one run's plan, worker tasks, commits, worktree paths, PR links, text, and errors
-- `baton_fork`: create a new thread from a conversation, optionally through a completed turn, without changing the source; set `native=true` for a Codex native fork
+- `baton_fork`: create a new thread from a conversation, optionally through a completed turn, without changing the source; set `native=true` for a Codex or OpenCode native fork
 - `baton_latest_diff`: newest stored turn diff
 
 The server is read-only except for the explicit `baton_queue` clear option and `baton_fork`, which creates a new thread and leaves the source unchanged. It opens the same `~/.baton/baton.sqlite` database and honors `BATON_HOME`.

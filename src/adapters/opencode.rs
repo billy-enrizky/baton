@@ -10,7 +10,10 @@ use tokio::process::Child;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use uuid::Uuid;
 
-use crate::adapters::{AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{
+    AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, ModelListInput,
+    SteerHandle, TurnEvent, TurnEventSender, TurnStartInput,
+};
 use crate::config::auth_signature;
 use crate::process::ProcessRecorder;
 use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
@@ -470,6 +473,34 @@ impl BatonAdapter for OpenCodeAdapter {
             });
             true
         }))
+    }
+
+    async fn fork_session(&mut self, input: ForkSessionInput) -> Result<Option<String>> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting("native-fork");
+        if input.last_turn_id.is_some() {
+            anyhow::bail!(
+                "opencode native fork supports whole sessions only; omit --turn"
+            );
+        }
+        let runtime = self.ensure_runtime(&input.auth_env).await?;
+        let response = self
+            .post(
+                &runtime,
+                &format!("/session/{}/fork", input.session.native_session_id),
+                json!({}),
+            )
+            .await?;
+        let forked = response
+            .get("id")
+            .or_else(|| response.pointer("/data/id"))
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        match forked {
+            Some(id) => Ok(Some(id)),
+            None => anyhow::bail!("opencode session fork did not return a session id"),
+        }
     }
 
     async fn list_models(&mut self, input: ModelListInput) -> Result<Vec<String>> {

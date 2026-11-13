@@ -3,9 +3,10 @@
 ## Sub-features
 - Codex whole-thread native fork
 - Codex fork through a completed provider turn
+- OpenCode whole-session native fork
 - New native session attached to the baton fork
 - Source thread remains unchanged
-- Unsupported provider or missing session fails with guidance
+- Unsupported provider, unsupported turn boundary, or missing session fails with guidance
 
 ## How to get to it (user POV)
 Create or select a Codex thread with a native session, then run:
@@ -14,6 +15,14 @@ Create or select a Codex thread with a native session, then run:
 baton fork -t <source> --native --json "branch"
 baton fork -t <source> --native --turn 1 --json "branch at turn 1"
 ```
+
+For OpenCode, use a whole-session fork:
+
+```sh
+baton fork -t <source> --native --json "branch"
+```
+
+OpenCode native fork does not support `--turn` yet.
 
 ## Driving it with the PTY/CLI harness
 A temp home has no native session. For a real proof, use a copied state directory or create one short Codex turn first:
@@ -42,8 +51,8 @@ printf '%s\n' \
 ```
 
 ## Gotchas
-- `--native` is Codex-only today. Claude and OpenCode fail loudly rather than silently falling back.
-- A source thread needs a Codex provider session and, for `--turn N`, a recorded provider turn id.
+- `--native` supports Codex and OpenCode. Claude still fails loudly rather than silently falling back.
+- A source thread needs a native provider session. Codex `--turn N` also needs a recorded provider turn id; OpenCode currently refuses `--turn`.
 - The provider fork runs before the baton thread is created. If baton creation fails, use the reported native id to avoid losing the provider work.
 - The source thread and its provider session are never changed.
-- The native fork helper disposes its Codex app-server; `baton ps --json` must be empty afterwards.
+- The native fork helper disposes its Codex app-server or OpenCode server; `baton ps --json` must be empty afterwards.

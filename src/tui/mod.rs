@@ -73,6 +73,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/auth", "billing mode: /auth <provider> <subscription|api>"),
     ("/new", "start a new thread"),
     ("/fork", "branch this conversation into a new thread"),
+    ("/worktree", "fork this conversation into an isolated git worktree"),
     ("/threads", "list threads in this directory"),
     ("/open", "open a thread by id prefix"),
     ("/usage", "token usage and cache hit rate"),
@@ -3609,6 +3610,190 @@ fn handle_command(
                 Err(error) => state.notice = Some(format!("cannot fork: {error}")),
             }
         }
+        "/worktree" => {
+            if state.running {
+                state.notice = Some("wait for the current turn to finish before creating a worktree".into());
+                return;
+            }
+            let source_id = state.thread.id.clone();
+            let source_title = state.thread.title.clone();
+            let source_cwd = state.thread.cwd.clone();
+            let source_provider = state.thread.current_provider;
+            let source_session_mode = state.thread.session_mode;
+            let repo_root = match crate::worktree::repo_root(std::path::Path::new(&source_cwd)) {
+                Ok(root) => root,
+                Err(error) => {
+                    state.notice = Some(format!("/worktree needs a git repository: {error}"));
+                    return;
+                }
+            };
+            if crate::worktree::is_dirty(&repo_root).unwrap_or(false) {
+                state.notice = Some(
+                    "source checkout has uncommitted changes; commit or stash before /worktree, or use /fork to stay in this checkout".into(),
+                );
+                return;
+            }
+            let persisted = {
+                let guard = store.lock().unwrap();
+                ensure_persisted(&guard, &mut state.thread)
+            };
+            if let Err(error) = persisted {
+                state.notice = Some(format!("cannot prepare worktree fork: {error}"));
+                return;
+            }
+            let title = if args.is_empty() {
+                format!("{source_title} (worktree)")
+            } else {
+                args.join(" ")
+            };
+            let run_id = uuid::Uuid::new_v4().to_string();
+            let short_thread = source_id[..8.min(source_id.len())].to_string();
+            let worktree = match crate::worktree::create(
+                &state.home,
+                &repo_root,
+                &run_id,
+                &format!("thread-{short_thread}"),
+            ) {
+                Ok(worktree) => worktree,
+                Err(error) => {
+                    state.notice = Some(format!("cannot create worktree: {error}"));
+                    return;
+                }
+            };
+            let fork = {
+                let guard = store.lock().unwrap();
+                guard.fork_thread(&source_id, &title)
+            };
+            let fork = match fork {
+                Ok(fork) => fork,
+                Err(error) => {
+                    let _ = crate::worktree::remove(&worktree);
+                    state.notice = Some(format!("cannot fork into worktree: {error}"));
+                    return;
+                }
+            };
+            let worktree_path = worktree.path.to_string_lossy().to_string();
+            let switched = {
+                let guard = store.lock().unwrap();
+                guard
+                    .set_thread_cwd(&fork.id, &worktree_path)
+                    .and_then(|()| guard.set_thread_session_mode(&fork.id, SessionMode::Single))
+            };
+            if let Err(error) = switched {
+                let _ = crate::worktree::remove(&worktree);
+                state.notice = Some(format!("cannot attach worktree to fork: {error}"));
+                return;
+            }
+            let resolved = resolve_config(&state.home, std::path::Path::new(&source_cwd));
+            let model = state
+                .thread
+                .current_model
+                .clone()
+                .unwrap_or_else(|| resolved.for_provider(source_provider).model.clone());
+            let plan = orchestrate::Plan {
+                summary: Some(format!("thread worktree from {short_thread}")),
+                tasks: vec![orchestrate::PlanTask {
+                    title: "thread worktree".to_string(),
+                    provider: source_provider.as_str().to_string(),
+                    prompt: title.clone(),
+                }],
+            };
+            let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let task_id = uuid::Uuid::new_v4().to_string();
+            let record = {
+                let guard = store.lock().unwrap();
+                serde_json::to_string(&plan)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|plan_json| {
+                        guard.create_orchestration_run(
+                            &run_id,
+                            &title,
+                            source_provider,
+                            &model,
+                            Some("thread worktree"),
+                            &plan_json,
+                            false,
+                        )
+                    })
+                    .and_then(|()| {
+                        guard.add_orchestration_task(
+                            &task_id,
+                            &run_id,
+                            1,
+                            "thread worktree",
+                            source_provider,
+                            &model,
+                            &title,
+                            Some(worktree_path.as_str()),
+                            Some(&worktree.branch),
+                            None,
+                            Some(fork.id.as_str()),
+                            "completed",
+                            None,
+                            None,
+                            &now,
+                            Some(&now),
+                        )
+                    })
+                    .and_then(|()| guard.finish_orchestration_run(&run_id, "completed"))
+            };
+            if let Err(error) = record {
+                let _ = store.lock().unwrap().set_thread_cwd(&fork.id, &source_cwd);
+                let _ = store
+                    .lock()
+                    .unwrap()
+                    .set_thread_session_mode(&fork.id, source_session_mode);
+                let _ = crate::worktree::remove(&worktree);
+                state.notice = Some(format!("cannot record worktree run: {error}"));
+                return;
+            }
+            let short_run = run_id[..8.min(run_id.len())].to_string();
+            let short_fork = fork.id[..8.min(fork.id.len())].to_string();
+            {
+                let guard = store.lock().unwrap();
+                let _ = guard.add_message(
+                    &source_id,
+                    0,
+                    "orchestration",
+                    None,
+                    None,
+                    &format!(
+                        "worktree fork {short_fork} · run {short_run} · branch {}",
+                        worktree.branch
+                    ),
+                );
+                let _ = guard.add_message(
+                    &fork.id,
+                    0,
+                    "orchestration",
+                    None,
+                    None,
+                    &format!(
+                        "worktree · run {short_run} · next successful turn commits here"
+                    ),
+                );
+            }
+            let mut fork = fork;
+            fork.cwd = worktree_path;
+            fork.session_mode = SessionMode::Single;
+            load_thread_state(state, store, fork);
+            state.prompt_history = store
+                .lock()
+                .unwrap()
+                .list_prompt_history(&state.thread.cwd)
+                .unwrap_or_default();
+            state.prompt_history_index = None;
+            state.custom_commands = discover_custom_commands(&state.thread.cwd);
+            state.overlay = Overlay::None;
+            state.multi = None;
+            state.review = None;
+            state.orchestration_report = None;
+            state.input.clear();
+            state.input_cursor = 0;
+            state.notice = Some(format!(
+                "worktree fork {short_fork} · run {short_run} · next turn commits here"
+            ));
+        }
         "/threads" => {
             let threads: Vec<(String, String)> = {
                 let guard = store.lock().unwrap();
@@ -5872,12 +6057,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 31);
+        assert_eq!(suggestions.len(), 32);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/31"), "position indicator must reflect the selection");
+        assert!(text.contains("11/32"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -7744,6 +7929,156 @@ mod tests {
         assert_eq!(state.goal.as_deref(), Some("other goal"));
         assert!(state.goal_paused);
         assert_eq!(state.thread.session_mode, SessionMode::Orchestrate);
+    }
+
+    #[test]
+    fn worktree_command_forks_into_an_isolated_checked_out_thread() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let source_id = state.thread.id.clone();
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        state.thread.session_mode = SessionMode::Orchestrate;
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .set_thread_cwd(&source_id, &state.thread.cwd)
+                .unwrap();
+            guard
+                .set_thread_session_mode(&source_id, SessionMode::Orchestrate)
+                .unwrap();
+        }
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/worktree",
+        );
+
+        assert_ne!(state.thread.id, source_id);
+        assert_eq!(state.thread.title, "test (worktree)");
+        assert_eq!(state.thread.session_mode, SessionMode::Single);
+        assert!(
+            state.thread.cwd.contains("/worktrees/"),
+            "cwd: {}",
+            state.thread.cwd
+        );
+        assert!(std::path::Path::new(&state.thread.cwd).is_dir());
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("worktree fork"),
+            "notice: {:?}",
+            state.notice
+        );
+
+        let runs = store.lock().unwrap().list_orchestration_runs(10).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "completed");
+        let tasks = store
+            .lock()
+            .unwrap()
+            .list_orchestration_tasks(&runs[0].id)
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].thread_id.as_deref(), Some(state.thread.id.as_str()));
+        assert_eq!(tasks[0].worktree_path.as_deref(), Some(state.thread.cwd.as_str()));
+        assert_eq!(tasks[0].status, "completed");
+        assert!(tasks[0].commit_sha.is_none());
+
+        let source_messages = store.lock().unwrap().list_messages(&source_id).unwrap();
+        assert!(
+            source_messages
+                .iter()
+                .any(|message| message.text.contains("worktree fork")),
+            "source thread records the fork"
+        );
+        let fork_messages = store
+            .lock()
+            .unwrap()
+            .list_messages(&state.thread.id)
+            .unwrap();
+        assert!(
+            fork_messages
+                .iter()
+                .any(|message| message.text.contains("next successful turn commits here")),
+            "fork thread records the worktree run"
+        );
+    }
+
+    #[test]
+    fn worktree_command_refuses_dirty_and_non_git_sources() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let source_id = state.thread.id.clone();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/worktree");
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("needs a git repository"),
+            "notice: {:?}",
+            state.notice
+        );
+        assert_eq!(state.thread.id, source_id);
+
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        store
+            .lock()
+            .unwrap()
+            .set_thread_cwd(&source_id, &state.thread.cwd)
+            .unwrap();
+        handle_command(&mut state, &store, &engine_command_sender, "/worktree");
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("uncommitted changes"),
+            "notice: {:?}",
+            state.notice
+        );
+        assert_eq!(state.thread.id, source_id);
+        let worktrees = home.path().join("worktrees");
+        assert!(!worktrees.exists() || std::fs::read_dir(worktrees).unwrap().next().is_none());
     }
 
     #[test]

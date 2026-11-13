@@ -724,6 +724,14 @@ impl BatonStore {
         Ok(())
     }
 
+    pub fn set_thread_cwd(&self, id: &str, cwd: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET cwd = ?, updated_at = ? WHERE id = ?",
+            params![cwd, now_iso(), id],
+        )?;
+        Ok(())
+    }
+
     pub fn set_thread_session_mode(&self, id: &str, mode: SessionMode) -> Result<()> {
         self.db.execute(
             "UPDATE threads SET session_mode = ?, updated_at = ? WHERE id = ?",

@@ -13,6 +13,7 @@
 - Push worker branches and open PRs with `--open-prs` or `p` in the report
 - Live per-worker progress in the TUI and with `--progress`
 - `/multi --worktrees` fan-out through a generated plan, one isolated worker per provider
+- `/worktree` conversation fork bound to a one-task orchestration run
 
 ## How to get to it (user POV)
 
@@ -41,6 +42,8 @@ In the TUI:
 ```
 
 `/multi --worktrees` does not call the coordinator. It writes a deterministic plan with one task per provider and starts the normal orchestration run, so the result is a durable report with worker worktrees, commits, `i` integration, and `p` PR shipping. Plain `/multi` keeps the live merged view and shared working tree.
+
+`/worktree [title]` forks the current conversation into an isolated worktree and binds the new thread to a completed one-task run. The first successful turn commits through the worker follow-up path; the report then exposes integrate, ship, archive, and cleanup. Dirty source checkouts are refused, and the original thread stays in the source checkout.
 
 The transcript shows a live per-worker list while the run is active: queued, running, completed with commit, failed with the error, or cancelled. Ctrl+C cancels the run and terminates the worker process groups. `--progress` prints the same lines to stderr. When it
 finishes, the full-screen report lists each worker. Up/Down selects a worker,

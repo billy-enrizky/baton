@@ -1,6 +1,6 @@
-use baton::adapters::{duplex_halves, BatonAdapter, ModelListInput, TransportHalves};
+use baton::adapters::{duplex_halves, BatonAdapter, ForkSessionInput, ModelListInput, TransportHalves};
 use baton::adapters::codex::CodexAdapter;
-use baton::types::{ApprovalDecision, PermissionMode, ProviderId};
+use baton::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -162,6 +162,45 @@ async fn fake_server_resume_with_approval(read: tokio::io::DuplexStream, mut wri
     }
 }
 
+async fn fake_server_fork(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    params_sender: tokio::sync::mpsc::UnboundedSender<Value>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+            }
+            "thread/fork" => {
+                let _ = params_sender.send(frame.get("params").cloned().unwrap_or(Value::Null));
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "thread": { "id": "native-forked" } }
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn fake_server_models(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
     let mut lines = BufReader::new(read);
     let mut line = String::new();
@@ -231,6 +270,43 @@ async fn codex_adapter_lists_visible_models_across_pages() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_adapter_forks_a_native_thread() {
+    let (params_sender, mut params_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let spawner = Arc::new(move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+        let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+        tokio::spawn(fake_server_fork(server_read, server_write, params_sender.clone()));
+        Ok(halves)
+    });
+    let mut adapter = CodexAdapter::new(spawner);
+    let forked = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.fork_session(ForkSessionInput {
+            cwd: "/work".into(),
+            model: "gpt-6.1-sol".into(),
+            session: NativeSessionRef {
+                native_session_id: "native-source".into(),
+                rollout_path: None,
+            },
+            auth_env: vec![],
+            last_turn_id: Some("turn-source".into()),
+        }),
+    )
+    .await
+    .expect("fork completes")
+    .expect("fork succeeds");
+    assert_eq!(forked.as_deref(), Some("native-forked"));
+    let params = tokio::time::timeout(Duration::from_secs(2), params_receiver.recv())
+        .await
+        .expect("fork params arrive")
+        .expect("fork params channel");
+    assert_eq!(params["threadId"], "native-source");
+    assert_eq!(params["lastTurnId"], "turn-source");
+    assert_eq!(params["excludeTurns"], true);
+    assert_eq!(params["cwd"], "/work");
+    adapter.dispose().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_adapter_runs_a_full_turn() {
     let spawner = Arc::new(move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
         let (halves, server_read, server_write) = duplex_halves(64 * 1024);
@@ -279,6 +355,11 @@ async fn codex_adapter_runs_a_full_turn() {
         })
         .collect();
     assert_eq!(deltas, "hel");
+    let provider_turn = events.iter().find_map(|event| match event {
+        baton::adapters::TurnEvent::ProviderTurnId { id } => Some(id.clone()),
+        _ => None,
+    });
+    assert_eq!(provider_turn.as_deref(), Some("turn-1"));
     adapter.dispose().await.unwrap();
 }
 

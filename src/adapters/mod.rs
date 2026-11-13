@@ -210,6 +210,16 @@ pub struct TurnStartInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct ForkSessionInput {
+    pub cwd: String,
+    pub model: String,
+    pub session: NativeSessionRef,
+    pub auth_env: Vec<(String, String)>,
+    /// Provider turn id to fork through, inclusive. None forks the whole thread.
+    pub last_turn_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelListInput {
     pub cwd: String,
     pub auth_env: Vec<(String, String)>,
@@ -217,6 +227,7 @@ pub struct ModelListInput {
 
 #[derive(Debug)]
 pub enum TurnEvent {
+    ProviderTurnId { id: String },
     TextDelta { text: String },
     AssistantText { text: String },
     ToolStarted { id: Option<String>, tool: String, detail: Option<String> },
@@ -402,6 +413,11 @@ pub trait BatonAdapter: Send {
     /// override this.
     async fn list_models(&mut self, _input: ModelListInput) -> Result<Vec<String>> {
         Ok(Vec::new())
+    }
+    /// Provider-native conversation fork. Returning None means this provider
+    /// has no native fork and the caller must keep the transcript fallback.
+    async fn fork_session(&mut self, _input: ForkSessionInput) -> Result<Option<String>> {
+        Ok(None)
     }
     async fn start_turn(
         &mut self,

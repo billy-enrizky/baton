@@ -81,6 +81,9 @@ pub enum Commands {
         /// Copy only messages and turns through this completed turn
         #[arg(long)]
         turn: Option<i64>,
+        /// Fork the provider's native session when supported (currently Codex)
+        #[arg(long)]
+        native: bool,
         /// Emit a JSON object instead of lines
         #[arg(long)]
         json: bool,

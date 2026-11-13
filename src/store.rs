@@ -386,6 +386,37 @@ impl BatonStore {
         self.fork_thread_through_turn(source_id, title, None)
     }
 
+    /// Validates a fork cutoff and returns the provider turn id to use for a
+    /// native fork. A None result means the whole thread is eligible. The
+    /// caller can run the provider fork before creating the baton thread.
+    pub fn fork_provider_turn_id(
+        &self,
+        source_id: &str,
+        through_turn: Option<i64>,
+    ) -> Result<Option<String>> {
+        self.get_thread(source_id)?
+            .ok_or_else(|| anyhow::anyhow!("thread not found: {source_id}"))?;
+        let turns = self.list_turn_records(source_id)?;
+        match through_turn {
+            Some(cutoff) => {
+                let turn = turns
+                    .iter()
+                    .find(|turn| turn.turn == cutoff)
+                    .ok_or_else(|| anyhow::anyhow!("turn {cutoff} not found in thread"))?;
+                if !turn.phase.is_terminal() {
+                    anyhow::bail!("turn {cutoff} is not terminal");
+                }
+                Ok(turn.provider_turn_id.clone())
+            }
+            None => {
+                if turns.iter().any(|turn| !turn.phase.is_terminal()) {
+                    anyhow::bail!("cannot fork while a turn is open");
+                }
+                Ok(None)
+            }
+        }
+    }
+
     /// Branches a thread through a specific completed turn. Later turns,
     /// including a currently open turn, are left in the source thread.
     pub fn fork_thread_through_turn(

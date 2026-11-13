@@ -817,7 +817,7 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                 state.tool_lines.push(ToolLine { id, label, status });
             }
         }
-        TurnEvent::Usage { .. } => {}
+        TurnEvent::ProviderTurnId { .. } | TurnEvent::Usage { .. } => {}
         // Approval requests need their thread id, so the run loop routes them
         // through apply_turn_event_for_thread before calling this function.
         TurnEvent::ApprovalRequest { .. } => {}

@@ -43,7 +43,7 @@ impl McpServer {
                     "version": env!("CARGO_PKG_VERSION"),
                     "title": "Baton thread state"
                 },
-                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, and baton_latest_diff to inspect the local baton store and provider readiness. baton_fork creates a new thread from an existing conversation."
+                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, and baton_latest_diff to inspect the local baton store and provider readiness. baton_fork creates a new thread from an existing conversation; set native=true for a Codex native fork."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
@@ -257,9 +257,36 @@ impl McpServer {
                         Some(turn) => format!("{} (fork at turn {turn})", thread.title),
                         None => format!("{} (fork)", thread.title),
                     });
+                let native = arguments
+                    .get("native")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let native_session = if native {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    runtime.block_on(crate::provider_runtime::fork_codex_session(
+                        &self.store,
+                        &self.home,
+                        &thread,
+                        turn,
+                        crate::process::ProcessRecorder::disabled(),
+                    ))?
+                } else {
+                    None
+                };
                 let forked = self
                     .store
                     .fork_thread_through_turn(&thread.id, &title, turn)?;
+                if let Some((native_id, model)) = native_session.as_ref() {
+                    self.store.upsert_provider_session(
+                        &forked.id,
+                        crate::types::ProviderId::Codex,
+                        native_id,
+                        Some(model.clone()),
+                        None,
+                    )?;
+                }
                 Ok(json!({
                     "schema_version": status::SCHEMA_VERSION,
                     "source_thread_id": thread.id,
@@ -269,6 +296,8 @@ impl McpServer {
                     "provider": forked.current_provider.as_str(),
                     "model": forked.current_model,
                     "through_turn": turn,
+                    "native": native,
+                    "native_session_id": native_session.as_ref().map(|(id, _)| id),
                 }))
             }
             _ => anyhow::bail!("unknown baton tool {name}"),
@@ -483,7 +512,8 @@ fn tool_descriptors() -> Vec<Value> {
                 "properties": {
                     "thread": { "type": "string", "description": "Source thread id or unique prefix. Omit for the newest thread in the server cwd." },
                     "title": { "type": "string", "description": "Title for the new thread." },
-                    "turn": { "type": "integer", "minimum": 1, "description": "Copy only messages and turns through this completed turn." }
+                    "turn": { "type": "integer", "minimum": 1, "description": "Copy only messages and turns through this completed turn." },
+                    "native": { "type": "boolean", "description": "Fork the provider's native session when supported (currently Codex)." }
                 },
                 "additionalProperties": false
             },
@@ -594,6 +624,13 @@ mod tests {
         assert!(names.contains(&"baton_latest_diff"));
         assert!(names.contains(&"baton_processes"));
         assert!(names.contains(&"baton_fork"));
+        let fork_tool = listed["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "baton_fork")
+            .unwrap();
+        assert!(fork_tool["inputSchema"]["properties"]["native"].is_object());
     }
 
     #[test]

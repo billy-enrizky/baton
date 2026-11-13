@@ -652,6 +652,7 @@ fn main_result() -> Result<()> {
                     &store,
                     permission_mode,
                     Some(&sink as &orchestrate::ProgressFn<'_>),
+                    None,
                 )?
             } else {
                 orchestrate::run(
@@ -670,6 +671,9 @@ fn main_result() -> Result<()> {
                 println!("{}", serde_json::to_string_pretty(&orchestrate::to_json(&report))?);
             } else {
                 println!("{}", orchestrate::render(&report));
+            }
+            if report.status == "cancelled" {
+                std::process::exit(130);
             }
             if report.status == "failed" {
                 std::process::exit(1);

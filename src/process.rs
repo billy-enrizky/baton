@@ -238,6 +238,7 @@ fn pid_alive(pid: u32) -> bool {
         Ok(_) => false,
         Err(_) => std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|status| status.success())
             .unwrap_or(false),
@@ -253,9 +254,64 @@ fn pid_alive(_pid: u32) -> bool {
 fn send_signal(pid: u32, signal: &str) -> bool {
     std::process::Command::new("kill")
         .args([signal, &pid.to_string()])
+        .stderr(std::process::Stdio::null())
         .status()
         .map(|status| status.success())
         .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn send_group_signal(pgid: u32, signal: &str) -> bool {
+    std::process::Command::new("kill")
+        .args([signal, &format!("-{pgid}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn group_alive(pgid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &format!("-{pgid}")])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+/// Stops every process in a worker's process group. The worker runs `baton
+/// exec` in its own group, so its provider child dies with it.
+#[cfg(unix)]
+pub fn terminate_group(pgid: u32) -> bool {
+    if pgid == 0 {
+        return false;
+    }
+    let _ = send_group_signal(pgid, "-TERM");
+    if !group_alive(pgid) {
+        return true;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if !group_alive(pgid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = send_group_signal(pgid, "-KILL");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    while Instant::now() < deadline {
+        if !group_alive(pgid) {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    !group_alive(pgid)
+}
+
+#[cfg(not(unix))]
+pub fn terminate_group(_pgid: u32) -> bool {
+    false
 }
 
 #[cfg(unix)]

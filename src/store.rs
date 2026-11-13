@@ -55,6 +55,7 @@ pub struct OrchestrationRunRow {
     pub dirty_source: bool,
     pub created_at: String,
     pub finished_at: Option<String>,
+    pub archived_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -277,7 +278,8 @@ CREATE TABLE IF NOT EXISTS orchestration_runs (
   status TEXT NOT NULL,
   dirty_source INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
-  finished_at TEXT
+  finished_at TEXT,
+  archived_at TEXT
 );
 CREATE TABLE IF NOT EXISTS orchestration_tasks (
   id TEXT PRIMARY KEY,
@@ -401,6 +403,23 @@ fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
     })
 }
 
+fn map_orchestration_run(row: &rusqlite::Row) -> rusqlite::Result<OrchestrationRunRow> {
+    let provider: String = row.get(2)?;
+    Ok(OrchestrationRunRow {
+        id: row.get(0)?,
+        goal: row.get(1)?,
+        coordinator_provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Codex),
+        coordinator_model: row.get(3)?,
+        summary: row.get(4)?,
+        plan_json: row.get(5)?,
+        status: row.get(6)?,
+        dirty_source: row.get::<_, i64>(7)? != 0,
+        created_at: row.get(8)?,
+        finished_at: row.get(9)?,
+        archived_at: row.get(10)?,
+    })
+}
+
 const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode";
 
 /// Per-project prompt history cap, Claude Code style.
@@ -425,6 +444,7 @@ impl BatonStore {
         ensure_column(&db, "orchestration_tasks", "position", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&db, "orchestration_tasks", "pr_url", "TEXT")?;
         ensure_column(&db, "orchestration_runs", "dirty_source", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column(&db, "orchestration_runs", "archived_at", "TEXT")?;
         Ok(BatonStore { db })
     }
 
@@ -1487,6 +1507,14 @@ impl BatonStore {
         Ok(())
     }
 
+    pub fn archive_orchestration_run(&self, id: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE orchestration_runs SET archived_at = COALESCE(archived_at, ?) WHERE id = ?",
+            params![now_iso(), id],
+        )?;
+        Ok(())
+    }
+
     pub fn add_orchestration_task(
         &self,
         id: &str,
@@ -1548,24 +1576,21 @@ impl BatonStore {
 
     pub fn list_orchestration_runs(&self, limit: usize) -> Result<Vec<OrchestrationRunRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at FROM orchestration_runs ORDER BY created_at DESC LIMIT ?",
+            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at, archived_at FROM orchestration_runs ORDER BY created_at DESC LIMIT ?",
         )?;
         let rows = statement
-            .query_map(params![limit as i64], |row| {
-                let provider: String = row.get(2)?;
-                Ok(OrchestrationRunRow {
-                    id: row.get(0)?,
-                    goal: row.get(1)?,
-                    coordinator_provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Codex),
-                    coordinator_model: row.get(3)?,
-                    summary: row.get(4)?,
-                    plan_json: row.get(5)?,
-                    status: row.get(6)?,
-                    dirty_source: row.get::<_, i64>(7)? != 0,
-                    created_at: row.get(8)?,
-                    finished_at: row.get(9)?,
-                })
-            })?
+            .query_map(params![limit as i64], map_orchestration_run)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn find_orchestration_runs(&self, run_id: &str) -> Result<Vec<OrchestrationRunRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, finished_at, archived_at FROM orchestration_runs WHERE id = ? OR id LIKE ? ORDER BY created_at DESC LIMIT 3",
+        )?;
+        let pattern = format!("{run_id}%");
+        let rows = statement
+            .query_map(params![run_id, pattern], map_orchestration_run)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

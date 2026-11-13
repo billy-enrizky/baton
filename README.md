@@ -135,6 +135,8 @@ Tools:
 - `baton_queue`: inspect queued follow-ups, or clear them explicitly
 - `baton_search`: search thread titles and conversation text in the project, or every project with `all=true`
 - `baton_processes`: provider server processes tracked by baton, including PID, owner, port, command-line, and process-start verification
+- `baton_orchestration_runs`: durable orchestration runs with status, coordinator, task counts, and timestamps; `all=true` includes archived runs
+- `baton_orchestration_report`: one run's plan, worker tasks, commits, worktree paths, PR links, text, and errors
 - `baton_fork`: create a new thread from a conversation, optionally through a completed turn, without changing the source; set `native=true` for a Codex native fork
 - `baton_latest_diff`: newest stored turn diff
 

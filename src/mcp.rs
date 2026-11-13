@@ -7,6 +7,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::config::resolve_config;
+use crate::orchestrate;
 use crate::process;
 use crate::status::{self, ThreadStatus, TurnStatus};
 use crate::store::{BatonStore, MessageRow, ThreadRow, TurnRow};
@@ -43,7 +44,7 @@ impl McpServer {
                     "version": env!("CARGO_PKG_VERSION"),
                     "title": "Baton thread state"
                 },
-                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, and baton_latest_diff to inspect the local baton store and provider readiness. baton_fork creates a new thread from an existing conversation; set native=true for a Codex native fork."
+                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. baton_fork creates a new thread from an existing conversation; set native=true for a Codex native fork."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
@@ -215,6 +216,80 @@ impl McpServer {
             "baton_doctor" => {
                 let report = crate::doctor::build(&self.home, &self.cwd, &self.store)?;
                 Ok(crate::doctor::to_json(&report))
+            }
+            "baton_orchestration_runs" => {
+                let limit = arguments
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(10)
+                    .clamp(1, 100) as usize;
+                let all = arguments
+                    .get("all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let mut runs = self.store.list_orchestration_runs(500)?;
+                if !all {
+                    runs.retain(|run| run.archived_at.is_none());
+                }
+                runs.truncate(limit);
+                let values = runs
+                    .iter()
+                    .map(|run| {
+                        let tasks = self
+                            .store
+                            .list_orchestration_tasks(&run.id)
+                            .unwrap_or_default();
+                        let completed = tasks
+                            .iter()
+                            .filter(|task| task.status == "completed")
+                            .count();
+                        let failed = tasks
+                            .iter()
+                            .filter(|task| task.status == "failed")
+                            .count();
+                        let cancelled = tasks
+                            .iter()
+                            .filter(|task| task.status == "cancelled")
+                            .count();
+                        let running = tasks
+                            .iter()
+                            .filter(|task| task.status == "running")
+                            .count();
+                        json!({
+                            "run_id": run.id,
+                            "goal": run.goal,
+                            "status": run.status,
+                            "coordinator_provider": run.coordinator_provider.as_str(),
+                            "coordinator_model": run.coordinator_model,
+                            "summary": run.summary,
+                            "dirty_source": run.dirty_source,
+                            "created_at": run.created_at,
+                            "finished_at": run.finished_at,
+                            "archived_at": run.archived_at,
+                            "owner_pid": run.owner_pid,
+                            "task_count": tasks.len(),
+                            "completed": completed,
+                            "failed": failed,
+                            "cancelled": cancelled,
+                            "running": running,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                Ok(json!({
+                    "schema_version": orchestrate::SCHEMA_VERSION,
+                    "count": values.len(),
+                    "runs": values,
+                }))
+            }
+            "baton_orchestration_report" => {
+                let run = arguments
+                    .get("run")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|run| !run.is_empty())
+                    .ok_or_else(|| anyhow::anyhow!("run is required"))?;
+                let report = orchestrate::report_from_rows(&self.store, &self.cwd, run)?;
+                Ok(orchestrate::to_json(&report))
             }
             "baton_processes" => {
                 let rows = self.store.list_provider_processes()?;
@@ -506,6 +581,32 @@ fn tool_descriptors() -> Vec<Value> {
             "annotations": { "readOnlyHint": true }
         }),
         json!({
+            "name": "baton_orchestration_runs",
+            "description": "List durable orchestration runs with status, coordinator, task counts, and timestamps. Archived runs require all=true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10 },
+                    "all": { "type": "boolean", "description": "Include archived runs." }
+                },
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "baton_orchestration_report",
+            "description": "Read one orchestration run's plan, worker tasks, commits, worktree paths, PR links, text, and errors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "run": { "type": "string", "description": "Run id or unique prefix." }
+                },
+                "required": ["run"],
+                "additionalProperties": false
+            },
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
             "name": "baton_fork",
             "description": "Create a new thread by copying a conversation, optionally only through a completed turn. The source thread is unchanged.",
             "inputSchema": {
@@ -624,6 +725,8 @@ mod tests {
         assert!(names.contains(&"baton_messages"));
         assert!(names.contains(&"baton_latest_diff"));
         assert!(names.contains(&"baton_processes"));
+        assert!(names.contains(&"baton_orchestration_runs"));
+        assert!(names.contains(&"baton_orchestration_report"));
         assert!(names.contains(&"baton_fork"));
         let fork_tool = listed["result"]["tools"]
             .as_array()
@@ -699,6 +802,89 @@ mod tests {
         assert_eq!(processes["processes"][0]["provider"], "opencode");
         assert_eq!(processes["processes"][0]["process_alive"], false);
         assert_eq!(processes["processes"][0]["command_matches"], false);
+    }
+
+    #[test]
+    fn orchestration_runs_and_reports_are_readable() {
+        let server = server();
+        let plan = r#"{"summary":"one worker","tasks":[{"title":"worker","provider":"codex","prompt":"do it"}]}"#;
+        server
+            .store
+            .create_orchestration_run(
+                "run-mcp-1234",
+                "read orchestration",
+                ProviderId::Codex,
+                "model-1",
+                Some("one worker"),
+                plan,
+                false,
+            )
+            .unwrap();
+        server
+            .store
+            .add_orchestration_task(
+                "task-mcp-1",
+                "run-mcp-1234",
+                1,
+                "worker",
+                ProviderId::Codex,
+                "model-1",
+                "do it",
+                Some("/tmp/worktree"),
+                Some("baton/run-mcp/worker"),
+                Some("abc123"),
+                Some("thread-mcp"),
+                "completed",
+                Some("done"),
+                None,
+                "2026-11-13T00:00:00Z",
+                Some("2026-11-13T00:00:01Z"),
+            )
+            .unwrap();
+        server
+            .store
+            .finish_orchestration_run("run-mcp-1234", "completed")
+            .unwrap();
+
+        let runs = tool_json(&server, "baton_orchestration_runs", json!({}));
+        assert_eq!(runs["schema_version"], orchestrate::SCHEMA_VERSION);
+        assert_eq!(runs["count"], 1);
+        assert_eq!(runs["runs"][0]["run_id"], "run-mcp-1234");
+        assert_eq!(runs["runs"][0]["status"], "completed");
+        assert_eq!(runs["runs"][0]["task_count"], 1);
+        assert_eq!(runs["runs"][0]["completed"], 1);
+
+        let report = tool_json(
+            &server,
+            "baton_orchestration_report",
+            json!({ "run": "run-mcp" }),
+        );
+        assert_eq!(report["schema_version"], orchestrate::SCHEMA_VERSION);
+        assert_eq!(report["run_id"], "run-mcp-1234");
+        assert_eq!(report["tasks"][0]["commit"], "abc123");
+        assert_eq!(report["tasks"][0]["thread_id"], "thread-mcp");
+
+        server
+            .store
+            .archive_orchestration_run("run-mcp-1234")
+            .unwrap();
+        let visible = tool_json(&server, "baton_orchestration_runs", json!({}));
+        assert_eq!(visible["count"], 0);
+        let all = tool_json(&server, "baton_orchestration_runs", json!({ "all": true }));
+        assert_eq!(all["count"], 1);
+
+        let missing = tool_json(
+            &server,
+            "baton_orchestration_report",
+            json!({ "run": "does-not-exist" }),
+        );
+        assert!(
+            missing["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("no orchestration run"),
+            "missing report error: {missing}"
+        );
     }
 
     #[test]

@@ -19,7 +19,7 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 - **Live catalogs.** `/switch` loads the provider's current model list (Codex, OpenCode, and ACP providers), with type-to-filter search.
 - **Parallel, then merged.** `/multi` fans one prompt across providers and opens a merged live view; press Enter to inspect any child thread. `/multi --worktrees` runs the same fan-out as isolated orchestration workers, so `i` merges and `p` opens PRs through the existing worker flows.
 - **Queued by provider.** If two threads target the same provider at once, the second waits in a durable `queued` phase and starts when the adapter is free instead of failing.
-- **Agent-readable state.** `status`, `threads`, `turns`, `queue`, and `exec` have versioned JSON output. `baton mcp` exposes the same durable state over MCP stdio.
+- **Agent-readable state.** `status`, `threads`, `turns`, `queue`, and `exec` have versioned JSON output. `baton exec --stream-json` emits one JSON event per line for live progress and ends with a result row. `baton mcp` exposes the same durable state over MCP stdio.
 - **Subscription or API billing.** Each provider runs on its harness login or an API key, switchable per provider (`baton auth <provider> api`).
 - **codex-style keys.** Esc interrupts, Esc-Esc backtracks to a previous prompt, streaming Markdown with tables and aligned columns, tinted diffs, and per-tool activity rows.
 
@@ -59,8 +59,10 @@ baton search <query> [--all] [--json]  # search thread titles and conversation t
 baton ps [--json]        # list provider servers tracked by baton
 baton doctor [--json]    # provider binaries, configs, database, and process health
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
-baton exec -p <provider> [--effort level] [--json] "prompt"  # one non-interactive turn
+baton exec -p <provider> [--effort level] [--json | --stream-json] "prompt"  # one non-interactive turn
 baton exec -t <worker-thread> [--json] "answer"  # answer an orchestration worker question
+
+`--json` prints one final result object. `--stream-json` prints one compact JSON object per line for provider session and turn ids, text deltas, tool start and finish, usage, and turn completion, then a final `type: "result"` row. Use it when an agent needs live progress; stdout stays parseable JSONL and progress text stays off stderr.
 baton mcp                # MCP stdio server for agent access to the thread store
 baton fork [-t id] [--turn n] [--native] [--json] [title]  # branch a thread; Codex and OpenCode can fork natively
 baton import [--dry-run] # import recent native sessions as threads

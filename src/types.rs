@@ -232,7 +232,7 @@ pub enum ApprovalDecision {
     Deny,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct TurnUsage {
     pub input_tokens: i64,
     pub output_tokens: i64,

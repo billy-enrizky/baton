@@ -251,6 +251,10 @@ impl McpServer {
                             .iter()
                             .filter(|task| task.status == "cancelled")
                             .count();
+                        let needs_input = tasks
+                            .iter()
+                            .filter(|task| task.status == "needs_input")
+                            .count();
                         let running = tasks
                             .iter()
                             .filter(|task| task.status == "running")
@@ -272,6 +276,7 @@ impl McpServer {
                             "completed": completed,
                             "failed": failed,
                             "cancelled": cancelled,
+                            "needs_input": needs_input,
                             "running": running,
                         })
                     })

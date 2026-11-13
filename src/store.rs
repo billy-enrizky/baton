@@ -1703,8 +1703,15 @@ impl BatonStore {
             params![run_id],
             |row| row.get(0),
         )?;
+        let needs_input: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ? AND status = 'needs_input'",
+            params![run_id],
+            |row| row.get(0),
+        )?;
         let status = if cancelled > 0 {
             "cancelled"
+        } else if needs_input > 0 {
+            "needs_input"
         } else if total > 0 && completed == total {
             "completed"
         } else if completed > 0 {
@@ -1893,6 +1900,28 @@ impl BatonStore {
         Ok(())
     }
 
+    pub fn update_orchestration_task_needs_input(
+        &self,
+        id: &str,
+        text: Option<&str>,
+        commit_sha: Option<&str>,
+        clear_markers: bool,
+    ) -> Result<()> {
+        let finished_at = now_iso();
+        if clear_markers {
+            self.db.execute(
+                "UPDATE orchestration_tasks SET status = 'needs_input', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ?, merged_at = NULL, pr_url = NULL WHERE id = ?",
+                params![text, commit_sha, finished_at, id],
+            )?;
+        } else {
+            self.db.execute(
+                "UPDATE orchestration_tasks SET status = 'needs_input', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ? WHERE id = ?",
+                params![text, commit_sha, finished_at, id],
+            )?;
+        }
+        Ok(())
+    }
+
     pub fn refresh_orchestration_run_status(&self, run_id: &str) -> Result<()> {
         let tasks = self.list_orchestration_tasks(run_id)?;
         if tasks.is_empty() {
@@ -1900,11 +1929,14 @@ impl BatonStore {
         }
         let completed = tasks.iter().filter(|task| task.status == "completed").count();
         let cancelled = tasks.iter().any(|task| task.status == "cancelled");
+        let needs_input = tasks.iter().any(|task| task.status == "needs_input");
         let running = tasks.iter().any(|task| task.status == "running");
         let status = if running {
             "running"
         } else if cancelled {
             "cancelled"
+        } else if needs_input {
+            "needs_input"
         } else if completed == tasks.len() {
             "completed"
         } else if completed == 0 {

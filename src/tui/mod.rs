@@ -1409,28 +1409,48 @@ fn record_worker_followup(
         }
     };
     let clear_markers = commit.is_some();
+    let asked_again = text
+        .as_deref()
+        .and_then(orchestrate::worker_question)
+        .is_some();
     let result = {
         let guard = store.lock().unwrap();
-        guard
-            .update_orchestration_task_success(
-                &task.id,
-                text.as_deref(),
-                commit.as_deref(),
-                clear_markers,
-            )
-            .and_then(|()| guard.refresh_orchestration_run_status(&task.run_id))
+        if asked_again {
+            guard
+                .update_orchestration_task_needs_input(
+                    &task.id,
+                    text.as_deref(),
+                    commit.as_deref(),
+                    clear_markers,
+                )
+                .and_then(|()| guard.refresh_orchestration_run_status(&task.run_id))
+        } else {
+            guard
+                .update_orchestration_task_success(
+                    &task.id,
+                    text.as_deref(),
+                    commit.as_deref(),
+                    clear_markers,
+                )
+                .and_then(|()| guard.refresh_orchestration_run_status(&task.run_id))
+        }
     };
     if thread_id == state.thread.id {
         match result {
             Ok(()) => {
+                let label = if asked_again {
+                    "worker question recorded"
+                } else {
+                    "worker follow-up recorded"
+                };
                 state.notice = Some(match &commit {
                     Some(commit) => format!(
-                        "worker follow-up recorded in run {} · commit {}",
+                        "{label} in run {} · commit {}",
                         &task.run_id[..8.min(task.run_id.len())],
                         &commit[..8.min(commit.len())]
                     ),
                     None => format!(
-                        "worker follow-up recorded in run {} · no file changes",
+                        "{label} in run {} · no file changes",
                         &task.run_id[..8.min(task.run_id.len())]
                     ),
                 });
@@ -4747,6 +4767,7 @@ fn draw_orchestration_report(
         task_starts.push(lines.len());
         let (marker, status_color) = match task.status.as_str() {
             "completed" => ("✓", COLORS.success),
+            "needs_input" => ("?", COLORS.warning),
             "cancelled" => ("⊘", COLORS.warning),
             "failed" => ("✗", COLORS.error),
             "running" => ("◐", COLORS.accent),
@@ -4818,7 +4839,12 @@ fn draw_orchestration_report(
                 Style::default().fg(COLORS.muted),
             ));
         }
-        if let Some(text) = &task.text {
+        if let Some(question) = task.text.as_deref().and_then(orchestrate::worker_question) {
+            lines.push(Line::styled(
+                truncate_chars(&format!("    question: {question}"), width),
+                Style::default().fg(COLORS.warning),
+            ));
+        } else if let Some(text) = &task.text {
             for line in text.lines().filter(|line| !line.trim().is_empty()).take(2) {
                 lines.push(Line::styled(
                     truncate_chars(&format!("    {line}"), width),
@@ -5734,6 +5760,8 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         for worker in &state.orchestration_workers {
             let (marker, color) = if worker.status.starts_with("completed") {
                 ("✓", COLORS.success)
+            } else if worker.status == "needs_input" {
+                ("?", COLORS.warning)
             } else if worker.status == "cancelled" {
                 ("⊘", COLORS.warning)
             } else if worker.status == "failed" {
@@ -7683,8 +7711,8 @@ mod tests {
                     Some(&worktree.branch),
                     Some("old-commit"),
                     Some(&worker.id),
-                    "completed",
-                    Some("old answer"),
+                    "needs_input",
+                    Some("BATON_QUESTION: old answer"),
                     None,
                     "now",
                     Some("now"),
@@ -7700,7 +7728,7 @@ mod tests {
                 .mark_orchestration_task_pr("task-followup", "https://example.test/pr/1")
                 .unwrap();
             guard
-                .finish_orchestration_run("run-followup", "completed")
+                .finish_orchestration_run("run-followup", "needs_input")
                 .unwrap();
             guard
                 .add_message(
@@ -7741,6 +7769,19 @@ mod tests {
         assert_eq!(task.commit_sha.as_deref().map(str::len), Some(40));
         assert!(task.merged_at.is_none(), "new work clears the merge marker");
         assert!(task.pr_url.is_none(), "new work must be shipped again");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .find_orchestration_runs("run-followup")
+                .unwrap()
+                .into_iter()
+                .find(|run| run.id == "run-followup")
+                .unwrap()
+                .status,
+            "completed",
+            "answering the question resolves the run"
+        );
         assert!(
             state.notice.as_deref().unwrap_or("").contains("worker follow-up recorded"),
             "notice: {:?}",
@@ -7749,6 +7790,65 @@ mod tests {
         assert_eq!(
             store.lock().unwrap().list_orchestration_runs(10).unwrap()[0].status,
             "completed"
+        );
+
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .mark_orchestration_task_merged("task-followup", "merged")
+                .unwrap();
+            guard
+                .mark_orchestration_task_pr("task-followup", "https://example.test/pr/1")
+                .unwrap();
+            guard
+                .add_message(
+                    &worker.id,
+                    2,
+                    "assistant",
+                    Some("codex"),
+                    None,
+                    "BATON_QUESTION: choose the follow-up path?",
+                )
+                .unwrap();
+        }
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: worker.id.clone(),
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+        let task = store
+            .lock()
+            .unwrap()
+            .orchestration_task_for_thread(&worker.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "needs_input", "a second question keeps the gate");
+        assert_eq!(
+            task.text.as_deref(),
+            Some("BATON_QUESTION: choose the follow-up path?")
+        );
+        assert!(
+            task.merged_at.is_some(),
+            "a question without new work preserves the merge marker"
+        );
+        assert!(
+            task.pr_url.is_some(),
+            "a question without new work preserves the PR marker"
+        );
+        assert_eq!(
+            store.lock().unwrap().list_orchestration_runs(10).unwrap()[0].status,
+            "needs_input"
+        );
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("worker question recorded"),
+            "notice: {:?}",
+            state.notice
         );
     }
 
@@ -10117,6 +10217,21 @@ mod tests {
             "notice: {:?}",
             state.notice
         );
+    }
+
+    #[test]
+    fn orchestration_report_renders_a_worker_question() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let mut report = sample_report(None);
+        report.status = "needs_input".to_string();
+        report.tasks[0].status = "needs_input".to_string();
+        report.tasks[0].text = Some("BATON_QUESTION: approve the worker change?".to_string());
+        state.orchestration_report = Some(report);
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("needs_input"), "{text}");
+        assert!(text.contains("question: approve the worker change?"), "{text}");
     }
 
     #[test]

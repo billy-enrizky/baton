@@ -138,6 +138,7 @@ pub struct WorkerResult {
     pub text: Option<String>,
     pub error: Option<String>,
     pub pr_url: Option<String>,
+    pub merged_at: Option<String>,
     pub created_at: String,
     pub finished_at: String,
 }
@@ -573,6 +574,7 @@ fn panicked_worker(fallback: &WorkerFallback) -> (usize, WorkerResult) {
             text: None,
             error: Some("worker thread panicked".to_string()),
             pr_url: None,
+            merged_at: None,
             created_at: now.clone(),
             finished_at: now,
             snapshot: None,
@@ -659,6 +661,7 @@ fn run_worker_inner(
                 text: None,
                 error: None,
                 pr_url: None,
+                merged_at: None,
                 created_at: created_at.clone(),
                 finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                 snapshot: None,
@@ -686,6 +689,7 @@ fn run_worker_inner(
                         "{provider} does not support reasoning effort; use codex or claude"
                     )),
                     pr_url: None,
+                    merged_at: None,
                     created_at,
                     finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     snapshot: None,
@@ -724,6 +728,7 @@ fn run_worker_inner(
                             text: None,
                             error: Some(format!("cannot create worktree: {error}")),
                             pr_url: None,
+                            merged_at: None,
                             created_at,
                             finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                             snapshot: None,
@@ -757,6 +762,7 @@ fn run_worker_inner(
                         text: None,
                         error: Some(format!("cannot apply source snapshot: {error}")),
                         pr_url: None,
+                        merged_at: None,
                         created_at,
                         finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                         snapshot: None,
@@ -868,6 +874,7 @@ fn run_worker_inner(
             text,
             error,
             pr_url: None,
+            merged_at: None,
             created_at,
             finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         },
@@ -2003,6 +2010,9 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
                     "shared_paths": worktree.shared_paths,
                 })),
                 "pr_url": task.pr_url,
+                "merged_at": task.merged_at,
+                "created_at": task.created_at,
+                "finished_at": task.finished_at,
             })
         })
         .collect::<Vec<_>>();
@@ -2176,6 +2186,7 @@ pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<
                 text: task.text,
                 error: task.error,
                 pr_url: task.pr_url,
+                merged_at: task.merged_at,
                 created_at: task.created_at,
                 finished_at: task.finished_at.unwrap_or_default(),
             }
@@ -2498,6 +2509,16 @@ mod tests {
         assert_eq!(run.status, "completed");
         let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
         assert_eq!(integrated.merged.len(), 1);
+
+        let reloaded = report_from_rows(&store, repo.path(), &report.run_id).unwrap();
+        let json = to_json(&reloaded);
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["goal"], "test worker question");
+        assert!(json["tasks"][0]["created_at"].as_str().is_some());
+        assert!(
+            json["tasks"][0]["merged_at"].as_str().is_some(),
+            "the reloaded report keeps the merge marker"
+        );
     }
 
     #[allow(clippy::type_complexity)]

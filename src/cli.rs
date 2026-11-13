@@ -117,6 +117,21 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List or clean orchestration worktrees
+    Worktrees {
+        /// Remove clean worktrees whose branch is merged into the current branch
+        #[arg(long)]
+        clean: bool,
+        /// Also remove dirty or unmerged worktrees
+        #[arg(long, requires = "clean")]
+        force: bool,
+        /// Only worktrees whose run id starts with this value
+        #[arg(long)]
+        run: Option<String>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     /// Rewind a thread to before a turn
     Rewind {
         thread_id: Option<String>,

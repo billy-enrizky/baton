@@ -1,4 +1,4 @@
-use baton::{adapters, checkpoints, cli, config, doctor, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, scanner, status, store, tui, types, usage};
+use baton::{adapters, checkpoints, cli, config, doctor, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, scanner, status, store, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::Parser;
@@ -652,6 +652,106 @@ fn main_result() -> Result<()> {
             }
             if report.status == "failed" {
                 std::process::exit(1);
+            }
+            Ok(())
+        }
+        cli::Commands::Worktrees { clean, force, run, json } => {
+            let entries_json = |entries: &[worktree::ManagedWorktree]| {
+                entries
+                    .iter()
+                    .map(|entry| {
+                        serde_json::json!({
+                            "path": entry.path.display().to_string(),
+                            "run": entry.run,
+                            "task": entry.task,
+                            "branch": entry.branch,
+                            "repo_root": entry.repo_root.as_ref().map(|root| root.display().to_string()),
+                            "head": entry.head,
+                            "dirty": entry.dirty,
+                            "merged": entry.merged,
+                            "error": entry.error,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if clean {
+                let cleanup = worktree::clean_managed(&home, run.as_deref(), force)?;
+                let remaining = worktree::list_managed(&home)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": 1,
+                            "worktrees": entries_json(&remaining),
+                            "removed": entries_json(&cleanup.removed),
+                            "skipped": cleanup.skipped.iter().map(|skip| serde_json::json!({
+                                "path": skip.path.display().to_string(),
+                                "branch": skip.branch,
+                                "reason": skip.reason,
+                            })).collect::<Vec<_>>(),
+                            "warnings": cleanup.warnings,
+                        }))?
+                    );
+                } else {
+                    if cleanup.removed.is_empty() {
+                        println!("removed no worktrees");
+                    } else {
+                        println!("removed {} worktree(s)", cleanup.removed.len());
+                        for entry in &cleanup.removed {
+                            println!(
+                                "  {} · {}",
+                                entry.branch.as_deref().unwrap_or("-"),
+                                entry.path.display()
+                            );
+                        }
+                    }
+                    for skip in &cleanup.skipped {
+                        println!(
+                            "  skipped {} · {}",
+                            skip.branch.as_deref().unwrap_or("-"),
+                            skip.reason
+                        );
+                    }
+                    for warning in &cleanup.warnings {
+                        println!("  warning: {warning}");
+                    }
+                    if !remaining.is_empty() {
+                        println!("{} worktree(s) remain", remaining.len());
+                    }
+                }
+            } else {
+                let entries = worktree::list_managed(&home)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": 1,
+                            "worktrees": entries_json(&entries),
+                        }))?
+                    );
+                } else if entries.is_empty() {
+                    println!(
+                        "no managed worktrees under {}",
+                        home.join("worktrees").display()
+                    );
+                } else {
+                    for entry in &entries {
+                        let state = match (&entry.error, entry.dirty, entry.merged) {
+                            (Some(error), _, _) => format!("invalid: {error}"),
+                            (None, true, _) => "dirty".to_string(),
+                            (None, false, true) => "clean · merged".to_string(),
+                            (None, false, false) => "clean · unmerged".to_string(),
+                        };
+                        println!(
+                            "{}  {}/{}  {}  {}",
+                            state,
+                            entry.run,
+                            entry.task,
+                            entry.branch.as_deref().unwrap_or("-"),
+                            entry.path.display()
+                        );
+                    }
+                }
             }
             Ok(())
         }

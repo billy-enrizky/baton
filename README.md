@@ -45,6 +45,10 @@ baton login antigravity  # prints the Google sign-in instructions
 
 API-rate billing: set the provider's key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CURSOR_API_KEY`, `XAI_API_KEY`, `OPENCODE_API_KEY`, `GEMINI_API_KEY`) and run `baton auth <provider> api`.
 
+## Start here
+
+Run `baton` with no arguments. The workspace opens in orchestrate mode. Type what you want to do in plain language and press Enter. Baton picks a harness or splits the work. `/help` shows the common paths, `/help all` lists every command, and `baton doctor` checks what is installed.
+
 ## Usage
 
 ```

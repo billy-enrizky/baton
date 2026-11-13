@@ -105,6 +105,23 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "exit baton"),
 ];
 
+const HELP_SUMMARY: &str = "\
+Type what you want to do. Baton picks a harness.
+
+Common
+  /switch <provider> [model]  use one harness
+  /model                      choose a model
+  /new                        start a new thread
+  /threads                    list threads here
+  /status                     what is happening now
+  /orchestrate [on|off] [goal]  split work across harnesses
+  /runs                       orchestration history
+  /review                     line notes on the latest diff
+  /rewind                     go back to a previous message
+  /quit                       exit
+
+/help all  every command · shift+enter newline · up/down history";
+
 #[derive(Debug, Clone, PartialEq)]
 struct ToolLine {
     id: Option<String>,
@@ -3221,15 +3238,20 @@ fn handle_command(
     match command {
         "/quit" | "/exit" => state.quit = true,
         "/help" => {
-            let mut help = SLASH_COMMANDS
-                .iter()
-                .map(|(name, description)| format!("{name:<14} {description}"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            help.push_str(
-                "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · drag transcript to copy",
-            );
-            state.notice = Some(help);
+            let all = args.first().map(String::as_str) == Some("all");
+            state.notice = Some(if all {
+                let mut help = SLASH_COMMANDS
+                    .iter()
+                    .map(|(name, description)| format!("{name:<14} {description}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                help.push_str(
+                    "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · drag transcript to copy",
+                );
+                help
+            } else {
+                HELP_SUMMARY.to_string()
+            });
         }
         "/clear" => {
             state.diff_output = None;
@@ -8848,6 +8870,28 @@ mod tests {
         assert_eq!(state.thread.id, source_id);
         let worktrees = home.path().join("worktrees");
         assert!(!worktrees.exists() || std::fs::read_dir(worktrees).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn help_shows_common_paths_before_the_full_list() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/help");
+        let text = state.notice.as_deref().unwrap_or("");
+        assert!(text.starts_with("Type what you want to do."), "{text}");
+        assert!(text.contains("Common"));
+        assert!(text.contains("/orchestrate"));
+        assert!(text.contains("/help all"));
+        assert!(!text.contains("/compact"), "the default help stays short");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/help all");
+        let text = state.notice.as_deref().unwrap_or("");
+        for (name, _) in SLASH_COMMANDS {
+            assert!(text.contains(name), "missing {name} from /help all");
+        }
     }
 
     #[test]

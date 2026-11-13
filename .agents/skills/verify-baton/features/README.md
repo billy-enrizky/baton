@@ -8,7 +8,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | TUI status | TUI | `/status` shows thread, phase, queue, and adapter lifecycle |
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |
-| Native rewind | CLI | `baton rewind --native` truncates Codex history and keeps the session |
+| Native rewind | CLI | `baton rewind --native` truncates Codex or OpenCode history and keeps the session |
 | Process registry | CLI | `baton ps --json` returns a stable schema and no false live processes |
 | Orchestration | CLI | `baton orchestrate` creates worktrees, runs harnesses, and records runs |
 

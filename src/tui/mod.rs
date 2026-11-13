@@ -1680,7 +1680,9 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                 state.tool_lines.push(ToolLine { id, label, status });
             }
         }
-        TurnEvent::ProviderTurnId { .. } | TurnEvent::Usage { .. } => {}
+        TurnEvent::ProviderTurnId { .. }
+        | TurnEvent::ProviderSession { .. }
+        | TurnEvent::Usage { .. } => {}
         // Approval requests need their thread id, so the run loop routes them
         // through apply_turn_event_for_thread before calling this function.
         TurnEvent::ApprovalRequest { .. } => {}
@@ -2352,8 +2354,13 @@ fn start_native_rewind(
         state.notice = Some("interrupt the current turn before a native rewind".into());
         return;
     }
-    if state.thread.current_provider != ProviderId::Codex {
-        state.notice = Some("native rewind is Codex-only; use /rewind without --native".into());
+    if !matches!(
+        state.thread.current_provider,
+        ProviderId::Codex | ProviderId::OpenCode
+    ) {
+        state.notice = Some(
+            "native rewind is Codex and OpenCode-only; use /rewind without --native".into(),
+        );
         return;
     }
     let persisted = {
@@ -2365,7 +2372,10 @@ fn start_native_rewind(
         return;
     }
     state.native_rewind_running = true;
-    state.notice = Some("rewinding Codex session natively...".into());
+    state.notice = Some(format!(
+        "rewinding {} session natively...",
+        state.thread.current_provider
+    ));
     let home = state.home.clone();
     let source = state.thread.clone();
     let sender = state.native_rewind_sender.clone();
@@ -5862,7 +5872,7 @@ fn draw_rewind_picker(
     let newest_first: Vec<&(&i64, &String) > = user_messages.iter().rev().collect();
     let mut lines: Vec<Line> = vec![Line::styled(
         if native {
-            "rewind to message · native Codex · enter select · esc cancel"
+            "rewind to message · native history · enter select · esc cancel"
         } else {
             "rewind to message · enter select · esc cancel"
         },
@@ -8869,7 +8879,7 @@ mod tests {
             Overlay::RewindPicker { native: true, .. }
         ));
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
-        assert!(text.contains("native Codex"), "{text}");
+        assert!(text.contains("native history"), "{text}");
     }
 
     #[test]
@@ -8926,10 +8936,11 @@ mod tests {
     }
 
     #[test]
-    fn native_rewind_refuses_non_codex_threads() {
+    fn native_rewind_refuses_unsupported_threads() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Cursor;
         start_native_rewind(&mut state, &store, 1, "prompt".to_string());
         assert!(!state.native_rewind_running);
         assert!(
@@ -8937,7 +8948,7 @@ mod tests {
                 .notice
                 .as_deref()
                 .unwrap_or("")
-                .contains("Codex-only"),
+                .contains("Codex and OpenCode-only"),
             "notice: {:?}",
             state.notice
         );

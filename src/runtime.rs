@@ -793,6 +793,7 @@ async fn execute_turn(
     let interrupted_for_thread = interrupted_slot.clone();
     let tools_for_thread = tools_slot.clone();
     let store_for_forwarder = store.clone();
+    let model_for_forwarder = model.clone();
     let forwarder = std::thread::spawn(move || {
         for event in event_receiver {
             match &event {
@@ -802,6 +803,21 @@ async fn execute_turn(
                             &event_thread_id,
                             turn,
                             id,
+                        );
+                    }
+                    let _ = tui_sender.send((event_thread_id.clone(), event));
+                }
+                TurnEvent::ProviderSession {
+                    native_session_id,
+                    rollout_path,
+                } => {
+                    if let Ok(store) = store_for_forwarder.lock() {
+                        let _ = store.upsert_provider_session(
+                            &event_thread_id,
+                            provider,
+                            native_session_id,
+                            Some(model_for_forwarder.clone()),
+                            rollout_path.clone(),
                         );
                     }
                     let _ = tui_sender.send((event_thread_id.clone(), event));
@@ -1031,6 +1047,10 @@ mod tests {
                     });
                 }
                 AdapterMode::Fail => {
+                    let _ = emit.send(TurnEvent::ProviderSession {
+                        native_session_id: "native-fail".into(),
+                        rollout_path: None,
+                    });
                     let _ = emit.send(TurnEvent::TurnFailed {
                         error: "provider died".into(),
                     });
@@ -2030,6 +2050,19 @@ mod tests {
         assert_eq!(turn.provider_turn_id.as_deref(), Some("provider-turn-1"));
         let messages = store.lock().unwrap().list_messages(&thread_id).unwrap();
         assert!(messages.iter().any(|message| message.role == "assistant" && message.text == "done"));
+    }
+
+    #[tokio::test]
+    async fn a_provider_session_is_persisted_even_when_the_turn_fails() {
+        let (store, thread_id, result) = run_scripted_turn(AdapterMode::Fail).await;
+        assert!(result.is_err());
+        let session = store
+            .lock()
+            .unwrap()
+            .get_provider_session(&thread_id, ProviderId::Codex)
+            .unwrap()
+            .expect("session persisted before the failure");
+        assert_eq!(session.native_session_id, "native-fail");
     }
 
     #[tokio::test]

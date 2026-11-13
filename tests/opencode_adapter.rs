@@ -1,5 +1,5 @@
 use baton::adapters::opencode::{OpenCodeAdapter, OpenCodeChild, OpenCodeSpawner};
-use baton::adapters::{BatonAdapter, ForkSessionInput, ModelListInput};
+use baton::adapters::{BatonAdapter, ForkSessionInput, ModelListInput, RevertSessionInput};
 use baton::process::ProcessRecorder;
 use baton::store::BatonStore;
 use baton::types::PermissionMode;
@@ -115,6 +115,40 @@ fn respond(
                 .unwrap()
                 .push((path.to_string(), body.to_string()));
             respond_json(&mut stream, "200 OK", r#"{"id":"ses_fork"}"#)
+        }
+        "/api/session/ses_test/revert/stage" => {
+            requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.to_string()));
+            let value: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            if value["messageID"] == "msg_bad" {
+                respond_json(
+                    &mut stream,
+                    "500 Internal Server Error",
+                    r#"{"error":"revert failed"}"#,
+                );
+            } else {
+                respond_json(
+                    &mut stream,
+                    "200 OK",
+                    r#"{"data":{"messageID":"msg_2","diff":"","files":[]}}"#,
+                );
+            }
+        }
+        "/api/session/ses_test/revert/commit" => {
+            requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.to_string()));
+            respond_json(&mut stream, "200 OK", "")
+        }
+        "/api/session/ses_test/revert/clear" => {
+            requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.to_string()));
+            respond_json(&mut stream, "200 OK", "")
         }
         "/api/event" => {
             if release.lock().unwrap().is_none() {
@@ -290,11 +324,12 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
     });
 
     // Deltas (and the tool-calls step end) must arrive while the turn is held open.
+    let mut early_events = Vec::new();
     let first_delta = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             match event_receiver.try_recv() {
                 Ok(baton::adapters::TurnEvent::TextDelta { text }) => break text,
-                Ok(_) => {}
+                Ok(event) => early_events.push(event),
                 Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
             }
         }
@@ -350,7 +385,8 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
     let _ = release_sender.send(());
     tokio::time::timeout(Duration::from_secs(10), turn_task).await.unwrap().unwrap();
 
-    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    let events: Vec<baton::adapters::TurnEvent> =
+        early_events.into_iter().chain(event_receiver.iter()).collect();
     let deltas: String = std::iter::once(first_delta)
         .chain(events.iter().filter_map(|event| match event {
             baton::adapters::TurnEvent::TextDelta { text } => Some(text.clone()),
@@ -380,5 +416,77 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
     assert_eq!(completed.0, "streamed live", "final text comes from session.next.text.ended");
     assert_eq!(completed.1.unwrap().input_tokens, 15, "usage sums across steps");
     assert_eq!(completed.2.as_deref(), Some("ses_test"));
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            baton::adapters::TurnEvent::ProviderTurnId { id } if id == "msg_1"
+        )),
+        "the prompt admission id is recorded for native rewind"
+    );
     assert!(!steer("too late".into()), "steering after completion is rejected");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_adapter_stages_and_commits_a_history_only_revert() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_server = requests.clone();
+    std::thread::spawn(move || serve_opencode(listener, Arc::new(Mutex::new(None)), requests_for_server));
+
+    let spawner: OpenCodeSpawner = Arc::new(move |_auth_env: &[(String, String)]| {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        Ok(OpenCodeChild { port, password: "pw".to_string(), child })
+    });
+    let mut adapter = OpenCodeAdapter::new(spawner);
+    let reverted = adapter
+        .revert_session(RevertSessionInput {
+            session: NativeSessionRef {
+                native_session_id: "ses_test".into(),
+                rollout_path: None,
+            },
+            before_turn_id: "msg_2".into(),
+            auth_env: vec![],
+        })
+        .await
+        .unwrap();
+    assert!(reverted);
+    {
+        let requests = requests.lock().unwrap();
+        let stage = requests
+            .iter()
+            .find(|(path, _)| path.ends_with("/revert/stage"))
+            .expect("stage request");
+        let body: Value = serde_json::from_str(&stage.1).unwrap();
+        assert_eq!(body["messageID"], "msg_2");
+        assert_eq!(body["files"], false, "native rewind never restores files");
+        assert!(requests
+            .iter()
+            .any(|(path, _)| path.ends_with("/revert/commit")));
+    }
+
+    let error = adapter
+        .revert_session(RevertSessionInput {
+            session: NativeSessionRef {
+                native_session_id: "ses_test".into(),
+                rollout_path: None,
+            },
+            before_turn_id: "msg_bad".into(),
+            auth_env: vec![],
+        })
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("revert"), "{error}");
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(path, _)| path.ends_with("/revert/clear")),
+        "a failed stage clears the pending revert"
+    );
+    adapter.dispose().await.unwrap();
 }

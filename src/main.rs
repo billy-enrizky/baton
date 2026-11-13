@@ -554,6 +554,7 @@ fn main_result() -> Result<()> {
                                 "worktree_path": task.worktree_path,
                                 "branch": task.branch,
                                 "commit": task.commit_sha,
+                                "merged_at": task.merged_at,
                                 "created_at": task.created_at,
                                 "finished_at": task.finished_at,
                             })).collect::<Vec<_>>(),
@@ -576,6 +577,9 @@ fn main_result() -> Result<()> {
                         }
                         if let Some(commit) = task.commit_sha {
                             println!("  commit: {}", &commit[..8.min(commit.len())]);
+                        }
+                        if let Some(merged_at) = task.merged_at {
+                            println!("  merged: {merged_at}");
                         }
                         if let Some(error) = task.error {
                             println!("  error: {error}");

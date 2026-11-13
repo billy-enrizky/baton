@@ -68,6 +68,8 @@ fn main_result() -> Result<()> {
                 .model
                 .clone()
                 .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
+            let permission_mode = permission_override
+                .unwrap_or_else(|| resolved.for_provider(provider).permission_mode);
             let thread = store.lock().unwrap().draft_thread(crate::store::NewThread {
                 title: baton::handoff::derive_title(&prompt),
                 cwd: cwd.to_string_lossy().to_string(),
@@ -408,10 +410,10 @@ fn main_result() -> Result<()> {
                 },
                 session_mode,
             )?;
-            if let Some(mode) = permission_override {
-                store.set_thread_permission_mode(&thread.id, mode)?;
-                thread.permission_mode = mode;
-            }
+            let initial_permission = permission_override
+                .unwrap_or_else(|| resolved.for_provider(provider).permission_mode);
+            store.set_thread_permission_mode(&thread.id, initial_permission)?;
+            thread.permission_mode = initial_permission;
             println!(
                 "created thread {} ({}/{}) session {} mode {}",
                 &thread.id[..8],
@@ -1753,9 +1755,13 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: O
                 .or_else(|| Some(resolved.for_provider(provider).model.clone()));
             let mut thread = guard_draft_thread(&store, provider, model, cwd)?;
             thread.session_mode = config::get_default_session_mode(home);
+            thread.permission_mode = resolved.for_provider(provider).permission_mode;
             thread
         }
     };
+    if let Some(mode) = permission_override {
+        thread.permission_mode = mode;
+    }
     if let Some(mode) = requested_mode {
         thread.session_mode = mode;
         let guard = store.lock().unwrap();

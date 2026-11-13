@@ -933,7 +933,8 @@ fn cap_diff(diff: &str) -> String {
 
 pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()> {
     if store.get_thread(&thread.id)?.is_none() {
-        let created = store.create_thread_with_id_and_mode(
+        let desired_permission = thread.permission_mode;
+        let mut created = store.create_thread_with_id_and_mode(
             NewThread {
                 title: thread.title.clone(),
                 cwd: thread.cwd.clone(),
@@ -943,6 +944,10 @@ pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()
             thread.id.clone(),
             thread.session_mode,
         )?;
+        if desired_permission != created.permission_mode {
+            store.set_thread_permission_mode(&created.id, desired_permission)?;
+            created.permission_mode = desired_permission;
+        }
         *thread = created;
     }
     Ok(())
@@ -952,6 +957,22 @@ pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()
 mod tests {
     use super::*;
     use crate::adapters::TurnEventSender;
+
+    #[test]
+    fn ensure_persisted_keeps_a_drafts_permission_mode() {
+        let store = BatonStore::memory().unwrap();
+        let mut thread = store.draft_thread(NewThread {
+            title: "permissions".to_string(),
+            cwd: "/tmp/project".to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        });
+        thread.permission_mode = PermissionMode::BypassPermissions;
+        ensure_persisted(&store, &mut thread).unwrap();
+        assert_eq!(thread.permission_mode, PermissionMode::BypassPermissions);
+        let stored = store.get_thread(&thread.id).unwrap().expect("thread persisted");
+        assert_eq!(stored.permission_mode, PermissionMode::BypassPermissions);
+    }
 
     #[derive(Clone, Copy)]
     enum AdapterMode {

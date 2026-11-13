@@ -1962,17 +1962,19 @@ fn search_snippet(text: &str, query: &str) -> String {
 }
 
 fn default_provider_from_configs(home: &PathBuf, cwd: &PathBuf) -> ProviderId {
-    if let Some(provider) = config::get_default_provider(home) {
-        return provider;
-    }
+    let configured = config::get_default_provider(home);
     let resolved = resolve_config(home, cwd);
-    for provider in ProviderId::all() {
-        let config = resolved.for_provider(*provider);
-        if config.mode == crate::config::AuthMode::Api {
-            return *provider;
-        }
-    }
-    ProviderId::Claude
+    let installed = ProviderId::all()
+        .iter()
+        .copied()
+        .filter(|provider| doctor::find_executable(provider.binary_name()).is_some())
+        .collect::<Vec<_>>();
+    let api = ProviderId::all()
+        .iter()
+        .copied()
+        .filter(|provider| resolved.for_provider(*provider).mode == crate::config::AuthMode::Api)
+        .collect::<Vec<_>>();
+    config::pick_default_provider(configured, &installed, &api)
 }
 
 fn resolve_thread(store: &BatonStore, thread_id: &str) -> Result<store::ThreadRow> {

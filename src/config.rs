@@ -130,6 +130,31 @@ pub fn get_default_session_mode(home: &Path) -> crate::types::SessionMode {
         .unwrap_or(crate::types::SessionMode::Orchestrate)
 }
 
+/// Chooses the harness a new thread starts on. An explicit config choice wins,
+/// then an installed harness with API auth, then the first installed harness.
+/// Claude remains the last resort so the missing-harness hint can explain it.
+pub fn pick_default_provider(
+    configured: Option<ProviderId>,
+    installed: &[ProviderId],
+    api: &[ProviderId],
+) -> ProviderId {
+    if let Some(provider) = configured {
+        return provider;
+    }
+    let order = ProviderId::all();
+    order
+        .iter()
+        .copied()
+        .find(|provider| installed.contains(provider) && api.contains(provider))
+        .or_else(|| {
+            order
+                .iter()
+                .copied()
+                .find(|provider| installed.contains(provider))
+        })
+        .unwrap_or(ProviderId::Claude)
+}
+
 pub fn get_default_provider(home: &Path) -> Option<ProviderId> {
     let file = load_config_file(home)?;
     file.default_provider
@@ -210,5 +235,46 @@ pub fn describe_auth(auth: &EffectiveProviderConfig) -> String {
                 format!("api (MISSING {})", auth.api_key_env_name)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_default_wins_even_when_missing() {
+        assert_eq!(
+            pick_default_provider(Some(ProviderId::Cursor), &[], &[]),
+            ProviderId::Cursor
+        );
+    }
+
+    #[test]
+    fn installed_api_provider_beats_subscription_provider() {
+        assert_eq!(
+            pick_default_provider(
+                None,
+                &[ProviderId::Claude, ProviderId::Codex],
+                &[ProviderId::Codex]
+            ),
+            ProviderId::Codex
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_first_installed_provider() {
+        assert_eq!(
+            pick_default_provider(None, &[ProviderId::OpenCode], &[]),
+            ProviderId::OpenCode
+        );
+    }
+
+    #[test]
+    fn falls_back_to_claude_when_nothing_is_installed() {
+        assert_eq!(
+            pick_default_provider(None, &[], &[]),
+            ProviderId::Claude
+        );
     }
 }

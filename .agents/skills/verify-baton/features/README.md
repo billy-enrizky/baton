@@ -4,7 +4,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 
 | Feature | Surface | Proof |
 |---|---|---|
-| Doctor | CLI | `baton doctor --json` schema, six providers, database count |
+| Doctor | CLI | `baton doctor` next action, six providers, readiness, database count |
 | TUI status | TUI | `/status` shows thread, phase, queue, and adapter lifecycle |
 | Status next action | CLI | `baton status` and `--json` answer what to do now |
 | Provider readiness | CLI and TUI | doctor summarizes ready/missing; pickers mark missing harnesses |

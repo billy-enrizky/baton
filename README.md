@@ -61,7 +61,7 @@ baton turns [-t id] [--json]   # full durable turn history
 baton queue [-t id] [--clear] [--json]  # inspect/clear queued follow-ups
 baton search <query> [--all] [--json]  # search thread titles and conversation text
 baton ps [--json]        # list provider servers tracked by baton
-baton doctor [--json]    # ready and missing harnesses, configs, database, and process health
+baton doctor [--json]    # next action, ready and missing harnesses, configs, database, and process health
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
 baton exec -p <provider> [--effort level] [--json | --stream-json] "prompt"  # one non-interactive turn
 baton exec -t <worker-thread> [--json] "answer"  # answer an orchestration worker question

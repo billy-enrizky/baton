@@ -10,6 +10,86 @@ pub struct WorktreeInfo {
     pub path: PathBuf,
     pub branch: String,
     pub base_ref: String,
+    pub shared_paths: Vec<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RepoWorktreeConfig {
+    #[serde(default)]
+    worktree: RepoWorktreeSection,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct RepoWorktreeSection {
+    #[serde(default, rename = "sharedDirectories")]
+    shared_directories: Vec<String>,
+}
+
+fn shared_directories(repo_root: &Path) -> Vec<String> {
+    let path = repo_root.join("baton.json");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    serde_json::from_str::<RepoWorktreeConfig>(&contents)
+        .map(|config| config.worktree.shared_directories)
+        .unwrap_or_default()
+}
+
+fn safe_relative(path: &str) -> Option<&Path> {
+    let path = Path::new(path);
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return None;
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+    Some(path)
+}
+
+fn is_gitignored(repo_root: &Path, path: &str) -> bool {
+    Command::new("git")
+        .args(["check-ignore", "-q", "--", path])
+        .current_dir(repo_root)
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn share_directories(repo_root: &Path, worktree_path: &Path) -> Vec<String> {
+    let mut shared = Vec::new();
+    for entry in shared_directories(repo_root).into_iter().take(100) {
+        let Some(relative) = safe_relative(&entry) else {
+            continue;
+        };
+        let source = repo_root.join(relative);
+        if !source.is_dir() || !is_gitignored(repo_root, &entry) {
+            continue;
+        }
+        let destination = worktree_path.join(relative);
+        if destination.exists() {
+            continue;
+        }
+        if let Some(parent) = destination.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        #[cfg(unix)]
+        let created = std::os::unix::fs::symlink(&source, &destination).is_ok();
+        #[cfg(windows)]
+        let created = std::os::windows::fs::symlink_dir(&source, &destination).is_ok();
+        if created {
+            shared.push(entry);
+        }
+    }
+    shared
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Result<String> {
@@ -89,11 +169,13 @@ pub fn create(
         repo_root,
         &["worktree", "add", "-b", &branch, &path_text, &base_ref],
     )?;
+    let shared_paths = share_directories(repo_root, &path);
     Ok(WorktreeInfo {
         repo_root: repo_root.to_path_buf(),
         path,
         branch,
         base_ref,
+        shared_paths,
     })
 }
 
@@ -373,6 +455,41 @@ mod tests {
         assert!(git(&wt.path, &["status", "--porcelain"]).unwrap().is_empty());
         assert_eq!(git(root.path(), &["rev-parse", &wt.branch]).unwrap(), sha);
         remove(&wt).unwrap();
+    }
+
+    #[test]
+    fn shares_only_existing_gitignored_directories() {
+        let root = repo();
+        let home = tempfile::tempdir().unwrap();
+        let repo_root = repo_root(root.path()).unwrap();
+        std::fs::create_dir_all(root.path().join("node_modules/pkg")).unwrap();
+        std::fs::write(root.path().join("node_modules/pkg/index.js"), "x\n").unwrap();
+        std::fs::create_dir_all(root.path().join("notignored")).unwrap();
+        std::fs::write(root.path().join("notignored/file.txt"), "x\n").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "node_modules\n").unwrap();
+        git(root.path(), &["add", ".gitignore"]).unwrap();
+        git(root.path(), &["commit", "-q", "-m", "ignore"]).unwrap();
+        std::fs::write(
+            root.path().join("baton.json"),
+            r#"{"worktree":{"sharedDirectories":["node_modules","notignored","missing","../outside"]}}"#,
+        )
+        .unwrap();
+
+        let wt = create(home.path(), &repo_root, "run-share", "shared task").unwrap();
+        assert_eq!(wt.shared_paths, vec!["node_modules"]);
+        let linked = wt.path.join("node_modules");
+        assert!(std::fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_link(&linked).unwrap(),
+            root.path().canonicalize().unwrap().join("node_modules")
+        );
+        assert!(!wt.path.join("notignored").exists());
+        assert!(git(&wt.path, &["status", "--porcelain"]).unwrap().is_empty());
+        remove(&wt).unwrap();
+        assert!(root.path().join("node_modules").is_dir());
     }
 
     #[test]

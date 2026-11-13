@@ -1253,6 +1253,7 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
                     "path": worktree.path.display().to_string(),
                     "branch": worktree.branch,
                     "base_ref": worktree.base_ref,
+                    "shared_paths": worktree.shared_paths,
                 })),
             })
         })
@@ -1295,6 +1296,7 @@ pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<
                     path: PathBuf::from(path),
                     branch: branch.to_string(),
                     base_ref: "HEAD".to_string(),
+                    shared_paths: Vec::new(),
                 }),
                 _ => None,
             };

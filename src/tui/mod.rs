@@ -7062,6 +7062,7 @@ mod tests {
                         path: std::path::PathBuf::from("/tmp/worktrees/run/worker-one"),
                         branch: "baton/run/worker-one".to_string(),
                         base_ref: "HEAD".to_string(),
+                        shared_paths: Vec::new(),
                     }),
                     commit: Some("0123456789abcdef".to_string()),
                     thread_id,

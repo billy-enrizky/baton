@@ -540,6 +540,7 @@ fn run_worker(
     home: &Path,
     cwd: &Path,
     repo_root: Option<&Path>,
+    repo_snapshot: Option<&worktree::RepoSnapshot>,
     worker_bin: Option<&Path>,
     progress: Option<&ProgressFn<'_>>,
     cancel: Option<&AtomicBool>,
@@ -552,6 +553,7 @@ fn run_worker(
         home,
         cwd,
         repo_root,
+        repo_snapshot,
         worker_bin,
         progress,
         cancel,
@@ -584,6 +586,7 @@ fn run_worker_inner(
     home: &Path,
     cwd: &Path,
     repo_root: Option<&Path>,
+    repo_snapshot: Option<&worktree::RepoSnapshot>,
     worker_bin: Option<&Path>,
     progress: Option<&ProgressFn<'_>>,
     cancel: Option<&AtomicBool>,
@@ -614,8 +617,47 @@ fn run_worker_inner(
         );
     }
     let worktree = match repo_root {
-        Some(root) => match worktree::create(home, root, run_id, &task.title) {
-            Ok(worktree) => Some(worktree),
+        Some(root) => {
+            let created = match repo_snapshot {
+                Some(snapshot) => worktree::create_at(
+                    home,
+                    root,
+                    run_id,
+                    &task.title,
+                    &snapshot.base_ref,
+                ),
+                None => worktree::create(home, root, run_id, &task.title),
+            };
+            match created {
+                Ok(worktree) => Some(worktree),
+                Err(error) => {
+                    return (
+                        index,
+                        WorkerResult {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            title: task.title.clone(),
+                            provider,
+                            model,
+                            prompt: task.prompt.clone(),
+                            worktree: None,
+                            commit: None,
+                            thread_id: None,
+                            status: "failed".to_string(),
+                            text: None,
+                            error: Some(format!("cannot create worktree: {error}")),
+                            pr_url: None,
+                            created_at,
+                            finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        },
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+    let snapshot_tree = match (worktree.as_ref(), repo_snapshot) {
+        (Some(worktree), Some(snapshot)) => match worktree::apply_snapshot(&worktree.path, snapshot) {
+            Ok(()) => Some(snapshot.tree.clone()),
             Err(error) => {
                 return (
                     index,
@@ -625,12 +667,12 @@ fn run_worker_inner(
                         provider,
                         model,
                         prompt: task.prompt.clone(),
-                        worktree: None,
+                        worktree: Some(worktree.clone()),
                         commit: None,
                         thread_id: None,
                         status: "failed".to_string(),
                         text: None,
-                        error: Some(format!("cannot create worktree: {error}")),
+                        error: Some(format!("cannot apply source snapshot: {error}")),
                         pr_url: None,
                         created_at,
                         finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
@@ -638,7 +680,7 @@ fn run_worker_inner(
                 );
             }
         },
-        None => None,
+        _ => None,
     };
     let worker_cwd = worktree
         .as_ref()
@@ -697,10 +739,16 @@ fn run_worker_inner(
     let mut commit = None;
     if status == "completed" {
         if let Some(worktree) = worktree.as_ref() {
-            match worktree::commit_changes(
-                &worktree.path,
-                &format!("baton worker: {}", task.title),
-            ) {
+            let message = format!("baton worker: {}", task.title);
+            let committed = match snapshot_tree.as_deref() {
+                Some(tree) => worktree::commit_changes_after_snapshot(
+                    &worktree.path,
+                    tree,
+                    &message,
+                ),
+                None => worktree::commit_changes(&worktree.path, &message),
+            };
+            match committed {
                 Ok(sha) => commit = sha,
                 Err(commit_error) => {
                     status = "failed";
@@ -1491,10 +1539,6 @@ fn run_with_worker_bin_and_progress(
         anyhow::bail!(CANCELLED_ERROR);
     }
     let repo_root = worktree::repo_root(cwd).ok();
-    let dirty_source = repo_root
-        .as_ref()
-        .and_then(|root| worktree::is_dirty(root).ok())
-        .unwrap_or(false);
     let plan = plan(
         goal,
         cwd,
@@ -1505,6 +1549,15 @@ fn run_with_worker_bin_and_progress(
         permission_mode,
         cancel,
     )?;
+    // Capture the source after planning so workers see the latest dirty state.
+    let dirty_source = repo_root
+        .as_ref()
+        .and_then(|root| worktree::is_dirty(root).ok())
+        .unwrap_or(false);
+    let repo_snapshot = match repo_root.as_ref() {
+        Some(root) if dirty_source => worktree::snapshot(root)?,
+        _ => None,
+    };
     let run_id = uuid::Uuid::new_v4().to_string();
     let summary = plan.summary.clone();
     let owner_pid = std::process::id();
@@ -1547,6 +1600,7 @@ fn run_with_worker_bin_and_progress(
                 let cwd = cwd.to_path_buf();
                 let repo_root = repo_root.clone();
                 let worker_bin = worker_bin.map(Path::to_path_buf);
+                let worker_snapshot = repo_snapshot.as_ref();
                 let handle = scope.spawn(move || {
                     run_worker(
                         task,
@@ -1555,6 +1609,7 @@ fn run_with_worker_bin_and_progress(
                         &home,
                         &cwd,
                         repo_root.as_deref(),
+                        worker_snapshot,
                         worker_bin.as_deref(),
                         progress,
                         cancel,
@@ -1652,7 +1707,7 @@ pub fn render(report: &RunReport) -> String {
                 .as_ref()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "not a git repository".to_string()),
-            if report.dirty_source { " (dirty; worktrees branch from HEAD)" } else { "" }
+            if report.dirty_source { " (dirty; workers received a source snapshot)" } else { "" }
         ),
     ];
     if let Some(summary) = &report.summary {
@@ -1737,6 +1792,7 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
         "plan": report.plan,
         "repo_root": report.repo_root.as_ref().map(|path| path.display().to_string()),
         "dirty_source": report.dirty_source,
+        "worker_baseline": if report.dirty_source { "source snapshot" } else { "HEAD" },
         "archived_at": report.archived_at,
         "tasks": tasks,
     })
@@ -2211,6 +2267,118 @@ exit 1
             watcher.join().unwrap();
         }
         (repo, home, store, report)
+    }
+
+    #[test]
+    fn dirty_source_snapshot_reaches_workers_without_entering_the_worker_commit() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("a.txt"), "base\n").unwrap();
+        std::fs::write(repo.path().join("b.txt"), "base b\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let base = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repo.path().join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(repo.path().join("b.txt"), "dirty b\n").unwrap();
+        std::fs::write(repo.path().join("source-only.txt"), "source\n").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let plan_path = repo.path().join("plan.json");
+        std::fs::write(
+            &plan_path,
+            r#"{"summary":"snapshot worker","tasks":[{"title":"worker","provider":"codex","prompt":"inspect the snapshot"}]}"#,
+        )
+        .unwrap();
+        let store = BatonStore::memory().unwrap();
+        let worker = worker_script(
+            home.path(),
+            "snapshot-worker",
+            "cp a.txt seen.txt\nprintf 'worker final\\n' > a.txt\nprintf 'worker\\n' > worker.txt",
+        );
+        let report = run_with_worker_bin(
+            "test snapshot",
+            repo.path(),
+            home.path(),
+            ProviderId::Codex,
+            "test-model",
+            4,
+            Some(&plan_path),
+            &store,
+            Some(&worker),
+            PermissionMode::Default,
+        )
+        .unwrap();
+        assert_eq!(report.status, "completed");
+        assert!(report.dirty_source);
+        let task = &report.tasks[0];
+        let worktree = task.worktree.as_ref().unwrap();
+        assert_eq!(
+            git(&["show", &format!("{}:seen.txt", worktree.branch)]),
+            "dirty"
+        );
+        assert_eq!(
+            git(&["show", &format!("{}:worker.txt", worktree.branch)]),
+            "worker"
+        );
+        let source_only = Command::new("git")
+            .args(["show", &format!("{}:source-only.txt", worktree.branch)])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            !source_only.status.success(),
+            "untouched dirty source files must stay out of the worker branch"
+        );
+        assert_eq!(
+            git(&["show", &format!("{}:a.txt", worktree.branch)]),
+            "worker final",
+            "a worker edit to a dirty file commits the final content"
+        );
+        assert_eq!(
+            git(&["show", &format!("{}:b.txt", worktree.branch)]),
+            "base b",
+            "an untouched dirty tracked file stays at the source HEAD content"
+        );
+        assert_eq!(
+            git(&["rev-parse", &format!("{}^", worktree.branch)]),
+            base,
+            "the worker commit stays directly on the source base"
+        );
+        let worktree_status = Command::new("git")
+            .args(["status", "--porcelain"])
+            .current_dir(&worktree.path)
+            .output()
+            .unwrap();
+        assert!(
+            worktree_status.status.success()
+                && String::from_utf8_lossy(&worktree_status.stdout).trim().is_empty(),
+            "worker worktree is clean after its commit"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "dirty\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("b.txt")).unwrap(),
+            "dirty b\n"
+        );
+        assert!(repo.path().join("source-only.txt").exists());
     }
 
     #[test]

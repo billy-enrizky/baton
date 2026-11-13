@@ -4656,7 +4656,7 @@ fn draw_orchestration_report(
         .map(|path| path.display().to_string())
         .unwrap_or_else(|| "not a git repository".to_string());
     let dirty = if report.dirty_source {
-        " (dirty; worktrees branch from HEAD)"
+        " (dirty; workers received a source snapshot)"
     } else {
         ""
     };
@@ -5869,7 +5869,7 @@ fn draw_orchestration_preview(
     ];
     if preview.dirty_source {
         lines.push(Line::styled(
-            "warning: source is dirty; workers branch from HEAD",
+            "warning: source is dirty; workers receive a snapshot",
             Style::default().fg(COLORS.warning),
         ));
     }
@@ -5938,11 +5938,11 @@ fn draw_dirty_confirm(frame: &mut ratatui::Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Line::styled(
-            "workers start from HEAD and will not see them",
+            "workers receive a snapshot; commits keep only worker-touched files",
             Style::default().fg(COLORS.muted),
         ),
         Line::styled(
-            "enter: orchestrate anyway · s: run single harness · esc: cancel and edit",
+            "enter: orchestrate with snapshot · s: run single harness · esc: cancel and edit",
             Style::default().fg(COLORS.muted),
         ),
     ];
@@ -9181,7 +9181,7 @@ mod tests {
         let buffer = render_state(&state, 120, 30);
         let text = buffer_lines(&buffer).join("\n");
         assert!(text.contains("source checkout has uncommitted changes"));
-        assert!(text.contains("workers start from HEAD"));
+        assert!(text.contains("workers receive a snapshot"));
         assert!(text.contains("run single harness"));
     }
 

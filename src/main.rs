@@ -419,6 +419,116 @@ fn main_result() -> Result<()> {
             }
             return Ok(());
         }
+        cli::Commands::Spawn { prompt, json } => {
+            if cli.mode.is_some() {
+                anyhow::bail!("--mode applies to the interactive TUI; omit it for spawn");
+            }
+            if cli.thread.is_some() {
+                anyhow::bail!("spawn creates a new worker thread; omit --thread");
+            }
+            let prompt = prompt.join(" ");
+            if prompt.trim().is_empty() {
+                anyhow::bail!("usage: baton spawn [options] <task>");
+            }
+            let provider = cli
+                .provider
+                .as_deref()
+                .and_then(ProviderId::parse)
+                .unwrap_or_else(|| default_provider_from_configs(&home, &cwd));
+            if let Some(hint) = doctor::missing_provider_hint(provider) {
+                anyhow::bail!(hint);
+            }
+            worktree::repo_root(&cwd).map_err(|_| {
+                anyhow::anyhow!("spawn needs a git repository; run it inside one or use `baton exec`")
+            })?;
+            let resolved = resolve_config(&home, &cwd);
+            let model = cli
+                .model
+                .clone()
+                .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
+            if requested_effort.is_some() && !provider.supports_effort() {
+                anyhow::bail!("{provider} does not support --effort; use codex or claude");
+            }
+            let permission_mode = permission_override
+                .unwrap_or_else(|| resolved.for_provider(provider).permission_mode);
+            let plan = orchestrate::single_task_plan(
+                &prompt,
+                provider,
+                cli.model.clone(),
+                requested_effort.clone(),
+            );
+            std::fs::create_dir_all(&home)?;
+            let plan_path = home.join(format!("spawn-{}.json", uuid::Uuid::new_v4()));
+            std::fs::write(&plan_path, serde_json::to_string(&plan)?)?;
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let result = orchestrate::run(
+                &prompt,
+                &cwd,
+                &home,
+                provider,
+                &model,
+                1,
+                Some(&plan_path),
+                &store,
+                permission_mode,
+            );
+            let _ = std::fs::remove_file(&plan_path);
+            let report = result?;
+            let Some(task) = report.tasks.into_iter().next() else {
+                anyhow::bail!("spawn produced no task");
+            };
+            let question = task.text.as_deref().and_then(orchestrate::worker_question);
+            let ok = matches!(task.status.as_str(), "completed" | "needs_input");
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "run_id": report.run_id,
+                        "task_id": task.id,
+                        "thread_id": task.thread_id,
+                        "status": task.status,
+                        "provider": task.provider.as_str(),
+                        "model": task.model,
+                        "worktree": task.worktree.as_ref().map(|worktree| worktree.path.display().to_string()),
+                        "branch": task.worktree.as_ref().map(|worktree| worktree.branch.clone()),
+                        "commit": task.commit,
+                        "text": task.text,
+                        "question": question,
+                        "error": task.error,
+                    }))?
+                );
+            } else {
+                println!(
+                    "spawned {}/{} · run {} · {}",
+                    task.provider,
+                    task.model,
+                    &report.run_id[..8.min(report.run_id.len())],
+                    task.status
+                );
+                if let Some(worktree) = &task.worktree {
+                    println!("worktree: {}", worktree.path.display());
+                }
+                if let Some(commit) = &task.commit {
+                    println!("commit: {}", &commit[..8.min(commit.len())]);
+                }
+                if let Some(text) = &task.text {
+                    if !text.is_empty() {
+                        println!("{text}");
+                    }
+                }
+                if let Some(question) = &question {
+                    println!("question: {question}");
+                }
+                if let Some(error) = &task.error {
+                    println!("error: {error}");
+                }
+            }
+            if !ok {
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
         cli::Commands::Update => {
             println!("updating baton...");
             let status = std::process::Command::new("cargo")

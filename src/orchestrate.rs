@@ -525,6 +525,25 @@ fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
     }
 }
 
+/// One deterministic task for `baton spawn`, with no coordinator call.
+pub fn single_task_plan(
+    prompt: &str,
+    provider: ProviderId,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Plan {
+    Plan {
+        summary: Some("single subagent".to_string()),
+        tasks: vec![PlanTask {
+            title: crate::handoff::derive_title(prompt),
+            provider: provider.as_str().to_string(),
+            model,
+            effort,
+            prompt: prompt.to_string(),
+        }],
+    }
+}
+
 fn plan_is_empty(error: &anyhow::Error) -> bool {
     error.to_string() == "planner returned no tasks"
 }
@@ -2277,6 +2296,22 @@ pub fn task_rows(store: &BatonStore, run_id: &str) -> Result<Vec<OrchestrationTa
 mod tests {
     use super::*;
     use crate::store::BatonStore;
+
+    #[test]
+    fn single_task_plan_keeps_the_provider_and_overrides() {
+        let plan = single_task_plan(
+            "fix the login test",
+            ProviderId::OpenCode,
+            Some("provider/model".into()),
+            Some("high".into()),
+        );
+        assert_eq!(plan.summary.as_deref(), Some("single subagent"));
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].provider, "opencode");
+        assert_eq!(plan.tasks[0].model.as_deref(), Some("provider/model"));
+        assert_eq!(plan.tasks[0].effort.as_deref(), Some("high"));
+        assert_eq!(plan.tasks[0].prompt, "fix the login test");
+    }
 
     #[test]
     fn empty_planner_plan_falls_back_to_one_worker() {

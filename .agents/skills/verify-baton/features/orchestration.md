@@ -16,6 +16,7 @@
 - Worker follow-ups from `baton exec -t`, with `worker_followup` in the JSON result
 - `/multi --worktrees` fan-out through a generated plan, one isolated worker per provider
 - `/worktree` conversation fork bound to a one-task orchestration run
+- `baton spawn` one-task shortcut without a coordinator or plan file
 
 ## How to get to it (user POV)
 

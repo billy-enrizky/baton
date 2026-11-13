@@ -358,6 +358,45 @@ fn terminate_verified(pid: u32) -> bool {
     !pid_alive(pid)
 }
 
+/// Kills a provider child when its Baton parent disappears. `kill_on_drop`
+/// does not run when Baton is SIGKILLed, so a tiny detached shell watchdog
+/// closes that orphan window. Best-effort: a missing `sh` must not block a
+/// provider turn.
+#[cfg(unix)]
+pub fn spawn_parent_watchdog(server_pid: u32) -> Result<()> {
+    spawn_watchdog_for(std::process::id(), server_pid)
+}
+
+#[cfg(not(unix))]
+pub fn spawn_parent_watchdog(_server_pid: u32) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn spawn_watchdog_for(parent_pid: u32, server_pid: u32) -> Result<()> {
+    let script = watchdog_script(parent_pid, server_pid);
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    // Reap the watchdog when it exits normally; after a SIGKILL of Baton it
+    // reparents to init and exits on its own.
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+#[cfg(unix)]
+fn watchdog_script(parent_pid: u32, server_pid: u32) -> String {
+    format!(
+        "while kill -0 {parent_pid} 2>/dev/null && kill -0 {server_pid} 2>/dev/null; do sleep 1; done; if kill -0 {server_pid} 2>/dev/null; then kill -TERM {server_pid} 2>/dev/null; sleep 1; kill -KILL {server_pid} 2>/dev/null; fi"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,6 +516,32 @@ mod tests {
         assert!(report.errors.is_empty());
         assert!(store.list_provider_processes().unwrap().is_empty());
         assert!(child.0.try_wait().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn watchdog_kills_the_server_when_the_parent_is_gone() {
+        use std::time::{Duration, Instant};
+
+        let mut parent = std::process::Command::new("true").spawn().unwrap();
+        let parent_pid = parent.id();
+        parent.wait().unwrap();
+        let mut server = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let server_pid = server.id();
+        spawn_watchdog_for(parent_pid, server_pid).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some(status) = server.try_wait().unwrap() {
+                assert!(!status.success(), "the watchdog terminates the server");
+                break;
+            }
+            assert!(Instant::now() < deadline, "watchdog did not kill the server");
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
     #[test]

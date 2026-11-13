@@ -809,8 +809,21 @@ fn main_result() -> Result<()> {
             open_prs,
             tasks,
             progress,
+            stream_json,
             json,
         } => {
+            if stream_json
+                && (list
+                    || run.is_some()
+                    || archive.is_some()
+                    || integrate.is_some()
+                    || open_prs.is_some()
+                    || plan_only)
+            {
+                anyhow::bail!(
+                    "--stream-json applies to starting a run; use --json for inspection commands"
+                );
+            }
             let store = BatonStore::open(&paths::baton_db_path())?;
             if list {
                 let runs = orchestrate::run_rows(&store, 20)?
@@ -1069,7 +1082,29 @@ fn main_result() -> Result<()> {
                 }
                 return Ok(());
             }
-            let report = if progress {
+            let report = if stream_json {
+                let sink = |event: orchestrate::OrchestrationProgress| {
+                    if let Ok(line) =
+                        serde_json::to_string(&orchestrate::progress_json(&event))
+                    {
+                        println!("{line}");
+                        let _ = std::io::stdout().flush();
+                    }
+                };
+                orchestrate::run_with_progress(
+                    &goal,
+                    &cwd,
+                    &home,
+                    provider,
+                    &model,
+                    max_tasks,
+                    plan_path.as_deref(),
+                    &store,
+                    permission_mode,
+                    Some(&sink as &orchestrate::ProgressFn<'_>),
+                    None,
+                )?
+            } else if progress {
                 let sink = |event: orchestrate::OrchestrationProgress| {
                     eprintln!("{}", orchestrate::render_progress(&event));
                 };
@@ -1099,7 +1134,11 @@ fn main_result() -> Result<()> {
                     permission_mode,
                 )?
             };
-            if json {
+            if stream_json {
+                let mut value = orchestrate::to_json(&report);
+                value["type"] = serde_json::json!("result");
+                println!("{}", serde_json::to_string(&value)?);
+            } else if json {
                 println!("{}", serde_json::to_string_pretty(&orchestrate::to_json(&report))?);
             } else {
                 println!("{}", orchestrate::render(&report));

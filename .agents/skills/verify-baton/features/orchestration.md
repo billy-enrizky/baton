@@ -12,6 +12,7 @@
 - Worker commits, `--integrate`, and `worktrees --clean`
 - Push worker branches and open PRs with `--open-prs` or `p` in the report
 - Live per-worker progress in the TUI and with `--progress`
+- JSONL progress with `--stream-json`, ending in the full report
 - Worker questions, `needs_input`, and integration/PR decision gates
 - Worker follow-ups from `baton exec -t`, with `worker_followup` in the JSON result
 - `/multi --worktrees` fan-out through a generated plan, one isolated worker per provider

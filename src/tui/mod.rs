@@ -211,6 +211,7 @@ enum Overlay {
     AuthPicker { selected: usize },
     ThreadPicker { selected: usize, threads: Vec<(String, String)> },
     CheckpointPicker { selected: usize, checkpoints: Vec<(i64, String)> },
+    DirtyConfirm { goal: String, max_tasks: usize, plan_file: Option<String> },
 }
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -1075,6 +1076,36 @@ fn record_orchestration_message(state: &mut TuiState, text: String) {
     }
 }
 
+fn request_orchestration(
+    state: &mut TuiState,
+    goal: String,
+    max_tasks: usize,
+    plan_file: Option<String>,
+) {
+    if state.orchestration_pending {
+        state.notice = Some("an orchestration is already running".into());
+        return;
+    }
+    if goal.trim().is_empty() && plan_file.is_none() {
+        state.notice = Some(ORCHESTRATE_USAGE.into());
+        return;
+    }
+    let dirty = crate::worktree::repo_root(std::path::Path::new(&state.thread.cwd))
+        .ok()
+        .and_then(|root| crate::worktree::is_dirty(&root).ok())
+        .unwrap_or(false);
+    if dirty {
+        state.overlay = Overlay::DirtyConfirm {
+            goal,
+            max_tasks,
+            plan_file,
+        };
+        state.notice = None;
+        return;
+    }
+    start_orchestration(state, goal, max_tasks, plan_file);
+}
+
 fn start_orchestration(
     state: &mut TuiState,
     goal: String,
@@ -1830,6 +1861,38 @@ fn handle_key(
             }
             _ => {}
         },
+        Overlay::DirtyConfirm {
+            goal,
+            max_tasks,
+            plan_file,
+        } => match key.code {
+            KeyCode::Enter => start_orchestration(state, goal, max_tasks, plan_file),
+            KeyCode::Char('s') | KeyCode::Char('S') => {
+                if goal.trim().is_empty() {
+                    state.overlay = Overlay::DirtyConfirm {
+                        goal,
+                        max_tasks,
+                        plan_file,
+                    };
+                    state.notice =
+                        Some("a single harness needs a prompt; esc returns it to the composer".into());
+                } else {
+                    submit(state, store, engine_command_sender, goal);
+                }
+            }
+            KeyCode::Esc => {
+                state.set_input(goal);
+                state.notice =
+                    Some("orchestration cancelled; commit or stash, or run a single harness".into());
+            }
+            _ => {
+                state.overlay = Overlay::DirtyConfirm {
+                    goal,
+                    max_tasks,
+                    plan_file,
+                };
+            }
+        },
         Overlay::None => {
             handle_composer_key(state, store, engine_command_sender, key);
         }
@@ -1936,7 +1999,7 @@ fn dispatch_message(
         } else {
             text
         };
-        start_orchestration(state, text, 4, None);
+        request_orchestration(state, text, 4, None);
     } else if state.running {
         let _ = engine_command_sender.send(EngineCommand::Steer {
             thread_id: state.thread.id.clone(),
@@ -2684,7 +2747,7 @@ fn handle_command(
             }
             match parse_orchestrate_args(&args) {
                 Ok(parsed) => {
-                    start_orchestration(state, parsed.goal, parsed.max_tasks, parsed.plan_file)
+                    request_orchestration(state, parsed.goal, parsed.max_tasks, parsed.plan_file)
                 }
                 Err(message) => state.notice = Some(message),
             }
@@ -3881,6 +3944,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::AuthPicker { .. } => 9,
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
             Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
+            Overlay::DirtyConfirm { .. } => 5,
         }
     };
     let chunks = Layout::vertical([
@@ -3948,6 +4012,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 selected,
                 checkpoints,
             } => draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected),
+            Overlay::DirtyConfirm { .. } => draw_dirty_confirm(frame, chunks[1]),
             Overlay::None => {}
         }
     }
@@ -4693,6 +4758,31 @@ fn draw_rewind_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
     }
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_dirty_confirm(frame: &mut ratatui::Frame, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.warning));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let lines = vec![
+        Line::styled(
+            "source checkout has uncommitted changes",
+            Style::default()
+                .fg(COLORS.warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "workers start from HEAD and will not see them",
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            "enter: orchestrate anyway · s: run single harness · esc: cancel and edit",
+            Style::default().fg(COLORS.muted),
+        ),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_code_confirm(frame: &mut ratatui::Frame, area: Rect, turn: i64) {
@@ -7083,6 +7173,23 @@ mod tests {
     }
 
     #[test]
+    fn dirty_confirm_overlay_renders_the_choices() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::DirtyConfirm {
+            goal: "fix the bug".to_string(),
+            max_tasks: 4,
+            plan_file: None,
+        };
+        let buffer = render_state(&state, 120, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains("source checkout has uncommitted changes"));
+        assert!(text.contains("workers start from HEAD"));
+        assert!(text.contains("run single harness"));
+    }
+
+    #[test]
     fn banner_shows_version_cwd_mode_and_permissions() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -7165,6 +7272,85 @@ mod tests {
             receiver.try_recv().is_err(),
             "a git repository prompt must not fall through to the single-harness engine"
         );
+    }
+
+    #[test]
+    fn dirty_source_prompts_before_orchestration() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("tracked.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.path().join("tracked.txt"), "dirty\n").unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        state.thread.session_mode = SessionMode::Orchestrate;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "fix the bug".to_string(),
+            false,
+        );
+        assert!(!state.orchestration_pending);
+        assert!(
+            matches!(state.overlay, Overlay::DirtyConfirm { .. }),
+            "dirty source must ask before orchestration"
+        );
+        assert!(receiver.try_recv().is_err(), "no turn may start yet");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Char('s'),
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            matches!(receiver.try_recv(), Ok(EngineCommand::Submit { .. })),
+            "s must run a single harness"
+        );
+
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "fix the bug".to_string(),
+            false,
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.input, "fix the bug");
     }
 
     #[test]

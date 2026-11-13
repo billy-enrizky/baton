@@ -1,6 +1,6 @@
 ---
 name: verify-baton
-description: "Drive baton's Rust CLI and TUI through an isolated PTY and prove user-visible behavior. Use after changing slash commands, adapter lifecycle/status, doctor, fork, queue, turn phases, or any TUI rendering. Also use when a provider readiness or process-leak claim needs live evidence."
+description: "Drive baton's Rust CLI, TUI, and MCP stdio server through isolated state and prove user-visible behavior. Use after changing slash commands, adapter lifecycle/status, doctor, fork, queue, review, rewind, steering, paste, greeting, MCP tools, turn phases, or any TUI rendering. Also use when a provider readiness or process-leak claim needs live evidence."
 ---
 
 # Verify baton
@@ -81,6 +81,47 @@ rm -rf "$BATON_HOME" "$WORKDIR"
 ```
 
 Do not remove `local_docs/verification/evidence/`.
+
+## Journeys
+
+Use the focused probe for the workflow you changed. Each one prints one JSON summary and exits non-zero on a failed step.
+
+| Journey | Script | Cost |
+|---|---|---|
+| Review overlay, line note, unsent storage | `scripts/review_probe.py` | one small Codex turn |
+| TUI native rewind (`/rewind --native`) | `scripts/rewind_probe.py` | zero, uses the OpenCode 401 fixture |
+| Greeting in default orchestrate mode | `scripts/greeting_probe.py` | one small Codex turn |
+| MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, uses the OpenCode 401 seed |
+| Single slash command or status frame | `scripts/tui_probe.py` | zero |
+
+Every probe accepts `--binary` (default `~/.cargo/bin/baton`) and `--evidence-dir`. To run it against a change before merge, pass `--binary target/debug/baton`.
+
+Model-turn policy:
+
+- Use the cheap configured default, never a premium model, for the probes that need a turn.
+- Never run a live Claude turn without the user's explicit confirmation.
+- Prefer the OpenCode 401 fixture when the workflow only needs a thread, a failed turn, and a native message id.
+
+## State-machine gates
+
+Run every formal gate from the repository root:
+
+```sh
+for d in local_docs/verification/*/; do
+  [ -f "$d/run.sh" ] && bash "$d/run.sh"
+done
+```
+
+A gate has a real config that must pass and at least one mutation that must fail. Read its `SKILL.md` before changing the flow it models.
+
+## After merge
+
+Reinstall from the repository root, then run the installed binary through the journey you changed and check for leftovers:
+
+```sh
+cargo install --path . --force
+~/.cargo/bin/baton ps --json
+```
 
 ## Feature map
 

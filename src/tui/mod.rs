@@ -2077,6 +2077,7 @@ fn handle_key(
                         state.notice = Some(format!("cannot save config: {error}"));
                         return;
                     }
+                    state.banner_cache.borrow_mut().take();
                     state.notice = Some(format!("{provider} billing set to {}", mode.as_str()));
                 }
             }
@@ -2360,6 +2361,17 @@ fn enqueue_message(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, text: S
         .unwrap()
         .enqueue_message(&state.thread.id, &text);
     state.queued_messages.push(text);
+}
+
+fn effective_permission_mode(
+    selected: PermissionMode,
+    provider_default: PermissionMode,
+) -> PermissionMode {
+    if selected == PermissionMode::Default {
+        provider_default
+    } else {
+        selected
+    }
 }
 
 fn is_conversational_greeting(text: &str) -> bool {
@@ -3684,6 +3696,7 @@ fn handle_command(
                         state.notice = Some(format!("cannot save config: {error}"));
                         return;
                     }
+                    state.banner_cache.borrow_mut().take();
                     state.notice = Some(format!("{provider} billing set to {}", mode.as_str()));
                 }
                 (Some(provider), None) => {
@@ -5820,7 +5833,11 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
             Style::default().fg(COLORS.secondary),
         ),
         Span::styled(
-            format!(" · {effective_model} · {} · mode {}", describe_auth(provider_config), state.permission_mode),
+            format!(
+                " · {effective_model} · {} · mode {}",
+                describe_auth(provider_config),
+                effective_permission_mode(state.permission_mode, provider_config.permission_mode)
+            ),
             Style::default().fg(COLORS.muted),
         ),
     ]));
@@ -5951,7 +5968,9 @@ impl TuiState {
             SessionMode::Orchestrate => "orchestrate",
             SessionMode::Single => "single",
         };
-        let (permission, permission_color) = match self.permission_mode {
+        let permission_mode =
+            effective_permission_mode(self.permission_mode, provider_config.permission_mode);
+        let (permission, permission_color) = match permission_mode {
             PermissionMode::Default => ("default", COLORS.muted),
             PermissionMode::AcceptEdits => ("auto-accept edits", COLORS.secondary),
             PermissionMode::BypassPermissions => ("YOLO mode", COLORS.warning),
@@ -8901,6 +8920,21 @@ mod tests {
         assert!(text.contains("source checkout has uncommitted changes"));
         assert!(text.contains("workers start from HEAD"));
         assert!(text.contains("run single harness"));
+    }
+
+    #[test]
+    fn effective_permission_uses_the_provider_default_until_overridden() {
+        assert_eq!(
+            effective_permission_mode(
+                PermissionMode::Default,
+                PermissionMode::BypassPermissions
+            ),
+            PermissionMode::BypassPermissions
+        );
+        assert_eq!(
+            effective_permission_mode(PermissionMode::Plan, PermissionMode::BypassPermissions),
+            PermissionMode::Plan
+        );
     }
 
     #[test]

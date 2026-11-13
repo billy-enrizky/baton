@@ -223,6 +223,7 @@ async fn acp_adapter_runs_a_full_turn_with_streaming() {
     let (event_sender, event_receiver) = std::sync::mpsc::channel();
     tokio::time::timeout(Duration::from_secs(10), adapter.start_turn(
         baton::adapters::TurnStartInput {
+            turn: 1,
             thread_id: "bt".into(),
             cwd: "/work".into(),
             model: "grok-build".into(),
@@ -347,6 +348,7 @@ async fn acp_adapter_maps_permission_decisions_to_options() {
         adapter
             .start_turn(
                 baton::adapters::TurnStartInput {
+                    turn: 1,
                     thread_id: "bt".into(),
                     cwd: "/work".into(),
                     model: "grok-build".into(),

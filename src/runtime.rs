@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, TurnEvent, TurnStartInput};
+use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, SteerOutcome, SteerRequest, TurnEvent, TurnStartInput};
 use crate::checkpoints::capture_checkpoint;
 use crate::config::{provider_auth_env, resolve_config};
 use crate::handoff::{build_handoff, derive_title, git_status_summary, wrap_prompt_with_handoff, HandoffMessage};
@@ -210,37 +210,45 @@ fn phase_for_error(error: &str) -> TurnPhase {
     }
 }
 
-/// Marks the thread that currently owns a provider adapter. This keeps
-/// steering and interrupts from reaching another thread's live turn.
-struct ProviderOwnerGuard {
-    owners: Arc<Mutex<HashMap<ProviderId, String>>>,
-    provider: ProviderId,
+/// The exact turn a provider adapter is running. Steering is validated
+/// against this claim, not just against the thread, so a steer cannot land in
+/// a later turn for the same thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProviderClaim {
     thread_id: String,
+    turn: i64,
+}
+
+type ProviderClaims = Arc<Mutex<HashMap<ProviderId, ProviderClaim>>>;
+
+/// Marks the turn that currently owns a provider adapter. This keeps steering
+/// and interrupts from reaching another thread's live turn.
+struct ProviderOwnerGuard {
+    claims: ProviderClaims,
+    provider: ProviderId,
+    claim: ProviderClaim,
 }
 
 impl ProviderOwnerGuard {
-    fn claim(
-        owners: Arc<Mutex<HashMap<ProviderId, String>>>,
-        provider: ProviderId,
-        thread_id: &str,
-    ) -> Self {
-        owners
-            .lock()
-            .unwrap()
-            .insert(provider, thread_id.to_string());
-        Self {
-            owners,
-            provider,
+    fn claim(claims: ProviderClaims, provider: ProviderId, thread_id: &str, turn: i64) -> Self {
+        let claim = ProviderClaim {
             thread_id: thread_id.to_string(),
+            turn,
+        };
+        claims.lock().unwrap().insert(provider, claim.clone());
+        Self {
+            claims,
+            provider,
+            claim,
         }
     }
 }
 
 impl Drop for ProviderOwnerGuard {
     fn drop(&mut self) {
-        if let Ok(mut owners) = self.owners.lock() {
-            if owners.get(&self.provider).map(String::as_str) == Some(self.thread_id.as_str()) {
-                owners.remove(&self.provider);
+        if let Ok(mut claims) = self.claims.lock() {
+            if claims.get(&self.provider) == Some(&self.claim) {
+                claims.remove(&self.provider);
             }
         }
     }
@@ -340,8 +348,7 @@ pub async fn run_engine(
         }
         indices
     });
-    let provider_owners: Arc<Mutex<HashMap<ProviderId, String>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let provider_claims: ProviderClaims = Arc::new(Mutex::new(HashMap::new()));
     let turn_cancellations: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     while let Some(command) = command_receiver.recv().await {
@@ -359,8 +366,8 @@ pub async fn run_engine(
                 for cancel in cancellations {
                     let _ = cancel.send(true);
                 }
-                let owners = provider_owners.lock().unwrap().clone();
-                for (provider, _) in owners {
+                let claims = provider_claims.lock().unwrap().clone();
+                for provider in claims.keys().copied() {
                     if let Some((_, handle)) = interrupt_handles
                         .iter()
                         .find(|(candidate, _)| *candidate == provider)
@@ -378,68 +385,78 @@ pub async fn run_engine(
                 break;
             }
             EngineCommand::Steer { thread_id, text } => {
-                let provider = store
-                    .lock()
-                    .unwrap()
-                    .get_thread(&thread_id)
-                    .ok()
-                    .flatten()
-                    .map(|thread| thread.current_provider);
-                let accepted = provider
-                    .and_then(|provider| {
-                        let owner = provider_owners
-                            .lock()
-                            .unwrap()
-                            .get(&provider)
-                            .cloned();
-                        if owner.as_deref() != Some(thread_id.as_str()) {
-                            return None;
-                        }
-                        steer_handles
-                            .iter()
-                            .find(|(candidate, _)| *candidate == provider)
-                            .map(|(_, handle)| handle(text.clone()))
+                let resolved = {
+                    let store = store.lock().unwrap();
+                    store.get_thread(&thread_id).ok().flatten().map(|thread| {
+                        let model = thread.current_model.clone().unwrap_or_else(|| {
+                            crate::models::default_model(thread.current_provider).to_string()
+                        });
+                        (thread.current_provider, model)
                     })
-                    .unwrap_or(false);
-                if accepted {
-                    let (provider, model, turn) = {
-                        let store = store.lock().unwrap();
-                        let thread = store.get_thread(&thread_id).ok().flatten();
-                        let turn = store.next_turn_number(&thread_id).unwrap_or(1).saturating_sub(1);
-                        thread
-                            .map(|thread| {
-                                let model = thread
-                                    .current_model
-                                    .clone()
-                                    .unwrap_or_else(|| crate::models::default_model(thread.current_provider).to_string());
-                                (thread.current_provider, model, turn)
-                            })
-                            .unwrap_or((ProviderId::Codex, String::new(), turn))
-                    };
-                    {
-                        let store = store.lock().unwrap();
-                        let _ = store.add_message(
-                            &thread_id,
-                            turn,
-                            "user",
-                            Some(provider.as_str()),
-                            Some(&model),
-                            &text,
-                        );
-                    }
-                    let _ = engine_event_sender.send(EngineEvent::UserEcho {
-                        thread_id,
-                        turn,
-                        text,
-                        provider,
-                        model: Some(model),
-                    });
-                } else {
+                };
+                let claim = resolved.as_ref().and_then(|(provider, _)| {
+                    provider_claims.lock().unwrap().get(provider).cloned()
+                });
+                let handle = resolved.as_ref().and_then(|(provider, _)| {
+                    steer_handles
+                        .iter()
+                        .find(|(candidate, _)| candidate == provider)
+                        .map(|(_, handle)| handle.clone())
+                });
+                let (Some((provider, model)), Some(claim), Some(handle)) = (resolved, claim, handle)
+                else {
                     let _ = engine_event_sender.send(EngineEvent::SteerRejected {
                         thread_id,
                         text,
                     });
+                    continue;
+                };
+                if claim.thread_id != thread_id {
+                    let _ = engine_event_sender.send(EngineEvent::SteerRejected {
+                        thread_id,
+                        text,
+                    });
+                    continue;
                 }
+                // Delivery is asynchronous and turn-scoped. The echo and the
+                // stored message wait for the harness verdict so the
+                // transcript never claims a steer that was not delivered.
+                let turn = claim.turn;
+                let sender = engine_event_sender.clone();
+                let store = store.clone();
+                tokio::spawn(async move {
+                    let outcome = handle(SteerRequest {
+                        thread_id: thread_id.clone(),
+                        turn,
+                        text: text.clone(),
+                    })
+                    .await;
+                    if outcome == SteerOutcome::Delivered {
+                        {
+                            let store = store.lock().unwrap();
+                            let _ = store.add_message(
+                                &thread_id,
+                                turn,
+                                "user",
+                                Some(provider.as_str()),
+                                Some(&model),
+                                &text,
+                            );
+                        }
+                        let _ = sender.send(EngineEvent::UserEcho {
+                            thread_id,
+                            turn,
+                            text,
+                            provider,
+                            model: Some(model),
+                        });
+                    } else {
+                        let _ = sender.send(EngineEvent::SteerRejected {
+                            thread_id,
+                            text,
+                        });
+                    }
+                });
             }
             EngineCommand::ListModels {
                 thread_id,
@@ -474,11 +491,11 @@ pub async fn run_engine(
                     .flatten()
                     .map(|thread| thread.current_provider);
                 if let Some(provider) = provider {
-                    let owner = provider_owners
+                    let owner = provider_claims
                         .lock()
                         .unwrap()
                         .get(&provider)
-                        .cloned();
+                        .map(|claim| claim.thread_id.clone());
                     let cancel = turn_cancellations
                         .lock()
                         .unwrap()
@@ -520,7 +537,7 @@ pub async fn run_engine(
                     home.clone(),
                     adapters.clone(),
                     adapter_indices.clone(),
-                    provider_owners.clone(),
+                    provider_claims.clone(),
                     turn_cancellations.clone(),
                     cancel_receiver,
                     thread_id,
@@ -541,7 +558,7 @@ async fn run_turn(
     home: std::path::PathBuf,
     adapters: Vec<SharedAdapter>,
     adapter_indices: Arc<HashMap<ProviderId, usize>>,
-    provider_owners: Arc<Mutex<HashMap<ProviderId, String>>>,
+    provider_claims: ProviderClaims,
     turn_cancellations: Arc<Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>>,
     cancel_receiver: tokio::sync::watch::Receiver<bool>,
     thread_id: String,
@@ -569,7 +586,7 @@ async fn run_turn(
         &home,
         &adapters,
         &adapter_indices,
-        &provider_owners,
+        &provider_claims,
         cancel_receiver,
         &thread_id,
         &text,
@@ -649,7 +666,7 @@ async fn execute_turn(
     home: &std::path::PathBuf,
     adapters: &[SharedAdapter],
     adapter_indices: &HashMap<ProviderId, usize>,
-    provider_owners: &Arc<Mutex<HashMap<ProviderId, String>>>,
+    provider_claims: &ProviderClaims,
     mut cancel_receiver: tokio::sync::watch::Receiver<bool>,
     thread_id: &str,
     text: &str,
@@ -730,6 +747,7 @@ async fn execute_turn(
     let cwd_for_checkpoint = cwd.clone();
     let input = TurnStartInput {
         thread_id: thread_id.to_string(),
+        turn,
         cwd,
         model: model.clone(),
         effort: reasoning_effort,
@@ -758,7 +776,7 @@ async fn execute_turn(
             guard
         }
     };
-    let _provider_owner = ProviderOwnerGuard::claim(provider_owners.clone(), provider, thread_id);
+    let _provider_owner = ProviderOwnerGuard::claim(provider_claims.clone(), provider, thread_id, turn);
     if *cancel_receiver.borrow() {
         let message = "interrupted while queued".to_string();
         turn_ledger.settle(TurnPhase::Interrupted, Some(&message));
@@ -1097,7 +1115,7 @@ mod tests {
             Box::new(ScriptAdapter { mode }) as Box<dyn BatonAdapter>
         ))];
         let adapter_indices = HashMap::from([(ProviderId::Codex, 0)]);
-        let provider_owners = Arc::new(Mutex::new(HashMap::new()));
+        let provider_claims: ProviderClaims = Arc::new(Mutex::new(HashMap::new()));
         let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
         let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
         let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
@@ -1106,7 +1124,7 @@ mod tests {
             &home.path().to_path_buf(),
             &adapters,
             &adapter_indices,
-            &provider_owners,
+            &provider_claims,
             cancel_receiver,
             &thread.id,
             "hello",
@@ -1219,10 +1237,17 @@ mod tests {
         .expect("engine event arrives")
     }
 
-    #[tokio::test]
-    async fn steering_is_scoped_to_the_provider_owner() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
+    async fn steer_test_engine(
+        steer: SteerHandle,
+    ) -> (
+        SharedStore,
+        ThreadRow,
+        Arc<tokio::sync::Notify>,
+        tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+        std::sync::mpsc::Receiver<EngineEvent>,
+        tokio::task::JoinHandle<Result<()>>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let thread = store
             .lock()
@@ -1234,15 +1259,9 @@ mod tests {
                 current_model: Some("m".into()),
             })
             .unwrap();
-        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (started_sender, started_receiver) = tokio::sync::mpsc::unbounded_channel();
         let release = Arc::new(tokio::sync::Notify::new());
         let adapters = vec![gate_shared(ProviderId::Codex, &started_sender, &release)];
-        let accepted = Arc::new(AtomicBool::new(false));
-        let accepted_handle = accepted.clone();
-        let steer: SteerHandle = Arc::new(move |text: String| {
-            accepted_handle.store(text == "try this", Ordering::SeqCst);
-            true
-        });
         let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (event_sender, event_receiver) = std::sync::mpsc::channel();
         let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
@@ -1256,6 +1275,30 @@ mod tests {
             event_sender,
             turn_sender,
         ));
+        (
+            store,
+            thread,
+            release,
+            command_sender,
+            event_receiver,
+            engine,
+            started_receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn steering_is_scoped_to_the_owner_and_turn() {
+        let observed = Arc::new(Mutex::new(Vec::<SteerRequest>::new()));
+        let observed_handle = observed.clone();
+        let steer: SteerHandle = Arc::new(move |request: SteerRequest| {
+            let observed_handle = observed_handle.clone();
+            Box::pin(async move {
+                observed_handle.lock().unwrap().push(request);
+                SteerOutcome::Delivered
+            })
+        });
+        let (store, thread, release, command_sender, event_receiver, engine, mut started) =
+            steer_test_engine(steer).await;
         command_sender
             .send(EngineCommand::Submit {
                 thread_id: thread.id.clone(),
@@ -1263,7 +1306,7 @@ mod tests {
                 permission_mode: PermissionMode::Default,
             })
             .unwrap();
-        assert_eq!(next_started(&mut started_receiver).await, thread.id);
+        assert_eq!(next_started(&mut started).await, thread.id);
 
         command_sender
             .send(EngineCommand::Steer {
@@ -1275,7 +1318,13 @@ mod tests {
             matches!(event, EngineEvent::UserEcho { text, .. } if text == "try this")
         })
         .await;
-        assert!(accepted.load(Ordering::SeqCst));
+        {
+            let requests = observed.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].thread_id, thread.id);
+            assert_eq!(requests[0].turn, 1, "a steer is scoped to the running turn");
+            assert_eq!(requests[0].text, "try this");
+        }
 
         let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
         assert!(messages.iter().any(|message| message.text == "hello"));
@@ -1298,6 +1347,46 @@ mod tests {
         })
         .await;
 
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+    }
+
+    #[tokio::test]
+    async fn a_stale_turn_steer_is_rejected_and_not_recorded() {
+        let steer: SteerHandle =
+            Arc::new(|_request: SteerRequest| Box::pin(async { SteerOutcome::StaleTurn }));
+        let (store, thread, release, command_sender, event_receiver, engine, mut started) =
+            steer_test_engine(steer).await;
+        command_sender
+            .send(EngineCommand::Submit {
+                thread_id: thread.id.clone(),
+                text: "hello".into(),
+                permission_mode: PermissionMode::Default,
+            })
+            .unwrap();
+        assert_eq!(next_started(&mut started).await, thread.id);
+
+        command_sender
+            .send(EngineCommand::Steer {
+                thread_id: thread.id.clone(),
+                text: "too late".into(),
+            })
+            .unwrap();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::SteerRejected { text, .. } if text == "too late")
+        })
+        .await;
+        let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
+        assert!(
+            !messages.iter().any(|message| message.text == "too late"),
+            "a steer the harness did not take must not appear in history"
+        );
+
+        release.notify_one();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnFinished { thread_id, ok: true, .. } if thread_id == &thread.id)
+        })
+        .await;
         command_sender.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
     }

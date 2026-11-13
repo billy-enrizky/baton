@@ -2,11 +2,10 @@ use anyhow::Result;
 use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{child_halves, child_halves_with_cleanup, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineWriter, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{child_halves, child_halves_with_cleanup, ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineWriter, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::process::{self, ProcessRecorder};
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -17,7 +16,9 @@ type SharedWriter = Arc<AsyncMutex<Option<Box<dyn LineWriter>>>>;
 pub struct ClaudeAdapter {
     interrupt: Arc<Mutex<Option<tokio::sync::watch::Sender<bool>>>>,
     writer: SharedWriter,
-    active_turn: Arc<AtomicBool>,
+    /// The live baton turn published as one value so a steer cannot land in
+    /// a newer turn that happens to share the same process.
+    active_turn: Arc<AsyncMutex<Option<ActiveTurn>>>,
     spawner: ClaudeSpawner,
     lifecycle: AdapterLifecycle,
 }
@@ -35,7 +36,7 @@ impl ClaudeAdapter {
         ClaudeAdapter {
             interrupt: Arc::new(Mutex::new(None)),
             writer: Arc::new(AsyncMutex::new(None)),
-            active_turn: Arc::new(AtomicBool::new(false)),
+            active_turn: Arc::new(AsyncMutex::new(None)),
             spawner,
             lifecycle: AdapterLifecycle::new(),
         }
@@ -207,25 +208,33 @@ impl BatonAdapter for ClaudeAdapter {
     fn steer_handle(&self) -> Option<SteerHandle> {
         let writer = self.writer.clone();
         let active = self.active_turn.clone();
-        Some(Arc::new(move |text: String| -> bool {
-            if !active.load(Ordering::SeqCst) {
-                return false;
-            }
-            let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                return false;
-            };
+        Some(Arc::new(move |request: SteerRequest| -> SteerFuture {
             let writer = writer.clone();
-            handle.spawn(async move {
+            let active = active.clone();
+            Box::pin(async move {
+                let current = match active.try_lock() {
+                    Ok(current) => current.clone(),
+                    Err(_) => return SteerOutcome::StaleTurn,
+                };
+                let current = match current {
+                    Some(current) => current,
+                    None => return SteerOutcome::StaleTurn,
+                };
+                if current.thread_id != request.thread_id || current.turn != request.turn {
+                    return SteerOutcome::StaleTurn;
+                }
                 let message = json!({
                     "type": "user",
                     "message": {
                         "role": "user",
-                        "content": [ { "type": "text", "text": text } ]
+                        "content": [ { "type": "text", "text": request.text } ]
                     }
                 });
-                let _ = write_value(&writer, &message).await;
-            });
-            true
+                match write_value(&writer, &message).await {
+                    Ok(()) => SteerOutcome::Delivered,
+                    Err(error) => SteerOutcome::Unavailable(error.to_string()),
+                }
+            })
         }))
     }
 
@@ -240,7 +249,12 @@ impl BatonAdapter for ClaudeAdapter {
         let (mut reader, writer) = (self.spawner)(&input, session.as_ref())?;
         let writer_handle = self.writer.clone();
         *writer_handle.lock().await = Some(writer);
-        self.active_turn.store(true, Ordering::SeqCst);
+        *self.active_turn.lock().await = Some(ActiveTurn {
+            thread_id: input.thread_id.clone(),
+            turn: input.turn,
+            native_thread_id: input.thread_id.clone(),
+            native_turn_id: None,
+        });
         self.lifecycle.turn_running(&input.thread_id);
         let writer = writer_handle;
         let user_message = json!({
@@ -251,7 +265,7 @@ impl BatonAdapter for ClaudeAdapter {
             }
         });
         if let Err(error) = write_value(&writer, &user_message).await {
-            self.active_turn.store(false, Ordering::SeqCst);
+            *self.active_turn.lock().await = None;
             let mut guard = self.writer.lock().await;
             if let Some(mut writer) = guard.take() {
                 let _ = writer.shutdown().await;
@@ -451,7 +465,7 @@ impl BatonAdapter for ClaudeAdapter {
             }
         }
 
-        self.active_turn.store(false, Ordering::SeqCst);
+        *self.active_turn.lock().await = None;
         *self.interrupt.lock().unwrap() = None;
         {
             let mut guard = self.writer.lock().await;
@@ -485,7 +499,7 @@ impl BatonAdapter for ClaudeAdapter {
 
     async fn dispose(&mut self) -> Result<()> {
         self.lifecycle.disposing();
-        self.active_turn.store(false, Ordering::SeqCst);
+        *self.active_turn.lock().await = None;
         let mut guard = self.writer.lock().await;
         if let Some(mut writer) = guard.take() {
             let _ = writer.shutdown().await;
@@ -503,6 +517,7 @@ mod tests {
     #[test]
     fn command_args_request_partial_stream_messages() {
         let input = TurnStartInput {
+            turn: 1,
             thread_id: "t".into(),
             cwd: "/work".into(),
             model: "claude-sonnet-4-5".into(),

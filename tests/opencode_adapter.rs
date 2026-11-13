@@ -301,13 +301,23 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
     assert_eq!(models, vec!["myprovider/model-a", "myprovider/model-b"]);
     let steer = adapter.steer_handle().expect("opencode exposes steering");
     let interrupt = adapter.interrupt_handle();
-    assert!(!steer("too early".into()), "no runtime means no active turn");
+    let request = |text: &str| baton::adapters::SteerRequest {
+        thread_id: "baton-thread".into(),
+        turn: 1,
+        text: text.into(),
+    };
+    assert_eq!(
+        steer(request("too early")).await,
+        baton::adapters::SteerOutcome::StaleTurn,
+        "no active turn means the steer is stale"
+    );
 
     let (event_sender, event_receiver) = std::sync::mpsc::channel();
     let turn_task = tokio::spawn(async move {
         adapter
             .start_turn(
                 baton::adapters::TurnStartInput {
+                    turn: 1,
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "myprovider/rits-zai-org/glm-5-3".into(),
@@ -353,7 +363,11 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
         );
     }
 
-    assert!(steer("change direction".into()), "steering is accepted during the live turn");
+    assert_eq!(
+        steer(request("change direction")).await,
+        baton::adapters::SteerOutcome::Delivered,
+        "steering is delivered during the live turn"
+    );
     let steer_body = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let bodies = requests.lock().unwrap().clone();
@@ -437,7 +451,11 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
         )),
         "the prompt admission id is recorded for native rewind"
     );
-    assert!(!steer("too late".into()), "steering after completion is rejected");
+    assert_eq!(
+        steer(request("too late")).await,
+        baton::adapters::SteerOutcome::StaleTurn,
+        "steering after completion is rejected"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

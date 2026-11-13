@@ -189,6 +189,8 @@ impl Drop for AdapterTurnGuard {
 #[derive(Debug, Clone)]
 pub struct TurnStartInput {
     pub thread_id: String,
+    /// Baton turn number. Steering is scoped to this value.
+    pub turn: i64,
     pub cwd: String,
     pub model: String,
     pub effort: Option<String>,
@@ -251,7 +253,39 @@ pub enum TurnEvent {
 }
 
 pub type TurnEventSender = std::sync::mpsc::Sender<TurnEvent>;
-pub type SteerHandle = std::sync::Arc<dyn Fn(String) -> bool + Send + Sync>;
+
+/// The harness turn an adapter is driving right now. Adapters publish this as
+/// one value so a steer validates the baton turn and routes with the native
+/// ids without reading a half-updated pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveTurn {
+    pub thread_id: String,
+    pub turn: i64,
+    /// Harness conversation id used to address the turn.
+    pub native_thread_id: String,
+    /// Harness turn id once the harness reports one.
+    pub native_turn_id: Option<String>,
+}
+
+/// A steer is scoped to the baton turn the user saw running.
+#[derive(Debug, Clone)]
+pub struct SteerRequest {
+    pub thread_id: String,
+    pub turn: i64,
+    pub text: String,
+}
+
+/// What happened to a steer. Only `Delivered` earns a user echo and a stored
+/// message; every other outcome falls back to the queue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SteerOutcome {
+    Delivered,
+    StaleTurn,
+    Unavailable(String),
+}
+
+pub type SteerFuture = std::pin::Pin<Box<dyn std::future::Future<Output = SteerOutcome> + Send>>;
+pub type SteerHandle = std::sync::Arc<dyn Fn(SteerRequest) -> SteerFuture + Send + Sync>;
 
 #[async_trait]
 pub trait LineReader: Send {

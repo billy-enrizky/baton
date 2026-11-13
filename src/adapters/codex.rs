@@ -4,9 +4,10 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, LineReader, LineWriter, ModelListInput, RevertSessionInput, SteerHandle, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, LineReader, LineWriter, ModelListInput, RevertSessionInput, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -16,8 +17,33 @@ struct CodexRuntime {
     pending: Mutex<HashMap<u32, oneshot::Sender<Result<Value, String>>>>,
     notifications: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
     current_emit: AsyncMutex<Option<TurnEventSender>>,
-    active_thread: AsyncMutex<Option<String>>,
-    active_turn: AsyncMutex<Option<String>>,
+    /// The baton turn and native ids published as one value so steering and
+    /// interrupts never read a pair from two different turns.
+    active_turn: AsyncMutex<Option<ActiveTurn>>,
+}
+
+/// Sends one JSON-RPC request and waits for its response. Free so the steer
+/// handle can use it without borrowing the adapter.
+async fn request_on(
+    runtime: &Arc<CodexRuntime>,
+    next_id: &AtomicU32,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value> {
+    let id = next_id.fetch_add(1, Ordering::SeqCst);
+    let (sender, receiver) = oneshot::channel();
+    runtime.pending.lock().unwrap().insert(id, sender);
+    let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+    {
+        let mut writer = runtime.writer.lock().await;
+        writer.write_line(&serde_json::to_string(&frame)?).await?;
+    }
+    match tokio::time::timeout(timeout, receiver).await {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(error))) => anyhow::bail!("codex app-server error: {error}"),
+        _ => anyhow::bail!("codex app-server request timed out: {method}"),
+    }
 }
 
 pub type HalvesSpawner = Arc<dyn Fn(&[(String, String)]) -> Result<TransportHalves> + Send + Sync>;
@@ -259,7 +285,6 @@ impl CodexAdapter {
                 pending: Mutex::new(HashMap::new()),
                 notifications: notification_sender,
                 current_emit: AsyncMutex::new(None),
-                active_thread: AsyncMutex::new(None),
                 active_turn: AsyncMutex::new(None),
             });
             spawn_reader(runtime.clone());
@@ -277,19 +302,7 @@ impl CodexAdapter {
     }
 
     async fn request(&self, runtime: &Arc<CodexRuntime>, method: &str, params: Value) -> Result<Value> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
-        let (sender, receiver) = oneshot::channel();
-        runtime.pending.lock().unwrap().insert(id, sender);
-        let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        {
-            let mut writer = runtime.writer.lock().await;
-            writer.write_line(&serde_json::to_string(&frame)?).await?;
-        }
-        match tokio::time::timeout(std::time::Duration::from_secs(60), receiver).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(error))) => anyhow::bail!("codex app-server error: {error}"),
-            _ => anyhow::bail!("codex app-server request timed out: {method}"),
-        }
+        request_on(runtime, &self.next_id, method, params, Duration::from_secs(60)).await
     }
 
     async fn ensure_initialized(&self, runtime: &Arc<CodexRuntime>) -> Result<()> {
@@ -431,16 +444,16 @@ impl BatonAdapter for CodexAdapter {
                         Some(runtime) => runtime,
                         None => return,
                     };
-                    let thread_id = runtime.active_thread.lock().await.clone();
-                    let thread_id = match thread_id {
-                        Some(thread_id) => thread_id,
+                    let active = runtime.active_turn.lock().await.clone();
+                    let active = match active {
+                        Some(active) => active,
                         None => return,
                     };
-                    let turn_id = runtime.active_turn.lock().await.clone();
-                    let turn_id = match turn_id {
+                    let turn_id = match active.native_turn_id {
                         Some(turn_id) => turn_id,
                         None => return,
                     };
+                    let thread_id = active.native_thread_id;
                     let id = next_id.fetch_add(1, Ordering::SeqCst);
                     let frame = json!({
                         "jsonrpc": "2.0",
@@ -459,67 +472,41 @@ impl BatonAdapter for CodexAdapter {
 
     fn steer_handle(&self) -> Option<SteerHandle> {
         let runtime = self.runtime.clone();
-        let adapter_ptr = self as *const Self as usize;
-        let slot_ptr = Arc::as_ptr(&runtime) as usize;
-        steer_debug(&format!("handle adapter={adapter_ptr:x} slot={slot_ptr:x}"));
         let next_id = self.next_id.clone();
-        Some(Arc::new(move |text: String| -> bool {
-            let Ok(handle) = tokio::runtime::Handle::try_current() else {
-                steer_debug("no tokio runtime");
-                return false;
-            };
-            let runtime = match runtime.try_lock() {
-                Ok(slot) => slot.clone(),
-                Err(_) => {
-                    steer_debug("runtime slot busy");
-                    return false;
+        Some(Arc::new(move |request: SteerRequest| -> SteerFuture {
+            let runtime = runtime.clone();
+            let next_id = next_id.clone();
+            Box::pin(async move {
+                let runtime = match runtime.try_lock() {
+                    Ok(slot) => slot.clone(),
+                    Err(_) => return SteerOutcome::Unavailable("codex adapter is busy".into()),
+                };
+                let Some(runtime) = runtime else {
+                    return SteerOutcome::Unavailable("codex is not running".into());
+                };
+                let active = match runtime.active_turn.try_lock() {
+                    Ok(active) => active.clone(),
+                    Err(_) => return SteerOutcome::StaleTurn,
+                };
+                let Some(active) = active else {
+                    return SteerOutcome::StaleTurn;
+                };
+                if active.thread_id != request.thread_id || active.turn != request.turn {
+                    return SteerOutcome::StaleTurn;
                 }
-            };
-            let runtime = match runtime {
-                Some(runtime) => runtime,
-                None => {
-                    steer_debug(&format!("runtime not spawned adapter={adapter_ptr:x} slot={slot_ptr:x}"));
-                    return false;
-                }
-            };
-            steer_debug(&format!("runtime found adapter={adapter_ptr:x} runtime={:p}", Arc::as_ptr(&runtime)));
-            let thread_id = match runtime.active_thread.try_lock() {
-                Ok(value) => value.clone(),
-                Err(_) => {
-                    steer_debug("active thread busy");
-                    return false;
-                }
-            };
-            let turn_id = match runtime.active_turn.try_lock() {
-                Ok(value) => value.clone(),
-                Err(_) => {
-                    steer_debug("active turn busy");
-                    return false;
-                }
-            };
-            let (Some(thread_id), Some(turn_id)) = (thread_id, turn_id) else {
-                steer_debug("no active thread or turn");
-                return false;
-            };
-            let id = next_id.fetch_add(1, Ordering::SeqCst);
-            steer_debug("accepted");
-            handle.spawn(async move {
-                let frame = json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "method": "turn/steer",
-                    "params": {
-                        "threadId": thread_id,
-                        "expectedTurnId": turn_id,
-                        "input": [ { "type": "text", "text": text } ]
-                    }
+                let Some(native_turn_id) = active.native_turn_id else {
+                    return SteerOutcome::StaleTurn;
+                };
+                let params = json!({
+                    "threadId": active.native_thread_id,
+                    "expectedTurnId": native_turn_id,
+                    "input": [ { "type": "text", "text": request.text } ]
                 });
-                if let Ok(serialized) = serde_json::to_string(&frame) {
-                    let mut writer = runtime.writer.lock().await;
-                    let _ = writer.write_line(&serialized).await;
+                match request_on(&runtime, &next_id, "turn/steer", params, Duration::from_secs(10)).await {
+                    Ok(_) => SteerOutcome::Delivered,
+                    Err(error) => SteerOutcome::Unavailable(error.to_string()),
                 }
-            });
-            true
+            })
         }))
     }
 
@@ -656,7 +643,6 @@ impl BatonAdapter for CodexAdapter {
                 }
             }
         };
-        *runtime.active_thread.lock().await = Some(thread_id.clone());
         let _ = emit.send(TurnEvent::ProviderSession {
             native_session_id: thread_id.clone(),
             rollout_path: rollout_path.clone(),
@@ -690,9 +676,14 @@ impl BatonAdapter for CodexAdapter {
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| started.get("turnId").and_then(Value::as_str).map(str::to_string));
+        *runtime.active_turn.lock().await = Some(ActiveTurn {
+            thread_id: input.thread_id.clone(),
+            turn: input.turn,
+            native_thread_id: thread_id.clone(),
+            native_turn_id: turn_id.clone(),
+        });
         if let Some(turn_id) = turn_id.as_ref() {
             let _ = emit.send(TurnEvent::ProviderTurnId { id: turn_id.clone() });
-            *runtime.active_turn.lock().await = Some(turn_id.clone());
         }
 
         let mut receiver = match self.notification_receiver.take() {
@@ -716,7 +707,11 @@ impl BatonAdapter for CodexAdapter {
                             .and_then(Value::as_str)
                         {
                             let _ = emit.send(TurnEvent::ProviderTurnId { id: id.to_string() });
-                            *runtime.active_turn.lock().await = Some(id.to_string());
+                            if let Some(active) = runtime.active_turn.lock().await.as_mut() {
+                                if active.native_thread_id == started_thread {
+                                    active.native_turn_id = Some(id.to_string());
+                                }
+                            }
                         }
                     }
                 }
@@ -734,7 +729,11 @@ impl BatonAdapter for CodexAdapter {
                             .and_then(Value::as_str)
                             .map(str::to_string);
                         if let Some(id) = turn.get("id").and_then(Value::as_str) {
-                            *runtime.active_turn.lock().await = Some(id.to_string());
+                            if let Some(active) = runtime.active_turn.lock().await.as_mut() {
+                                if active.native_thread_id == completed_thread {
+                                    active.native_turn_id = Some(id.to_string());
+                                }
+                            }
                         }
                         match status {
                             "completed" => {
@@ -800,7 +799,6 @@ impl BatonAdapter for CodexAdapter {
         };
         self.notification_receiver = Some(receiver);
         *runtime.current_emit.lock().await = None;
-        *runtime.active_thread.lock().await = None;
         *runtime.active_turn.lock().await = None;
         result
     }

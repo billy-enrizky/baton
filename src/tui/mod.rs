@@ -13,6 +13,7 @@ use crate::adapters::{AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
 use crate::config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
+use crate::orchestrate::{self, RunReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
@@ -81,6 +82,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/goal", "set a multi-turn objective the agent works toward"),
     ("/find", "search the conversation"),
     ("/multi", "send the same prompt to multiple providers"),
+    ("/orchestrate", "coordinator and worker harnesses in isolated worktrees"),
     ("/queue", "show or clear queued follow-ups"),
     ("/turns", "list durable turn phases"),
     ("/status", "show thread phase, goal, queue, and adapter states"),
@@ -154,6 +156,11 @@ struct MultiView {
     prompt: String,
     selected: usize,
     children: Vec<MultiChild>,
+}
+
+enum OrchestrationEvent {
+    Done(Box<RunReport>),
+    Failed(String),
 }
 
 #[derive(Debug, Clone)]
@@ -242,6 +249,11 @@ pub struct TuiState {
     transcript_anchor: std::cell::Cell<Option<usize>>,
     transcript_total: std::cell::Cell<usize>,
     model_request_id: u64,
+    orchestration_pending: bool,
+    orchestration_report: Option<RunReport>,
+    orchestration_scroll: usize,
+    orchestration_selected: usize,
+    orchestration_sender: std::sync::mpsc::Sender<OrchestrationEvent>,
 }
 
 pub fn run_tui(
@@ -273,6 +285,7 @@ pub fn run_tui(
         .unwrap_or_default();
 
     let custom_commands = discover_custom_commands(&thread.cwd);
+    let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
     let mut state = TuiState {
         store: store.clone(),
         prompt_history,
@@ -315,6 +328,11 @@ pub fn run_tui(
         transcript_anchor: std::cell::Cell::new(None),
         transcript_total: std::cell::Cell::new(0),
         model_request_id: 0,
+        orchestration_pending: false,
+        orchestration_report: None,
+        orchestration_scroll: 0,
+        orchestration_selected: 0,
+        orchestration_sender,
     };
 
     if !reconciled.is_empty() {
@@ -380,6 +398,9 @@ pub fn run_tui(
         }
         while let Ok(event) = engine_event_receiver.try_recv() {
             apply_engine_event(&mut state, &store, event, &engine_command_sender);
+        }
+        while let Ok(event) = orchestration_receiver.try_recv() {
+            apply_orchestration_event(&mut state, event);
         }
         if crossterm::event::poll(Duration::from_millis(32))? {
             match crossterm::event::read()? {
@@ -769,6 +790,134 @@ fn apply_engine_event(
     }
 }
 
+fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
+    match event {
+        OrchestrationEvent::Done(report) => {
+            state.orchestration_pending = false;
+            state.orchestration_scroll = 0;
+            state.notice = Some(format!(
+                "orchestration {}: {} worker(s)",
+                report.status,
+                report.tasks.len()
+            ));
+            state.orchestration_report = Some(*report);
+        }
+        OrchestrationEvent::Failed(error) => {
+            state.orchestration_pending = false;
+            state.orchestration_report = None;
+            state.orchestration_scroll = 0;
+            state.orchestration_selected = 0;
+            state.notice = Some(format!("orchestration failed: {error}"));
+        }
+    }
+}
+
+const ORCHESTRATE_USAGE: &str =
+    "usage: /orchestrate [--max-tasks N] [--plan-file path] <goal>";
+
+#[derive(Debug, PartialEq, Eq)]
+struct OrchestrateArgs {
+    goal: String,
+    max_tasks: usize,
+    plan_file: Option<String>,
+}
+
+fn parse_orchestrate_args(args: &[String]) -> std::result::Result<OrchestrateArgs, String> {
+    let mut goal_parts: Vec<String> = Vec::new();
+    let mut max_tasks = 4usize;
+    let mut plan_file = None;
+    let mut index = 0usize;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--max-tasks" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(format!("--max-tasks needs a number · {ORCHESTRATE_USAGE}"));
+                };
+                let Ok(value) = value.parse::<usize>() else {
+                    return Err(format!("--max-tasks must be a number, got \"{value}\""));
+                };
+                max_tasks = value.clamp(1, 16);
+                index += 2;
+            }
+            "--plan-file" => {
+                let Some(value) = args.get(index + 1) else {
+                    return Err(format!("--plan-file needs a path · {ORCHESTRATE_USAGE}"));
+                };
+                plan_file = Some(value.clone());
+                index += 2;
+            }
+            "--help" | "-h" => return Err(ORCHESTRATE_USAGE.to_string()),
+            other => {
+                goal_parts.push(other.to_string());
+                index += 1;
+            }
+        }
+    }
+    let goal = goal_parts.join(" ");
+    if goal.trim().is_empty() && plan_file.is_none() {
+        return Err(ORCHESTRATE_USAGE.to_string());
+    }
+    Ok(OrchestrateArgs { goal, max_tasks, plan_file })
+}
+
+fn start_orchestration(
+    state: &mut TuiState,
+    goal: String,
+    max_tasks: usize,
+    plan_file: Option<String>,
+) {
+    if state.orchestration_pending {
+        state.notice = Some("an orchestration is already running".into());
+        return;
+    }
+    if goal.trim().is_empty() && plan_file.is_none() {
+        state.notice = Some(ORCHESTRATE_USAGE.into());
+        return;
+    }
+    let cwd = state.thread.cwd.clone();
+    let home = state.home.clone();
+    let provider = state.thread.current_provider;
+    let model = state
+        .thread
+        .current_model
+        .clone()
+        .unwrap_or_else(|| resolve_config(&home, std::path::Path::new(&cwd)).for_provider(provider).model.clone());
+    let permission_mode = state.permission_mode;
+    let plan_path = plan_file.map(|path| {
+        let path = std::path::PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            std::path::Path::new(&cwd).join(path)
+        }
+    });
+    state.orchestration_pending = true;
+    state.orchestration_report = None;
+    state.orchestration_scroll = 0;
+    state.notice = Some("orchestrating: coordinator planning...".into());
+    let sender = state.orchestration_sender.clone();
+    std::thread::spawn(move || {
+        let result = BatonStore::open(&home.join("baton.sqlite")).and_then(|store| {
+            orchestrate::run(
+                &goal,
+                std::path::Path::new(&cwd),
+                &home,
+                provider,
+                &model,
+                max_tasks,
+                plan_path.as_deref(),
+                &store,
+                permission_mode,
+            )
+        });
+        let event = match result {
+            Ok(report) => OrchestrationEvent::Done(Box::new(report)),
+            Err(error) => OrchestrationEvent::Failed(error.to_string()),
+        };
+        let _ = sender.send(event);
+    });
+}
+
 fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
     match event {
         TurnEvent::TextDelta { text } => {
@@ -1015,6 +1164,11 @@ fn handle_key(
 
     if state.review.is_some() {
         handle_review_key(state, store, engine_command_sender, key);
+        return;
+    }
+
+    if state.orchestration_report.is_some() {
+        handle_orchestration_key(state, store, key);
         return;
     }
 
@@ -1666,6 +1820,74 @@ fn handle_review_key(
     state.review = Some(review);
 }
 
+fn handle_orchestration_key(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    key: KeyEvent,
+) {
+    let Some(worker_count) = state
+        .orchestration_report
+        .as_ref()
+        .map(|report| report.tasks.len())
+    else {
+        return;
+    };
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => {
+            state.orchestration_report = None;
+            state.orchestration_scroll = 0;
+            state.orchestration_selected = 0;
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            state.orchestration_selected = state.orchestration_selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if worker_count > 0 {
+                state.orchestration_selected =
+                    (state.orchestration_selected + 1).min(worker_count - 1);
+            }
+        }
+        KeyCode::PageUp => {
+            state.orchestration_scroll = state.orchestration_scroll.saturating_sub(10);
+        }
+        KeyCode::PageDown => {
+            state.orchestration_scroll = state.orchestration_scroll.saturating_add(10);
+        }
+        KeyCode::Enter => {
+            let thread_id = state
+                .orchestration_report
+                .as_ref()
+                .and_then(|report| report.tasks.get(state.orchestration_selected))
+                .and_then(|task| task.thread_id.clone());
+            match thread_id {
+                Some(thread_id) => {
+                    let thread = store
+                        .lock()
+                        .unwrap()
+                        .get_thread(&thread_id)
+                        .unwrap_or(None);
+                    match thread {
+                        Some(thread) => {
+                            state.orchestration_report = None;
+                            state.orchestration_scroll = 0;
+                            state.orchestration_selected = 0;
+                            load_thread_state(state, store, thread);
+                        }
+                        None => {
+                            state.notice =
+                                Some(format!("worker thread {thread_id} no longer exists"));
+                        }
+                    }
+                }
+                None => {
+                    state.notice = Some("worker has no thread (it never started)".into());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 fn handle_composer_key(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -1902,6 +2124,9 @@ fn handle_command(
         }
         "/clear" => {
             state.diff_output = None;
+            state.orchestration_report = None;
+            state.orchestration_scroll = 0;
+            state.orchestration_selected = 0;
             state.notice = None;
         }
         "/goal" => {
@@ -2082,6 +2307,10 @@ fn handle_command(
                 valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
             ));
         }
+        "/orchestrate" => match parse_orchestrate_args(&args) {
+            Ok(parsed) => start_orchestration(state, parsed.goal, parsed.max_tasks, parsed.plan_file),
+            Err(message) => state.notice = Some(message),
+        },
         "/status" => {
             let turns = store
                 .lock()
@@ -2855,6 +3084,210 @@ fn draw_multi(frame: &mut ratatui::Frame, area: Rect, multi: &MultiView) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if limit == 0 {
+        return String::new();
+    }
+    let mut chars = text.chars();
+    let mut out: String = chars.by_ref().take(limit).collect();
+    if chars.next().is_some() {
+        out.pop();
+        out.push('…');
+    }
+    out
+}
+
+fn draw_orchestration_report(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    report: &RunReport,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = inner.width as usize;
+    let short_run = &report.run_id[..8.min(report.run_id.len())];
+    let status_color = match report.status.as_str() {
+        "completed" => COLORS.success,
+        "failed" => COLORS.error,
+        _ => COLORS.warning,
+    };
+    let header_lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("orchestration {short_run} "),
+                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                report.status.clone(),
+                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {} worker(s)", report.tasks.len()),
+                Style::default().fg(COLORS.muted),
+            ),
+        ]),
+        Line::styled(
+            "↑↓ select · enter opens worker thread · pgup/pgdn scroll · esc closes",
+            Style::default().fg(COLORS.muted),
+        ),
+    ];
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut task_starts: Vec<usize> = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled("goal: ", Style::default().fg(COLORS.muted)),
+        Span::styled(
+            truncate_chars(&report.goal, width.saturating_sub(6)),
+            Style::default().fg(COLORS.text),
+        ),
+    ]));
+    lines.push(Line::styled(
+        truncate_chars(
+            &format!(
+                "coordinator: {}/{}",
+                report.coordinator_provider, report.coordinator_model
+            ),
+            width,
+        ),
+        Style::default().fg(COLORS.muted),
+    ));
+    let source = report
+        .repo_root
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "not a git repository".to_string());
+    let dirty = if report.dirty_source {
+        " (dirty; worktrees branch from HEAD)"
+    } else {
+        ""
+    };
+    lines.push(Line::styled(
+        truncate_chars(&format!("source: {source}{dirty}"), width),
+        Style::default().fg(COLORS.muted),
+    ));
+    if let Some(summary) = &report.summary {
+        lines.push(Line::styled(
+            truncate_chars(&format!("plan: {summary}"), width),
+            Style::default().fg(COLORS.secondary),
+        ));
+    }
+    for (index, task) in report.tasks.iter().enumerate() {
+        task_starts.push(lines.len());
+        let (marker, status_color) = match task.status.as_str() {
+            "completed" => ("✓", COLORS.success),
+            "failed" => ("✗", COLORS.error),
+            "running" => ("◐", COLORS.accent),
+            _ => ("·", COLORS.muted),
+        };
+        let selected = index == state.orchestration_selected;
+        let row_style = if selected {
+            Style::default().fg(COLORS.text).bg(COLORS.user_bg)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let pointer = if selected { "›" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{pointer} {marker} "),
+                Style::default().fg(status_color).bg(if selected {
+                    COLORS.user_bg
+                } else {
+                    Color::Reset
+                }),
+            ),
+            Span::styled(
+                truncate_chars(
+                    &format!(
+                        "[{}] {} · {}/{} · {}",
+                        index + 1,
+                        task.title,
+                        task.provider,
+                        task.model,
+                        task.status
+                    ),
+                    width.saturating_sub(4),
+                ),
+                row_style.add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        if let Some(worktree) = &task.worktree {
+            lines.push(Line::styled(
+                truncate_chars(
+                    &format!(
+                        "    worktree: {} ({})",
+                        worktree.path.display(),
+                        worktree.branch
+                    ),
+                    width,
+                ),
+                Style::default().fg(COLORS.muted),
+            ));
+        }
+        if let Some(thread_id) = &task.thread_id {
+            lines.push(Line::styled(
+                format!("    thread: {}", &thread_id[..8.min(thread_id.len())]),
+                Style::default().fg(COLORS.muted),
+            ));
+        }
+        if let Some(text) = &task.text {
+            for line in text.lines().filter(|line| !line.trim().is_empty()).take(2) {
+                lines.push(Line::styled(
+                    truncate_chars(&format!("    {line}"), width),
+                    Style::default().fg(COLORS.text),
+                ));
+            }
+        }
+        if let Some(error) = &task.error {
+            lines.push(Line::styled(
+                truncate_chars(&format!("    error: {error}"), width),
+                Style::default().fg(COLORS.error),
+            ));
+        }
+        lines.push(Line::raw(""));
+    }
+    if report.tasks.is_empty() {
+        lines.push(Line::styled(
+            "no workers were planned",
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+
+    let header_height = header_lines.len() as u16;
+    let header_area = Rect {
+        height: header_height.min(inner.height),
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(header_lines), header_area);
+
+    let body_height = inner.height.saturating_sub(header_height);
+    if body_height == 0 {
+        return;
+    }
+    let body_area = Rect {
+        y: inner.y + header_height,
+        height: body_height,
+        ..inner
+    };
+    let visible = body_height as usize;
+    let max_scroll = lines.len().saturating_sub(visible);
+    let mut offset = state.orchestration_scroll.min(max_scroll);
+    if let Some(start) = task_starts.get(state.orchestration_selected) {
+        if *start < offset {
+            offset = *start;
+        } else if *start >= offset + visible {
+            offset = start.saturating_sub(visible.saturating_sub(1));
+        }
+    }
+    frame.render_widget(
+        Paragraph::new(lines).scroll((offset.min(u16::MAX as usize) as u16, 0)),
+        body_area,
+    );
+}
+
 fn draw_floating_approval(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     let Some(approval) = state.approvals.last() else {
         return;
@@ -2872,6 +3305,12 @@ fn draw_floating_approval(frame: &mut ratatui::Frame, area: Rect, state: &TuiSta
 
 fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     let area = frame.area();
+    if let Some(report) = &state.orchestration_report {
+        hide_transcript_view(state);
+        draw_orchestration_report(frame, area, state, report);
+        draw_floating_approval(frame, area, state);
+        return;
+    }
     if let Some(multi) = &state.multi {
         draw_multi(frame, area, multi);
         draw_floating_approval(frame, area, state);
@@ -3520,6 +3959,17 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         live_lines += markdown_lines.len();
         all_lines.extend(markdown_lines);
     }
+    if state.orchestration_pending {
+        all_lines.push(Line::from(vec![
+            Span::styled(spinner, Style::default().fg(COLORS.secondary)),
+            Span::raw(" "),
+            Span::styled(
+                "Orchestrating: coordinator planning and workers running",
+                Style::default().fg(COLORS.secondary),
+            ),
+        ]));
+        live_lines += 1;
+    }
     if live_lines > 0 {
         all_lines.push(Line::from(vec![Span::raw(" ")]));
     }
@@ -4038,6 +4488,11 @@ mod tests {
             transcript_anchor: std::cell::Cell::new(None),
             transcript_total: std::cell::Cell::new(0),
             model_request_id: 0,
+            orchestration_pending: false,
+            orchestration_report: None,
+            orchestration_scroll: 0,
+            orchestration_selected: 0,
+            orchestration_sender: std::sync::mpsc::channel().0,
         }
     }
 
@@ -4063,12 +4518,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 29);
+        assert_eq!(suggestions.len(), 30);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/29"), "position indicator must reflect the selection");
+        assert!(text.contains("11/30"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -5737,5 +6192,197 @@ mod tests {
         let scrolled = state.scroll_offset;
         handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
         assert_eq!(state.scroll_offset, scrolled + 1, "Up with edited input scrolls the transcript");
+    }
+
+    fn sample_report(thread_id: Option<String>) -> RunReport {
+        RunReport {
+            run_id: "abcdef1234567890".to_string(),
+            goal: "split the work".to_string(),
+            coordinator_provider: ProviderId::Codex,
+            coordinator_model: "gpt-test".to_string(),
+            summary: Some("two independent workers".to_string()),
+            plan: crate::orchestrate::Plan {
+                summary: Some("two independent workers".to_string()),
+                tasks: vec![
+                    crate::orchestrate::PlanTask {
+                        title: "worker one".to_string(),
+                        provider: "codex".to_string(),
+                        prompt: "do one".to_string(),
+                    },
+                    crate::orchestrate::PlanTask {
+                        title: "worker two".to_string(),
+                        provider: "claude".to_string(),
+                        prompt: "do two".to_string(),
+                    },
+                ],
+            },
+            repo_root: Some(std::path::PathBuf::from("/tmp/repo")),
+            dirty_source: false,
+            status: "completed".to_string(),
+            tasks: vec![
+                crate::orchestrate::WorkerResult {
+                    id: "task-1".to_string(),
+                    title: "worker one".to_string(),
+                    provider: ProviderId::Codex,
+                    model: "gpt-test".to_string(),
+                    prompt: "do one".to_string(),
+                    worktree: Some(crate::worktree::WorktreeInfo {
+                        repo_root: std::path::PathBuf::from("/tmp/repo"),
+                        path: std::path::PathBuf::from("/tmp/worktrees/run/worker-one"),
+                        branch: "baton/run/worker-one".to_string(),
+                        base_ref: "HEAD".to_string(),
+                    }),
+                    thread_id,
+                    status: "completed".to_string(),
+                    text: Some("one is done".to_string()),
+                    error: None,
+                    created_at: String::new(),
+                    finished_at: String::new(),
+                },
+                crate::orchestrate::WorkerResult {
+                    id: "task-2".to_string(),
+                    title: "worker two".to_string(),
+                    provider: ProviderId::Claude,
+                    model: "claude-test".to_string(),
+                    prompt: "do two".to_string(),
+                    worktree: None,
+                    thread_id: None,
+                    status: "failed".to_string(),
+                    text: None,
+                    error: Some("boom".to_string()),
+                    created_at: String::new(),
+                    finished_at: String::new(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn orchestrate_args_parse_goal_and_flags() {
+        let parsed = parse_orchestrate_args(&[
+            "--max-tasks".to_string(),
+            "2".to_string(),
+            "split".to_string(),
+            "the".to_string(),
+            "work".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.goal, "split the work");
+        assert_eq!(parsed.max_tasks, 2);
+        assert_eq!(parsed.plan_file, None);
+
+        let parsed = parse_orchestrate_args(&[
+            "--plan-file".to_string(),
+            "plan.json".to_string(),
+            "--max-tasks".to_string(),
+            "99".to_string(),
+            "goal".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(parsed.max_tasks, 16, "task count is capped");
+        assert_eq!(parsed.plan_file.as_deref(), Some("plan.json"));
+
+        assert!(parse_orchestrate_args(&[]).is_err());
+        assert!(parse_orchestrate_args(&[
+            "--max-tasks".to_string(),
+            "many".to_string(),
+            "goal".to_string()
+        ])
+        .is_err());
+        assert!(
+            parse_orchestrate_args(&["--plan-file".to_string(), "plan.json".to_string()]).is_ok(),
+            "a plan file alone is a valid run"
+        );
+    }
+
+    #[test]
+    fn orchestration_events_update_state() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_pending = true;
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::Done(Box::new(sample_report(None))),
+        );
+        assert!(!state.orchestration_pending);
+        assert_eq!(state.orchestration_report.as_ref().unwrap().tasks.len(), 2);
+        assert!(state.notice.as_deref().unwrap_or("").contains("completed"));
+
+        state.orchestration_pending = true;
+        apply_orchestration_event(&mut state, OrchestrationEvent::Failed("boom".to_string()));
+        assert!(!state.orchestration_pending);
+        assert!(state.orchestration_report.is_none());
+        assert!(state.notice.as_deref().unwrap_or("").contains("boom"));
+    }
+
+    #[test]
+    fn orchestration_report_keys_scroll_select_and_close() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_report = Some(sample_report(None));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        assert_eq!(state.orchestration_selected, 1);
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        assert_eq!(state.orchestration_selected, 1, "selection stops at the last worker");
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::PageDown));
+        assert_eq!(state.orchestration_scroll, 10);
+        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
+        assert!(state.orchestration_report.is_none(), "esc closes the report");
+        assert_eq!(state.orchestration_selected, 0);
+        assert_eq!(state.orchestration_scroll, 0);
+    }
+
+    #[test]
+    fn orchestration_report_enter_opens_worker_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let worker = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "worker one".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("gpt-test".to_string()),
+            })
+            .unwrap();
+        state.orchestration_report = Some(sample_report(Some(worker.id.clone())));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let enter = KeyEvent {
+            code: KeyCode::Enter,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(&mut state, &store, &engine_command_sender, enter);
+        assert!(state.orchestration_report.is_none());
+        assert_eq!(state.thread.id, worker.id, "enter switches to the worker thread");
+        assert_eq!(state.thread.current_provider, ProviderId::Codex);
+    }
+
+    #[test]
+    fn orchestration_report_renders_workers_and_hints() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_report = Some(sample_report(None));
+        let buffer = render_state(&state, 100, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains("orchestration abcdef12 completed"), "{text}");
+        assert!(text.contains("worker one"), "{text}");
+        assert!(text.contains("worker two"), "{text}");
+        assert!(text.contains("esc closes"), "{text}");
+        assert!(text.contains("boom"), "{text}");
     }
 }

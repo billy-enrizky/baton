@@ -508,7 +508,9 @@ fn main_result() -> Result<()> {
             max_tasks,
             plan_file,
             list,
+            all,
             run,
+            archive,
             integrate,
             open_prs,
             tasks,
@@ -517,7 +519,10 @@ fn main_result() -> Result<()> {
         } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             if list {
-                let runs = orchestrate::run_rows(&store, 20)?;
+                let runs = orchestrate::run_rows(&store, 20)?
+                    .into_iter()
+                    .filter(|run| all || run.archived_at.is_none())
+                    .collect::<Vec<_>>();
                 if json {
                     println!(
                         "{}",
@@ -531,6 +536,7 @@ fn main_result() -> Result<()> {
                                 "coordinator_model": run.coordinator_model,
                                 "summary": run.summary,
                                 "dirty_source": run.dirty_source,
+                                "archived_at": run.archived_at,
                                 "created_at": run.created_at,
                                 "finished_at": run.finished_at,
                             })).collect::<Vec<_>>(),
@@ -541,12 +547,13 @@ fn main_result() -> Result<()> {
                 } else {
                     for run in runs {
                         println!(
-                            "{}  {:<9}  {}/{}  {}",
+                            "{}  {:<9}  {}/{}  {}{}",
                             &run.id[..8.min(run.id.len())],
                             run.status,
                             run.coordinator_provider,
                             run.coordinator_model,
-                            run.summary.unwrap_or_else(|| run.goal.clone())
+                            run.summary.unwrap_or_else(|| run.goal.clone()),
+                            if run.archived_at.is_some() { " (archived)" } else { "" }
                         );
                     }
                 }
@@ -612,6 +619,27 @@ fn main_result() -> Result<()> {
                 }
                 return Ok(());
             }
+            if let Some(run_id) = archive {
+                let run_id = orchestrate::archive(&store, &run_id)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": orchestrate::SCHEMA_VERSION,
+                            "run_id": run_id,
+                            "archived": true,
+                            "worktrees_remain": true,
+                        }))?
+                    );
+                } else {
+                    println!(
+                        "archived {}; worktrees remain, use `baton worktrees --clean --run {}`",
+                        &run_id[..8.min(run_id.len())],
+                        &run_id[..8.min(run_id.len())]
+                    );
+                }
+                return Ok(());
+            }
             if let Some(run_id) = open_prs {
                 let report = orchestrate::open_prs(&store, &cwd, &run_id, &tasks)?;
                 if json {
@@ -645,7 +673,7 @@ fn main_result() -> Result<()> {
             let goal = goal.join(" ");
             if goal.trim().is_empty() {
                 anyhow::bail!(
-                    "usage: baton orchestrate <goal> | --list | --run <id> | --integrate <run-id> | --open-prs <run-id>"
+                    "usage: baton orchestrate <goal> | --list [--all] | --run <id> | --archive <run-id> | --integrate <run-id> | --open-prs <run-id>"
                 );
             }
             let provider = cli

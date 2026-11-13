@@ -208,6 +208,7 @@ pub struct RunReport {
     pub repo_root: Option<PathBuf>,
     pub dirty_source: bool,
     pub status: String,
+    pub archived_at: Option<String>,
     pub tasks: Vec<WorkerResult>,
 }
 
@@ -893,7 +894,7 @@ pub fn integrate(
 }
 
 pub fn resolve_run_id(store: &BatonStore, run_id: &str) -> Result<String> {
-    let runs = store.list_orchestration_runs(200)?;
+    let runs = store.find_orchestration_runs(run_id)?;
     if let Some(exact) = runs.iter().find(|run| run.id == run_id) {
         return Ok(exact.id.clone());
     }
@@ -906,6 +907,20 @@ pub fn resolve_run_id(store: &BatonStore, run_id: &str) -> Result<String> {
         [run] => Ok(run.id.clone()),
         _ => anyhow::bail!("run id {run_id} is ambiguous; use more characters"),
     }
+}
+
+pub fn archive(store: &BatonStore, run_id: &str) -> Result<String> {
+    let run_id = resolve_run_id(store, run_id)?;
+    let run = store
+        .find_orchestration_runs(&run_id)?
+        .into_iter()
+        .find(|run| run.id == run_id)
+        .ok_or_else(|| anyhow::anyhow!("no orchestration run matches {run_id}"))?;
+    if run.status == "running" {
+        anyhow::bail!("run {} is still running; archive it after it finishes", &run_id[..8.min(run_id.len())]);
+    }
+    store.archive_orchestration_run(&run_id)?;
+    Ok(run_id)
 }
 
 fn current_branch(root: &Path) -> Result<String> {
@@ -1521,13 +1536,19 @@ fn run_with_worker_bin_and_progress(
         repo_root,
         dirty_source,
         status: status.to_string(),
+        archived_at: None,
         tasks,
     })
 }
 
 pub fn render(report: &RunReport) -> String {
     let mut lines = vec![
-        format!("run: {}  {}", &report.run_id[..8.min(report.run_id.len())], report.status),
+        format!(
+            "run: {}  {}{}",
+            &report.run_id[..8.min(report.run_id.len())],
+            report.status,
+            if report.archived_at.is_some() { " (archived)" } else { "" }
+        ),
         format!("goal: {}", report.goal),
         format!("coordinator: {}/{}", report.coordinator_provider, report.coordinator_model),
         format!(
@@ -1622,15 +1643,17 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
         "plan": report.plan,
         "repo_root": report.repo_root.as_ref().map(|path| path.display().to_string()),
         "dirty_source": report.dirty_source,
+        "archived_at": report.archived_at,
         "tasks": tasks,
     })
 }
 
 pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<RunReport> {
+    let run_id = resolve_run_id(store, run_id)?;
     let run = store
-        .list_orchestration_runs(200)?
+        .find_orchestration_runs(&run_id)?
         .into_iter()
-        .find(|run| run.id.starts_with(run_id))
+        .find(|run| run.id == run_id)
         .ok_or_else(|| anyhow::anyhow!("no orchestration run matches {run_id}"))?;
     let plan: Plan = serde_json::from_str(&run.plan_json).unwrap_or_else(|_| Plan {
         summary: run.summary.clone(),
@@ -1679,6 +1702,7 @@ pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<
         repo_root,
         dirty_source: run.dirty_source,
         status: run.status,
+        archived_at: run.archived_at,
         tasks,
     })
 }
@@ -1987,6 +2011,47 @@ exit 1
             error: None,
         });
         assert_eq!(finished, "[1] completed first · commit 01234567");
+    }
+
+    #[test]
+    fn archives_a_finished_run_idempotently_and_refuses_a_running_run() {
+        let store = BatonStore::memory().unwrap();
+        store
+            .create_orchestration_run(
+                "abcdef1234567890",
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+            )
+            .unwrap();
+        store
+            .finish_orchestration_run("abcdef1234567890", "completed")
+            .unwrap();
+        let archived = archive(&store, "abcdef12").unwrap();
+        assert_eq!(archived, "abcdef1234567890");
+        let runs = store.list_orchestration_runs(10).unwrap();
+        assert!(runs[0].archived_at.is_some());
+        let first = runs[0].archived_at.clone();
+        archive(&store, "abcdef12").unwrap();
+        let runs = store.list_orchestration_runs(10).unwrap();
+        assert_eq!(runs[0].archived_at, first, "a second archive keeps the first timestamp");
+
+        store
+            .create_orchestration_run(
+                "run-running",
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+            )
+            .unwrap();
+        let error = archive(&store, "run-running").unwrap_err();
+        assert!(error.to_string().contains("still running"), "{error}");
     }
 
     #[test]

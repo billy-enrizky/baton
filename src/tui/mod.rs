@@ -2363,6 +2363,37 @@ fn handle_orchestration_key(
                 ));
             }
         }
+        KeyCode::Char('a') => {
+            let Some(run_id) = state
+                .orchestration_report
+                .as_ref()
+                .map(|report| report.run_id.clone())
+            else {
+                return;
+            };
+            let result = {
+                let guard = store.lock().unwrap();
+                orchestrate::archive(&guard, &run_id)
+            };
+            match result {
+                Ok(run_id) => {
+                    let short = &run_id[..8.min(run_id.len())];
+                    record_orchestration_message(
+                        state,
+                        format!("run {short} archived; worktrees remain"),
+                    );
+                    state.notice = Some(format!(
+                        "archived run {short}; worktrees remain, use baton worktrees --clean --run {short}"
+                    ));
+                    state.orchestration_report = None;
+                    state.orchestration_scroll = 0;
+                    state.orchestration_selected = 0;
+                    state.orchestration_confirm_integrate = false;
+                    state.orchestration_confirm_ship = false;
+                }
+                Err(error) => state.notice = Some(format!("cannot archive run: {error}")),
+            }
+        }
         KeyCode::Char('p') => {
             let shippable = state
                 .orchestration_report
@@ -2866,13 +2897,15 @@ fn handle_command(
             }
         }
         "/runs" => {
-            if let Some(run_id) = args.first() {
+            let include_archived = args.first().map(|arg| arg == "--all").unwrap_or(false);
+            let run_id = args.first().filter(|arg| *arg != "--all").cloned();
+            if let Some(run_id) = run_id {
                 let result = {
                     let guard = store.lock().unwrap();
                     orchestrate::report_from_rows(
                         &guard,
                         std::path::Path::new(&state.thread.cwd),
-                        run_id,
+                        &run_id,
                     )
                 };
                 match result {
@@ -2895,24 +2928,32 @@ fn handle_command(
                     .lock()
                     .unwrap()
                     .list_orchestration_runs(10)
-                    .unwrap_or_default();
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|run| include_archived || run.archived_at.is_none())
+                    .collect::<Vec<_>>();
                 if runs.is_empty() {
-                    state.notice = Some("no orchestration runs yet".into());
+                    state.notice = Some(if include_archived {
+                        "no orchestration runs yet".to_string()
+                    } else {
+                        "no active orchestration runs; /runs --all includes archived runs".to_string()
+                    });
                 } else {
                     let lines = runs
                         .iter()
                         .map(|run| {
                             format!(
-                                "{}  {:<9}  {}",
+                                "{}  {:<9}  {}{}",
                                 &run.id[..8.min(run.id.len())],
                                 run.status,
-                                run.summary.as_deref().unwrap_or(&run.goal)
+                                run.summary.as_deref().unwrap_or(&run.goal),
+                                if run.archived_at.is_some() { " (archived)" } else { "" }
                             )
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
                     state.notice = Some(format!(
-                        "recent orchestration runs:\n{lines}\n\n/runs <id> opens a report"
+                        "recent orchestration runs:\n{lines}\n\n/runs <id> opens a report · /runs --all includes archived"
                     ));
                 }
             }
@@ -3737,6 +3778,11 @@ fn draw_orchestration_report(
                 format!(" · {} worker(s)", report.tasks.len()),
                 Style::default().fg(COLORS.muted),
             ),
+            if report.archived_at.is_some() {
+                Span::styled(" · archived", Style::default().fg(COLORS.warning))
+            } else {
+                Span::raw("")
+            },
         ]),
         if state.orchestration_confirm_integrate {
             Line::styled(
@@ -3778,7 +3824,7 @@ fn draw_orchestration_report(
             )
         } else {
             Line::styled(
-                "↑↓ select · enter opens worker thread · i integrate · p open PRs · pgup/pgdn scroll · esc closes",
+                "↑↓ select · enter open · i merge · p PRs · a archive · PgUp/PgDn scroll · esc closes",
                 Style::default().fg(COLORS.muted),
             )
         },
@@ -7254,6 +7300,7 @@ mod tests {
             repo_root: Some(std::path::PathBuf::from("/tmp/repo")),
             dirty_source: false,
             status: "completed".to_string(),
+            archived_at: None,
             tasks: vec![
                 crate::orchestrate::WorkerResult {
                     id: "task-1".to_string(),
@@ -7329,6 +7376,81 @@ mod tests {
             skipped: Vec::new(),
             failed: Vec::new(),
         }
+    }
+
+    #[test]
+    fn runs_command_hides_archived_runs_unless_all_is_requested() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let guard = store.lock().unwrap();
+            for (id, goal) in [("run-active", "active goal"), ("run-archived", "archived goal")] {
+                guard
+                    .create_orchestration_run(id, goal, ProviderId::Codex, "model-1", None, "{}", false)
+                    .unwrap();
+                guard.finish_orchestration_run(id, "completed").unwrap();
+            }
+            guard.archive_orchestration_run("run-archived").unwrap();
+        }
+
+        handle_command(&mut state, &store, &engine_command_sender, "/runs");
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("active goal"), "{notice}");
+        assert!(!notice.contains("archived goal"), "{notice}");
+        assert!(notice.contains("/runs --all"), "{notice}");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/runs --all");
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("active goal"), "{notice}");
+        assert!(notice.contains("archived goal (archived)"), "{notice}");
+    }
+
+    #[test]
+    fn orchestration_report_a_archives_and_closes_the_run() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .create_orchestration_run(
+                    "abcdef1234567890",
+                    "goal",
+                    ProviderId::Codex,
+                    "model",
+                    None,
+                    "{}",
+                    false,
+                )
+                .unwrap();
+            guard
+                .finish_orchestration_run("abcdef1234567890", "completed")
+                .unwrap();
+        }
+        state.orchestration_report = Some(sample_report(None));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('a')),
+        );
+        assert!(state.orchestration_report.is_none());
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("archived run abcdef12"),
+            "notice: {:?}",
+            state.notice
+        );
+        let runs = store.lock().unwrap().list_orchestration_runs(10).unwrap();
+        assert!(runs[0].archived_at.is_some());
     }
 
     #[test]
@@ -8034,7 +8156,7 @@ mod tests {
             "esc only cancels the ship prompt"
         );
         let buffer = render_state(&state, 120, 30);
-        assert!(buffer_lines(&buffer).join("\n").contains("p open PRs"));
+        assert!(buffer_lines(&buffer).join("\n").contains("p PRs"));
     }
 
     #[test]

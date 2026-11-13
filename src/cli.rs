@@ -105,9 +105,15 @@ pub enum Commands {
         /// List recent orchestration runs
         #[arg(long, conflicts_with = "run")]
         list: bool,
+        /// Include archived runs with --list
+        #[arg(long, requires = "list")]
+        all: bool,
         /// Show tasks for an orchestration run id
         #[arg(long, conflicts_with = "list")]
         run: Option<String>,
+        /// Hide a completed run from the default run lists without deleting it
+        #[arg(long, value_name = "run-id", conflicts_with_all = ["list", "run", "integrate", "open_prs"])]
+        archive: Option<String>,
         /// Merge completed worker branches into the current repository
         #[arg(long, value_name = "run-id", conflicts_with_all = ["list", "run", "open_prs"])]
         integrate: Option<String>,

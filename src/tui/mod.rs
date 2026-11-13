@@ -3028,6 +3028,7 @@ fn multi_worktree_plan(providers: &[ProviderId], prompt: &str) -> orchestrate::P
             .map(|provider| orchestrate::PlanTask {
                 title: format!("multi {provider}"),
                 provider: provider.as_str().to_string(),
+                model: None,
                 prompt: prompt.to_string(),
             })
             .collect(),
@@ -3876,6 +3877,7 @@ fn handle_command(
                 tasks: vec![orchestrate::PlanTask {
                     title: "thread worktree".to_string(),
                     provider: source_provider.as_str().to_string(),
+                    model: None,
                     prompt: title.clone(),
                 }],
             };
@@ -8675,11 +8677,13 @@ mod tests {
                     crate::orchestrate::PlanTask {
                         title: "worker one".to_string(),
                         provider: "codex".to_string(),
+                        model: None,
                         prompt: "do one".to_string(),
                     },
                     crate::orchestrate::PlanTask {
                         title: "worker two".to_string(),
                         provider: "claude".to_string(),
+                        model: None,
                         prompt: "do two".to_string(),
                     },
                 ],
@@ -9428,11 +9432,13 @@ mod tests {
                     crate::orchestrate::PlanTask {
                         title: "first task".to_string(),
                         provider: "codex".to_string(),
+                        model: None,
                         prompt: "one".to_string(),
                     },
                     crate::orchestrate::PlanTask {
                         title: "second task".to_string(),
                         provider: "claude".to_string(),
+                        model: None,
                         prompt: "two".to_string(),
                     },
                 ],

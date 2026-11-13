@@ -102,6 +102,8 @@ fn run_command_cancellable(
 pub struct PlanTask {
     pub title: String,
     pub provider: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     pub prompt: String,
 }
 
@@ -243,6 +245,7 @@ Use the smallest number of tasks that truly parallelizes. Return exactly one tas
 Each task prompt must be self-contained. Never ask a worker to coordinate with another worker.
 Each worker runs in its own git worktree, so tasks must not depend on another task's output and must avoid overlapping files.
 Choose the best installed harness for each task from: PROVIDERS. Prefer COORDINATOR when the task does not benefit from another harness.
+When the goal explicitly names a model for a task, set that task's "model" field. Otherwise omit "model" so the harness default applies.
 Every worker starts in its own worktree, so each prompt must refer to the current working directory, never to the source checkout path.
 Return ONLY a JSON object, with no markdown fences or commentary:
 {"summary":"one sentence","tasks":[{"title":"short task name","provider":"codex","prompt":"complete self-contained instructions for the worker"}]}
@@ -310,10 +313,14 @@ pub fn parse_plan(text: &str, max_tasks: usize) -> Result<Plan> {
     if plan.tasks.len() > max_tasks {
         plan.tasks.truncate(max_tasks);
     }
-    for task in &plan.tasks {
+    for task in &mut plan.tasks {
         if task.title.trim().is_empty() {
             anyhow::bail!("planner returned a task without a title");
         }
+        let model = task.model.take();
+        task.model = model
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty());
         if task.prompt.trim().is_empty() {
             anyhow::bail!("planner returned a task without a prompt");
         }
@@ -467,6 +474,7 @@ fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
         tasks: vec![PlanTask {
             title: "answer".to_string(),
             provider: provider.as_str().to_string(),
+            model: None,
             prompt: goal.to_string(),
         }],
     }
@@ -562,6 +570,13 @@ fn run_worker(
     (index, result)
 }
 
+fn worker_model(task: &PlanTask, home: &Path, cwd: &Path, provider: ProviderId) -> String {
+    task.model
+        .clone()
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or_else(|| resolve_config(home, cwd).for_provider(provider).model.clone())
+}
+
 fn run_worker_inner(
     task: &PlanTask,
     index: usize,
@@ -576,8 +591,7 @@ fn run_worker_inner(
 ) -> (usize, WorkerResult) {
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let provider = ProviderId::parse(task.provider.trim()).unwrap_or(ProviderId::Codex);
-    let resolved = resolve_config(home, cwd);
-    let model = resolved.for_provider(provider).model.clone();
+    let model = worker_model(task, home, cwd, provider);
     if is_cancelled(cancel) {
         return (
             index,
@@ -1494,10 +1508,7 @@ fn run_with_worker_bin_and_progress(
                     index,
                     title: task.title.clone(),
                     provider: fallback_provider,
-                    model: resolve_config(home, cwd)
-                        .for_provider(fallback_provider)
-                        .model
-                        .clone(),
+                    model: worker_model(task, home, cwd, fallback_provider),
                     prompt: task.prompt.clone(),
                 };
                 let run_id = run_id.clone();
@@ -1879,6 +1890,7 @@ mod tests {
         assert!(prompt.contains("codex, claude"), "{prompt}");
         assert!(prompt.contains("Prefer codex"), "{prompt}");
         assert!(prompt.contains("Never ask a worker to coordinate"), "{prompt}");
+        assert!(prompt.contains("explicitly names a model"), "{prompt}");
     }
 
     #[test]
@@ -1906,9 +1918,39 @@ mod tests {
     }
 
     #[test]
+    fn plan_task_model_is_trimmed_and_optional() {
+        let plan = parse_plan(
+            r#"{"tasks":[{"title":"custom","provider":"codex","model":"  custom-model  ","prompt":"do it"},{"title":"default","provider":"codex","model":"   ","prompt":"do it too"}]}"#,
+            4,
+        )
+        .unwrap();
+        assert_eq!(plan.tasks[0].model.as_deref(), Some("custom-model"));
+        assert_eq!(plan.tasks[1].model, None);
+    }
+
+    #[test]
     fn rejects_unknown_provider() {
         let text = r#"{"tasks":[{"title":"a","provider":"not-a-provider","prompt":"do a"}]}"#;
         assert!(parse_plan(text, 4).is_err());
+    }
+
+    #[test]
+    fn plan_task_model_overrides_the_provider_default_in_the_worker_command() {
+        let plan = r#"{"summary":"model override","tasks":[{"title":"worker","provider":"codex","model":"custom-worker-model","prompt":"do it"}]}"#;
+        let (_repo, _home, _store, report) = run_fixture(
+            plan,
+            "printf '%s\n' \"$@\" > worker-args.txt",
+        );
+        assert_eq!(report.status, "completed");
+        assert_eq!(report.tasks[0].model, "custom-worker-model");
+        let worktree = report.tasks[0].worktree.as_ref().unwrap();
+        let args = std::fs::read_to_string(worktree.path.join("worker-args.txt")).unwrap();
+        let lines: Vec<&str> = args.lines().collect();
+        let model_index = lines
+            .iter()
+            .position(|line| *line == "-m")
+            .expect("worker command carries -m");
+        assert_eq!(lines.get(model_index + 1), Some(&"custom-worker-model"));
     }
 
     fn fake_gh(root: &Path) -> PathBuf {
@@ -2120,11 +2162,13 @@ exit 1
                 PlanTask {
                     title: "a".to_string(),
                     provider: "codex".to_string(),
+                    model: None,
                     prompt: "a".to_string(),
                 },
                 PlanTask {
                     title: "b".to_string(),
                     provider: "claude".to_string(),
+                    model: None,
                     prompt: "b".to_string(),
                 },
             ],

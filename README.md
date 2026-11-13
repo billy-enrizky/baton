@@ -60,6 +60,7 @@ baton ps [--json]        # list provider servers tracked by baton
 baton doctor [--json]    # provider binaries, configs, database, and process health
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
 baton exec -p <provider> [--effort level] [--json] "prompt"  # one non-interactive turn
+baton exec -t <worker-thread> [--json] "answer"  # answer an orchestration worker question
 baton mcp                # MCP stdio server for agent access to the thread store
 baton fork [-t id] [--turn n] [--native] [--json] [title]  # branch a thread; Codex and OpenCode can fork natively
 baton import [--dry-run] # import recent native sessions as threads

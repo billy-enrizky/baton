@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use crate::config::resolve_config;
 use crate::store::{BatonStore, OrchestrationRunRow, OrchestrationTaskRow};
-use crate::types::{PermissionMode, ProviderId};
+use crate::types::{PermissionMode, ProviderId, TurnPhase};
 use crate::worktree::{self, WorktreeInfo};
 
 pub const SCHEMA_VERSION: u32 = 1;
@@ -2025,6 +2025,113 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
     })
 }
 
+#[derive(Debug, Clone)]
+pub struct WorkerFollowupOutcome {
+    pub run_id: String,
+    pub task_id: String,
+    pub title: String,
+    pub status: String,
+    pub commit: Option<String>,
+    pub question: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Records a normal thread turn as a worker follow-up. Returns None when the
+/// thread is not attached to an orchestration task.
+pub fn record_worker_followup(
+    store: &BatonStore,
+    thread_id: &str,
+    ok: bool,
+    error: Option<&str>,
+    phase: TurnPhase,
+) -> Result<Option<WorkerFollowupOutcome>> {
+    let Some(task) = store.orchestration_task_for_thread(thread_id)? else {
+        return Ok(None);
+    };
+    let text = store
+        .list_messages(thread_id)?
+        .into_iter()
+        .rev()
+        .find(|message| message.role == "assistant")
+        .map(|message| message.text);
+    if !ok {
+        if task.commit_sha.is_some() {
+            return Ok(Some(WorkerFollowupOutcome {
+                run_id: task.run_id,
+                task_id: task.id,
+                title: task.title,
+                status: task.status,
+                commit: task.commit_sha,
+                question: None,
+                error: error.map(str::to_string),
+            }));
+        }
+        let status = if phase == TurnPhase::Interrupted {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        let detail = error.unwrap_or("worker turn failed");
+        store
+            .update_orchestration_task_failure(&task.id, status, text.as_deref(), detail)
+            .and_then(|()| store.refresh_orchestration_run_status(&task.run_id))
+            .map_err(|error| anyhow::anyhow!("worker failure recorded but run update failed: {error}"))?;
+        return Ok(Some(WorkerFollowupOutcome {
+            run_id: task.run_id,
+            task_id: task.id,
+            title: task.title,
+            status: status.to_string(),
+            commit: None,
+            question: None,
+            error: Some(detail.to_string()),
+        }));
+    }
+    let Some(worktree_path) = task.worktree_path.as_deref() else {
+        return Ok(None);
+    };
+    let path = Path::new(worktree_path);
+    if !path.is_dir() {
+        return Ok(None);
+    }
+    let commit = worktree::commit_changes(path, &format!("baton worker: {}", task.title))
+        .map_err(|error| anyhow::anyhow!("worker follow-up commit failed: {error}"))?;
+    let clear_markers = commit.is_some();
+    let question = text.as_deref().and_then(worker_question);
+    if question.is_some() {
+        store
+            .update_orchestration_task_needs_input(
+                &task.id,
+                text.as_deref(),
+                commit.as_deref(),
+                clear_markers,
+            )
+            .map_err(|error| anyhow::anyhow!("worker question recorded but run update failed: {error}"))?;
+    } else {
+        store
+            .update_orchestration_task_success(
+                &task.id,
+                text.as_deref(),
+                commit.as_deref(),
+                clear_markers,
+            )
+            .map_err(|error| anyhow::anyhow!("worker follow-up recorded but run update failed: {error}"))?;
+    }
+    store.refresh_orchestration_run_status(&task.run_id)?;
+    Ok(Some(WorkerFollowupOutcome {
+        run_id: task.run_id,
+        task_id: task.id,
+        title: task.title,
+        status: if question.is_some() {
+            "needs_input".to_string()
+        } else {
+            "completed".to_string()
+        },
+        commit,
+        question,
+        error: None,
+    }))
+}
+
 pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<RunReport> {
     let run_id = resolve_run_id(store, run_id)?;
     let run = store
@@ -2391,6 +2498,257 @@ mod tests {
         assert_eq!(run.status, "completed");
         let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
         assert_eq!(integrated.merged.len(), 1);
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn followup_fixture(
+        run_id: &str,
+        task_status: &str,
+        commit: Option<&str>,
+        assistant_text: &str,
+    ) -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        BatonStore,
+        crate::store::ThreadRow,
+        crate::worktree::WorktreeInfo,
+    ) {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let home = tempfile::tempdir().unwrap();
+        let repo_root = crate::worktree::repo_root(repo.path()).unwrap();
+        let worktree =
+            crate::worktree::create(home.path(), &repo_root, run_id, "worker task").unwrap();
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(crate::store::NewThread {
+                title: "worker".to_string(),
+                cwd: worktree.path.to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("model".to_string()),
+            })
+            .unwrap();
+        store
+            .create_orchestration_run(
+                run_id,
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+            )
+            .unwrap();
+        store
+            .add_orchestration_task(
+                &format!("task-{run_id}"),
+                run_id,
+                1,
+                "worker task",
+                ProviderId::Codex,
+                "model",
+                "prompt",
+                Some(&worktree.path.to_string_lossy()),
+                Some(&worktree.branch),
+                commit,
+                Some(&thread.id),
+                task_status,
+                Some("old answer"),
+                None,
+                "now",
+                Some("now"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        if commit.is_some() {
+            store
+                .mark_orchestration_task_merged(&format!("task-{run_id}"), "merged")
+                .unwrap();
+            store
+                .mark_orchestration_task_pr(
+                    &format!("task-{run_id}"),
+                    "https://example.test/pr/1",
+                )
+                .unwrap();
+        }
+        store
+            .add_message(&thread.id, 1, "assistant", Some("codex"), None, assistant_text)
+            .unwrap();
+        (repo, home, store, thread, worktree)
+    }
+
+    fn task_row(store: &BatonStore, run_id: &str) -> crate::store::OrchestrationTaskRow {
+        store
+            .orchestration_task_for_thread(
+                &store.list_orchestration_tasks(run_id).unwrap()[0]
+                    .thread_id
+                    .clone()
+                    .unwrap(),
+            )
+            .unwrap()
+            .unwrap()
+    }
+
+    fn run_status(store: &BatonStore, run_id: &str) -> String {
+        store
+            .find_orchestration_runs(run_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.id == run_id)
+            .unwrap()
+            .status
+    }
+
+    #[test]
+    fn followup_ignores_threads_without_an_orchestration_task() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(crate::store::NewThread {
+                title: "plain".to_string(),
+                cwd: "/tmp".to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let outcome =
+            record_worker_followup(&store, &thread.id, true, None, TurnPhase::Completed).unwrap();
+        assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn followup_question_without_new_work_keeps_merge_markers() {
+        let (_repo, _home, store, thread, _worktree) = followup_fixture(
+            "run-question",
+            "needs_input",
+            Some("old-commit"),
+            "BATON_QUESTION: use green",
+        );
+        let outcome = record_worker_followup(
+            &store,
+            &thread.id,
+            true,
+            None,
+            TurnPhase::Completed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.status, "needs_input");
+        assert_eq!(outcome.question.as_deref(), Some("use green"));
+        assert!(outcome.commit.is_none());
+        let task = task_row(&store, "run-question");
+        assert_eq!(task.status, "needs_input");
+        assert_eq!(
+            worker_question(task.text.as_deref().unwrap()).as_deref(),
+            Some("use green")
+        );
+        assert_eq!(task.commit_sha.as_deref(), Some("old-commit"));
+        assert!(task.merged_at.is_some(), "marker survives a no-op answer");
+        assert!(task.pr_url.is_some(), "PR marker survives a no-op answer");
+        assert_eq!(run_status(&store, "run-question"), "needs_input");
+    }
+
+    #[test]
+    fn followup_with_new_work_commits_and_completes_the_task() {
+        let (_repo, _home, store, thread, worktree) = followup_fixture(
+            "run-complete",
+            "needs_input",
+            Some("old-commit"),
+            "used green",
+        );
+        std::fs::write(worktree.path.join("answer.txt"), "green\n").unwrap();
+        let outcome = record_worker_followup(
+            &store,
+            &thread.id,
+            true,
+            None,
+            TurnPhase::Completed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.status, "completed");
+        assert!(outcome.question.is_none());
+        let commit = outcome.commit.expect("new work is committed");
+        assert_ne!(commit, "old-commit");
+        let task = task_row(&store, "run-complete");
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.commit_sha.as_deref(), Some(commit.as_str()));
+        assert_eq!(task.text.as_deref(), Some("used green"));
+        assert!(task.merged_at.is_none(), "new work invalidates the merge marker");
+        assert!(task.pr_url.is_none(), "new work invalidates the PR marker");
+        assert_eq!(run_status(&store, "run-complete"), "completed");
+    }
+
+    #[test]
+    fn followup_failure_after_a_commit_does_not_roll_the_task_back() {
+        let (_repo, _home, store, thread, _worktree) = followup_fixture(
+            "run-committed",
+            "completed",
+            Some("old-commit"),
+            "old answer",
+        );
+        let outcome = record_worker_followup(
+            &store,
+            &thread.id,
+            false,
+            Some("follow-up failed"),
+            TurnPhase::Failed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.commit.as_deref(), Some("old-commit"));
+        assert_eq!(outcome.error.as_deref(), Some("follow-up failed"));
+        let task = task_row(&store, "run-committed");
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.commit_sha.as_deref(), Some("old-commit"));
+        assert!(task.error.is_none());
+        assert!(task.merged_at.is_some());
+        assert!(task.pr_url.is_some());
+    }
+
+    #[test]
+    fn followup_failure_without_a_commit_marks_the_task_failed() {
+        let (_repo, _home, store, thread, _worktree) = followup_fixture(
+            "run-failed",
+            "running",
+            None,
+            "",
+        );
+        let outcome = record_worker_followup(
+            &store,
+            &thread.id,
+            false,
+            Some("provider crashed"),
+            TurnPhase::Failed,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.status, "failed");
+        assert!(outcome.commit.is_none());
+        let task = task_row(&store, "run-failed");
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.error.as_deref(), Some("provider crashed"));
+        assert_eq!(run_status(&store, "run-failed"), "failed");
     }
 
     #[test]

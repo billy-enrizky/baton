@@ -82,6 +82,8 @@ fn shipped_worktree_branches_are_only_the_ones_with_pr_urls() {
                 None,
                 "now",
                 Some("now"),
+                None,
+                None,
             )
             .unwrap();
         if let Some(pr) = pr {
@@ -126,6 +128,8 @@ fn worker_followup_updates_task_and_clears_merge_and_pr_markers() {
             None,
             "now",
             Some("now"),
+            None,
+            None,
         )
         .unwrap();
     store
@@ -227,6 +231,8 @@ fn worker_failure_without_a_commit_updates_task_and_run_status() {
             None,
             "now",
             Some("now"),
+            None,
+            None,
         )
         .unwrap();
     store
@@ -1115,6 +1121,8 @@ fn abandoned_orchestration_is_reconciled_without_losing_completed_tasks() {
             None,
             "now",
             Some("now"),
+            None,
+            None,
         )
         .unwrap();
     store
@@ -1134,6 +1142,8 @@ fn abandoned_orchestration_is_reconciled_without_losing_completed_tasks() {
             None,
             None,
             "now",
+            None,
+            None,
             None,
         )
         .unwrap();

@@ -26,6 +26,9 @@ pub fn spawn_tracked_provider(
         .ok_or_else(|| anyhow::anyhow!("{provider} did not expose a process id"))?;
     let command_line = process::command_line(pid).unwrap_or_default();
     let process_start = process::process_start(pid);
+    // Start the guard before the durable record, so every recorded child has
+    // a watchdog even if this process dies immediately after the write.
+    let _ = process::spawn_parent_watchdog(pid);
     recorder.record(
         pid,
         provider,
@@ -33,7 +36,6 @@ pub fn spawn_tracked_provider(
         &command_line,
         process_start.as_deref(),
     )?;
-    let _ = process::spawn_parent_watchdog(pid);
     let recorder = recorder.clone();
     crate::adapters::child_halves_with_cleanup(
         child,
@@ -108,6 +110,9 @@ pub fn build_opencode_adapter_with_recorder(
                 format!("opencode serve --hostname=127.0.0.1 --port {port}")
             });
             let process_start = process::process_start(pid);
+            // Start the guard before the durable record, so every recorded
+            // child has a watchdog even if this process dies after the write.
+            let _ = process::spawn_parent_watchdog(pid);
             if let Err(error) = recorder_for_spawner.record(
                 pid,
                 ProviderId::OpenCode,
@@ -118,7 +123,6 @@ pub fn build_opencode_adapter_with_recorder(
                 let _ = child.start_kill();
                 return Err(error);
             }
-            let _ = process::spawn_parent_watchdog(pid);
             Ok(OpenCodeChild {
                 port,
                 password,

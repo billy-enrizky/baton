@@ -45,6 +45,10 @@ impl ProviderId {
         }
     }
 
+    pub fn supports_effort(self) -> bool {
+        matches!(self, ProviderId::Codex | ProviderId::Claude)
+    }
+
     pub fn all() -> &'static [ProviderId] {
         &[
             ProviderId::Claude,
@@ -61,6 +65,27 @@ impl fmt::Display for ProviderId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
+}
+
+/// Reasoning effort values are passed to provider CLIs as single tokens. Keep
+/// the accepted alphabet narrow so a plan file cannot smuggle argument syntax.
+pub fn is_effort_clear(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "default" | "off" | "none"
+    )
+}
+
+pub fn normalize_reasoning_effort(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || !trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+    {
+        return None;
+    }
+    Some(trimmed.to_ascii_lowercase())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +249,7 @@ pub struct NativeSessionRef {
 
 #[cfg(test)]
 mod tests {
-    use super::TurnPhase;
+    use super::*;
 
     #[test]
     fn only_terminal_phases_report_terminal() {
@@ -239,6 +264,21 @@ mod tests {
         ] {
             assert!(phase.is_terminal(), "{} must be terminal", phase.as_str());
         }
+    }
+
+    #[test]
+    fn reasoning_effort_is_normalized_and_provider_gated() {
+        assert_eq!(normalize_reasoning_effort(" High "), Some("high".to_string()));
+        assert_eq!(normalize_reasoning_effort("x-high"), Some("x-high".to_string()));
+        assert_eq!(normalize_reasoning_effort(""), None);
+        assert_eq!(normalize_reasoning_effort("high effort"), None);
+        assert!(is_effort_clear(" default "));
+        assert!(is_effort_clear("OFF"));
+        assert!(!is_effort_clear("high"));
+        assert!(ProviderId::Codex.supports_effort());
+        assert!(ProviderId::Claude.supports_effort());
+        assert!(!ProviderId::OpenCode.supports_effort());
+        assert!(!ProviderId::Cursor.supports_effort());
     }
 
     #[test]

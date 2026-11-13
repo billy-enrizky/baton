@@ -523,6 +523,9 @@ impl BatonAdapter for OpenCodeAdapter {
     ) -> Result<()> {
         let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
         self.lifecycle.starting(&input.thread_id);
+        if input.effort.is_some() {
+            anyhow::bail!("opencode does not support reasoning effort; use codex or claude");
+        }
         let runtime = self.ensure_runtime(&input.auth_env).await?;
         *runtime.current_emit.lock().await = Some(emit.clone());
         let _ = &self.current_model;

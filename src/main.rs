@@ -11,7 +11,10 @@ use adapters::{AcpAdapter, BatonAdapter, ClaudeAdapter, OpenCodeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use runtime::{run_engine, EngineCommand, EngineEvent, SharedAdapter, SharedStore};
 use store::{BatonStore, ImportedMessage, NewThread};
-use types::{PermissionMode, ProviderId, SessionMode, TurnPhase};
+use types::{
+    is_effort_clear, normalize_reasoning_effort, PermissionMode, ProviderId, SessionMode,
+    TurnPhase,
+};
 use adapters::TurnEvent;
 use usage::{cache_hit_rate, format_usage_line, sum_usage};
 
@@ -30,6 +33,15 @@ fn main_result() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
     let home = paths::baton_home();
+    let requested_effort = match cli.effort.as_deref() {
+        Some(value) if is_effort_clear(value) => None,
+        Some(value) => Some(normalize_reasoning_effort(value).ok_or_else(|| {
+            anyhow::anyhow!(
+                "invalid --effort \"{value}\"; use one token such as low, medium, high, xhigh, or max"
+            )
+        })?),
+        None => None,
+    };
     let command = cli.command.clone().unwrap_or(cli::Commands::Chat);
     let cli_prompt = cli.prompt.clone();
 
@@ -71,14 +83,18 @@ fn main_result() -> Result<()> {
                 .model
                 .clone()
                 .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
+            if requested_effort.is_some() && !provider.supports_effort() {
+                anyhow::bail!("{provider} does not support --effort; use codex or claude");
+            }
             let permission_mode = permission_override
                 .unwrap_or_else(|| resolved.for_provider(provider).permission_mode);
-            let thread = store.lock().unwrap().draft_thread(crate::store::NewThread {
+            let mut thread = store.lock().unwrap().draft_thread(crate::store::NewThread {
                 title: baton::handoff::derive_title(&prompt),
                 cwd: cwd.to_string_lossy().to_string(),
                 current_provider: provider,
                 current_model: Some(model),
             });
+            thread.reasoning_effort = requested_effort.clone();
             {
                 let guard = store.lock().unwrap();
                 let persisted = guard.create_thread_with_id(
@@ -96,6 +112,12 @@ fn main_result() -> Result<()> {
                     .lock()
                     .unwrap()
                     .set_thread_permission_mode(&thread.id, permission_mode)?;
+                if let Some(effort) = requested_effort.as_deref() {
+                    store
+                        .lock()
+                        .unwrap()
+                        .set_thread_effort(&thread.id, Some(effort))?;
+                }
             }
 
             let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -230,6 +252,7 @@ fn main_result() -> Result<()> {
                         serde_json::to_string_pretty(&serde_json::json!({
                             "schema_version": status::SCHEMA_VERSION,
                             "thread_id": thread.id,
+                            "effort": requested_effort,
                             "ok": false,
                             "phase": "unverified",
                             "error": "exec timed out after 300s",
@@ -253,6 +276,7 @@ fn main_result() -> Result<()> {
                     serde_json::to_string_pretty(&serde_json::json!({
                         "schema_version": status::SCHEMA_VERSION,
                         "thread_id": thread.id,
+                        "effort": requested_effort,
                         "ok": result_ok,
                         "phase": result_phase.map(|phase| phase.as_str()).unwrap_or("unverified"),
                         "error": result_error,
@@ -283,7 +307,14 @@ fn main_result() -> Result<()> {
             }
             return Ok(());
         }
-        cli::Commands::Chat => run_chat(cli, &home, &cwd, permission_override, cli_prompt),
+        cli::Commands::Chat => run_chat(
+            cli,
+            &home,
+            &cwd,
+            permission_override,
+            cli_prompt,
+            requested_effort,
+        ),
         cli::Commands::Mcp => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             mcp::run_stdio(mcp::McpServer::new(store, home.clone(), cwd.clone()))
@@ -324,6 +355,7 @@ fn main_result() -> Result<()> {
                         "title": thread.title,
                         "provider": thread.current_provider.as_str(),
                         "model": model,
+                        "reasoning_effort": thread.reasoning_effort,
                         "session_mode": thread.session_mode.as_str(),
                         "permission_mode": thread.permission_mode.as_str(),
                         "goal": thread.goal,
@@ -365,10 +397,15 @@ fn main_result() -> Result<()> {
                     .unwrap_or_else(|| "idle".to_string());
                 let queued = store.list_queued_messages(&thread.id)?.len();
                 println!(
-                    "{}  {}/{}  session:{}  {}  turns:{}  queue:{}  {}",
+                    "{}  {}/{}{}  session:{}  {}  turns:{}  queue:{}  {}",
                     &thread.id[..8],
                     thread.current_provider,
                     model,
+                    thread
+                        .reasoning_effort
+                        .as_deref()
+                        .map(|effort| format!("@{effort}"))
+                        .unwrap_or_default(),
                     thread.session_mode,
                     phase,
                     turn_count,
@@ -393,6 +430,9 @@ fn main_result() -> Result<()> {
                 .model
                 .clone()
                 .or_else(|| Some(resolved.for_provider(provider).model.clone()));
+            if requested_effort.is_some() && !provider.supports_effort() {
+                anyhow::bail!("{provider} does not support --effort; use codex or claude");
+            }
             let thread_title = if title.is_empty() {
                 "New thread".to_string()
             } else {
@@ -417,11 +457,20 @@ fn main_result() -> Result<()> {
                 .unwrap_or_else(|| resolved.for_provider(provider).permission_mode);
             store.set_thread_permission_mode(&thread.id, initial_permission)?;
             thread.permission_mode = initial_permission;
+            if let Some(effort) = requested_effort.as_deref() {
+                store.set_thread_effort(&thread.id, Some(effort))?;
+                thread.reasoning_effort = Some(effort.to_string());
+            }
             println!(
-                "created thread {} ({}/{}) session {} mode {}",
+                "created thread {} ({}/{}{}) session {} mode {}",
                 &thread.id[..8],
                 provider,
                 model.unwrap_or_default(),
+                thread
+                    .reasoning_effort
+                    .as_deref()
+                    .map(|effort| format!("@{effort}"))
+                    .unwrap_or_default(),
                 thread.session_mode,
                 thread.permission_mode
             );
@@ -724,6 +773,8 @@ fn main_result() -> Result<()> {
                                 "provider": task_provider.as_str(),
                                 "model": effective_model,
                                 "model_override": task.model.is_some(),
+                                "effort": task.effort,
+                                "effort_override": task.effort.is_some(),
                                 "prompt": task.prompt,
                             })
                         })
@@ -767,11 +818,15 @@ fn main_result() -> Result<()> {
                             resolved.for_provider(task_provider).model.clone()
                         });
                         println!(
-                            "  [{}] {} · {}/{}",
+                            "  [{}] {} · {}/{}{}",
                             index + 1,
                             task.title,
                             task_provider,
-                            effective_model
+                            effective_model,
+                            task.effort
+                                .as_deref()
+                                .map(|effort| format!("@{effort}"))
+                                .unwrap_or_default()
                         );
                         if let Some(first) = task.prompt.lines().next() {
                             println!("      {first}");
@@ -1521,6 +1576,7 @@ fn main_result() -> Result<()> {
                 title: thread.title.clone(),
                 provider: thread.current_provider,
                 model,
+                reasoning_effort: thread.reasoning_effort.clone(),
                 permission_mode: thread.permission_mode,
                 session_mode: thread.session_mode,
                 goal: thread.goal.clone(),
@@ -1844,7 +1900,14 @@ fn resolve_thread(store: &BatonStore, thread_id: &str) -> Result<store::ThreadRo
         .ok_or_else(|| anyhow::anyhow!("no thread matches {thread_id}"))
 }
 
-fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: Option<PermissionMode>, initial_prompt: Option<String>) -> Result<()> {
+fn run_chat(
+    cli: cli::Cli,
+    home: &PathBuf,
+    cwd: &PathBuf,
+    permission_override: Option<PermissionMode>,
+    initial_prompt: Option<String>,
+    requested_effort: Option<String>,
+) -> Result<()> {
     let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
     let resolved = resolve_config(home, cwd);
     let requested_mode = match cli.mode.as_deref() {
@@ -1877,6 +1940,25 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: O
     };
     if let Some(mode) = permission_override {
         thread.permission_mode = mode;
+    }
+    if let Some(effort) = requested_effort.as_deref() {
+        if !thread.current_provider.supports_effort() {
+            anyhow::bail!(
+                "{} does not support --effort; use codex or claude",
+                thread.current_provider
+            );
+        }
+        thread.reasoning_effort = Some(effort.to_string());
+        let guard = store.lock().unwrap();
+        if guard.get_thread(&thread.id)?.is_some() {
+            guard.set_thread_effort(&thread.id, Some(effort))?;
+        }
+    } else if cli.effort.is_some() {
+        thread.reasoning_effort = None;
+        let guard = store.lock().unwrap();
+        if guard.get_thread(&thread.id)?.is_some() {
+            guard.set_thread_effort(&thread.id, None)?;
+        }
     }
     if let Some(mode) = requested_mode {
         thread.session_mode = mode;

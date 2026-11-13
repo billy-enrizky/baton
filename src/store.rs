@@ -12,6 +12,7 @@ pub struct ThreadRow {
     pub cwd: String,
     pub current_provider: ProviderId,
     pub current_model: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub permission_mode: PermissionMode,
     pub goal: Option<String>,
     pub goal_paused: bool,
@@ -78,6 +79,7 @@ pub struct OrchestrationTaskRow {
     pub pr_url: Option<String>,
     pub snapshot_base: Option<String>,
     pub snapshot_tree: Option<String>,
+    pub reasoning_effort: Option<String>,
     pub text: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
@@ -183,6 +185,7 @@ CREATE TABLE IF NOT EXISTS threads (
   cwd TEXT NOT NULL,
   current_provider TEXT NOT NULL,
   current_model TEXT,
+  reasoning_effort TEXT,
   permission_mode TEXT NOT NULL DEFAULT 'default',
   goal TEXT,
   goal_paused INTEGER NOT NULL DEFAULT 0,
@@ -321,7 +324,8 @@ CREATE TABLE IF NOT EXISTS orchestration_tasks (
   merged_at TEXT,
   pr_url TEXT,
   snapshot_base TEXT,
-  snapshot_tree TEXT
+  snapshot_tree TEXT,
+  reasoning_effort TEXT
 );
 CREATE INDEX IF NOT EXISTS orchestration_tasks_run_idx ON orchestration_tasks (run_id, created_at);
 "#;
@@ -346,6 +350,7 @@ fn ensure_column(db: &Connection, table: &str, column: &str, definition: &str) -
 
 fn ensure_thread_columns(db: &Connection) -> Result<()> {
     ensure_column(db, "threads", "permission_mode", "TEXT NOT NULL DEFAULT 'default'")?;
+    ensure_column(db, "threads", "reasoning_effort", "TEXT")?;
     ensure_column(db, "threads", "goal", "TEXT")?;
     ensure_column(db, "threads", "goal_paused", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(db, "threads", "session_mode", "TEXT NOT NULL DEFAULT 'single'")?;
@@ -416,6 +421,7 @@ fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
         cwd: row.get(2)?,
         current_provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
         current_model: row.get(4)?,
+        reasoning_effort: row.get(11)?,
         permission_mode: PermissionMode::parse(&permission_mode).unwrap_or(PermissionMode::Default),
         goal: row.get(8)?,
         goal_paused: row.get::<_, i64>(9)? != 0,
@@ -467,10 +473,11 @@ fn map_orchestration_task(row: &rusqlite::Row) -> rusqlite::Result<Orchestration
         pr_url: row.get(17)?,
         snapshot_base: row.get(18)?,
         snapshot_tree: row.get(19)?,
+        reasoning_effort: row.get(20)?,
     })
 }
 
-const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode";
+const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode, reasoning_effort";
 
 /// Per-project prompt history cap, Claude Code style.
 pub const PROMPT_HISTORY_LIMIT: i64 = 100;
@@ -495,6 +502,7 @@ impl BatonStore {
         ensure_column(&db, "orchestration_tasks", "pr_url", "TEXT")?;
         ensure_column(&db, "orchestration_tasks", "snapshot_base", "TEXT")?;
         ensure_column(&db, "orchestration_tasks", "snapshot_tree", "TEXT")?;
+        ensure_column(&db, "orchestration_tasks", "reasoning_effort", "TEXT")?;
         ensure_column(&db, "orchestration_runs", "dirty_source", "INTEGER NOT NULL DEFAULT 0")?;
         ensure_column(&db, "orchestration_runs", "archived_at", "TEXT")?;
         ensure_column(&db, "orchestration_runs", "owner_pid", "INTEGER")?;
@@ -541,6 +549,7 @@ impl BatonStore {
             cwd: input.cwd,
             current_provider: input.current_provider,
             current_model: input.current_model,
+            reasoning_effort: None,
             permission_mode: PermissionMode::Default,
             goal: None,
             goal_paused: false,
@@ -623,13 +632,14 @@ impl BatonStore {
         let now = now_iso();
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, session_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO threads (id, title, cwd, current_provider, current_model, reasoning_effort, permission_mode, goal, goal_paused, session_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 id,
                 title,
                 source.cwd,
                 source.current_provider.as_str(),
                 source.current_model,
+                source.reasoning_effort,
                 source.permission_mode.as_str(),
                 source.goal,
                 source.goal_paused as i64,
@@ -681,6 +691,7 @@ impl BatonStore {
             cwd: input.cwd,
             current_provider: input.current_provider,
             current_model: input.current_model,
+            reasoning_effort: None,
             permission_mode: PermissionMode::Default,
             goal: None,
             goal_paused: false,
@@ -790,6 +801,14 @@ impl BatonStore {
         self.db.execute(
             "UPDATE threads SET current_model = ?, updated_at = ? WHERE id = ?",
             params![model, now_iso(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_effort(&self, id: &str, effort: Option<&str>) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET reasoning_effort = ?, updated_at = ? WHERE id = ?",
+            params![effort, now_iso(), id],
         )?;
         Ok(())
     }
@@ -993,7 +1012,7 @@ impl BatonStore {
     pub fn find_thread_by_native_session(&self, provider: ProviderId, native_session_id: &str) -> Result<Option<ThreadRow>> {
         self.db
             .query_row(
-                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
+                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode, t.reasoning_effort FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
                 params![provider.as_str(), native_session_id],
                 |row| {
                     let provider: String = row.get(3)?;
@@ -1005,6 +1024,7 @@ impl BatonStore {
                         cwd: row.get(2)?,
                         current_provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
                         current_model: row.get(4)?,
+                        reasoning_effort: row.get(11)?,
                         permission_mode: PermissionMode::parse(&permission_mode)
                             .unwrap_or(PermissionMode::Default),
                         goal: row.get(8)?,
@@ -1728,9 +1748,10 @@ impl BatonStore {
         finished_at: Option<&str>,
         snapshot_base: Option<&str>,
         snapshot_tree: Option<&str>,
+        reasoning_effort: Option<&str>,
     ) -> Result<()> {
         self.db.execute(
-            "INSERT INTO orchestration_tasks (id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, snapshot_base, snapshot_tree) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO orchestration_tasks (id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, snapshot_base, snapshot_tree, reasoning_effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 id,
                 run_id,
@@ -1750,6 +1771,7 @@ impl BatonStore {
                 finished_at,
                 snapshot_base,
                 snapshot_tree,
+                reasoning_effort,
             ],
         )?;
         Ok(())
@@ -1814,7 +1836,7 @@ impl BatonStore {
 
     pub fn list_orchestration_tasks(&self, run_id: &str) -> Result<Vec<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
+            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree, reasoning_effort FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
         )?;
         let rows = statement
             .query_map(params![run_id], map_orchestration_task)?
@@ -1827,7 +1849,7 @@ impl BatonStore {
         thread_id: &str,
     ) -> Result<Option<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree FROM orchestration_tasks WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree, reasoning_effort FROM orchestration_tasks WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
         )?;
         let row = statement
             .query_row(params![thread_id], map_orchestration_task)

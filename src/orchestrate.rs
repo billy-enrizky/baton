@@ -104,6 +104,8 @@ pub struct PlanTask {
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub prompt: String,
 }
 
@@ -126,6 +128,7 @@ pub struct WorkerResult {
     pub title: String,
     pub provider: ProviderId,
     pub model: String,
+    pub effort: Option<String>,
     pub prompt: String,
     pub worktree: Option<WorktreeInfo>,
     pub snapshot: Option<WorkerSnapshot>,
@@ -253,6 +256,7 @@ Each task prompt must be self-contained. Never ask a worker to coordinate with a
 Each worker runs in its own git worktree, so tasks must not depend on another task's output and must avoid overlapping files.
 Choose the best installed harness for each task from: PROVIDERS. Prefer COORDINATOR when the task does not benefit from another harness.
 When the goal explicitly names a model for a task, set that task's "model" field. Otherwise omit "model" so the harness default applies.
+When the goal explicitly names a reasoning effort, set that task's "effort" field. Use a lowercase value such as low, medium, high, xhigh, or max. Only codex and claude support effort. Otherwise omit "effort" so the harness default applies.
 Every worker starts in its own worktree, so each prompt must refer to the current working directory, never to the source checkout path.
 Return ONLY a JSON object, with no markdown fences or commentary:
 {"summary":"one sentence","tasks":[{"title":"short task name","provider":"codex","prompt":"complete self-contained instructions for the worker"}]}
@@ -328,6 +332,19 @@ pub fn parse_plan(text: &str, max_tasks: usize) -> Result<Plan> {
         task.model = model
             .map(|model| model.trim().to_string())
             .filter(|model| !model.is_empty());
+        let effort = task.effort.take();
+        task.effort = match effort {
+            Some(effort)
+                if effort.trim().is_empty() || crate::types::is_effort_clear(&effort) =>
+            {
+                None
+            }
+            Some(effort) => Some(
+                crate::types::normalize_reasoning_effort(&effort)
+                    .ok_or_else(|| anyhow::anyhow!("planner returned an invalid reasoning effort"))?,
+            ),
+            None => None,
+        };
         if task.prompt.trim().is_empty() {
             anyhow::bail!("planner returned a task without a prompt");
         }
@@ -482,6 +499,7 @@ fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
             title: "answer".to_string(),
             provider: provider.as_str().to_string(),
             model: None,
+            effort: None,
             prompt: goal.to_string(),
         }],
     }
@@ -514,6 +532,7 @@ struct WorkerFallback {
     title: String,
     provider: ProviderId,
     model: String,
+    effort: Option<String>,
     prompt: String,
 }
 
@@ -526,6 +545,7 @@ fn panicked_worker(fallback: &WorkerFallback) -> (usize, WorkerResult) {
             title: fallback.title.clone(),
             provider: fallback.provider,
             model: fallback.model.clone(),
+            effort: fallback.effort.clone(),
             prompt: fallback.prompt.clone(),
             worktree: None,
             commit: None,
@@ -611,6 +631,7 @@ fn run_worker_inner(
                 title: task.title.clone(),
                 provider,
                 model,
+                effort: task.effort.clone(),
                 prompt: task.prompt.clone(),
                 worktree: None,
                 commit: None,
@@ -624,6 +645,34 @@ fn run_worker_inner(
                 snapshot: None,
             },
         );
+    }
+    let effort = task.effort.clone();
+    if let Some(effort) = effort.as_deref() {
+        if !provider.supports_effort() {
+            return (
+                index,
+                WorkerResult {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    title: task.title.clone(),
+                    provider,
+                    model,
+                    effort: Some(effort.to_string()),
+                    prompt: task.prompt.clone(),
+                    worktree: None,
+                    commit: None,
+                    thread_id: None,
+                    status: "failed".to_string(),
+                    text: None,
+                    error: Some(format!(
+                        "{provider} does not support reasoning effort; use codex or claude"
+                    )),
+                    pr_url: None,
+                    created_at,
+                    finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                    snapshot: None,
+                },
+            );
+        }
     }
     let worktree = match repo_root {
         Some(root) => {
@@ -647,6 +696,7 @@ fn run_worker_inner(
                             title: task.title.clone(),
                             provider,
                             model,
+                            effort: effort.clone(),
                             prompt: task.prompt.clone(),
                             worktree: None,
                             commit: None,
@@ -679,6 +729,7 @@ fn run_worker_inner(
                         title: task.title.clone(),
                         provider,
                         model,
+                        effort: effort.clone(),
                         prompt: task.prompt.clone(),
                         worktree: Some(worktree.clone()),
                         commit: None,
@@ -725,6 +776,9 @@ fn run_worker_inner(
         .arg("-m")
         .arg(&model)
         .arg("--json");
+    if let Some(effort) = effort.as_deref() {
+        command.arg("--effort").arg(effort);
+    }
     apply_permission_args(&mut command, permission_mode);
     command.arg(&effective_prompt).env("BATON_HOME", home);
     let output = run_command_cancellable(command, cancel);
@@ -780,6 +834,7 @@ fn run_worker_inner(
             title: task.title.clone(),
             provider,
             model,
+            effort,
             prompt: task.prompt.clone(),
             worktree,
             snapshot: worker_snapshot,
@@ -1705,6 +1760,7 @@ fn run_with_worker_bin_and_progress(
                     title: task.title.clone(),
                     provider: fallback_provider,
                     model: worker_model(task, home, cwd, fallback_provider),
+                    effort: task.effort.clone(),
                     prompt: task.prompt.clone(),
                 };
                 let run_id = run_id.clone();
@@ -1774,6 +1830,7 @@ fn run_with_worker_bin_and_progress(
             Some(&task.finished_at),
             task.snapshot.as_ref().map(|snapshot| snapshot.base_ref.as_str()),
             task.snapshot.as_ref().map(|snapshot| snapshot.tree.as_str()),
+            task.effort.as_deref(),
         )?;
         tasks.push(task);
     }
@@ -1830,11 +1887,15 @@ pub fn render(report: &RunReport) -> String {
     lines.push(format!("workers: {}", report.tasks.len()));
     for (index, task) in report.tasks.iter().enumerate() {
         lines.push(format!(
-            "  [{}] {} · {}/{} · {}{}",
+            "  [{}] {} · {}/{}{} · {}{}",
             index + 1,
             task.title,
             task.provider,
             task.model,
+            task.effort
+                .as_deref()
+                .map(|effort| format!("@{effort}"))
+                .unwrap_or_default(),
             task.status,
             task.thread_id
                 .as_ref()
@@ -1877,6 +1938,7 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
                 "title": task.title,
                 "provider": task.provider.as_str(),
                 "model": task.model,
+                "effort": task.effort,
                 "prompt": task.prompt,
                 "status": task.status,
                 "thread_id": task.thread_id,
@@ -1947,6 +2009,7 @@ pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<
                 title: task.title,
                 provider: task.provider,
                 model: task.model,
+                effort: task.reasoning_effort,
                 prompt: task.prompt,
                 worktree,
                 snapshot: match (task.snapshot_base, task.snapshot_tree) {
@@ -2091,7 +2154,7 @@ mod tests {
         let path = dir.path().join("plan.json");
         std::fs::write(
             &path,
-            r#"{"summary":"preview","tasks":[{"title":"worker","provider":"codex","model":"preview-model","prompt":"do it"}]}"#,
+            r#"{"summary":"preview","tasks":[{"title":"worker","provider":"codex","model":"preview-model","effort":"high","prompt":"do it"}]}"#,
         )
         .unwrap();
         let file_plan = plan(
@@ -2107,6 +2170,7 @@ mod tests {
         .unwrap();
         assert_eq!(file_plan.summary.as_deref(), Some("preview"));
         assert_eq!(file_plan.tasks[0].model.as_deref(), Some("preview-model"));
+        assert_eq!(file_plan.tasks[0].effort.as_deref(), Some("high"));
 
         let greeting = plan(
             "hi",
@@ -2150,6 +2214,8 @@ mod tests {
         assert!(prompt.contains("Prefer codex"), "{prompt}");
         assert!(prompt.contains("Never ask a worker to coordinate"), "{prompt}");
         assert!(prompt.contains("explicitly names a model"), "{prompt}");
+        assert!(prompt.contains("explicitly names a reasoning effort"), "{prompt}");
+        assert!(prompt.contains("Only codex and claude support effort"), "{prompt}");
     }
 
     #[test]
@@ -2177,14 +2243,23 @@ mod tests {
     }
 
     #[test]
-    fn plan_task_model_is_trimmed_and_optional() {
+    fn plan_task_model_and_effort_are_trimmed_and_optional() {
         let plan = parse_plan(
-            r#"{"tasks":[{"title":"custom","provider":"codex","model":"  custom-model  ","prompt":"do it"},{"title":"default","provider":"codex","model":"   ","prompt":"do it too"}]}"#,
+            r#"{"tasks":[{"title":"custom","provider":"codex","model":"  custom-model  ","effort":" High ","prompt":"do it"},{"title":"default","provider":"codex","model":"   ","effort":"  ","prompt":"do it too"}]}"#,
             4,
         )
         .unwrap();
         assert_eq!(plan.tasks[0].model.as_deref(), Some("custom-model"));
+        assert_eq!(plan.tasks[0].effort.as_deref(), Some("high"));
         assert_eq!(plan.tasks[1].model, None);
+        assert_eq!(plan.tasks[1].effort, None);
+
+        let invalid = parse_plan(
+            r#"{"tasks":[{"title":"bad","provider":"codex","effort":"high effort","prompt":"do it"}]}"#,
+            4,
+        )
+        .unwrap_err();
+        assert!(invalid.to_string().contains("invalid reasoning effort"));
     }
 
     #[test]
@@ -2194,14 +2269,15 @@ mod tests {
     }
 
     #[test]
-    fn plan_task_model_overrides_the_provider_default_in_the_worker_command() {
-        let plan = r#"{"summary":"model override","tasks":[{"title":"worker","provider":"codex","model":"custom-worker-model","prompt":"do it"}]}"#;
-        let (_repo, _home, _store, report) = run_fixture(
+    fn plan_task_model_and_effort_override_the_worker_command() {
+        let plan = r#"{"summary":"model override","tasks":[{"title":"worker","provider":"codex","model":"custom-worker-model","effort":"high","prompt":"do it"}]}"#;
+        let (_repo, _home, store, report) = run_fixture(
             plan,
             "printf '%s\n' \"$@\" > worker-args.txt",
         );
         assert_eq!(report.status, "completed");
         assert_eq!(report.tasks[0].model, "custom-worker-model");
+        assert_eq!(report.tasks[0].effort.as_deref(), Some("high"));
         let worktree = report.tasks[0].worktree.as_ref().unwrap();
         let args = std::fs::read_to_string(worktree.path.join("worker-args.txt")).unwrap();
         let lines: Vec<&str> = args.lines().collect();
@@ -2210,6 +2286,32 @@ mod tests {
             .position(|line| *line == "-m")
             .expect("worker command carries -m");
         assert_eq!(lines.get(model_index + 1), Some(&"custom-worker-model"));
+        let effort_index = lines
+            .iter()
+            .position(|line| *line == "--effort")
+            .expect("worker command carries --effort");
+        assert_eq!(lines.get(effort_index + 1), Some(&"high"));
+
+        let stored = report_from_rows(&store, _repo.path(), &report.run_id).unwrap();
+        assert_eq!(stored.tasks[0].effort.as_deref(), Some("high"));
+        assert_eq!(to_json(&stored)["tasks"][0]["effort"], "high");
+    }
+
+    #[test]
+    fn unsupported_provider_effort_fails_the_task_with_a_clear_error() {
+        let plan = r#"{"tasks":[{"title":"worker","provider":"opencode","effort":"high","prompt":"do it"}]}"#;
+        let (_repo, _home, _store, report) = run_fixture(
+            plan,
+            "printf '%s\n' \"$@\" > worker-args.txt",
+        );
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.tasks[0].status, "failed");
+        assert!(report.tasks[0].worktree.is_none());
+        assert!(report.tasks[0]
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("does not support reasoning effort"));
     }
 
     fn fake_gh(root: &Path) -> PathBuf {
@@ -2687,6 +2789,7 @@ printf 'worker\n' > worker.txt",
             title: "second task".to_string(),
             provider: ProviderId::Claude,
             model: "claude-test".to_string(),
+            effort: Some("high".to_string()),
             prompt: "do two".to_string(),
         };
         let (index, result) = panicked_worker(&fallback);
@@ -2694,6 +2797,7 @@ printf 'worker\n' > worker.txt",
         assert_eq!(result.title, "second task");
         assert_eq!(result.provider, ProviderId::Claude);
         assert_eq!(result.model, "claude-test");
+        assert_eq!(result.effort.as_deref(), Some("high"));
         assert_eq!(result.prompt, "do two");
         assert_eq!(result.status, "failed");
         assert!(result.error.as_deref().unwrap().contains("panicked"));
@@ -2711,12 +2815,14 @@ printf 'worker\n' > worker.txt",
                     title: "a".to_string(),
                     provider: "codex".to_string(),
                     model: None,
+                    effort: None,
                     prompt: "a".to_string(),
                 },
                 PlanTask {
                     title: "b".to_string(),
                     provider: "claude".to_string(),
                     model: None,
+                    effort: None,
                     prompt: "b".to_string(),
                 },
             ],

@@ -84,6 +84,7 @@ fn shipped_worktree_branches_are_only_the_ones_with_pr_urls() {
                 Some("now"),
                 None,
                 None,
+                None,
             )
             .unwrap();
         if let Some(pr) = pr {
@@ -128,6 +129,7 @@ fn worker_followup_updates_task_and_clears_merge_and_pr_markers() {
             None,
             "now",
             Some("now"),
+            None,
             None,
             None,
         )
@@ -231,6 +233,7 @@ fn worker_failure_without_a_commit_updates_task_and_run_status() {
             None,
             "now",
             Some("now"),
+            None,
             None,
             None,
         )
@@ -347,6 +350,35 @@ fn store_crud_and_thread_lifecycle() {
     store.add_message(&thread.id, 1, "assistant", Some("codex"), Some("gpt-6.1-sol"), "hi").unwrap();
     assert_eq!(store.next_turn_number(&thread.id).unwrap(), 2);
     assert_eq!(store.list_messages(&thread.id).unwrap().len(), 2);
+}
+
+#[test]
+fn thread_reasoning_effort_persists_and_forks() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "effort".to_string(),
+            cwd: "/tmp/project".to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    store.set_thread_effort(&thread.id, Some("high")).unwrap();
+    let stored = store.get_thread(&thread.id).unwrap().unwrap();
+    assert_eq!(stored.reasoning_effort.as_deref(), Some("high"));
+
+    let fork = store.fork_thread(&thread.id, "effort fork").unwrap();
+    assert_eq!(fork.reasoning_effort.as_deref(), Some("high"));
+
+    store.set_thread_effort(&thread.id, None).unwrap();
+    assert_eq!(
+        store
+            .get_thread(&thread.id)
+            .unwrap()
+            .unwrap()
+            .reasoning_effort,
+        None
+    );
 }
 
 #[test]
@@ -1123,6 +1155,7 @@ fn abandoned_orchestration_is_reconciled_without_losing_completed_tasks() {
             Some("now"),
             None,
             None,
+            None,
         )
         .unwrap();
     store
@@ -1142,6 +1175,7 @@ fn abandoned_orchestration_is_reconciled_without_losing_completed_tasks() {
             None,
             None,
             "now",
+            None,
             None,
             None,
             None,

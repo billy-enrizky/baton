@@ -273,6 +273,36 @@ fn load_plan(path: &Path, max_tasks: usize) -> Result<Plan> {
     parse_plan(&text, max_tasks)
 }
 
+struct WorkerFallback {
+    index: usize,
+    title: String,
+    provider: ProviderId,
+    model: String,
+    prompt: String,
+}
+
+fn panicked_worker(fallback: &WorkerFallback) -> (usize, WorkerResult) {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    (
+        fallback.index,
+        WorkerResult {
+            id: uuid::Uuid::new_v4().to_string(),
+            title: fallback.title.clone(),
+            provider: fallback.provider,
+            model: fallback.model.clone(),
+            prompt: fallback.prompt.clone(),
+            worktree: None,
+            commit: None,
+            thread_id: None,
+            status: "failed".to_string(),
+            text: None,
+            error: Some("worker thread panicked".to_string()),
+            created_at: now.clone(),
+            finished_at: now,
+        },
+    )
+}
+
 fn run_worker(
     task: &PlanTask,
     index: usize,
@@ -836,12 +866,24 @@ fn run_with_worker_bin_and_progress(
             .iter()
             .enumerate()
             .map(|(index, task)| {
+                let fallback_provider = ProviderId::parse(task.provider.trim())
+                    .unwrap_or(ProviderId::Codex);
+                let fallback = WorkerFallback {
+                    index,
+                    title: task.title.clone(),
+                    provider: fallback_provider,
+                    model: resolve_config(home, cwd)
+                        .for_provider(fallback_provider)
+                        .model
+                        .clone(),
+                    prompt: task.prompt.clone(),
+                };
                 let run_id = run_id.clone();
                 let home = home.to_path_buf();
                 let cwd = cwd.to_path_buf();
                 let repo_root = repo_root.clone();
                 let worker_bin = worker_bin.map(Path::to_path_buf);
-                scope.spawn(move || {
+                let handle = scope.spawn(move || {
                     run_worker(
                         task,
                         index,
@@ -853,32 +895,28 @@ fn run_with_worker_bin_and_progress(
                         progress,
                         permission_mode,
                     )
-                })
+                });
+                (handle, fallback)
             })
             .collect::<Vec<_>>();
         handles
             .into_iter()
-            .map(|handle| {
-                handle.join().unwrap_or_else(|_| {
-                    (
-                        0,
-                        WorkerResult {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            title: "worker panicked".into(),
-                            provider: coordinator_provider,
-                            model: coordinator_model.to_string(),
-                            prompt: String::new(),
-                            worktree: None,
+            .map(|(handle, fallback)| match handle.join() {
+                Ok(result) => result,
+                Err(_) => {
+                    let (index, result) = panicked_worker(&fallback);
+                    emit(
+                        progress,
+                        OrchestrationProgress::WorkerFinished {
+                            index: index + 1,
+                            title: result.title.clone(),
+                            status: result.status.clone(),
                             commit: None,
-                            thread_id: None,
-                            status: "failed".into(),
-                            text: None,
-                            error: Some("worker thread panicked".into()),
-                            created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                            finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                            error: result.error.clone(),
                         },
-                    )
-                })
+                    );
+                    (index, result)
+                }
             })
             .collect::<Vec<_>>()
     });
@@ -1123,6 +1161,28 @@ mod tests {
         )
         .unwrap();
         (repo, home, store, report)
+    }
+
+    #[test]
+    fn panic_fallback_keeps_task_identity_and_position() {
+        let fallback = WorkerFallback {
+            index: 2,
+            title: "second task".to_string(),
+            provider: ProviderId::Claude,
+            model: "claude-test".to_string(),
+            prompt: "do two".to_string(),
+        };
+        let (index, result) = panicked_worker(&fallback);
+        assert_eq!(index, 2, "position survives a panic");
+        assert_eq!(result.title, "second task");
+        assert_eq!(result.provider, ProviderId::Claude);
+        assert_eq!(result.model, "claude-test");
+        assert_eq!(result.prompt, "do two");
+        assert_eq!(result.status, "failed");
+        assert!(result.error.as_deref().unwrap().contains("panicked"));
+        assert!(result.worktree.is_none());
+        assert!(result.commit.is_none());
+        assert!(result.thread_id.is_none());
     }
 
     #[test]

@@ -1182,6 +1182,29 @@ fn abandoned_orchestration_is_reconciled_without_losing_completed_tasks() {
         )
         .unwrap();
     store
+        .add_orchestration_task(
+            "task-waiting",
+            "run-abandoned",
+            3,
+            "waiting worker",
+            ProviderId::Codex,
+            "model",
+            "waiting",
+            Some("/tmp/waiting"),
+            Some("baton/run/waiting"),
+            Some("def456"),
+            Some("thread-waiting"),
+            "needs_input",
+            Some("BATON_QUESTION: choose a path"),
+            None,
+            "now",
+            Some("now"),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    store
         .start_turn_record("thread-done", 1, ProviderId::Codex, Some("model"))
         .unwrap();
     store
@@ -1194,17 +1217,20 @@ fn abandoned_orchestration_is_reconciled_without_losing_completed_tasks() {
     let reconciled = baton::orchestrate::reconcile_abandoned_runs(&store).unwrap();
     assert_eq!(reconciled.len(), 1);
     assert_eq!(reconciled[0].run_id, "run-abandoned");
-    assert_eq!(reconciled[0].status, "partial");
+    assert_eq!(reconciled[0].status, "needs_input");
     assert_eq!(reconciled[0].completed_tasks, 1);
     assert_eq!(reconciled[0].failed_tasks, 1);
+    assert_eq!(reconciled[0].needs_input_tasks, 1);
 
     let run = &store.list_orchestration_runs(10).unwrap()[0];
-    assert_eq!(run.status, "partial");
+    assert_eq!(run.status, "needs_input");
     assert!(run.finished_at.is_some());
     let tasks = store.list_orchestration_tasks("run-abandoned").unwrap();
     assert_eq!(tasks[0].status, "completed");
     assert_eq!(tasks[0].commit_sha.as_deref(), Some("abc123"));
     assert_eq!(tasks[1].status, "failed");
+    assert_eq!(tasks[2].status, "needs_input");
+    assert_eq!(tasks[2].commit_sha.as_deref(), Some("def456"));
     assert!(
         tasks[1]
             .error

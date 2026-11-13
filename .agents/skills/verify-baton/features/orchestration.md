@@ -12,6 +12,7 @@
 - Worker commits, `--integrate`, and `worktrees --clean`
 - Push worker branches and open PRs with `--open-prs` or `p` in the report
 - Live per-worker progress in the TUI and with `--progress`
+- Worker questions, `needs_input`, and integration/PR decision gates
 - `/multi --worktrees` fan-out through a generated plan, one isolated worker per provider
 - `/worktree` conversation fork bound to a one-task orchestration run
 
@@ -47,7 +48,7 @@ In the TUI:
 `/worktree [title]` forks the current conversation into an isolated worktree and binds the new thread to a completed one-task run. The first successful turn commits through the worker follow-up path; the report then exposes integrate, ship, archive, and cleanup. Dirty source checkouts are refused, and the original thread stays in the source checkout.
 
 The transcript shows a live per-worker list while the run is active: queued, running, completed with commit, failed with the error, or cancelled. Ctrl+C cancels the run and terminates the worker process groups. If the orchestrator process dies, the next Baton start marks unfinished tasks failed, keeps completed tasks and commits, settles the run, and shows a recovery notice in the TUI. A run owned by another live Baton process is left alone. `--progress` prints the same lines to stderr. When it
-finishes, the full-screen report lists each worker. Up/Down selects a worker,
+finishes, the full-screen report lists each worker. A `?` row is waiting for input; the report prints its `BATON_QUESTION:` line, and Enter opens the worker thread so the answer can be sent as a normal follow-up. Up/Down selects a worker,
 Enter opens that worker's thread (with its worktree as cwd), PageUp/PageDown
 scrolls, and Esc closes the report. `/clear` also dismisses it. Press `i` to
 integrate completed worker branches: the report asks for confirmation, merges in
@@ -87,6 +88,7 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 ```
 
 ## Gotchas
+- A worker that cannot finish says so with `BATON_QUESTION: <question>` as its last line. Baton marks it `needs_input`, keeps any commit, and refuses `--integrate` and `--open-prs` until the worker thread has a successful follow-up. The report JSON exposes `tasks[].question`; the TUI shows the question and a `?` marker.
 - Worker worktrees branch from `HEAD`, then receive a snapshot of tracked and untracked non-ignored source changes. The worker commit contains only paths the worker changed relative to that snapshot, so untouched dirty files stay out of the branch. The report sets `dirty_source` and exposes the snapshot base/tree per task. Integration rebuilds the worker result over the snapshot and uses it as a three-way merge against the source, so committing dirty source edits after the run does not produce a false same-file conflict.
 - `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan. A task `model` overrides the provider config; omit it to use the configured default. A task `effort` is a lowercase reasoning level such as `low`, `medium`, `high`, `xhigh`, or `max`; omit it for the harness default. Only Codex and Claude support explicit effort in this release. The worker thread persists the effort, and the report exposes `tasks[].effort`.
 - `--plan-only` resolves and prints the plan with effective models and efforts but creates no run, task rows, worktrees, or provider worker processes. Use it to review a coordinator plan or validate a plan file before spending worker turns. In the TUI, the same flag opens a preview overlay; Enter writes that exact plan and starts the normal runner, while Esc restores the goal to the composer.

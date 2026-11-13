@@ -1702,12 +1702,13 @@ fn reconcile_startup_orchestrations() {
         Ok(runs) => {
             for run in runs {
                 eprintln!(
-                    "recovered abandoned orchestration {} ({}, {} completed, {} failed, {} cancelled)",
+                    "recovered abandoned orchestration {} ({}, {} completed, {} failed, {} cancelled, {} needs input)",
                     &run.run_id[..8.min(run.run_id.len())],
                     run.status,
                     run.completed_tasks,
                     run.failed_tasks,
-                    run.cancelled_tasks
+                    run.cancelled_tasks,
+                    run.needs_input_tasks
                 );
             }
         }

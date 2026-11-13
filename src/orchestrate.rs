@@ -196,7 +196,12 @@ pub fn render_progress(event: &OrchestrationProgress) -> String {
             commit,
             error,
         } => format!(
-            "[{index}] {status} {title}{}{}",
+            "[{index}] {} {title}{}{}",
+            if status == "needs_input" {
+                "waiting for input"
+            } else {
+                status.as_str()
+            },
             commit
                 .as_ref()
                 .map(|commit| format!(" · commit {}", &commit[..8.min(commit.len())]))
@@ -289,7 +294,21 @@ fn validate_plan_providers(plan: &Plan, available: &[ProviderId]) -> Result<()> 
     Ok(())
 }
 
-const WORKER_PREAMBLE: &str = "You are a worker in an isolated git worktree. Treat the current working directory as the repository root. Do not read or write the source checkout outside this worktree.";
+const WORKER_PREAMBLE: &str = "You are a worker in an isolated git worktree. Treat the current working directory as the repository root. Do not read or write the source checkout outside this worktree. If you cannot finish without a user decision or information only the user can provide, stop and end your reply with exactly one line formatted as `BATON_QUESTION: <question>`. Do not guess. Otherwise finish the task.";
+
+pub const QUESTION_PREFIX: &str = "BATON_QUESTION:";
+
+/// Extracts a worker's decision request from the last matching line. The
+/// sentinel is a protocol marker, not ordinary prose.
+pub fn worker_question(text: &str) -> Option<String> {
+    text.lines().rev().find_map(|line| {
+        line.trim()
+            .strip_prefix(QUESTION_PREFIX)
+            .map(str::trim)
+            .filter(|question| !question.is_empty())
+            .map(str::to_string)
+    })
+}
 
 fn apply_permission_args(command: &mut Command, permission_mode: PermissionMode) {
     match permission_mode {
@@ -796,16 +815,21 @@ fn run_worker_inner(
         }
         Err(error) => (None, None, Some(format!("cannot run worker: {error}")), None, false),
     };
+    let question = text.as_deref().and_then(worker_question);
     let mut status = if cancelled {
         "cancelled"
     } else if error.is_none() {
-        "completed"
+        if question.is_some() {
+            "needs_input"
+        } else {
+            "completed"
+        }
     } else {
         "failed"
     };
     let mut error = error;
     let mut commit = None;
-    if status == "completed" {
+    if matches!(status, "completed" | "needs_input") {
         if let Some(worktree) = worktree.as_ref() {
             let message = format!("baton worker: {}", task.title);
             let committed = match worker_snapshot.as_ref() {
@@ -821,7 +845,7 @@ fn run_worker_inner(
                 Err(commit_error) => {
                     status = "failed";
                     error = Some(format!(
-                        "worker completed but its changes could not be committed: {commit_error}"
+                        "worker finished but its changes could not be committed: {commit_error}"
                     ));
                 }
             }
@@ -927,6 +951,21 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn ensure_no_worker_questions(tasks: &[OrchestrationTaskRow]) -> Result<()> {
+    let waiting = tasks
+        .iter()
+        .filter(|task| task.status == "needs_input")
+        .map(|task| task.title.as_str())
+        .collect::<Vec<_>>();
+    if !waiting.is_empty() {
+        anyhow::bail!(
+            "worker(s) waiting for input: {}; answer them before integrating or opening PRs",
+            waiting.join(", ")
+        );
+    }
+    Ok(())
 }
 
 fn branch_exists(root: &Path, branch: &str) -> bool {
@@ -1073,6 +1112,7 @@ pub fn integrate(
     if tasks.is_empty() {
         anyhow::bail!("run {} has no tasks", &run_id[..8.min(run_id.len())]);
     }
+    ensure_no_worker_questions(&tasks)?;
     for index in selection {
         if *index == 0 || *index > tasks.len() {
             anyhow::bail!(
@@ -1286,6 +1326,7 @@ fn open_prs_with_gh(
     if tasks.is_empty() {
         anyhow::bail!("run {} has no tasks", &run_id[..8.min(run_id.len())]);
     }
+    ensure_no_worker_questions(&tasks)?;
     for index in selection {
         if *index == 0 || *index > tasks.len() {
             anyhow::bail!(
@@ -1836,8 +1877,11 @@ fn run_with_worker_bin_and_progress(
     }
     let completed = tasks.iter().filter(|task| task.status == "completed").count();
     let cancelled = tasks.iter().any(|task| task.status == "cancelled");
+    let needs_input = tasks.iter().any(|task| task.status == "needs_input");
     let status = if cancelled {
         "cancelled"
+    } else if needs_input {
+        "needs_input"
     } else if completed == tasks.len() {
         "completed"
     } else if completed == 0 {
@@ -1915,7 +1959,9 @@ pub fn render(report: &RunReport) -> String {
                 &commit[..8.min(commit.len())]
             ));
         }
-        if let Some(text) = &task.text {
+        if let Some(question) = task.text.as_deref().and_then(worker_question) {
+            lines.push(format!("      question: {question}"));
+        } else if let Some(text) = &task.text {
             let preview: Vec<&str> = text.lines().take(3).collect();
             if !preview.is_empty() {
                 lines.push(format!("      {}", preview.join(" ")));
@@ -1939,6 +1985,7 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
                 "provider": task.provider.as_str(),
                 "model": task.model,
                 "effort": task.effort,
+                "question": task.text.as_deref().and_then(worker_question),
                 "prompt": task.prompt,
                 "status": task.status,
                 "thread_id": task.thread_id,
@@ -2050,6 +2097,7 @@ pub struct ReconciledRun {
     pub completed_tasks: usize,
     pub failed_tasks: usize,
     pub cancelled_tasks: usize,
+    pub needs_input_tasks: usize,
 }
 
 /// A run whose orchestrator process is gone can never finish on its own.
@@ -2074,8 +2122,11 @@ pub fn reconcile_abandoned_runs(store: &BatonStore) -> Result<Vec<ReconciledRun>
         let completed_tasks = tasks.iter().filter(|task| task.status == "completed").count();
         let failed_tasks = tasks.iter().filter(|task| task.status == "failed").count();
         let cancelled_tasks = tasks.iter().filter(|task| task.status == "cancelled").count();
+        let needs_input_tasks = tasks.iter().filter(|task| task.status == "needs_input").count();
         let status = if cancelled_tasks > 0 {
             "cancelled"
+        } else if needs_input_tasks > 0 {
+            "needs_input"
         } else if !tasks.is_empty() && completed_tasks == tasks.len() {
             "completed"
         } else if completed_tasks > 0 {
@@ -2090,6 +2141,7 @@ pub fn reconcile_abandoned_runs(store: &BatonStore) -> Result<Vec<ReconciledRun>
             completed_tasks,
             failed_tasks,
             cancelled_tasks,
+            needs_input_tasks,
         });
     }
     Ok(reconciled)
@@ -2298,6 +2350,50 @@ mod tests {
     }
 
     #[test]
+    fn worker_question_marks_needs_input_and_blocks_integration_until_answered() {
+        let plan = r#"{"tasks":[{"title":"question worker","provider":"codex","prompt":"ask before finishing"}]}"#;
+        let question = "BATON_QUESTION: approve the worker change?";
+        let (repo, _home, store, report) = run_fixture_with_worker_text(
+            plan,
+            "printf 'worker change\n' > worker.txt",
+            question,
+        );
+        assert_eq!(report.status, "needs_input");
+        let task = &report.tasks[0];
+        assert_eq!(task.status, "needs_input");
+        assert!(task.commit.is_some(), "needs_input still commits worker changes");
+        assert_eq!(
+            worker_question(task.text.as_deref().unwrap()).as_deref(),
+            Some("approve the worker change?")
+        );
+        assert_eq!(
+            to_json(&report)["tasks"][0]["question"],
+            "approve the worker change?"
+        );
+        assert!(render(&report).contains("question: approve the worker change?"));
+
+        let error = integrate(&store, repo.path(), &report.run_id, &[]).unwrap_err();
+        assert!(error.to_string().contains("waiting for input"), "{error}");
+        let error = open_prs(&store, repo.path(), &report.run_id, &[]).unwrap_err();
+        assert!(error.to_string().contains("waiting for input"), "{error}");
+
+        let stored = store.list_orchestration_tasks(&report.run_id).unwrap().remove(0);
+        store
+            .update_orchestration_task_success(&stored.id, Some("answered"), None, false)
+            .unwrap();
+        store.refresh_orchestration_run_status(&report.run_id).unwrap();
+        let run = store
+            .find_orchestration_runs(&report.run_id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.id == report.run_id)
+            .unwrap();
+        assert_eq!(run.status, "completed");
+        let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
+        assert_eq!(integrated.merged.len(), 1);
+    }
+
+    #[test]
     fn unsupported_provider_effort_fails_the_task_with_a_clear_error() {
         let plan = r#"{"tasks":[{"title":"worker","provider":"opencode","effort":"high","prompt":"do it"}]}"#;
         let (_repo, _home, _store, report) = run_fixture(
@@ -2402,9 +2498,17 @@ exit 1
         path
     }
 
-    fn worker_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+    fn worker_script_for_text(dir: &Path, name: &str, body: &str, text: &str) -> PathBuf {
         let path = dir.join(name);
-        let json = "printf '%s\\n' '{\"schema_version\":1,\"thread_id\":\"fake-thread\",\"ok\":true,\"phase\":\"completed\",\"error\":null,\"text\":\"FAKE_OK\"}'\n";
+        let result = serde_json::json!({
+            "schema_version": 1,
+            "thread_id": "fake-thread",
+            "ok": true,
+            "phase": "completed",
+            "error": null,
+            "text": text,
+        });
+        let json = format!("printf '%s\n' '{}'\n", serde_json::to_string(&result).unwrap());
         let script = format!("#!/bin/sh\ncd \"$2\" || exit 1\n{body}\n{json}");
         std::fs::write(&path, script).unwrap();
         #[cfg(unix)]
@@ -2413,6 +2517,49 @@ exit 1
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         path
+    }
+
+    fn worker_script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        worker_script_for_text(dir, name, body, "FAKE_OK")
+    }
+
+    fn run_fixture_with_worker_text(
+        plan: &str,
+        worker_body: &str,
+        worker_text: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, BatonStore, RunReport) {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git").args(args).current_dir(repo.path()).output().unwrap();
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(repo.path().join("a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let home = tempfile::tempdir().unwrap();
+        let worker = worker_script_for_text(home.path(), "question-worker", worker_body, worker_text);
+        let plan_path = home.path().join("plan.json");
+        std::fs::write(&plan_path, plan).unwrap();
+        let store = BatonStore::memory().unwrap();
+        let report = run_with_worker_bin_and_progress(
+            "test worker question",
+            repo.path(),
+            home.path(),
+            ProviderId::Codex,
+            "test-model",
+            4,
+            Some(&plan_path),
+            &store,
+            Some(&worker),
+            None,
+            None,
+            PermissionMode::Default,
+        )
+        .unwrap();
+        (repo, home, store, report)
     }
 
     fn run_fixture(plan: &str, worker_body: &str) -> (tempfile::TempDir, tempfile::TempDir, BatonStore, RunReport) {

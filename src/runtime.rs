@@ -27,7 +27,7 @@ pub enum EngineEvent {
     TurnQueued { thread_id: String, provider: ProviderId },
     TurnStarted { thread_id: String },
     Turn(TurnEvent),
-    SteerRejected { thread_id: String, text: String },
+    SteerRejected { thread_id: String, text: String, reason: String },
     ModelsLoaded {
         thread_id: String,
         provider: ProviderId,
@@ -403,11 +403,27 @@ pub async fn run_engine(
                         .find(|(candidate, _)| candidate == provider)
                         .map(|(_, handle)| handle.clone())
                 });
-                let (Some((provider, model)), Some(claim), Some(handle)) = (resolved, claim, handle)
-                else {
+                let Some((provider, model)) = resolved else {
                     let _ = engine_event_sender.send(EngineEvent::SteerRejected {
                         thread_id,
                         text,
+                        reason: "thread not found".into(),
+                    });
+                    continue;
+                };
+                let Some(claim) = claim else {
+                    let _ = engine_event_sender.send(EngineEvent::SteerRejected {
+                        thread_id,
+                        text,
+                        reason: "no live turn for this harness".into(),
+                    });
+                    continue;
+                };
+                let Some(handle) = handle else {
+                    let _ = engine_event_sender.send(EngineEvent::SteerRejected {
+                        thread_id,
+                        text,
+                        reason: "this harness does not support steering".into(),
                     });
                     continue;
                 };
@@ -415,6 +431,7 @@ pub async fn run_engine(
                     let _ = engine_event_sender.send(EngineEvent::SteerRejected {
                         thread_id,
                         text,
+                        reason: "another thread owns this harness".into(),
                     });
                     continue;
                 }
@@ -451,9 +468,17 @@ pub async fn run_engine(
                             model: Some(model),
                         });
                     } else {
+                        let reason = match outcome {
+                            SteerOutcome::StaleTurn => {
+                                "the turn ended before the harness took the message".to_string()
+                            }
+                            SteerOutcome::Unavailable(reason) => reason,
+                            SteerOutcome::Delivered => unreachable!(),
+                        };
                         let _ = sender.send(EngineEvent::SteerRejected {
                             thread_id,
                             text,
+                            reason,
                         });
                     }
                 });
@@ -1372,10 +1397,19 @@ mod tests {
                 text: "too late".into(),
             })
             .unwrap();
-        wait_engine_event(&event_receiver, |event| {
+        let rejected = wait_engine_event(&event_receiver, |event| {
             matches!(event, EngineEvent::SteerRejected { text, .. } if text == "too late")
         })
         .await;
+        match rejected {
+            EngineEvent::SteerRejected { reason, .. } => {
+                assert!(
+                    reason.contains("turn ended"),
+                    "the rejection explains the stale turn: {reason}"
+                );
+            }
+            _ => unreachable!(),
+        }
         let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
         assert!(
             !messages.iter().any(|message| message.text == "too late"),

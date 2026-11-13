@@ -34,6 +34,17 @@ impl ProviderId {
         }
     }
 
+    pub fn binary_name(self) -> &'static str {
+        match self {
+            ProviderId::Claude => "claude",
+            ProviderId::Codex => "codex",
+            ProviderId::Cursor => "cursor-agent",
+            ProviderId::Grok => "grok",
+            ProviderId::OpenCode => "opencode",
+            ProviderId::Antigravity => "antigravity",
+        }
+    }
+
     pub fn all() -> &'static [ProviderId] {
         &[
             ProviderId::Claude,

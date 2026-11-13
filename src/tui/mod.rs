@@ -765,6 +765,7 @@ fn apply_engine_event(
             state.diff_output = None;
         }
         EngineEvent::TurnFinished { thread_id, ok, error, phase } => {
+            record_worker_followup(state, store, &thread_id, ok);
             state.approvals.retain(|approval| approval.thread_id != thread_id);
             if let Some(child) = state
                 .multi
@@ -1251,6 +1252,82 @@ fn record_orchestration_message(state: &mut TuiState, text: String) {
             text,
             created_at: String::new(),
         });
+    }
+}
+
+fn record_worker_followup(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    thread_id: &str,
+    ok: bool,
+) {
+    if !ok {
+        return;
+    }
+    let (task, text) = {
+        let guard = store.lock().unwrap();
+        let Some(task) = guard.orchestration_task_for_thread(thread_id).unwrap_or(None) else {
+            return;
+        };
+        let text = guard
+            .list_messages(thread_id)
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .find(|message| message.role == "assistant")
+            .map(|message| message.text);
+        (task, text)
+    };
+    let Some(worktree_path) = task.worktree_path.as_deref() else {
+        return;
+    };
+    let path = std::path::Path::new(worktree_path);
+    if !path.is_dir() {
+        return;
+    }
+    let commit = match crate::worktree::commit_changes(
+        path,
+        &format!("baton worker: {}", task.title),
+    ) {
+        Ok(commit) => commit,
+        Err(error) => {
+            if thread_id == state.thread.id {
+                state.notice = Some(format!("worker follow-up commit failed: {error}"));
+            }
+            return;
+        }
+    };
+    let clear_markers = commit.is_some();
+    let result = {
+        let guard = store.lock().unwrap();
+        guard
+            .update_orchestration_task_success(
+                &task.id,
+                text.as_deref(),
+                commit.as_deref(),
+                clear_markers,
+            )
+            .and_then(|()| guard.refresh_orchestration_run_status(&task.run_id))
+    };
+    if thread_id == state.thread.id {
+        match result {
+            Ok(()) => {
+                state.notice = Some(match &commit {
+                    Some(commit) => format!(
+                        "worker follow-up recorded in run {} · commit {}",
+                        &task.run_id[..8.min(task.run_id.len())],
+                        &commit[..8.min(commit.len())]
+                    ),
+                    None => format!(
+                        "worker follow-up recorded in run {} · no file changes",
+                        &task.run_id[..8.min(task.run_id.len())]
+                    ),
+                });
+            }
+            Err(error) => {
+                state.notice = Some(format!("worker follow-up recorded but run update failed: {error}"));
+            }
+        }
     }
 }
 
@@ -6622,6 +6699,136 @@ mod tests {
         assert_eq!(buffer.get(removed_cell, removed_row as u16).fg, COLORS.error, "removed lines render red");
         assert_eq!(buffer.get(0, added_row as u16).bg, ratatui::style::Color::Rgb(33, 58, 43), "added rows carry the tinted background");
         assert_eq!(buffer.get(0, removed_row as u16).bg, ratatui::style::Color::Rgb(74, 34, 29), "removed rows carry the tinted background");
+    }
+
+    #[test]
+    fn worker_followup_commits_and_updates_the_orchestration_task() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str], cwd: &std::path::Path| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+        };
+        git(&["init", "-q"], repo.path());
+        git(&["config", "user.email", "test@test"], repo.path());
+        git(&["config", "user.name", "test"], repo.path());
+        std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+        git(&["add", "."], repo.path());
+        git(&["commit", "-q", "-m", "init"], repo.path());
+        let repo_root = crate::worktree::repo_root(repo.path()).unwrap();
+
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let worktree = crate::worktree::create(
+            home.path(),
+            &repo_root,
+            "run-followup",
+            "worker task",
+        )
+        .unwrap();
+        let worker = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "worker".to_string(),
+                cwd: worktree.path.to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("model".to_string()),
+            })
+            .unwrap();
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .create_orchestration_run(
+                    "run-followup",
+                    "goal",
+                    ProviderId::Codex,
+                    "model",
+                    None,
+                    "{}",
+                    false,
+                )
+                .unwrap();
+            guard
+                .add_orchestration_task(
+                    "task-followup",
+                    "run-followup",
+                    1,
+                    "worker task",
+                    ProviderId::Codex,
+                    "model",
+                    "prompt",
+                    Some(&worktree.path.to_string_lossy()),
+                    Some(&worktree.branch),
+                    Some("old-commit"),
+                    Some(&worker.id),
+                    "completed",
+                    Some("old answer"),
+                    None,
+                    "now",
+                    Some("now"),
+                )
+                .unwrap();
+            guard
+                .mark_orchestration_task_merged("task-followup", "merged")
+                .unwrap();
+            guard
+                .mark_orchestration_task_pr("task-followup", "https://example.test/pr/1")
+                .unwrap();
+            guard
+                .finish_orchestration_run("run-followup", "completed")
+                .unwrap();
+            guard
+                .add_message(
+                    &worker.id,
+                    1,
+                    "assistant",
+                    Some("codex"),
+                    None,
+                    "updated answer",
+                )
+                .unwrap();
+        }
+        std::fs::write(worktree.path.join("followup.txt"), "new work\n").unwrap();
+
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread = worker.clone();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: worker.id.clone(),
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &engine_command_sender,
+        );
+
+        let task = store
+            .lock()
+            .unwrap()
+            .orchestration_task_for_thread(&worker.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.text.as_deref(), Some("updated answer"));
+        assert_eq!(task.commit_sha.as_deref().map(str::len), Some(40));
+        assert!(task.merged_at.is_none(), "new work clears the merge marker");
+        assert!(task.pr_url.is_none(), "new work must be shipped again");
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("worker follow-up recorded"),
+            "notice: {:?}",
+            state.notice
+        );
+        assert_eq!(
+            store.lock().unwrap().list_orchestration_runs(10).unwrap()[0].status,
+            "completed"
+        );
     }
 
     #[test]

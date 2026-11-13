@@ -420,6 +420,30 @@ fn map_orchestration_run(row: &rusqlite::Row) -> rusqlite::Result<OrchestrationR
     })
 }
 
+fn map_orchestration_task(row: &rusqlite::Row) -> rusqlite::Result<OrchestrationTaskRow> {
+    let provider: String = row.get(4)?;
+    Ok(OrchestrationTaskRow {
+        id: row.get(0)?,
+        run_id: row.get(1)?,
+        position: row.get(2)?,
+        title: row.get(3)?,
+        provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Codex),
+        model: row.get(5)?,
+        prompt: row.get(6)?,
+        worktree_path: row.get(7)?,
+        branch: row.get(8)?,
+        commit_sha: row.get(9)?,
+        thread_id: row.get(10)?,
+        status: row.get(11)?,
+        text: row.get(12)?,
+        error: row.get(13)?,
+        created_at: row.get(14)?,
+        finished_at: row.get(15)?,
+        merged_at: row.get(16)?,
+        pr_url: row.get(17)?,
+    })
+}
+
 const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode";
 
 /// Per-project prompt history cap, Claude Code style.
@@ -1610,31 +1634,70 @@ impl BatonStore {
             "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
         )?;
         let rows = statement
-            .query_map(params![run_id], |row| {
-                let provider: String = row.get(4)?;
-                Ok(OrchestrationTaskRow {
-                    id: row.get(0)?,
-                    run_id: row.get(1)?,
-                    position: row.get(2)?,
-                    title: row.get(3)?,
-                    provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Codex),
-                    model: row.get(5)?,
-                    prompt: row.get(6)?,
-                    worktree_path: row.get(7)?,
-                    branch: row.get(8)?,
-                    commit_sha: row.get(9)?,
-                    thread_id: row.get(10)?,
-                    status: row.get(11)?,
-                    text: row.get(12)?,
-                    error: row.get(13)?,
-                    created_at: row.get(14)?,
-                    finished_at: row.get(15)?,
-                    merged_at: row.get(16)?,
-                    pr_url: row.get(17)?,
-                })
-            })?
+            .query_map(params![run_id], map_orchestration_task)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    pub fn orchestration_task_for_thread(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<OrchestrationTaskRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url FROM orchestration_tasks WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
+        )?;
+        let row = statement
+            .query_row(params![thread_id], map_orchestration_task)
+            .optional()?;
+        Ok(row)
+    }
+
+    pub fn update_orchestration_task_success(
+        &self,
+        id: &str,
+        text: Option<&str>,
+        commit_sha: Option<&str>,
+        clear_markers: bool,
+    ) -> Result<()> {
+        let finished_at = now_iso();
+        if clear_markers {
+            self.db.execute(
+                "UPDATE orchestration_tasks SET status = 'completed', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ?, merged_at = NULL, pr_url = NULL WHERE id = ?",
+                params![text, commit_sha, finished_at, id],
+            )?;
+        } else {
+            self.db.execute(
+                "UPDATE orchestration_tasks SET status = 'completed', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ? WHERE id = ?",
+                params![text, commit_sha, finished_at, id],
+            )?;
+        }
+        Ok(())
+    }
+
+    pub fn refresh_orchestration_run_status(&self, run_id: &str) -> Result<()> {
+        let tasks = self.list_orchestration_tasks(run_id)?;
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        let completed = tasks.iter().filter(|task| task.status == "completed").count();
+        let cancelled = tasks.iter().any(|task| task.status == "cancelled");
+        let running = tasks.iter().any(|task| task.status == "running");
+        let status = if running {
+            "running"
+        } else if cancelled {
+            "cancelled"
+        } else if completed == tasks.len() {
+            "completed"
+        } else if completed == 0 {
+            "failed"
+        } else {
+            "partial"
+        };
+        self.db.execute(
+            "UPDATE orchestration_runs SET status = ?, finished_at = ? WHERE id = ?",
+            params![status, if status == "running" { None } else { Some(now_iso()) }, run_id],
+        )?;
+        Ok(())
     }
 
     pub fn import_thread(

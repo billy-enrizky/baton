@@ -510,6 +510,7 @@ fn main_result() -> Result<()> {
             list,
             run,
             integrate,
+            open_prs,
             tasks,
             progress,
             json,
@@ -552,6 +553,7 @@ fn main_result() -> Result<()> {
                 return Ok(());
             }
             if let Some(run_id) = run {
+                let run_id = orchestrate::resolve_run_id(&store, &run_id)?;
                 let tasks = orchestrate::task_rows(&store, &run_id)?;
                 if json {
                     println!(
@@ -573,6 +575,7 @@ fn main_result() -> Result<()> {
                                 "branch": task.branch,
                                 "commit": task.commit_sha,
                                 "merged_at": task.merged_at,
+                                "pr_url": task.pr_url,
                                 "created_at": task.created_at,
                                 "finished_at": task.finished_at,
                             })).collect::<Vec<_>>(),
@@ -599,10 +602,28 @@ fn main_result() -> Result<()> {
                         if let Some(merged_at) = task.merged_at {
                             println!("  merged: {merged_at}");
                         }
+                        if let Some(pr_url) = task.pr_url {
+                            println!("  pr: {pr_url}");
+                        }
                         if let Some(error) = task.error {
                             println!("  error: {error}");
                         }
                     }
+                }
+                return Ok(());
+            }
+            if let Some(run_id) = open_prs {
+                let report = orchestrate::open_prs(&store, &cwd, &run_id, &tasks)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&orchestrate::ship_to_json(&report))?
+                    );
+                } else {
+                    println!("{}", orchestrate::render_ship(&report));
+                }
+                if !report.failed.is_empty() {
+                    std::process::exit(1);
                 }
                 return Ok(());
             }
@@ -624,7 +645,7 @@ fn main_result() -> Result<()> {
             let goal = goal.join(" ");
             if goal.trim().is_empty() {
                 anyhow::bail!(
-                    "usage: baton orchestrate <goal> | --list | --run <id> | --integrate <run-id>"
+                    "usage: baton orchestrate <goal> | --list | --run <id> | --integrate <run-id> | --open-prs <run-id>"
                 );
             }
             let provider = cli

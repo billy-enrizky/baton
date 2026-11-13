@@ -109,9 +109,12 @@ pub enum Commands {
         #[arg(long, conflicts_with = "list")]
         run: Option<String>,
         /// Merge completed worker branches into the current repository
-        #[arg(long, value_name = "run-id", conflicts_with_all = ["list", "run"])]
+        #[arg(long, value_name = "run-id", conflicts_with_all = ["list", "run", "open_prs"])]
         integrate: Option<String>,
-        /// Worker number to integrate (repeatable, 1-based; default all completed)
+        /// Push completed worker branches and open one pull request per worker
+        #[arg(long = "open-prs", value_name = "run-id", conflicts_with_all = ["list", "run", "integrate"])]
+        open_prs: Option<String>,
+        /// Worker number to integrate or ship (repeatable, 1-based; default all eligible)
         #[arg(long = "task", value_name = "N")]
         tasks: Vec<usize>,
         /// Print worker progress lines to stderr

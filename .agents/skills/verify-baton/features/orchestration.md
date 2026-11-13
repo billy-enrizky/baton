@@ -16,6 +16,7 @@ baton orchestrate --list
 baton orchestrate --run <run-id> --json
 baton orchestrate --integrate <run-id> --json
 baton orchestrate --integrate <run-id> --task 2 --json
+baton orchestrate --progress --json "Audit billing, add tests, update docs"
 ```
 
 In the TUI:
@@ -23,7 +24,7 @@ In the TUI:
 /orchestrate --max-tasks 3 Audit billing, add tests, update docs
 ```
 
-The transcript shows a live orchestration line while the run is active. When it
+The transcript shows a live per-worker list while the run is active: queued, running, completed with commit, or failed with the error. `--progress` prints the same lines to stderr. When it
 finishes, the full-screen report lists each worker. Up/Down selects a worker,
 Enter opens that worker's thread (with its worktree as cwd), PageUp/PageDown
 scrolls, and Esc closes the report. `/clear` also dismisses it. Press `i` to

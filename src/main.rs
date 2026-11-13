@@ -494,6 +494,7 @@ fn main_result() -> Result<()> {
             run,
             integrate,
             tasks,
+            progress,
             json,
         } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
@@ -615,17 +616,35 @@ fn main_result() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
             let plan_path = plan_file.map(PathBuf::from);
-            let report = orchestrate::run(
-                &goal,
-                &cwd,
-                &home,
-                provider,
-                &model,
-                max_tasks,
-                plan_path.as_deref(),
-                &store,
-                permission_mode,
-            )?;
+            let report = if progress {
+                let sink = |event: orchestrate::OrchestrationProgress| {
+                    eprintln!("{}", orchestrate::render_progress(&event));
+                };
+                orchestrate::run_with_progress(
+                    &goal,
+                    &cwd,
+                    &home,
+                    provider,
+                    &model,
+                    max_tasks,
+                    plan_path.as_deref(),
+                    &store,
+                    permission_mode,
+                    Some(&sink as &orchestrate::ProgressFn<'_>),
+                )?
+            } else {
+                orchestrate::run(
+                    &goal,
+                    &cwd,
+                    &home,
+                    provider,
+                    &model,
+                    max_tasks,
+                    plan_path.as_deref(),
+                    &store,
+                    permission_mode,
+                )?
+            };
             if json {
                 println!("{}", serde_json::to_string_pretty(&orchestrate::to_json(&report))?);
             } else {

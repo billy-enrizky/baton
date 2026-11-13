@@ -110,6 +110,9 @@ pub enum Commands {
         /// Worker number to integrate (repeatable, 1-based; default all completed)
         #[arg(long = "task", value_name = "N")]
         tasks: Vec<usize>,
+        /// Print worker progress lines to stderr
+        #[arg(long)]
+        progress: bool,
         /// Emit a JSON object instead of lines
         #[arg(long)]
         json: bool,

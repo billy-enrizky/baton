@@ -2374,29 +2374,6 @@ fn effective_permission_mode(
     }
 }
 
-fn is_conversational_greeting(text: &str) -> bool {
-    let normalized = text
-        .trim()
-        .trim_end_matches(|character: char| {
-            character.is_ascii_punctuation() || character.is_whitespace()
-        })
-        .to_lowercase();
-    matches!(
-        normalized.as_str(),
-        "hi"
-            | "hello"
-            | "hey"
-            | "yo"
-            | "hi there"
-            | "hello there"
-            | "good morning"
-            | "good afternoon"
-            | "good evening"
-            | "thanks"
-            | "thank you"
-    )
-}
-
 fn dispatch_message(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -2418,7 +2395,7 @@ fn dispatch_message(
             state.notice = Some("an orchestration is already running".into());
             return;
         }
-        if is_conversational_greeting(&text) {
+        if orchestrate::is_conversational_greeting(&text) {
             submit(state, store, engine_command_sender, text);
             return;
         }
@@ -3328,7 +3305,18 @@ fn handle_command(
             }
             match parse_orchestrate_args(&args) {
                 Ok(parsed) => {
-                    request_orchestration(state, parsed.goal, parsed.max_tasks, parsed.plan_file)
+                    if parsed.plan_file.is_none()
+                        && orchestrate::is_conversational_greeting(&parsed.goal)
+                    {
+                        submit(state, store, engine_command_sender, parsed.goal);
+                    } else {
+                        request_orchestration(
+                            state,
+                            parsed.goal,
+                            parsed.max_tasks,
+                            parsed.plan_file,
+                        );
+                    }
                 }
                 Err(message) => state.notice = Some(message),
             }
@@ -9103,11 +9091,37 @@ mod tests {
 
     #[test]
     fn greeting_detection_is_narrow() {
-        assert!(is_conversational_greeting("hi"));
-        assert!(is_conversational_greeting(" hello! "));
-        assert!(is_conversational_greeting("thanks."));
-        assert!(!is_conversational_greeting("hi, fix the tests"));
-        assert!(!is_conversational_greeting("fix the bug"));
+        assert!(orchestrate::is_conversational_greeting("hi"));
+        assert!(orchestrate::is_conversational_greeting(" hello! "));
+        assert!(orchestrate::is_conversational_greeting("thanks."));
+        assert!(!orchestrate::is_conversational_greeting("hi, fix the tests"));
+        assert!(!orchestrate::is_conversational_greeting("fix the bug"));
+    }
+
+    #[test]
+    fn orchestrate_command_routes_a_greeting_to_one_turn() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        state.thread.session_mode = SessionMode::Orchestrate;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/orchestrate hi");
+        assert!(!state.orchestration_pending);
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Ok(EngineCommand::Submit { ref text, .. }) if text == "hi"
+            ),
+            "a greeting should use one turn"
+        );
     }
 
     #[test]

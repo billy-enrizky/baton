@@ -9,7 +9,7 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 ## What it does
 
 - **A clear start.** The banner shows version, cwd, session mode, model, permissions, and billing before the first prompt. New threads inherit the harness config's permission mode, so the banner shows the mode the provider will actually use. Greetings go to one harness; real work goes to the planner.
-- **Orchestrated by default.** A first prompt starts a coordinator, which plans independent tasks and picks a harness for each. Workers run in isolated worktrees with live progress, commit their changes to their own branches, and can be merged back with a confirmation.
+- **Orchestrated by default.** A first prompt starts a coordinator, which plans independent tasks and picks a harness for each. Workers run in isolated worktrees with live progress, commit their changes to their own branches, and can be merged back with a confirmation. If the coordinator cannot return a usable plan, baton runs one direct worker instead of failing the run.
 - **One CLI, many harnesses.** Codex, Claude Code, Grok Build, OpenCode, Cursor, and Antigravity, driven through their supported programmatic surfaces (app-server JSON-RPC, headless stream-json, ACP, HTTP).
 - **The thread is the product.** Switching harness or model mid-thread is a dropdown: `/switch` opens the provider picker, then the model picker. First turn on a new harness carries a token-budgeted context handoff; after that each harness keeps its own native session.
 - **High prompt cache hit rates.** baton never replays history into a harness. The cache hit rate is always visible in the status bar.

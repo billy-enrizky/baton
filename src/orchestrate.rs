@@ -377,6 +377,29 @@ fn run_coordinator(
     text.ok_or_else(|| anyhow::anyhow!("coordinator returned no text"))
 }
 
+pub fn is_conversational_greeting(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .trim_end_matches(|character: char| {
+            character.is_ascii_punctuation() || character.is_whitespace()
+        })
+        .to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "hi"
+            | "hello"
+            | "hey"
+            | "yo"
+            | "hi there"
+            | "hello there"
+            | "good morning"
+            | "good afternoon"
+            | "good evening"
+            | "thanks"
+            | "thank you"
+    )
+}
+
 fn run_planner(
     goal: &str,
     cwd: &Path,
@@ -401,14 +424,21 @@ fn run_planner(
                     .unwrap_or_else(|| "invalid JSON".to_string())
             )
         };
-        let text = run_coordinator(
+        let text = match run_coordinator(
             &prompt,
             cwd,
             provider,
             model,
             permission_mode,
             cancel,
-        )?;
+        ) {
+            Ok(text) => text,
+            Err(error) if error.to_string() == CANCELLED_ERROR => return Err(error),
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        };
         if std::env::var_os("BATON_ORCHESTRATE_DEBUG").is_some() {
             eprintln!("[orchestrate] planner text (attempt {}): {text}", attempt + 1);
         }
@@ -418,13 +448,17 @@ fn run_planner(
             Ok(plan) => return Ok(plan),
             Err(error) => {
                 if plan_is_empty(&error) {
-                    return Ok(fallback_plan(goal, provider));
+                    return plan_after_planner_failure(goal, provider, &error);
                 }
                 last_error = Some(error);
             }
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("planner failed")))
+    let error = last_error.unwrap_or_else(|| anyhow::anyhow!("planner failed"));
+    if std::env::var_os("BATON_ORCHESTRATE_DEBUG").is_some() {
+        eprintln!("[orchestrate] planner failed; using one direct worker: {error}");
+    }
+    plan_after_planner_failure(goal, provider, &error)
 }
 
 fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
@@ -440,6 +474,19 @@ fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
 
 fn plan_is_empty(error: &anyhow::Error) -> bool {
     error.to_string() == "planner returned no tasks"
+}
+
+/// A planner that cannot produce a usable plan must not strand the user's
+/// work. Cancellation is the one exception: the user asked to stop.
+fn plan_after_planner_failure(
+    goal: &str,
+    provider: ProviderId,
+    error: &anyhow::Error,
+) -> Result<Plan> {
+    if error.to_string() == CANCELLED_ERROR {
+        anyhow::bail!(CANCELLED_ERROR);
+    }
+    Ok(fallback_plan(goal, provider))
 }
 
 fn load_plan(path: &Path, max_tasks: usize) -> Result<Plan> {
@@ -1398,6 +1445,7 @@ fn run_with_worker_bin_and_progress(
         .unwrap_or(false);
     let plan = match plan_path {
         Some(path) => load_plan(path, max_tasks)?,
+        None if is_conversational_greeting(goal) => fallback_plan(goal, coordinator_provider),
         None => {
             let available = available_providers(coordinator_provider);
             run_planner(
@@ -1728,6 +1776,36 @@ mod tests {
         assert_eq!(plan.tasks[0].prompt, "hi");
         assert!(plan_is_empty(&anyhow::anyhow!("planner returned no tasks")));
         assert!(!plan_is_empty(&anyhow::anyhow!("some other failure")));
+    }
+
+    #[test]
+    fn planner_failures_fall_back_unless_the_user_cancelled() {
+        let plan = plan_after_planner_failure(
+            "fix the test",
+            ProviderId::Codex,
+            &anyhow::anyhow!("planner returned no tasks"),
+        )
+        .unwrap();
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].provider, "codex");
+        assert_eq!(plan.tasks[0].prompt, "fix the test");
+
+        let cancelled = plan_after_planner_failure(
+            "fix the test",
+            ProviderId::Codex,
+            &anyhow::anyhow!(CANCELLED_ERROR),
+        )
+        .unwrap_err();
+        assert_eq!(cancelled.to_string(), CANCELLED_ERROR);
+    }
+
+    #[test]
+    fn greetings_use_a_direct_plan() {
+        assert!(is_conversational_greeting("hi"));
+        assert!(is_conversational_greeting(" hello! "));
+        assert!(is_conversational_greeting("thanks."));
+        assert!(!is_conversational_greeting("hi, fix the tests"));
+        assert!(!is_conversational_greeting("fix the bug"));
     }
 
     #[test]

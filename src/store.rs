@@ -1660,6 +1660,20 @@ impl BatonStore {
         Ok(row)
     }
 
+    pub fn update_orchestration_task_failure(
+        &self,
+        id: &str,
+        status: &str,
+        text: Option<&str>,
+        error: &str,
+    ) -> Result<()> {
+        self.db.execute(
+            "UPDATE orchestration_tasks SET status = ?, text = ?, error = ?, finished_at = ? WHERE id = ?",
+            params![status, text, error, now_iso(), id],
+        )?;
+        Ok(())
+    }
+
     pub fn update_orchestration_task_success(
         &self,
         id: &str,

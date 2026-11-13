@@ -766,7 +766,7 @@ fn apply_engine_event(
             state.diff_output = None;
         }
         EngineEvent::TurnFinished { thread_id, ok, error, phase } => {
-            record_worker_followup(state, store, &thread_id, ok);
+            record_worker_followup(state, store, &thread_id, ok, error.as_deref(), phase);
             state.approvals.retain(|approval| approval.thread_id != thread_id);
             if let Some(child) = state
                 .multi
@@ -1261,10 +1261,9 @@ fn record_worker_followup(
     store: &Arc<Mutex<BatonStore>>,
     thread_id: &str,
     ok: bool,
+    error: Option<&str>,
+    phase: TurnPhase,
 ) {
-    if !ok {
-        return;
-    }
     let (task, text) = {
         let guard = store.lock().unwrap();
         let Some(task) = guard.orchestration_task_for_thread(thread_id).unwrap_or(None) else {
@@ -1279,6 +1278,39 @@ fn record_worker_followup(
             .map(|message| message.text);
         (task, text)
     };
+    if !ok {
+        if task.commit_sha.is_some() {
+            return;
+        }
+        let status = if phase == TurnPhase::Interrupted {
+            "cancelled"
+        } else {
+            "failed"
+        };
+        let detail = error.unwrap_or("worker turn failed");
+        let result = {
+            let guard = store.lock().unwrap();
+            guard
+                .update_orchestration_task_failure(
+                    &task.id,
+                    status,
+                    text.as_deref(),
+                    detail,
+                )
+                .and_then(|()| guard.refresh_orchestration_run_status(&task.run_id))
+        };
+        if thread_id == state.thread.id {
+            state.notice = Some(match result {
+                Ok(()) => format!(
+                    "worker {} recorded in run {} · {detail}",
+                    if status == "cancelled" { "cancellation" } else { "failure" },
+                    &task.run_id[..8.min(task.run_id.len())]
+                ),
+                Err(error) => format!("worker failure recorded but run update failed: {error}"),
+            });
+        }
+        return;
+    }
     let Some(worktree_path) = task.worktree_path.as_deref() else {
         return;
     };
@@ -6884,6 +6916,148 @@ mod tests {
         assert_eq!(buffer.get(removed_cell, removed_row as u16).fg, COLORS.error, "removed lines render red");
         assert_eq!(buffer.get(0, added_row as u16).bg, ratatui::style::Color::Rgb(33, 58, 43), "added rows carry the tinted background");
         assert_eq!(buffer.get(0, removed_row as u16).bg, ratatui::style::Color::Rgb(74, 34, 29), "removed rows carry the tinted background");
+    }
+
+    #[test]
+    fn worker_failure_without_a_commit_marks_the_task_failed() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let worker_id = state.thread.id.clone();
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .create_orchestration_run(
+                    "run-failure",
+                    "goal",
+                    ProviderId::Codex,
+                    "model",
+                    None,
+                    "{}",
+                    false,
+                )
+                .unwrap();
+            guard
+                .add_orchestration_task(
+                    "task-failure",
+                    "run-failure",
+                    1,
+                    "worker task",
+                    ProviderId::Codex,
+                    "model",
+                    "prompt",
+                    Some("/tmp/worktree"),
+                    Some("baton/run-failure/worker-task"),
+                    None,
+                    Some(&worker_id),
+                    "completed",
+                    None,
+                    None,
+                    "now",
+                    Some("now"),
+                )
+                .unwrap();
+            guard
+                .finish_orchestration_run("run-failure", "completed")
+                .unwrap();
+        }
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: worker_id.clone(),
+                ok: false,
+                error: Some("boom".to_string()),
+                phase: TurnPhase::Failed,
+            },
+            &engine_command_sender,
+        );
+        let task = store
+            .lock()
+            .unwrap()
+            .orchestration_task_for_thread(&worker_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "failed");
+        assert_eq!(task.error.as_deref(), Some("boom"));
+        assert_eq!(
+            store.lock().unwrap().list_orchestration_runs(10).unwrap()[0].status,
+            "failed"
+        );
+
+        let worker2 = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "worker with commit".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .create_orchestration_run(
+                    "run-success",
+                    "goal",
+                    ProviderId::Codex,
+                    "model",
+                    None,
+                    "{}",
+                    false,
+                )
+                .unwrap();
+            guard
+                .add_orchestration_task(
+                    "task-success",
+                    "run-success",
+                    1,
+                    "committed worker",
+                    ProviderId::Codex,
+                    "model",
+                    "prompt",
+                    Some("/tmp/worktree"),
+                    Some("baton/run-success/worker-task"),
+                    Some("old-commit"),
+                    Some(&worker2.id),
+                    "completed",
+                    Some("old answer"),
+                    None,
+                    "now",
+                    Some("now"),
+                )
+                .unwrap();
+            guard
+                .mark_orchestration_task_merged("task-success", "merged")
+                .unwrap();
+            guard
+                .mark_orchestration_task_pr("task-success", "https://example.test/pr/2")
+                .unwrap();
+            guard
+                .finish_orchestration_run("run-success", "completed")
+                .unwrap();
+        }
+        record_worker_followup(
+            &mut state,
+            &store,
+            &worker2.id,
+            false,
+            Some("follow-up failed"),
+            TurnPhase::Failed,
+        );
+        let task = store
+            .lock()
+            .unwrap()
+            .orchestration_task_for_thread(&worker2.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.status, "completed", "a prior commit is still valid");
+        assert_eq!(task.commit_sha.as_deref(), Some("old-commit"));
+        assert!(task.error.is_none());
+        assert!(task.merged_at.is_some());
+        assert!(task.pr_url.is_some());
     }
 
     #[test]

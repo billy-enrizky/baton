@@ -1037,19 +1037,24 @@ fn apply_engine_event(
                 ));
             }
         }
-        EngineEvent::SteerRejected { thread_id, text } => {
+        EngineEvent::SteerRejected { thread_id, text, reason } => {
             if thread_id == state.thread.id {
                 if state.running {
                     enqueue_message(state, store, text);
                     state.notice = Some(format!(
-                        "message queued for after this turn ({} waiting)",
+                        "steer not delivered ({reason}); queued for after this turn ({} waiting)",
                         state.queued_messages.len()
                     ));
                 } else {
                     // The turn ended before the harness took the steer. Run it
                     // now instead of leaving it in a queue no turn will drain.
                     submit(state, store, engine_command_sender, text);
-                    state.notice = Some("the turn ended; sending as a new message".into());
+                    let notice = if reason.contains("turn ended") {
+                        "the turn ended; sending as a new message".to_string()
+                    } else {
+                        format!("steer not delivered ({reason}); sending as a new message")
+                    };
+                    state.notice = Some(notice);
                 }
             }
         }
@@ -8654,6 +8659,7 @@ mod tests {
             EngineEvent::SteerRejected {
                 thread_id,
                 text: "follow up".into(),
+                reason: "the turn ended before the harness took the message".into(),
             },
             &engine_command_sender,
         );
@@ -8847,6 +8853,7 @@ mod tests {
             EngineEvent::SteerRejected {
                 thread_id,
                 text: "follow up".into(),
+                reason: "the turn ended before the harness took the message".into(),
             },
             &engine_command_sender,
         );
@@ -8865,6 +8872,32 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(state.notice.as_deref().unwrap_or("").contains("new message"));
+    }
+
+    #[test]
+    fn a_rejected_steer_shows_the_harness_reason() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.running = true;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let thread_id = state.thread.id.clone();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::SteerRejected {
+                thread_id,
+                text: "try again".into(),
+                reason: "codex app-server request timed out: turn/steer".into(),
+            },
+            &engine_command_sender,
+        );
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(
+            notice.contains("codex app-server request timed out"),
+            "the notice carries the harness reason: {notice}"
+        );
+        assert!(notice.contains("queued"));
     }
 
     #[test]

@@ -512,6 +512,7 @@ fn main_result() -> Result<()> {
             goal,
             max_tasks,
             plan_file,
+            plan_only,
             list,
             all,
             run,
@@ -678,7 +679,7 @@ fn main_result() -> Result<()> {
             let goal = goal.join(" ");
             if goal.trim().is_empty() {
                 anyhow::bail!(
-                    "usage: baton orchestrate <goal> | --list [--all] | --run <id> | --archive <run-id> | --integrate <run-id> | --open-prs <run-id>"
+                    "usage: baton orchestrate [--plan-only] <goal> | --list [--all] | --run <id> | --archive <run-id> | --integrate <run-id> | --open-prs <run-id>"
                 );
             }
             let provider = cli
@@ -692,6 +693,91 @@ fn main_result() -> Result<()> {
                 .clone()
                 .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
             let plan_path = plan_file.map(PathBuf::from);
+            if plan_only {
+                let plan = orchestrate::plan(
+                    &goal,
+                    &cwd,
+                    provider,
+                    &model,
+                    max_tasks,
+                    plan_path.as_deref(),
+                    permission_mode,
+                    None,
+                )?;
+                let dirty_source = worktree::repo_root(&cwd)
+                    .ok()
+                    .and_then(|root| worktree::is_dirty(&root).ok())
+                    .unwrap_or(false);
+                if json {
+                    let tasks = plan
+                        .tasks
+                        .iter()
+                        .map(|task| {
+                            let task_provider = ProviderId::parse(task.provider.trim())
+                                .unwrap_or(ProviderId::Codex);
+                            let effective_model = task.model.clone().unwrap_or_else(|| {
+                                resolved.for_provider(task_provider).model.clone()
+                            });
+                            serde_json::json!({
+                                "title": task.title,
+                                "provider": task_provider.as_str(),
+                                "model": effective_model,
+                                "model_override": task.model.is_some(),
+                                "prompt": task.prompt,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": orchestrate::SCHEMA_VERSION,
+                            "plan_only": true,
+                            "goal": goal,
+                            "coordinator": {
+                                "provider": provider.as_str(),
+                                "model": model,
+                            },
+                            "dirty_source": dirty_source,
+                            "summary": plan.summary,
+                            "tasks": tasks,
+                        }))?
+                    );
+                } else {
+                    println!("plan · {} worker(s)", plan.tasks.len());
+                    println!("goal: {goal}");
+                    println!("coordinator: {provider}/{model}");
+                    println!(
+                        "source: {}{}",
+                        cwd.display(),
+                        if dirty_source {
+                            " (dirty; workers branch from HEAD)"
+                        } else {
+                            ""
+                        }
+                    );
+                    if let Some(summary) = &plan.summary {
+                        println!("summary: {summary}");
+                    }
+                    for (index, task) in plan.tasks.iter().enumerate() {
+                        let task_provider = ProviderId::parse(task.provider.trim())
+                            .unwrap_or(ProviderId::Codex);
+                        let effective_model = task.model.clone().unwrap_or_else(|| {
+                            resolved.for_provider(task_provider).model.clone()
+                        });
+                        println!(
+                            "  [{}] {} · {}/{}",
+                            index + 1,
+                            task.title,
+                            task_provider,
+                            effective_model
+                        );
+                        if let Some(first) = task.prompt.lines().next() {
+                            println!("      {first}");
+                        }
+                    }
+                }
+                return Ok(());
+            }
             let report = if progress {
                 let sink = |event: orchestrate::OrchestrationProgress| {
                     eprintln!("{}", orchestrate::render_progress(&event));

@@ -102,6 +102,9 @@ pub enum Commands {
         /// Read a plan JSON file instead of asking the coordinator
         #[arg(long = "plan-file")]
         plan_file: Option<String>,
+        /// Print the resolved plan without creating a run or starting workers
+        #[arg(long = "plan-only", conflicts_with_all = ["list", "run", "archive", "integrate", "open_prs"])]
+        plan_only: bool,
         /// List recent orchestration runs
         #[arg(long, conflicts_with = "run")]
         list: bool,

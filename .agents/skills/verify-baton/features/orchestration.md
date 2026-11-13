@@ -24,6 +24,7 @@ forces orchestration. Set `"defaultMode": "single"` in `~/.baton/config.json` to
 
 ```sh
 baton orchestrate --max-tasks 3 "Audit billing, add tests, update docs"
+baton orchestrate --plan-only --max-tasks 3 "Audit billing, add tests, update docs"
 baton orchestrate --list
 baton orchestrate --list --all --json
 baton orchestrate --run <run-id> --json
@@ -88,6 +89,7 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 ## Gotchas
 - Worker worktrees branch from `HEAD`; uncommitted source changes are not in the worker checkout. The report sets `dirty_source`.
 - `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan. A task `model` overrides the provider config; omit it to use the configured default.
+- `--plan-only` resolves and prints the plan with effective models but creates no run, task rows, worktrees, or provider worker processes. Use it to review a coordinator plan or validate a plan file before spending worker turns.
 - A run with one success and one failure is `partial`; all failures is `failed` and exits non-zero.
 - Worktrees are kept for review under `$BATON_HOME/worktrees/<run>/<task>`. Successful workers commit their changes as `baton worker: <title>`; the report and `--run --json` expose the SHA. `--integrate` merges completed branches into a clean source checkout, aborts on conflict, and skips already-merged workers. Use `baton worktrees` to list managed worktrees; JSON includes `shipped`, and the text state shows `clean · shipped` for a branch with a PR. `baton worktrees --clean` removes clean worktrees whose branch is merged or shipped; dirty worktrees, and unmerged branches without a recorded PR, require `--force`.
 - `baton.json` `worktree.sharedDirectories` symlinks existing, gitignored directories such as `node_modules` or `target` into each worker worktree. Shared paths appear in the report; edits inside them affect the primary checkout.

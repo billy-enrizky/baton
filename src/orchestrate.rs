@@ -1345,6 +1345,44 @@ pub fn integrate_to_json(report: &IntegrateReport) -> serde_json::Value {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
+pub fn plan(
+    goal: &str,
+    cwd: &Path,
+    coordinator_provider: ProviderId,
+    coordinator_model: &str,
+    max_tasks: usize,
+    plan_path: Option<&Path>,
+    permission_mode: PermissionMode,
+    cancel: Option<&AtomicBool>,
+) -> Result<Plan> {
+    if max_tasks == 0 {
+        anyhow::bail!("max tasks must be at least 1");
+    }
+    if is_cancelled(cancel) {
+        anyhow::bail!(CANCELLED_ERROR);
+    }
+    match plan_path {
+        Some(path) => load_plan(path, max_tasks),
+        None if is_conversational_greeting(goal) => {
+            Ok(fallback_plan(goal, coordinator_provider))
+        }
+        None => {
+            let available = available_providers(coordinator_provider);
+            run_planner(
+                goal,
+                cwd,
+                coordinator_provider,
+                coordinator_model,
+                max_tasks,
+                permission_mode,
+                cancel,
+                &available,
+            )
+        }
+    }
+}
+
 pub fn run(
     goal: &str,
     cwd: &Path,
@@ -1457,23 +1495,16 @@ fn run_with_worker_bin_and_progress(
         .as_ref()
         .and_then(|root| worktree::is_dirty(root).ok())
         .unwrap_or(false);
-    let plan = match plan_path {
-        Some(path) => load_plan(path, max_tasks)?,
-        None if is_conversational_greeting(goal) => fallback_plan(goal, coordinator_provider),
-        None => {
-            let available = available_providers(coordinator_provider);
-            run_planner(
-                goal,
-                cwd,
-                coordinator_provider,
-                coordinator_model,
-                max_tasks,
-                permission_mode,
-                cancel,
-                &available,
-            )?
-        }
-    };
+    let plan = plan(
+        goal,
+        cwd,
+        coordinator_provider,
+        coordinator_model,
+        max_tasks,
+        plan_path,
+        permission_mode,
+        cancel,
+    )?;
     let run_id = uuid::Uuid::new_v4().to_string();
     let summary = plan.summary.clone();
     let owner_pid = std::process::id();
@@ -1874,6 +1905,56 @@ mod tests {
         assert!(is_conversational_greeting("thanks."));
         assert!(!is_conversational_greeting("hi, fix the tests"));
         assert!(!is_conversational_greeting("fix the bug"));
+    }
+
+    #[test]
+    fn plan_only_resolves_files_and_greetings_without_running_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.json");
+        std::fs::write(
+            &path,
+            r#"{"summary":"preview","tasks":[{"title":"worker","provider":"codex","model":"preview-model","prompt":"do it"}]}"#,
+        )
+        .unwrap();
+        let file_plan = plan(
+            "preview goal",
+            dir.path(),
+            ProviderId::Codex,
+            "coordinator-model",
+            4,
+            Some(&path),
+            PermissionMode::Default,
+            None,
+        )
+        .unwrap();
+        assert_eq!(file_plan.summary.as_deref(), Some("preview"));
+        assert_eq!(file_plan.tasks[0].model.as_deref(), Some("preview-model"));
+
+        let greeting = plan(
+            "hi",
+            dir.path(),
+            ProviderId::Claude,
+            "coordinator-model",
+            4,
+            None,
+            PermissionMode::Default,
+            None,
+        )
+        .unwrap();
+        assert_eq!(greeting.tasks.len(), 1);
+        assert_eq!(greeting.tasks[0].provider, "claude");
+
+        assert!(plan(
+            "goal",
+            dir.path(),
+            ProviderId::Codex,
+            "coordinator-model",
+            0,
+            Some(&path),
+            PermissionMode::Default,
+            None,
+        )
+        .is_err());
     }
 
     #[test]

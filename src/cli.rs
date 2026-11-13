@@ -88,6 +88,26 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Split a goal into worker tasks and run each harness in its own worktree
+    Orchestrate {
+        /// Goal for the coordinator to split
+        goal: Vec<String>,
+        /// Maximum number of worker tasks
+        #[arg(long, default_value_t = 4)]
+        max_tasks: usize,
+        /// Read a plan JSON file instead of asking the coordinator
+        #[arg(long = "plan-file")]
+        plan_file: Option<String>,
+        /// List recent orchestration runs
+        #[arg(long, conflicts_with = "run")]
+        list: bool,
+        /// Show tasks for an orchestration run id
+        #[arg(long, conflicts_with = "list")]
+        run: Option<String>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     /// Rewind a thread to before a turn
     Rewind {
         thread_id: Option<String>,

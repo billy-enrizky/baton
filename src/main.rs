@@ -1,4 +1,4 @@
-use baton::{adapters, checkpoints, cli, config, doctor, mcp, paths, process, provider_runtime, resume, runtime, scanner, status, store, tui, types, usage};
+use baton::{adapters, checkpoints, cli, config, doctor, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, scanner, status, store, tui, types, usage};
 
 use anyhow::Result;
 use clap::Parser;
@@ -483,6 +483,132 @@ fn main_result() -> Result<()> {
                     forked.current_model.as_deref().unwrap_or("default"),
                     if native_session.is_some() { " native" } else { "" },
                 );
+            }
+            Ok(())
+        }
+        cli::Commands::Orchestrate {
+            goal,
+            max_tasks,
+            plan_file,
+            list,
+            run,
+            json,
+        } => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            if list {
+                let runs = orchestrate::run_rows(&store, 20)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": orchestrate::SCHEMA_VERSION,
+                            "runs": runs.iter().map(|run| serde_json::json!({
+                                "run_id": run.id,
+                                "goal": run.goal,
+                                "status": run.status,
+                                "coordinator_provider": run.coordinator_provider.as_str(),
+                                "coordinator_model": run.coordinator_model,
+                                "summary": run.summary,
+                                "created_at": run.created_at,
+                                "finished_at": run.finished_at,
+                            })).collect::<Vec<_>>(),
+                        }))?
+                    );
+                } else if runs.is_empty() {
+                    println!("no orchestration runs yet");
+                } else {
+                    for run in runs {
+                        println!(
+                            "{}  {:<9}  {}/{}  {}",
+                            &run.id[..8.min(run.id.len())],
+                            run.status,
+                            run.coordinator_provider,
+                            run.coordinator_model,
+                            run.summary.unwrap_or_else(|| run.goal.clone())
+                        );
+                    }
+                }
+                return Ok(());
+            }
+            if let Some(run_id) = run {
+                let tasks = orchestrate::task_rows(&store, &run_id)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": orchestrate::SCHEMA_VERSION,
+                            "run_id": run_id,
+                            "tasks": tasks.iter().map(|task| serde_json::json!({
+                                "id": task.id,
+                                "title": task.title,
+                                "provider": task.provider.as_str(),
+                                "model": task.model,
+                                "status": task.status,
+                                "thread_id": task.thread_id,
+                                "text": task.text,
+                                "error": task.error,
+                                "worktree_path": task.worktree_path,
+                                "branch": task.branch,
+                                "created_at": task.created_at,
+                                "finished_at": task.finished_at,
+                            })).collect::<Vec<_>>(),
+                        }))?
+                    );
+                } else if tasks.is_empty() {
+                    println!("no tasks for run {run_id}");
+                } else {
+                    for task in tasks {
+                        println!(
+                            "{}  {:<9}  {}/{}  {}",
+                            task.id,
+                            task.status,
+                            task.provider,
+                            task.model,
+                            task.title
+                        );
+                        if let Some(worktree) = task.worktree_path {
+                            println!("  worktree: {worktree}");
+                        }
+                        if let Some(error) = task.error {
+                            println!("  error: {error}");
+                        }
+                    }
+                }
+                return Ok(());
+            }
+            let goal = goal.join(" ");
+            if goal.trim().is_empty() {
+                anyhow::bail!("usage: baton orchestrate <goal> | --list | --run <id>");
+            }
+            let provider = cli
+                .provider
+                .as_deref()
+                .and_then(ProviderId::parse)
+                .unwrap_or_else(|| default_provider_from_configs(&home, &cwd));
+            let resolved = resolve_config(&home, &cwd);
+            let model = cli
+                .model
+                .clone()
+                .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
+            let plan_path = plan_file.map(PathBuf::from);
+            let report = orchestrate::run(
+                &goal,
+                &cwd,
+                &home,
+                provider,
+                &model,
+                max_tasks,
+                plan_path.as_deref(),
+                &store,
+                permission_mode,
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&orchestrate::to_json(&report))?);
+            } else {
+                println!("{}", orchestrate::render(&report));
+            }
+            if report.status == "failed" {
+                std::process::exit(1);
             }
             Ok(())
         }

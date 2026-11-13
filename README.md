@@ -65,11 +65,28 @@ baton auth [provider] [subscription|api]
 baton diff <id> [turn]   # checkpoint diff against the working tree
 baton restore <id> <turn>
 baton rewind [-t id] --turn N [--native] [--json]  # remove a turn and later turns; Codex can revert natively
+baton orchestrate [--max-tasks N] [--plan-file path] [--json] "goal"  # coordinator + workers in worktrees
+baton orchestrate --list [--json]
+baton orchestrate --run <run-id> [--json]
 ```
 
 In the TUI: `/help /status /switch /model /mode /auth /new /fork /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /queue /turns /copy /clear /quit`. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn, press twice to exit. Drag in the transcript to select and copy rendered lines; `/copy` copies the latest assistant reply. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably. `/fork [--turn N] [title]` branches the conversation into a new thread; both threads share the same working tree, and the fork starts with a transcript handoff instead of the source provider session.
 
 For Codex, `baton fork --native` asks the Codex app-server for a native `thread/fork`, then attaches the new provider session to the baton fork. The source thread is unchanged, and `--turn N` forks through that completed provider turn. Without `--native`, baton copies the transcript and starts the fork with a handoff.
+
+## Orchestration
+
+`baton orchestrate` is a small Orca-style multi-agent loop. A coordinator harness receives the goal, splits it into independent tasks, and chooses the best available harness for each task. Baton then creates a real git worktree per worker under `~/.baton/worktrees/<run>/<task>`, runs each worker through the normal `baton exec` path in parallel, and records the run and task results durably.
+
+```sh
+baton --yolo orchestrate --max-tasks 3 "Audit billing settings, add the missing tests, and update the docs"
+baton orchestrate --list
+baton orchestrate --run <run-id> --json
+```
+
+Workers are ordinary baton threads in their own worktrees, so they keep the same turn phases, adapter lifecycle, process tracking, and native-session behavior as single-thread runs. The global `--yolo`, `--full-auto`, and `--plan` flags apply to the coordinator and worker processes. Use `--plan-file` to supply a plan directly, which is useful for agents and repeatable tests. The coordinator retries once if its first plan is not valid JSON.
+
+Worktrees are kept after the run for review. Baton does not merge worker branches or clean them up automatically yet. A dirty source checkout is branched from `HEAD`, so uncommitted source changes are not present in worker worktrees.
 
 ## MCP
 

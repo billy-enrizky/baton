@@ -10,5 +10,6 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Native fork | CLI | `baton fork --native` attaches a Codex native session to the fork |
 | Native rewind | CLI | `baton rewind --native` truncates Codex history and keeps the session |
 | Process registry | CLI | `baton ps --json` returns a stable schema and no false live processes |
+| Orchestration | CLI | `baton orchestrate` creates worktrees, runs harnesses, and records runs |
 
 Start with the feature touched by the change. One real journey is enough for a smoke proof; the map exists so a broader change can cover the rest.

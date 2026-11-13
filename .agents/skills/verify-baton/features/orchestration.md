@@ -33,7 +33,7 @@ In the TUI:
 /orchestrate --max-tasks 3 Audit billing, add tests, update docs
 ```
 
-The transcript shows a live per-worker list while the run is active: queued, running, completed with commit, or failed with the error. `--progress` prints the same lines to stderr. When it
+The transcript shows a live per-worker list while the run is active: queued, running, completed with commit, failed with the error, or cancelled. Ctrl+C cancels the run and terminates the worker process groups. `--progress` prints the same lines to stderr. When it
 finishes, the full-screen report lists each worker. Up/Down selects a worker,
 Enter opens that worker's thread (with its worktree as cwd), PageUp/PageDown
 scrolls, and Esc closes the report. `/clear` also dismisses it. Press `i` to

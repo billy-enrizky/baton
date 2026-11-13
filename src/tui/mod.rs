@@ -6,6 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -263,6 +264,8 @@ pub struct TuiState {
     transcript_total: std::cell::Cell<usize>,
     model_request_id: u64,
     orchestration_pending: bool,
+    orchestration_cancel: Arc<AtomicBool>,
+    orchestration_cancelling: bool,
     orchestration_workers: Vec<OrchestrationWorkerView>,
     orchestration_report: Option<RunReport>,
     orchestration_scroll: usize,
@@ -346,6 +349,8 @@ pub fn run_tui(
         transcript_total: std::cell::Cell::new(0),
         model_request_id: 0,
         orchestration_pending: false,
+        orchestration_cancel: Arc::new(AtomicBool::new(false)),
+        orchestration_cancelling: false,
         orchestration_workers: Vec::new(),
         orchestration_report: None,
         orchestration_scroll: 0,
@@ -809,6 +814,7 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
     match event {
         OrchestrationEvent::Done(report) => {
             state.orchestration_pending = false;
+            state.orchestration_cancelling = false;
             state.orchestration_workers.clear();
             state.orchestration_scroll = 0;
             let mut summary = format!(
@@ -830,21 +836,34 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
                 }
             }
             record_orchestration_message(state, summary);
-            state.notice = Some(format!(
-                "orchestration {}: {} worker(s)",
-                report.status,
-                report.tasks.len()
-            ));
+            state.notice = Some(if report.status == "cancelled" {
+                format!(
+                    "orchestration cancelled: {} worker(s)",
+                    report.tasks.len()
+                )
+            } else {
+                format!(
+                    "orchestration {}: {} worker(s)",
+                    report.status,
+                    report.tasks.len()
+                )
+            });
             state.orchestration_report = Some(*report);
         }
         OrchestrationEvent::Failed(error) => {
             state.orchestration_pending = false;
+            state.orchestration_cancelling = false;
             state.orchestration_workers.clear();
             state.orchestration_report = None;
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
-            record_orchestration_message(state, format!("run failed · {error}"));
-            state.notice = Some(format!("orchestration failed: {error}"));
+            if error == orchestrate::CANCELLED_ERROR {
+                record_orchestration_message(state, "run cancelled".to_string());
+                state.notice = Some("orchestration cancelled".into());
+            } else {
+                record_orchestration_message(state, format!("run failed · {error}"));
+                state.notice = Some(format!("orchestration failed: {error}"));
+            }
         }
         OrchestrationEvent::Progress(progress) => match progress {
             OrchestrationProgress::PlanReady { tasks, .. } => {
@@ -1118,12 +1137,16 @@ fn start_orchestration(
     let goal_message = format!("goal · {effective_goal}");
     record_orchestration_message(state, goal_message);
     state.orchestration_pending = true;
+    state.orchestration_cancelling = false;
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.orchestration_cancel = cancel.clone();
     state.orchestration_workers.clear();
     state.orchestration_report = None;
     state.orchestration_scroll = 0;
     state.notice = Some("orchestrating: coordinator planning...".into());
     let sender = state.orchestration_sender.clone();
     std::thread::spawn(move || {
+        let cancel_for_run = cancel.clone();
         let progress_sender = std::sync::Mutex::new(sender.clone());
         let progress = move |event: OrchestrationProgress| {
             if let Ok(sender) = progress_sender.lock() {
@@ -1142,6 +1165,7 @@ fn start_orchestration(
                 &store,
                 permission_mode,
                 Some(&progress as &orchestrate::ProgressFn<'_>),
+                Some(cancel_for_run.as_ref()),
             )
         });
         let event = match result {
@@ -1316,9 +1340,9 @@ fn handle_key(
             return;
         }
         if state.orchestration_pending {
-            state.notice = Some(
-                "orchestration is running; wait for the report before exiting".into(),
-            );
+            state.orchestration_cancel.store(true, Ordering::Relaxed);
+            state.orchestration_cancelling = true;
+            state.notice = Some("cancelling orchestration...".into());
             return;
         }
         let now = Instant::now();
@@ -3524,6 +3548,7 @@ fn draw_orchestration_report(
         task_starts.push(lines.len());
         let (marker, status_color) = match task.status.as_str() {
             "completed" => ("✓", COLORS.success),
+            "cancelled" => ("⊘", COLORS.warning),
             "failed" => ("✗", COLORS.error),
             "running" => ("◐", COLORS.accent),
             _ => ("·", COLORS.muted),
@@ -4388,12 +4413,25 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         all_lines.push(Line::from(vec![
             Span::styled(spinner, Style::default().fg(COLORS.secondary)),
             Span::raw(" "),
-            Span::styled("Orchestrating", Style::default().fg(COLORS.secondary)),
+            Span::styled(
+                if state.orchestration_cancelling {
+                    "Cancelling orchestration"
+                } else {
+                    "Orchestrating"
+                },
+                Style::default().fg(if state.orchestration_cancelling {
+                    COLORS.warning
+                } else {
+                    COLORS.secondary
+                }),
+            ),
         ]));
         live_lines += 1;
         for worker in &state.orchestration_workers {
             let (marker, color) = if worker.status.starts_with("completed") {
                 ("✓", COLORS.success)
+            } else if worker.status == "cancelled" {
+                ("⊘", COLORS.warning)
             } else if worker.status == "failed" {
                 ("✗", COLORS.error)
             } else if worker.status == "running" {
@@ -4971,6 +5009,8 @@ mod tests {
             transcript_total: std::cell::Cell::new(0),
             model_request_id: 0,
             orchestration_pending: false,
+            orchestration_cancel: Arc::new(AtomicBool::new(false)),
+            orchestration_cancelling: false,
             orchestration_workers: Vec::new(),
             orchestration_report: None,
             orchestration_scroll: 0,
@@ -6852,7 +6892,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_does_not_exit_while_orchestration_is_running() {
+    fn ctrl_c_cancels_orchestration_without_exiting() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
@@ -6871,12 +6911,14 @@ mod tests {
         );
         assert!(!state.quit);
         assert!(state.exit_armed.is_none());
+        assert!(state.orchestration_cancelling);
+        assert!(state.orchestration_cancel.load(Ordering::Relaxed));
         assert!(
             state
                 .notice
                 .as_deref()
                 .unwrap_or("")
-                .contains("wait for the report"),
+                .contains("cancelling orchestration"),
             "notice: {:?}",
             state.notice
         );

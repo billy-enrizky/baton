@@ -4,8 +4,11 @@
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use crate::config::resolve_config;
 use crate::store::{BatonStore, OrchestrationRunRow, OrchestrationTaskRow};
@@ -13,6 +16,87 @@ use crate::types::{PermissionMode, ProviderId};
 use crate::worktree::{self, WorktreeInfo};
 
 pub const SCHEMA_VERSION: u32 = 1;
+pub const CANCELLED_ERROR: &str = "orchestration cancelled";
+
+fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
+    cancel
+        .map(|cancel| cancel.load(Ordering::Relaxed))
+        .unwrap_or(false)
+}
+
+struct CommandResult {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    cancelled: bool,
+}
+
+/// Runs a provider command in its own process group. The poll loop lets a
+/// cancellation reach the whole group, including the provider child that
+/// `baton exec` started.
+fn run_command_cancellable(
+    mut command: Command,
+    cancel: Option<&AtomicBool>,
+) -> std::io::Result<CommandResult> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pgid = child.id();
+    let stdout = child.stdout.take().map(|mut stream| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stream.read_to_end(&mut buffer);
+            buffer
+        })
+    });
+    let stderr = child.stderr.take().map(|mut stream| {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stream.read_to_end(&mut buffer);
+            buffer
+        })
+    });
+    let mut cancelled = false;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        if is_cancelled(cancel) {
+            cancelled = true;
+            #[cfg(unix)]
+            {
+                if !crate::process::terminate_group(pgid) {
+                    let _ = child.kill();
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = child.kill();
+            }
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let status = child.wait()?;
+    let stdout = stdout
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    let stderr = stderr
+        .map(|handle| handle.join().unwrap_or_default())
+        .unwrap_or_default();
+    Ok(CommandResult {
+        status,
+        stdout,
+        stderr,
+        cancelled,
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanTask {
@@ -210,6 +294,7 @@ fn run_coordinator(
     provider: ProviderId,
     model: &str,
     permission_mode: PermissionMode,
+    cancel: Option<&AtomicBool>,
 ) -> Result<String> {
     let temp_home = std::env::temp_dir().join(format!("baton-planner-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&temp_home)?;
@@ -225,9 +310,13 @@ fn run_coordinator(
         .arg(model)
         .arg("--json");
     apply_permission_args(&mut command, permission_mode);
-    let output = command.arg(prompt).env("BATON_HOME", &temp_home).output();
+    command.arg(prompt).env("BATON_HOME", &temp_home);
+    let output = run_command_cancellable(command, cancel);
     let _ = std::fs::remove_dir_all(&temp_home);
     let output = output?;
+    if output.cancelled {
+        anyhow::bail!(CANCELLED_ERROR);
+    }
     let (_, text, error, _) = parse_exec_output(&output.stdout, &output.stderr);
     if !output.status.success() && text.is_none() {
         anyhow::bail!(
@@ -245,6 +334,7 @@ fn run_planner(
     model: &str,
     max_tasks: usize,
     permission_mode: PermissionMode,
+    cancel: Option<&AtomicBool>,
 ) -> Result<Plan> {
     let base_prompt = planner_prompt(goal, cwd, max_tasks);
     let mut last_error = None;
@@ -256,7 +346,14 @@ fn run_planner(
                 "{base_prompt}\nYour previous response was not valid JSON. Return only the JSON object."
             )
         };
-        let text = run_coordinator(&prompt, cwd, provider, model, permission_mode)?;
+        let text = run_coordinator(
+            &prompt,
+            cwd,
+            provider,
+            model,
+            permission_mode,
+            cancel,
+        )?;
         if std::env::var_os("BATON_ORCHESTRATE_DEBUG").is_some() {
             eprintln!("[orchestrate] planner text (attempt {}): {text}", attempt + 1);
         }
@@ -312,6 +409,7 @@ fn run_worker(
     repo_root: Option<&Path>,
     worker_bin: Option<&Path>,
     progress: Option<&ProgressFn<'_>>,
+    cancel: Option<&AtomicBool>,
     permission_mode: PermissionMode,
 ) -> (usize, WorkerResult) {
     let (index, result) = run_worker_inner(
@@ -323,6 +421,7 @@ fn run_worker(
         repo_root,
         worker_bin,
         progress,
+        cancel,
         permission_mode,
     );
     emit(
@@ -347,12 +446,33 @@ fn run_worker_inner(
     repo_root: Option<&Path>,
     worker_bin: Option<&Path>,
     progress: Option<&ProgressFn<'_>>,
+    cancel: Option<&AtomicBool>,
     permission_mode: PermissionMode,
 ) -> (usize, WorkerResult) {
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     let provider = ProviderId::parse(task.provider.trim()).unwrap_or(ProviderId::Codex);
     let resolved = resolve_config(home, cwd);
     let model = resolved.for_provider(provider).model.clone();
+    if is_cancelled(cancel) {
+        return (
+            index,
+            WorkerResult {
+                id: uuid::Uuid::new_v4().to_string(),
+                title: task.title.clone(),
+                provider,
+                model,
+                prompt: task.prompt.clone(),
+                worktree: None,
+                commit: None,
+                thread_id: None,
+                status: "cancelled".to_string(),
+                text: None,
+                error: None,
+                created_at: created_at.clone(),
+                finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            },
+        );
+    }
     let worktree = match repo_root {
         Some(root) => match worktree::create(home, root, run_id, &task.title) {
             Ok(worktree) => Some(worktree),
@@ -409,29 +529,25 @@ fn run_worker_inner(
         .arg(&model)
         .arg("--json");
     apply_permission_args(&mut command, permission_mode);
-    let output = command
-        .arg(&effective_prompt)
-        .env("BATON_HOME", home)
-        .output();
-    let (thread_id, text, error, _phase) = match output {
-        Ok(output) => {
+    command.arg(&effective_prompt).env("BATON_HOME", home);
+    let output = run_command_cancellable(command, cancel);
+    let (thread_id, text, error, _phase, cancelled) = match output {
+        Ok(result) => {
             let (thread_id, text, error, phase) =
-                parse_exec_output(&output.stdout, &output.stderr);
-            let ok = output.status.success() && phase.as_deref() == Some("completed");
-            (
-                thread_id,
-                text,
-                if ok {
-                    None
-                } else {
-                    error.or_else(|| Some(format!("worker exited with {}", output.status)))
-                },
-                phase,
-            )
+                parse_exec_output(&result.stdout, &result.stderr);
+            let ok = result.status.success() && phase.as_deref() == Some("completed");
+            let error = if result.cancelled || ok {
+                None
+            } else {
+                error.or_else(|| Some(format!("worker exited with {}", result.status)))
+            };
+            (thread_id, text, error, phase, result.cancelled)
         }
-        Err(error) => (None, None, Some(format!("cannot run worker: {error}")), None),
+        Err(error) => (None, None, Some(format!("cannot run worker: {error}")), None, false),
     };
-    let mut status = if error.is_none() {
+    let mut status = if cancelled {
+        "cancelled"
+    } else if error.is_none() {
         "completed"
     } else {
         "failed"
@@ -750,6 +866,7 @@ pub fn run(
         store,
         permission_mode,
         None,
+        None,
     )
 }
 
@@ -765,6 +882,7 @@ pub fn run_with_progress(
     store: &BatonStore,
     permission_mode: PermissionMode,
     progress: Option<&ProgressFn<'_>>,
+    cancel: Option<&AtomicBool>,
 ) -> Result<RunReport> {
     run_with_worker_bin_and_progress(
         goal,
@@ -777,6 +895,7 @@ pub fn run_with_progress(
         store,
         None,
         progress,
+        cancel,
         permission_mode,
     )
 }
@@ -806,6 +925,7 @@ fn run_with_worker_bin(
         store,
         worker_bin,
         None,
+        None,
         permission_mode,
     )
 }
@@ -822,10 +942,14 @@ fn run_with_worker_bin_and_progress(
     store: &BatonStore,
     worker_bin: Option<&Path>,
     progress: Option<&ProgressFn<'_>>,
+    cancel: Option<&AtomicBool>,
     permission_mode: PermissionMode,
 ) -> Result<RunReport> {
     if max_tasks == 0 {
         anyhow::bail!("max tasks must be at least 1");
+    }
+    if is_cancelled(cancel) {
+        anyhow::bail!(CANCELLED_ERROR);
     }
     let repo_root = worktree::repo_root(cwd).ok();
     let dirty_source = repo_root
@@ -841,6 +965,7 @@ fn run_with_worker_bin_and_progress(
             coordinator_model,
             max_tasks,
             permission_mode,
+            cancel,
         )?,
     };
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -893,6 +1018,7 @@ fn run_with_worker_bin_and_progress(
                         repo_root.as_deref(),
                         worker_bin.as_deref(),
                         progress,
+                        cancel,
                         permission_mode,
                     )
                 });
@@ -944,7 +1070,10 @@ fn run_with_worker_bin_and_progress(
         tasks.push(task);
     }
     let completed = tasks.iter().filter(|task| task.status == "completed").count();
-    let status = if completed == tasks.len() {
+    let cancelled = tasks.iter().any(|task| task.status == "cancelled");
+    let status = if cancelled {
+        "cancelled"
+    } else if completed == tasks.len() {
         "completed"
     } else if completed == 0 {
         "failed"
@@ -1130,6 +1259,15 @@ mod tests {
         worker_body: &str,
         progress: Option<&ProgressFn<'_>>,
     ) -> (tempfile::TempDir, tempfile::TempDir, BatonStore, RunReport) {
+        run_fixture_with_control(plan, worker_body, progress, None)
+    }
+
+    fn run_fixture_with_control(
+        plan: &str,
+        worker_body: &str,
+        progress: Option<&ProgressFn<'_>>,
+        cancel: Option<std::sync::Arc<AtomicBool>>,
+    ) -> (tempfile::TempDir, tempfile::TempDir, BatonStore, RunReport) {
         let repo = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
             let output = Command::new("git").args(args).current_dir(repo.path()).output().unwrap();
@@ -1146,6 +1284,29 @@ mod tests {
         let plan_path = home.path().join("plan.json");
         std::fs::write(&plan_path, plan).unwrap();
         let store = BatonStore::memory().unwrap();
+        let cancel_watcher = cancel.clone().map(|cancel| {
+            let home = home.path().to_path_buf();
+            std::thread::spawn(move || {
+                let deadline = std::time::Instant::now()
+                    + std::time::Duration::from_secs(20);
+                while std::time::Instant::now() < deadline {
+                    if let Ok(runs) = std::fs::read_dir(home.join("worktrees")) {
+                        for run in runs.flatten() {
+                            if let Ok(tasks) = std::fs::read_dir(run.path()) {
+                                for task in tasks.flatten() {
+                                    if task.path().join("worker.pid").is_file() {
+                                        cancel.store(true, Ordering::Relaxed);
+                                        return;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                cancel.store(true, Ordering::Relaxed);
+            })
+        });
         let report = run_with_worker_bin_and_progress(
             "test goal",
             repo.path(),
@@ -1157,9 +1318,13 @@ mod tests {
             &store,
             Some(&worker),
             progress,
+            cancel.as_deref(),
             PermissionMode::Default,
         )
         .unwrap();
+        if let Some(watcher) = cancel_watcher {
+            watcher.join().unwrap();
+        }
         (repo, home, store, report)
     }
 
@@ -1219,6 +1384,40 @@ mod tests {
             error: None,
         });
         assert_eq!(finished, "[1] completed first · commit 01234567");
+    }
+
+    #[test]
+    fn cancellation_stops_the_worker_group_and_marks_the_run_cancelled() {
+        let plan = r#"{"summary":"one worker","tasks":[{"title":"long task","provider":"codex","prompt":"wait"}]}"#;
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let (_repo, _home, store, report) = run_fixture_with_control(
+            plan,
+            "echo $$ > worker.pid; sleep 30",
+            None,
+            Some(cancel),
+        );
+        assert_eq!(report.status, "cancelled");
+        assert_eq!(report.tasks[0].status, "cancelled");
+        let worktree = report.tasks[0]
+            .worktree
+            .as_ref()
+            .expect("the worker had time to create its worktree");
+        let pid: u32 = std::fs::read_to_string(worktree.path.join("worker.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(!alive, "the worker process group is gone");
+        let tasks = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert_eq!(tasks[0].status, "cancelled");
+        let runs = store.list_orchestration_runs(10).unwrap();
+        assert_eq!(runs[0].status, "cancelled");
     }
 
     #[test]

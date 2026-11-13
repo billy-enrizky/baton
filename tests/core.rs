@@ -196,6 +196,76 @@ fn worker_followup_updates_task_and_clears_merge_and_pr_markers() {
 }
 
 #[test]
+fn worker_failure_without_a_commit_updates_task_and_run_status() {
+    let store = BatonStore::memory().unwrap();
+    store
+        .create_orchestration_run(
+            "run-failure",
+            "goal",
+            ProviderId::Codex,
+            "model",
+            None,
+            "{}",
+            false,
+        )
+        .unwrap();
+    store
+        .add_orchestration_task(
+            "task-failure",
+            "run-failure",
+            1,
+            "worker task",
+            ProviderId::Codex,
+            "model",
+            "prompt",
+            Some("/tmp/worktree"),
+            Some("baton/run-failure/worker-task"),
+            None,
+            Some("thread-failure"),
+            "completed",
+            None,
+            None,
+            "now",
+            Some("now"),
+        )
+        .unwrap();
+    store
+        .finish_orchestration_run("run-failure", "completed")
+        .unwrap();
+
+    store
+        .update_orchestration_task_failure(
+            "task-failure",
+            "failed",
+            Some("last attempt"),
+            "boom",
+        )
+        .unwrap();
+    store.refresh_orchestration_run_status("run-failure").unwrap();
+    let task = store
+        .orchestration_task_for_thread("thread-failure")
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.status, "failed");
+    assert_eq!(task.error.as_deref(), Some("boom"));
+    assert_eq!(task.text.as_deref(), Some("last attempt"));
+    assert!(task.commit_sha.is_none());
+    assert_eq!(
+        store.list_orchestration_runs(10).unwrap()[0].status,
+        "failed"
+    );
+
+    store
+        .update_orchestration_task_failure("task-failure", "cancelled", None, "interrupted")
+        .unwrap();
+    store.refresh_orchestration_run_status("run-failure").unwrap();
+    assert_eq!(
+        store.list_orchestration_runs(10).unwrap()[0].status,
+        "cancelled"
+    );
+}
+
+#[test]
 fn store_crud_and_thread_lifecycle() {
     let store = BatonStore::memory().unwrap();
     let thread = store

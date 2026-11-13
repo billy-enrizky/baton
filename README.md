@@ -56,7 +56,7 @@ baton                    # fresh orchestrated session in the TUI
 baton --mode single      # fresh session on one harness
 baton -t <id>            # open an existing thread and its saved session mode
 baton threads [--json]   # list threads with phase, turns, goal, queue
-baton status [-t id] [--json]  # phase, goal, queue, usage
+baton status [-t id] [--json]  # plain-language next step, phase, goal, queue, usage
 baton turns [-t id] [--json]   # full durable turn history
 baton queue [-t id] [--clear] [--json]  # inspect/clear queued follow-ups
 baton search <query> [--all] [--json]  # search thread titles and conversation text

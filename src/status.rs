@@ -76,14 +76,30 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
         "queue": status.queued,
         "queue_count": status.queued.len(),
         "usage": status.usage,
+        "next_action": next_action(status),
         "open_turn": open_turn,
         "stale_hint": stale_hint,
     })
 }
 
+/// One plain-language answer to "what do I do now?" for humans and agents.
+pub fn next_action(status: &ThreadStatus) -> &'static str {
+    match status.latest_turn.as_ref().map(|turn| turn.phase) {
+        None => "ready for the first message",
+        Some(TurnPhase::Queued) => "waiting to start",
+        Some(TurnPhase::Running) => "working; wait or interrupt with Ctrl+C",
+        Some(TurnPhase::Settling) => "finishing up",
+        Some(TurnPhase::Completed) => "ready for the next message",
+        Some(TurnPhase::Failed) => "read the error, then send another message",
+        Some(TurnPhase::Interrupted) => "send another message to continue",
+        Some(TurnPhase::Unverified) => "check the running baton process; this turn is reconciled on next open",
+    }
+}
+
 pub fn render(status: &ThreadStatus) -> String {
     let mut lines = Vec::new();
     lines.push(format!("thread: {}  {}", status.thread_id, status.title));
+    lines.push(format!("now: {}", next_action(status)));
     lines.push(format!("provider: {}/{}", status.provider, status.model));
     if let Some(effort) = &status.reasoning_effort {
         lines.push(format!("effort: {effort}"));
@@ -170,6 +186,7 @@ mod tests {
     fn renders_stable_lines_for_agents() {
         let text = render(&status());
         assert!(text.contains("thread: thread-1  fix login"));
+        assert!(text.contains("now: read the error, then send another message"));
         assert!(text.contains("provider: codex/model-1"));
         assert!(text.contains("effort: high"));
         assert!(text.contains("mode: plan"));
@@ -195,8 +212,33 @@ mod tests {
         assert_eq!(value["turn_count"], 3);
         assert_eq!(value["queue_count"], 2);
         assert_eq!(value["queue"][0], "follow up");
+        assert_eq!(value["next_action"], "read the error, then send another message");
         assert_eq!(value["open_turn"], false);
         assert_eq!(value["stale_hint"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn next_action_covers_every_phase() {
+        let mut value = status();
+        let template = value.latest_turn.clone().expect("test status has a turn");
+        value.latest_turn = None;
+        assert_eq!(next_action(&value), "ready for the first message");
+        value.latest_turn = Some(template);
+        for (phase, expected) in [
+            (TurnPhase::Queued, "waiting to start"),
+            (TurnPhase::Running, "working; wait or interrupt with Ctrl+C"),
+            (TurnPhase::Settling, "finishing up"),
+            (TurnPhase::Completed, "ready for the next message"),
+            (TurnPhase::Failed, "read the error, then send another message"),
+            (TurnPhase::Interrupted, "send another message to continue"),
+            (
+                TurnPhase::Unverified,
+                "check the running baton process; this turn is reconciled on next open",
+            ),
+        ] {
+            value.latest_turn.as_mut().unwrap().phase = phase;
+            assert_eq!(next_action(&value), expected);
+        }
     }
 
     #[test]
@@ -222,6 +264,7 @@ mod tests {
         value.usage = None;
         let text = render(&value);
         assert!(text.contains("goal: none"));
+        assert!(text.contains("now: ready for the first message"));
         assert!(text.contains("turn: none"));
         assert!(text.contains("queue: empty"));
         assert!(!text.contains("usage:"));

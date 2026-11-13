@@ -122,6 +122,26 @@ Common
 
 /help all  every command · shift+enter newline · up/down history";
 
+#[derive(Debug, Clone)]
+struct ThreadChoice {
+    id: String,
+    title: String,
+    status: String,
+}
+
+fn short_thread_status(phase: Option<TurnPhase>) -> &'static str {
+    match phase {
+        None => "new",
+        Some(TurnPhase::Queued) => "queued",
+        Some(TurnPhase::Running) => "working",
+        Some(TurnPhase::Settling) => "finishing",
+        Some(TurnPhase::Completed) => "ready",
+        Some(TurnPhase::Failed) => "failed",
+        Some(TurnPhase::Interrupted) => "stopped",
+        Some(TurnPhase::Unverified) => "check",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ToolLine {
     id: Option<String>,
@@ -258,7 +278,7 @@ enum Overlay {
     SkillsPicker { selected: usize, skills: Vec<(String, String)> },
     ModePicker { selected: usize },
     AuthPicker { selected: usize },
-    ThreadPicker { selected: usize, threads: Vec<(String, String)> },
+    ThreadPicker { selected: usize, threads: Vec<ThreadChoice> },
     CheckpointPicker { selected: usize, checkpoints: Vec<(i64, String)> },
     DirtyConfirm { goal: String, max_tasks: usize, plan_file: Option<String> },
     OrchestrationPreview { preview: Box<OrchestrationPreview> },
@@ -2232,7 +2252,8 @@ fn handle_key(
                 }
             }
             KeyCode::Enter => {
-                if let Some((thread_id, _)) = threads.get(selected) {
+                if let Some(choice) = threads.get(selected) {
+                    let thread_id = &choice.id;
                     let found = {
                         let guard = store.lock().unwrap();
                         guard.list_threads(None).unwrap_or_default().into_iter()
@@ -4198,14 +4219,26 @@ fn handle_command(
             ));
         }
         "/threads" => {
-            let threads: Vec<(String, String)> = {
+            let threads: Vec<ThreadChoice> = {
                 let guard = store.lock().unwrap();
                 guard
                     .list_threads_for_path(std::path::Path::new(&state.thread.cwd))
                     .unwrap_or_default()
                     .into_iter()
                     .take(20)
-                    .map(|thread| (thread.id[..8].to_string(), thread.title))
+                    .map(|thread| {
+                        let status = guard
+                            .list_turn_records(&thread.id)
+                            .ok()
+                            .map(|turns| short_thread_status(turns.last().map(|turn| turn.phase)))
+                            .unwrap_or("new")
+                            .to_string();
+                        ThreadChoice {
+                            id: thread.id[..8].to_string(),
+                            title: thread.title,
+                            status,
+                        }
+                    })
                     .collect()
             };
             if threads.is_empty() {
@@ -4238,14 +4271,26 @@ fn handle_command(
                     None => state.notice = Some(format!("no thread matches \"{prefix}\"")),
                 }
             } else {
-                let threads: Vec<(String, String)> = {
+                let threads: Vec<ThreadChoice> = {
                     let guard = store.lock().unwrap();
                     guard
                         .list_threads(None)
                         .unwrap_or_default()
                         .into_iter()
                         .take(20)
-                        .map(|thread| (thread.id[..8].to_string(), thread.title))
+                        .map(|thread| {
+                            let status = guard
+                                .list_turn_records(&thread.id)
+                                .ok()
+                                .map(|turns| short_thread_status(turns.last().map(|turn| turn.phase)))
+                                .unwrap_or("new")
+                                .to_string();
+                            ThreadChoice {
+                                id: thread.id[..8].to_string(),
+                                title: thread.title,
+                                status,
+                            }
+                        })
                         .collect()
                 };
                 if threads.is_empty() {
@@ -5497,18 +5542,21 @@ fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_thread_picker(frame: &mut ratatui::Frame, area: Rect, threads: &[(String, String)], selected: usize) {
+fn draw_thread_picker(frame: &mut ratatui::Frame, area: Rect, threads: &[ThreadChoice], selected: usize) {
     let mut lines: Vec<Line> = vec![Line::styled(
         "threads · enter open · esc close",
         Style::default().fg(COLORS.muted),
     )];
-    for (index, (thread_id, title)) in threads.iter().take(8).enumerate() {
+    for (index, choice) in threads.iter().take(8).enumerate() {
         let style = if index == selected {
             Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
-        lines.push(Line::styled(format!("❯ {thread_id}  {title}"), style));
+        lines.push(Line::styled(
+            format!("❯ {}  {}  [{}]", choice.id, choice.title, choice.status),
+            style,
+        ));
     }
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -8731,7 +8779,11 @@ mod tests {
         }
         state.overlay = Overlay::ThreadPicker {
             selected: 0,
-            threads: vec![(other.id.clone(), other.title.clone())],
+            threads: vec![ThreadChoice {
+                id: other.id.clone(),
+                title: other.title.clone(),
+                status: "new".to_string(),
+            }],
         };
         handle_key(
             &mut state,
@@ -8899,6 +8951,35 @@ mod tests {
         assert_eq!(state.thread.id, source_id);
         let worktrees = home.path().join("worktrees");
         assert!(!worktrees.exists() || std::fs::read_dir(worktrees).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn thread_picker_renders_the_status_label() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::ThreadPicker {
+            selected: 0,
+            threads: vec![ThreadChoice {
+                id: "12345678".to_string(),
+                title: "fix login".to_string(),
+                status: "failed".to_string(),
+            }],
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("12345678  fix login  [failed]"), "{text}");
+    }
+
+    #[test]
+    fn thread_picker_status_covers_every_phase() {
+        assert_eq!(short_thread_status(None), "new");
+        assert_eq!(short_thread_status(Some(TurnPhase::Queued)), "queued");
+        assert_eq!(short_thread_status(Some(TurnPhase::Running)), "working");
+        assert_eq!(short_thread_status(Some(TurnPhase::Settling)), "finishing");
+        assert_eq!(short_thread_status(Some(TurnPhase::Completed)), "ready");
+        assert_eq!(short_thread_status(Some(TurnPhase::Failed)), "failed");
+        assert_eq!(short_thread_status(Some(TurnPhase::Interrupted)), "stopped");
+        assert_eq!(short_thread_status(Some(TurnPhase::Unverified)), "check");
     }
 
     #[test]

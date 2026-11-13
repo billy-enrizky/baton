@@ -1,6 +1,6 @@
 use baton::handoff::{build_handoff, wrap_prompt_with_handoff, HandoffMessage};
 use baton::store::{BatonStore, ImportedMessage, NewThread};
-use baton::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
+use baton::types::{PermissionMode, ProviderId, SessionMode, TurnPhase, TurnUsage};
 use baton::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 use baton::scanner::{parse_claude_transcript, parse_codex_transcript};
 use std::io::Write;
@@ -13,6 +13,37 @@ fn message(role: &str, text: &str) -> HandoffMessage {
         model: if role == "assistant" { Some("m".to_string()) } else { None },
         text: text.to_string(),
     }
+}
+
+#[test]
+fn draft_thread_persists_its_session_mode() {
+    let store = BatonStore::memory().unwrap();
+    let mut thread = store.draft_thread(NewThread {
+        title: "orchestrate".to_string(),
+        cwd: "/tmp/project".to_string(),
+        current_provider: ProviderId::Codex,
+        current_model: None,
+    });
+    thread.session_mode = SessionMode::Orchestrate;
+    baton::runtime::ensure_persisted(&store, &mut thread).unwrap();
+    assert_eq!(
+        store.get_thread(&thread.id).unwrap().unwrap().session_mode,
+        SessionMode::Orchestrate
+    );
+}
+
+#[test]
+fn default_session_mode_is_orchestrate_and_config_can_opt_out() {
+    let home = tempfile::tempdir().unwrap();
+    assert_eq!(
+        baton::config::get_default_session_mode(home.path()),
+        SessionMode::Orchestrate
+    );
+    std::fs::write(home.path().join("config.json"), r#"{"defaultMode":"single"}"#).unwrap();
+    assert_eq!(
+        baton::config::get_default_session_mode(home.path()),
+        SessionMode::Single
+    );
 }
 
 #[test]
@@ -29,6 +60,15 @@ fn store_crud_and_thread_lifecycle() {
     assert_eq!(store.get_thread(&thread.id).unwrap().unwrap().title, "New thread");
     assert_eq!(store.list_threads(Some("/tmp/project")).unwrap().len(), 1);
     assert_eq!(store.list_threads(Some("/tmp/other")).unwrap().len(), 0);
+
+    assert_eq!(thread.session_mode, SessionMode::Single);
+    store
+        .set_thread_session_mode(&thread.id, SessionMode::Orchestrate)
+        .unwrap();
+    assert_eq!(
+        store.get_thread(&thread.id).unwrap().unwrap().session_mode,
+        SessionMode::Orchestrate
+    );
 
     store.set_thread_provider(&thread.id, ProviderId::Codex, Some("gpt-6.1-sol".to_string())).unwrap();
     let updated = store.get_thread(&thread.id).unwrap().unwrap();

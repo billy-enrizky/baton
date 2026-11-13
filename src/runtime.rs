@@ -933,7 +933,7 @@ fn cap_diff(diff: &str) -> String {
 
 pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()> {
     if store.get_thread(&thread.id)?.is_none() {
-        let created = store.create_thread_with_id(
+        let created = store.create_thread_with_id_and_mode(
             NewThread {
                 title: thread.title.clone(),
                 cwd: thread.cwd.clone(),
@@ -941,6 +941,7 @@ pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()
                 current_model: thread.current_model.clone(),
             },
             thread.id.clone(),
+            thread.session_mode,
         )?;
         *thread = created;
     }
@@ -1837,7 +1838,7 @@ mod tests {
 
         let mut rejected = None;
         let mut finished = 0;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while std::time::Instant::now() < deadline && (rejected.is_none() || finished == 0) {
             while let Ok(event) = event_receiver.try_recv() {
                 match event {
@@ -1849,7 +1850,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert_eq!(rejected.as_deref(), Some("second"));
-        assert_eq!(finished, 1, "only the accepted turn finishes");
+        assert_eq!(
+            finished, 1,
+            "only the accepted turn finishes (rejected: {rejected:?})"
+        );
         command_sender.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
     }

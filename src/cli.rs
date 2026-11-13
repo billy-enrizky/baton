@@ -27,6 +27,10 @@ pub struct Cli {
     #[arg(short = 'm', long, global = true)]
     pub model: Option<String>,
 
+    /// Session mode: single or orchestrate
+    #[arg(long, global = true, value_name = "MODE")]
+    pub mode: Option<String>,
+
     /// Skip all permission checks (bypass permissions)
     #[arg(long, global = true, alias = "dangerously-skip-permissions")]
     pub yolo: bool,

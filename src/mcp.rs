@@ -353,6 +353,7 @@ impl McpServer {
             provider: thread.current_provider,
             model,
             permission_mode: thread.permission_mode,
+            session_mode: thread.session_mode,
             goal: thread.goal.clone(),
             goal_paused: thread.goal_paused,
             latest_turn,

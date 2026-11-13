@@ -87,6 +87,36 @@ impl fmt::Display for PermissionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SessionMode {
+    #[default]
+    Single,
+    Orchestrate,
+}
+
+impl SessionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SessionMode::Single => "single",
+            SessionMode::Orchestrate => "orchestrate",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<SessionMode> {
+        match value {
+            "single" => Some(SessionMode::Single),
+            "orchestrate" => Some(SessionMode::Orchestrate),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for SessionMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMode {

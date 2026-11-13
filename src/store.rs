@@ -43,6 +43,37 @@ pub struct ProviderSessionRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct OrchestrationRunRow {
+    pub id: String,
+    pub goal: String,
+    pub coordinator_provider: ProviderId,
+    pub coordinator_model: String,
+    pub summary: Option<String>,
+    pub plan_json: String,
+    pub status: String,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OrchestrationTaskRow {
+    pub id: String,
+    pub run_id: String,
+    pub title: String,
+    pub provider: ProviderId,
+    pub model: String,
+    pub prompt: String,
+    pub worktree_path: Option<String>,
+    pub branch: Option<String>,
+    pub thread_id: Option<String>,
+    pub status: String,
+    pub text: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ReviewNoteRow {
     pub id: i64,
     pub thread_id: String,
@@ -229,6 +260,34 @@ CREATE TABLE IF NOT EXISTS provider_processes (
   owner_pid INTEGER NOT NULL,
   started_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS orchestration_runs (
+  id TEXT PRIMARY KEY,
+  goal TEXT NOT NULL,
+  coordinator_provider TEXT NOT NULL,
+  coordinator_model TEXT NOT NULL,
+  summary TEXT,
+  plan_json TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS orchestration_tasks (
+  id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  model TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  worktree_path TEXT,
+  branch TEXT,
+  thread_id TEXT,
+  status TEXT NOT NULL,
+  text TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS orchestration_tasks_run_idx ON orchestration_tasks (run_id, created_at);
 "#;
 
 fn ensure_column(db: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
@@ -1333,6 +1392,128 @@ impl BatonStore {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn create_orchestration_run(
+        &self,
+        id: &str,
+        goal: &str,
+        coordinator_provider: ProviderId,
+        coordinator_model: &str,
+        summary: Option<&str>,
+        plan_json: &str,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO orchestration_runs (id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, created_at) VALUES (?, ?, ?, ?, ?, ?, 'running', ?)",
+            params![
+                id,
+                goal,
+                coordinator_provider.as_str(),
+                coordinator_model,
+                summary,
+                plan_json,
+                now_iso(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_orchestration_run(&self, id: &str, status: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE orchestration_runs SET status = ?, finished_at = ? WHERE id = ?",
+            params![status, now_iso(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_orchestration_task(
+        &self,
+        id: &str,
+        run_id: &str,
+        title: &str,
+        provider: ProviderId,
+        model: &str,
+        prompt: &str,
+        worktree_path: Option<&str>,
+        branch: Option<&str>,
+        thread_id: Option<&str>,
+        status: &str,
+        text: Option<&str>,
+        error: Option<&str>,
+        created_at: &str,
+        finished_at: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO orchestration_tasks (id, run_id, title, provider, model, prompt, worktree_path, branch, thread_id, status, text, error, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                id,
+                run_id,
+                title,
+                provider.as_str(),
+                model,
+                prompt,
+                worktree_path,
+                branch,
+                thread_id,
+                status,
+                text,
+                error,
+                created_at,
+                finished_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_orchestration_runs(&self, limit: usize) -> Result<Vec<OrchestrationRunRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, created_at, finished_at FROM orchestration_runs ORDER BY created_at DESC LIMIT ?",
+        )?;
+        let rows = statement
+            .query_map(params![limit as i64], |row| {
+                let provider: String = row.get(2)?;
+                Ok(OrchestrationRunRow {
+                    id: row.get(0)?,
+                    goal: row.get(1)?,
+                    coordinator_provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Codex),
+                    coordinator_model: row.get(3)?,
+                    summary: row.get(4)?,
+                    plan_json: row.get(5)?,
+                    status: row.get(6)?,
+                    created_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn list_orchestration_tasks(&self, run_id: &str) -> Result<Vec<OrchestrationTaskRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, run_id, title, provider, model, prompt, worktree_path, branch, thread_id, status, text, error, created_at, finished_at FROM orchestration_tasks WHERE run_id = ? ORDER BY created_at, id",
+        )?;
+        let rows = statement
+            .query_map(params![run_id], |row| {
+                let provider: String = row.get(3)?;
+                Ok(OrchestrationTaskRow {
+                    id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    title: row.get(2)?,
+                    provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Codex),
+                    model: row.get(4)?,
+                    prompt: row.get(5)?,
+                    worktree_path: row.get(6)?,
+                    branch: row.get(7)?,
+                    thread_id: row.get(8)?,
+                    status: row.get(9)?,
+                    text: row.get(10)?,
+                    error: row.get(11)?,
+                    created_at: row.get(12)?,
+                    finished_at: row.get(13)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
     }
 
     pub fn import_thread(

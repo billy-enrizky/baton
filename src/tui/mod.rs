@@ -3386,7 +3386,10 @@ fn handle_command(
                     .collect::<Vec<_>>()
                     .join("\n");
                 help.push_str(
-                    "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · drag transcript to copy",
+                    "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · esc: clear · drag transcript to copy",
+                );
+                help.push_str(
+                    "\npaste a multi-line prompt: it stays in the composer · typing during a turn steers it · enter on an empty composer sends the next queued message",
                 );
                 help
             } else {
@@ -5166,6 +5169,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     let suggestions = suggestions_for(&state.input);
     let composer_rows = 4u16
         + state.visible_input_lines().saturating_sub(1) as u16
+        + if composer_hint(state).is_some() { 1 } else { 0 }
         + if suggestions.is_empty() {
             0
         } else {
@@ -6224,6 +6228,23 @@ fn draw_code_confirm(frame: &mut ratatui::Frame, area: Rect, turn: i64) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// One line that explains what Enter will do right now. Shown only when the
+/// answer is not the default submit, so the composer stays quiet when idle.
+fn composer_hint(state: &TuiState) -> Option<String> {
+    if state.running {
+        Some("enter steers the live turn · esc interrupts · shift+enter adds a newline".to_string())
+    } else if state.orchestration_pending {
+        Some("orchestration running · enter queues your message for after the run".to_string())
+    } else if !state.queued_messages.is_empty() {
+        Some(format!(
+            "enter sends the next queued message ({} waiting) · shift+enter adds a newline",
+            state.queued_messages.len()
+        ))
+    } else {
+        None
+    }
+}
+
 fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, suggestions: &[&(&str, &str)]) {
     let mut rows: Vec<Line> = Vec::new();
     if !suggestions.is_empty() {
@@ -6365,6 +6386,9 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
             Style::default().fg(COLORS.muted),
         ),
     ]));
+    if let Some(hint) = composer_hint(state) {
+        rows.push(Line::styled(hint, Style::default().fg(COLORS.accent)));
+    }
     let border_color = if state.running { COLORS.border } else { COLORS.accent };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -9444,6 +9468,31 @@ mod tests {
         for (name, _) in SLASH_COMMANDS {
             assert!(text.contains(name), "missing {name} from /help all");
         }
+        assert!(text.contains("paste a multi-line prompt"), "{text}");
+        assert!(text.contains("typing during a turn steers it"), "{text}");
+        assert!(text.contains("enter on an empty composer sends the next queued message"), "{text}");
+    }
+
+    #[test]
+    fn composer_hint_matches_the_current_action() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        assert!(composer_hint(&state).is_none(), "an idle composer stays quiet");
+
+        state.running = true;
+        assert!(composer_hint(&state).unwrap().contains("enter steers"));
+
+        state.running = false;
+        state.orchestration_pending = true;
+        assert!(composer_hint(&state).unwrap().contains("enter queues"));
+
+        state.orchestration_pending = false;
+        enqueue_message(&mut state, &store, "later".into());
+        assert!(composer_hint(&state).unwrap().contains("enter sends the next queued message (1 waiting)"));
+
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("enter sends the next queued message (1 waiting)"), "{text}");
     }
 
     #[test]

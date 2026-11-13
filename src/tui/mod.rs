@@ -161,9 +161,19 @@ struct MultiView {
     children: Vec<MultiChild>,
 }
 
+struct OrchestrationPreview {
+    goal: String,
+    plan: orchestrate::Plan,
+    coordinator: ProviderId,
+    coordinator_model: String,
+    dirty_source: bool,
+}
+
 enum OrchestrationEvent {
     Done(Box<RunReport>),
     Failed(String),
+    Preview(Box<OrchestrationPreview>),
+    PreviewFailed(String),
     Progress(OrchestrationProgress),
     Integrated(Box<IntegrateReport>),
     IntegrateFailed(String),
@@ -230,6 +240,7 @@ enum Overlay {
     ThreadPicker { selected: usize, threads: Vec<(String, String)> },
     CheckpointPicker { selected: usize, checkpoints: Vec<(i64, String)> },
     DirtyConfirm { goal: String, max_tasks: usize, plan_file: Option<String> },
+    OrchestrationPreview { preview: Box<OrchestrationPreview> },
 }
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -958,6 +969,28 @@ fn apply_engine_event(
 
 fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
     match event {
+        OrchestrationEvent::Preview(preview) => {
+            state.orchestration_pending = false;
+            state.orchestration_cancelling = false;
+            state.orchestration_workers.clear();
+            state.orchestration_report = None;
+            state.orchestration_scroll = 0;
+            state.orchestration_selected = 0;
+            state.notice = Some(format!(
+                "plan ready · {} worker(s) · enter to run · esc to edit",
+                preview.plan.tasks.len()
+            ));
+            state.overlay = Overlay::OrchestrationPreview { preview };
+        }
+        OrchestrationEvent::PreviewFailed(error) => {
+            state.orchestration_pending = false;
+            state.orchestration_cancelling = false;
+            if error == orchestrate::CANCELLED_ERROR {
+                state.notice = Some("planning cancelled".into());
+            } else {
+                state.notice = Some(format!("planning failed: {error}"));
+            }
+        }
         OrchestrationEvent::Done(report) => {
             state.orchestration_pending = false;
             state.orchestration_cancelling = false;
@@ -1216,19 +1249,21 @@ fn start_shipping(state: &mut TuiState) {
 }
 
 const ORCHESTRATE_USAGE: &str =
-    "usage: /orchestrate [--max-tasks N] [--plan-file path] <goal>";
+    "usage: /orchestrate [--plan-only] [--max-tasks N] [--plan-file path] <goal>";
 
 #[derive(Debug, PartialEq, Eq)]
 struct OrchestrateArgs {
     goal: String,
     max_tasks: usize,
     plan_file: Option<String>,
+    plan_only: bool,
 }
 
 fn parse_orchestrate_args(args: &[String]) -> std::result::Result<OrchestrateArgs, String> {
     let mut goal_parts: Vec<String> = Vec::new();
     let mut max_tasks = 4usize;
     let mut plan_file = None;
+    let mut plan_only = false;
     let mut index = 0usize;
     while index < args.len() {
         match args[index].as_str() {
@@ -1249,6 +1284,10 @@ fn parse_orchestrate_args(args: &[String]) -> std::result::Result<OrchestrateArg
                 plan_file = Some(value.clone());
                 index += 2;
             }
+            "--plan-only" | "--preview" => {
+                plan_only = true;
+                index += 1;
+            }
             "--help" | "-h" => return Err(ORCHESTRATE_USAGE.to_string()),
             other => {
                 goal_parts.push(other.to_string());
@@ -1260,7 +1299,12 @@ fn parse_orchestrate_args(args: &[String]) -> std::result::Result<OrchestrateArg
     if goal.trim().is_empty() && plan_file.is_none() {
         return Err(ORCHESTRATE_USAGE.to_string());
     }
-    Ok(OrchestrateArgs { goal, max_tasks, plan_file })
+    Ok(OrchestrateArgs {
+        goal,
+        max_tasks,
+        plan_file,
+        plan_only,
+    })
 }
 
 fn record_orchestration_message(state: &mut TuiState, text: String) {
@@ -1394,6 +1438,129 @@ fn record_worker_followup(
     }
 }
 
+fn resolve_plan_path(cwd: &str, plan_file: Option<String>) -> Option<std::path::PathBuf> {
+    plan_file.map(|path| {
+        let path = std::path::PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            std::path::Path::new(cwd).join(path)
+        }
+    })
+}
+
+fn effective_orchestration_goal(goal: &str, plan_path: Option<&std::path::Path>) -> String {
+    if goal.trim().is_empty() {
+        plan_path
+            .map(|path| format!("plan file {}", path.display()))
+            .unwrap_or_else(|| "orchestration".to_string())
+    } else {
+        goal.to_string()
+    }
+}
+
+fn request_orchestration_preview(
+    state: &mut TuiState,
+    goal: String,
+    max_tasks: usize,
+    plan_file: Option<String>,
+) {
+    if state.orchestration_pending {
+        state.notice = Some("an orchestration is already running".into());
+        return;
+    }
+    if goal.trim().is_empty() && plan_file.is_none() {
+        state.notice = Some(ORCHESTRATE_USAGE.into());
+        return;
+    }
+    start_orchestration_preview(state, goal, max_tasks, plan_file);
+}
+
+fn start_orchestration_preview(
+    state: &mut TuiState,
+    goal: String,
+    max_tasks: usize,
+    plan_file: Option<String>,
+) {
+    let cwd = state.thread.cwd.clone();
+    let home = state.home.clone();
+    let provider = state.thread.current_provider;
+    let model = state
+        .thread
+        .current_model
+        .clone()
+        .unwrap_or_else(|| {
+            resolve_config(&home, std::path::Path::new(&cwd))
+                .for_provider(provider)
+                .model
+                .clone()
+        });
+    let permission_mode = state.permission_mode;
+    let plan_path = resolve_plan_path(&cwd, plan_file);
+    let effective_goal = effective_orchestration_goal(&goal, plan_path.as_deref());
+    let dirty_source = crate::worktree::repo_root(std::path::Path::new(&cwd))
+        .ok()
+        .and_then(|root| crate::worktree::is_dirty(&root).ok())
+        .unwrap_or(false);
+    state.orchestration_pending = true;
+    state.orchestration_cancelling = false;
+    let cancel = Arc::new(AtomicBool::new(false));
+    state.orchestration_cancel = cancel.clone();
+    state.notice = Some("planning preview...".into());
+    let sender = state.orchestration_sender.clone();
+    std::thread::spawn(move || {
+        let result = orchestrate::plan(
+            &effective_goal,
+            std::path::Path::new(&cwd),
+            provider,
+            &model,
+            max_tasks,
+            plan_path.as_deref(),
+            permission_mode,
+            Some(cancel.as_ref()),
+        );
+        let event = match result {
+            Ok(plan) => OrchestrationEvent::Preview(Box::new(OrchestrationPreview {
+                goal: effective_goal,
+                plan,
+                coordinator: provider,
+                coordinator_model: model,
+                dirty_source,
+            })),
+            Err(error) => OrchestrationEvent::PreviewFailed(error.to_string()),
+        };
+        let _ = sender.send(event);
+    });
+}
+
+fn write_preview_plan(
+    home: &std::path::Path,
+    plan: &orchestrate::Plan,
+) -> Result<std::path::PathBuf> {
+    let dir = home.join("plans");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("preview-{}.json", uuid::Uuid::new_v4()));
+    std::fs::write(&path, serde_json::to_string_pretty(plan)?)?;
+    Ok(path)
+}
+
+fn start_previewed_orchestration(state: &mut TuiState, preview: OrchestrationPreview) {
+    let path = match write_preview_plan(&state.home, &preview.plan) {
+        Ok(path) => path,
+        Err(error) => {
+            state.notice = Some(format!("cannot write preview plan: {error}"));
+            return;
+        }
+    };
+    state.overlay = Overlay::None;
+    start_orchestration(
+        state,
+        preview.goal,
+        preview.plan.tasks.len().max(1),
+        Some(path.to_string_lossy().to_string()),
+    );
+}
+
 fn request_orchestration(
     state: &mut TuiState,
     goal: String,
@@ -1447,22 +1614,8 @@ fn start_orchestration(
         .clone()
         .unwrap_or_else(|| resolve_config(&home, std::path::Path::new(&cwd)).for_provider(provider).model.clone());
     let permission_mode = state.permission_mode;
-    let plan_path = plan_file.map(|path| {
-        let path = std::path::PathBuf::from(path);
-        if path.is_absolute() {
-            path
-        } else {
-            std::path::Path::new(&cwd).join(path)
-        }
-    });
-    let effective_goal = if goal.trim().is_empty() {
-        plan_path
-            .as_ref()
-            .map(|path| format!("plan file {}", path.display()))
-            .unwrap_or_else(|| "orchestration".to_string())
-    } else {
-        goal.clone()
-    };
+    let plan_path = resolve_plan_path(&cwd, plan_file);
+    let effective_goal = effective_orchestration_goal(&goal, plan_path.as_deref());
     let result = {
         let guard = state.store.lock().unwrap();
         ensure_persisted(&guard, &mut state.thread)
@@ -2187,6 +2340,18 @@ fn handle_key(
                 }
             }
             _ => {}
+        },
+        Overlay::OrchestrationPreview { preview } => match key.code {
+            KeyCode::Esc => {
+                state.set_input(preview.goal.clone());
+                state.notice = Some("plan cancelled and returned to the composer".into());
+            }
+            KeyCode::Enter | KeyCode::Char('r') | KeyCode::Char('R') => {
+                start_previewed_orchestration(state, *preview);
+            }
+            _ => {
+                state.overlay = Overlay::OrchestrationPreview { preview };
+            }
         },
         Overlay::DirtyConfirm {
             goal,
@@ -3319,7 +3484,14 @@ fn handle_command(
             }
             match parse_orchestrate_args(&args) {
                 Ok(parsed) => {
-                    if parsed.plan_file.is_none()
+                    if parsed.plan_only {
+                        request_orchestration_preview(
+                            state,
+                            parsed.goal,
+                            parsed.max_tasks,
+                            parsed.plan_file,
+                        );
+                    } else if parsed.plan_file.is_none()
                         && orchestrate::is_conversational_greeting(&parsed.goal)
                     {
                         submit(state, store, engine_command_sender, parsed.goal);
@@ -4821,6 +4993,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
             Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
             Overlay::DirtyConfirm { .. } => 5,
+            Overlay::OrchestrationPreview { preview } => {
+                preview.plan.tasks.len().min(8) * 2 + 8
+            }
         }
     };
     let chunks = Layout::vertical([
@@ -4889,6 +5064,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 checkpoints,
             } => draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected),
             Overlay::DirtyConfirm { .. } => draw_dirty_confirm(frame, chunks[1]),
+            Overlay::OrchestrationPreview { preview } => {
+                draw_orchestration_preview(frame, chunks[1], state, preview)
+            }
             Overlay::None => {}
         }
     }
@@ -5664,6 +5842,86 @@ fn draw_rewind_picker(
     }
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_orchestration_preview(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    preview: &OrchestrationPreview,
+) {
+    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let mut lines = vec![
+        Line::styled(
+            "plan preview · enter run · esc edit",
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(format!("goal: {}", preview.goal), Style::default().fg(COLORS.text)),
+        Line::styled(
+            format!(
+                "coordinator: {}/{}",
+                preview.coordinator, preview.coordinator_model
+            ),
+            Style::default().fg(COLORS.muted),
+        ),
+    ];
+    if preview.dirty_source {
+        lines.push(Line::styled(
+            "warning: source is dirty; workers branch from HEAD",
+            Style::default().fg(COLORS.warning),
+        ));
+    }
+    if let Some(summary) = &preview.plan.summary {
+        lines.push(Line::styled(
+            format!("summary: {summary}"),
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    lines.push(Line::styled(
+        format!("workers: {}", preview.plan.tasks.len()),
+        Style::default().fg(COLORS.text),
+    ));
+    for (index, task) in preview.plan.tasks.iter().enumerate().take(8) {
+        let provider = ProviderId::parse(task.provider.trim()).unwrap_or(ProviderId::Codex);
+        let effective_model = task
+            .model
+            .clone()
+            .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
+        lines.push(Line::styled(
+            format!(
+                "  [{}] {} · {}/{}",
+                index + 1,
+                task.title,
+                provider,
+                effective_model
+            ),
+            Style::default().fg(COLORS.text),
+        ));
+        if let Some(first) = task.prompt.lines().next() {
+            let prompt: String = first.chars().take(120).collect();
+            lines.push(Line::styled(
+                format!("      {prompt}"),
+                Style::default().fg(COLORS.muted),
+            ));
+        }
+    }
+    if preview.plan.tasks.len() > 8 {
+        lines.push(Line::styled(
+            format!("  ... and {} more", preview.plan.tasks.len() - 8),
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
 }
 
 fn draw_dirty_confirm(frame: &mut ratatui::Frame, area: Rect) {
@@ -9317,6 +9575,7 @@ mod tests {
         assert_eq!(parsed.goal, "split the work");
         assert_eq!(parsed.max_tasks, 2);
         assert_eq!(parsed.plan_file, None);
+        assert!(!parsed.plan_only);
 
         let parsed = parse_orchestrate_args(&[
             "--plan-file".to_string(),
@@ -9328,6 +9587,16 @@ mod tests {
         .unwrap();
         assert_eq!(parsed.max_tasks, 16, "task count is capped");
         assert_eq!(parsed.plan_file.as_deref(), Some("plan.json"));
+        assert!(!parsed.plan_only);
+
+        let preview = parse_orchestrate_args(&[
+            "--plan-only".to_string(),
+            "preview".to_string(),
+            "this".to_string(),
+        ])
+        .unwrap();
+        assert!(preview.plan_only);
+        assert_eq!(preview.goal, "preview this");
 
         assert!(parse_orchestrate_args(&[]).is_err());
         assert!(parse_orchestrate_args(&[
@@ -9340,6 +9609,71 @@ mod tests {
             parse_orchestrate_args(&["--plan-file".to_string(), "plan.json".to_string()]).is_ok(),
             "a plan file alone is a valid run"
         );
+    }
+
+    #[test]
+    fn orchestration_preview_event_renders_and_escape_restores_the_goal() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let plan = sample_report(None).plan;
+        state.orchestration_pending = true;
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::Preview(Box::new(OrchestrationPreview {
+                goal: "split the work".to_string(),
+                plan,
+                coordinator: ProviderId::Codex,
+                coordinator_model: "gpt-test".to_string(),
+                dirty_source: true,
+            })),
+        );
+        assert!(!state.orchestration_pending);
+        assert!(matches!(
+            state.overlay,
+            Overlay::OrchestrationPreview { .. }
+        ));
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("plan preview"), "{text}");
+        assert!(text.contains("worker one"), "{text}");
+        assert!(text.contains("gpt-test"), "{text}");
+        assert!(text.contains("source is dirty"), "{text}");
+
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Esc,
+                modifiers: KeyModifiers::empty(),
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.input, "split the work");
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("plan cancelled"),
+            "notice: {:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn preview_plan_file_round_trips_the_resolved_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let plan = sample_report(None).plan;
+        let path = write_preview_plan(home.path(), &plan).unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let parsed = crate::orchestrate::parse_plan(&text, 4).unwrap();
+        assert_eq!(parsed.summary, plan.summary);
+        assert_eq!(parsed.tasks.len(), plan.tasks.len());
+        assert_eq!(parsed.tasks[0].title, plan.tasks[0].title);
     }
 
     #[test]

@@ -75,6 +75,11 @@ fn main_result() -> Result<()> {
             let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
             let resolved = resolve_config(&home, &cwd);
             let requested_provider = cli.provider.as_deref().and_then(ProviderId::parse);
+            if let Some(provider) = requested_provider {
+                if let Some(hint) = doctor::missing_provider_hint(provider) {
+                    anyhow::bail!(hint);
+                }
+            }
             let is_new = cli.thread.is_none();
             let mut thread = if let Some(thread_id) = cli.thread.as_deref() {
                 let guard = store.lock().unwrap();
@@ -123,6 +128,9 @@ fn main_result() -> Result<()> {
                 }
             }
             let provider = thread.current_provider;
+            if let Some(hint) = doctor::missing_provider_hint(provider) {
+                anyhow::bail!(hint);
+            }
             if requested_effort.is_some() && !provider.supports_effort() {
                 anyhow::bail!("{provider} does not support --effort; use codex or claude");
             }

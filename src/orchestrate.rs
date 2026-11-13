@@ -1056,6 +1056,7 @@ fn run_with_worker_bin_and_progress(
         coordinator_model,
         summary.as_deref(),
         &serde_json::to_string(&plan)?,
+        dirty_source,
     )?;
     emit(
         progress,
@@ -1270,6 +1271,61 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
         "repo_root": report.repo_root.as_ref().map(|path| path.display().to_string()),
         "dirty_source": report.dirty_source,
         "tasks": tasks,
+    })
+}
+
+pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<RunReport> {
+    let run = store
+        .list_orchestration_runs(200)?
+        .into_iter()
+        .find(|run| run.id.starts_with(run_id))
+        .ok_or_else(|| anyhow::anyhow!("no orchestration run matches {run_id}"))?;
+    let plan: Plan = serde_json::from_str(&run.plan_json).unwrap_or_else(|_| Plan {
+        summary: run.summary.clone(),
+        tasks: Vec::new(),
+    });
+    let repo_root = worktree::repo_root(cwd).ok();
+    let tasks = store
+        .list_orchestration_tasks(&run.id)?
+        .into_iter()
+        .map(|task| {
+            let worktree = match (task.worktree_path.as_deref(), task.branch.as_deref()) {
+                (Some(path), Some(branch)) => Some(WorktreeInfo {
+                    repo_root: repo_root.clone().unwrap_or_else(|| cwd.to_path_buf()),
+                    path: PathBuf::from(path),
+                    branch: branch.to_string(),
+                    base_ref: "HEAD".to_string(),
+                }),
+                _ => None,
+            };
+            WorkerResult {
+                id: task.id,
+                title: task.title,
+                provider: task.provider,
+                model: task.model,
+                prompt: task.prompt,
+                worktree,
+                commit: task.commit_sha,
+                thread_id: task.thread_id,
+                status: task.status,
+                text: task.text,
+                error: task.error,
+                created_at: task.created_at,
+                finished_at: task.finished_at.unwrap_or_default(),
+            }
+        })
+        .collect();
+    Ok(RunReport {
+        run_id: run.id,
+        goal: run.goal,
+        coordinator_provider: run.coordinator_provider,
+        coordinator_model: run.coordinator_model,
+        summary: run.summary,
+        plan,
+        repo_root,
+        dirty_source: run.dirty_source,
+        status: run.status,
+        tasks,
     })
 }
 
@@ -1504,6 +1560,22 @@ mod tests {
             error: None,
         });
         assert_eq!(finished, "[1] completed first · commit 01234567");
+    }
+
+    #[test]
+    fn stored_run_reconstructs_a_report() {
+        let plan = r#"{"summary":"one worker","tasks":[{"title":"first task","provider":"codex","prompt":"do one"}]}"#;
+        let (repo, _home, store, report) =
+            run_fixture(plan, "printf 'edited by worker\n' > worker-output.txt");
+        let stored = report_from_rows(&store, repo.path(), &report.run_id).unwrap();
+        assert_eq!(stored.run_id, report.run_id);
+        assert_eq!(stored.goal, report.goal);
+        assert_eq!(stored.status, "completed");
+        assert_eq!(stored.tasks.len(), 1);
+        assert_eq!(stored.tasks[0].title, "first task");
+        assert_eq!(stored.tasks[0].thread_id.as_deref(), Some("fake-thread"));
+        assert!(stored.tasks[0].worktree.is_some());
+        assert_eq!(stored.dirty_source, report.dirty_source);
     }
 
     #[test]

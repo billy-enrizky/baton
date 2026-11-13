@@ -67,7 +67,7 @@ echo base > "$repo/a.txt"
 git -C "$repo" add .
 git -C "$repo" commit -qm init
 cat > "$repo/plan.json" <<'JSON'
-{"summary":"one worker","tasks":[{"title":"pwd check","provider":"codex","prompt":"Run pwd and reply with the exact output. Do not modify files."}]}
+{"summary":"one worker","tasks":[{"title":"pwd check","provider":"codex","model":"optional-model-override","prompt":"Run pwd and reply with the exact output. Do not modify files."}]}
 JSON
 BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --plan-file "$repo/plan.json" --json "verify worker cwd" > /tmp/orchestrate.json
 jq -e '.status == "completed" and .tasks[0].text and .tasks[0].worktree.path' /tmp/orchestrate.json
@@ -87,7 +87,7 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 
 ## Gotchas
 - Worker worktrees branch from `HEAD`; uncommitted source changes are not in the worker checkout. The report sets `dirty_source`.
-- `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan.
+- `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan. A task `model` overrides the provider config; omit it to use the configured default.
 - A run with one success and one failure is `partial`; all failures is `failed` and exits non-zero.
 - Worktrees are kept for review under `$BATON_HOME/worktrees/<run>/<task>`. Successful workers commit their changes as `baton worker: <title>`; the report and `--run --json` expose the SHA. `--integrate` merges completed branches into a clean source checkout, aborts on conflict, and skips already-merged workers. Use `baton worktrees` to list managed worktrees; JSON includes `shipped`, and the text state shows `clean · shipped` for a branch with a PR. `baton worktrees --clean` removes clean worktrees whose branch is merged or shipped; dirty worktrees, and unmerged branches without a recorded PR, require `--force`.
 - `baton.json` `worktree.sharedDirectories` symlinks existing, gitignored directories such as `node_modules` or `target` into each worker worktree. Shared paths appear in the report; edits inside them affect the primary checkout.

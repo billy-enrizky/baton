@@ -65,6 +65,7 @@ pub struct OrchestrationTaskRow {
     pub prompt: String,
     pub worktree_path: Option<String>,
     pub branch: Option<String>,
+    pub commit_sha: Option<String>,
     pub thread_id: Option<String>,
     pub status: String,
     pub text: Option<String>,
@@ -280,6 +281,7 @@ CREATE TABLE IF NOT EXISTS orchestration_tasks (
   prompt TEXT NOT NULL,
   worktree_path TEXT,
   branch TEXT,
+  commit_sha TEXT,
   thread_id TEXT,
   status TEXT NOT NULL,
   text TEXT,
@@ -405,6 +407,7 @@ impl BatonStore {
         migrate_thread_model_nullable(&db)?;
         ensure_thread_columns(&db)?;
         ensure_column(&db, "provider_processes", "process_start", "TEXT")?;
+        ensure_column(&db, "orchestration_tasks", "commit_sha", "TEXT")?;
         Ok(BatonStore { db })
     }
 
@@ -1436,6 +1439,7 @@ impl BatonStore {
         prompt: &str,
         worktree_path: Option<&str>,
         branch: Option<&str>,
+        commit_sha: Option<&str>,
         thread_id: Option<&str>,
         status: &str,
         text: Option<&str>,
@@ -1444,7 +1448,7 @@ impl BatonStore {
         finished_at: Option<&str>,
     ) -> Result<()> {
         self.db.execute(
-            "INSERT INTO orchestration_tasks (id, run_id, title, provider, model, prompt, worktree_path, branch, thread_id, status, text, error, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO orchestration_tasks (id, run_id, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 id,
                 run_id,
@@ -1454,6 +1458,7 @@ impl BatonStore {
                 prompt,
                 worktree_path,
                 branch,
+                commit_sha,
                 thread_id,
                 status,
                 text,
@@ -1490,7 +1495,7 @@ impl BatonStore {
 
     pub fn list_orchestration_tasks(&self, run_id: &str) -> Result<Vec<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, run_id, title, provider, model, prompt, worktree_path, branch, thread_id, status, text, error, created_at, finished_at FROM orchestration_tasks WHERE run_id = ? ORDER BY created_at, id",
+            "SELECT id, run_id, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at FROM orchestration_tasks WHERE run_id = ? ORDER BY created_at, id",
         )?;
         let rows = statement
             .query_map(params![run_id], |row| {
@@ -1504,12 +1509,13 @@ impl BatonStore {
                     prompt: row.get(5)?,
                     worktree_path: row.get(6)?,
                     branch: row.get(7)?,
-                    thread_id: row.get(8)?,
-                    status: row.get(9)?,
-                    text: row.get(10)?,
-                    error: row.get(11)?,
-                    created_at: row.get(12)?,
-                    finished_at: row.get(13)?,
+                    commit_sha: row.get(8)?,
+                    thread_id: row.get(9)?,
+                    status: row.get(10)?,
+                    text: row.get(11)?,
+                    error: row.get(12)?,
+                    created_at: row.get(13)?,
+                    finished_at: row.get(14)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

@@ -61,6 +61,6 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 - Worker worktrees branch from `HEAD`; uncommitted source changes are not in the worker checkout. The report sets `dirty_source`.
 - `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan.
 - A run with one success and one failure is `partial`; all failures is `failed` and exits non-zero.
-- Worktrees are kept for review under `$BATON_HOME/worktrees/<run>/<task>`. There is no automatic merge or cleanup yet.
+- Worktrees are kept for review under `$BATON_HOME/worktrees/<run>/<task>`. Successful workers commit their changes as `baton worker: <title>`; the report and `--run --json` expose the SHA. There is no automatic merge or cleanup yet.
 - The coordinator retries once on invalid JSON. A second invalid plan fails the run before workers start.
 - The multi-harness path costs real provider turns; use `--plan-file` for smoke tests.

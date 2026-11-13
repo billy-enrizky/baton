@@ -36,6 +36,15 @@ pub fn is_dirty(repo_root: &Path) -> Result<bool> {
     Ok(!git(repo_root, &["status", "--porcelain"])?.trim().is_empty())
 }
 
+pub fn commit_changes(path: &Path, message: &str) -> Result<Option<String>> {
+    if git(path, &["status", "--porcelain"])?.trim().is_empty() {
+        return Ok(None);
+    }
+    git(path, &["add", "-A"])?;
+    git(path, &["commit", "-m", message])?;
+    Ok(Some(git(path, &["rev-parse", "HEAD"])?))
+}
+
 pub fn slugify(title: &str) -> String {
     let mut slug = String::new();
     let mut last_dash = false;
@@ -134,6 +143,27 @@ mod tests {
         remove(&second).unwrap();
         assert!(!first.path.exists());
         assert!(!second.path.exists());
+    }
+
+    #[test]
+    fn commits_changes_to_the_worktree_branch() {
+        let root = repo();
+        let home = tempfile::tempdir().unwrap();
+        let repo_root = repo_root(root.path()).unwrap();
+        let wt = create(home.path(), &repo_root, "run-commit", "commit check").unwrap();
+        assert_eq!(commit_changes(&wt.path, "noop").unwrap(), None);
+        std::fs::write(wt.path.join("worker.txt"), "worker\n").unwrap();
+        let sha = commit_changes(&wt.path, "baton worker: commit check")
+            .unwrap()
+            .expect("dirty worktree commits");
+        assert_eq!(sha.len(), 40);
+        assert_eq!(
+            git(&wt.path, &["log", "-1", "--pretty=%s"]).unwrap(),
+            "baton worker: commit check"
+        );
+        assert!(git(&wt.path, &["status", "--porcelain"]).unwrap().is_empty());
+        assert_eq!(git(root.path(), &["rev-parse", &wt.branch]).unwrap(), sha);
+        remove(&wt).unwrap();
     }
 
     #[test]

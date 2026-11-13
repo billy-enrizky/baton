@@ -210,10 +210,37 @@ pub struct RunReport {
     pub tasks: Vec<WorkerResult>,
 }
 
-fn planner_prompt(goal: &str, cwd: &Path, max_tasks: usize) -> String {
+fn available_providers(coordinator: ProviderId) -> Vec<ProviderId> {
+    let mut available = ProviderId::all()
+        .iter()
+        .copied()
+        .filter(|provider| {
+            crate::doctor::find_executable(provider.binary_name()).is_some()
+        })
+        .collect::<Vec<_>>();
+    if !available.contains(&coordinator) {
+        available.push(coordinator);
+    }
+    available
+}
+
+fn planner_prompt(
+    goal: &str,
+    cwd: &Path,
+    max_tasks: usize,
+    available: &[ProviderId],
+    coordinator: ProviderId,
+) -> String {
+    let providers = available
+        .iter()
+        .map(|provider| provider.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let template = r#"You are baton's coordinator. Split the goal into at most MAX independent worker tasks.
+Use the smallest number of tasks that truly parallelizes. Return exactly one task for a question, a small fix, or work that touches one cohesive area. Split only when the tasks are independent, touch disjoint files, and do not need each other's output. Do not invent extra work.
+Each task prompt must be self-contained. Never ask a worker to coordinate with another worker.
 Each worker runs in its own git worktree, so tasks must not depend on another task's output and must avoid overlapping files.
-Choose the best harness for each task from codex, claude, and opencode. Use different harnesses when their strengths differ.
+Choose the best installed harness for each task from: PROVIDERS. Prefer COORDINATOR when the task does not benefit from another harness.
 Every worker starts in its own worktree, so each prompt must refer to the current working directory, never to the source checkout path.
 Return ONLY a JSON object, with no markdown fences or commentary:
 {"summary":"one sentence","tasks":[{"title":"short task name","provider":"codex","prompt":"complete self-contained instructions for the worker"}]}
@@ -221,8 +248,29 @@ Goal: GOAL
 Source repository: CWD"#;
     template
         .replace("MAX", &max_tasks.to_string())
+        .replace("PROVIDERS", &providers)
+        .replace("COORDINATOR", coordinator.as_str())
         .replace("GOAL", goal)
         .replace("CWD", &cwd.display().to_string())
+}
+
+fn validate_plan_providers(plan: &Plan, available: &[ProviderId]) -> Result<()> {
+    for task in &plan.tasks {
+        let provider = ProviderId::parse(task.provider.trim())
+            .ok_or_else(|| anyhow::anyhow!("planner returned unknown provider {}", task.provider))?;
+        if !available.contains(&provider) {
+            anyhow::bail!(
+                "planner selected {} but that harness is not installed; available: {}",
+                provider,
+                available
+                    .iter()
+                    .map(|provider| provider.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(())
 }
 
 const WORKER_PREAMBLE: &str = "You are a worker in an isolated git worktree. Treat the current working directory as the repository root. Do not read or write the source checkout outside this worktree.";
@@ -335,15 +383,20 @@ fn run_planner(
     max_tasks: usize,
     permission_mode: PermissionMode,
     cancel: Option<&AtomicBool>,
+    available: &[ProviderId],
 ) -> Result<Plan> {
-    let base_prompt = planner_prompt(goal, cwd, max_tasks);
-    let mut last_error = None;
+    let base_prompt = planner_prompt(goal, cwd, max_tasks, available, provider);
+    let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..2 {
         let prompt = if attempt == 0 {
             base_prompt.clone()
         } else {
             format!(
-                "{base_prompt}\nYour previous response was not valid JSON. Return only the JSON object."
+                "{base_prompt}\nYour previous plan was not usable: {}. Use only the installed harnesses listed above. Return only the JSON object.",
+                last_error
+                    .as_ref()
+                    .map(|error| error.to_string())
+                    .unwrap_or_else(|| "invalid JSON".to_string())
             )
         };
         let text = run_coordinator(
@@ -357,12 +410,34 @@ fn run_planner(
         if std::env::var_os("BATON_ORCHESTRATE_DEBUG").is_some() {
             eprintln!("[orchestrate] planner text (attempt {}): {text}", attempt + 1);
         }
-        match parse_plan(&text, max_tasks) {
+        match parse_plan(&text, max_tasks)
+            .and_then(|plan| validate_plan_providers(&plan, available).map(|()| plan))
+        {
             Ok(plan) => return Ok(plan),
-            Err(error) => last_error = Some(error),
+            Err(error) => {
+                if plan_is_empty(&error) {
+                    return Ok(fallback_plan(goal, provider));
+                }
+                last_error = Some(error);
+            }
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("planner failed")))
+}
+
+fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
+    Plan {
+        summary: Some("direct task".to_string()),
+        tasks: vec![PlanTask {
+            title: "answer".to_string(),
+            provider: provider.as_str().to_string(),
+            prompt: goal.to_string(),
+        }],
+    }
+}
+
+fn plan_is_empty(error: &anyhow::Error) -> bool {
+    error.to_string() == "planner returned no tasks"
 }
 
 fn load_plan(path: &Path, max_tasks: usize) -> Result<Plan> {
@@ -958,15 +1033,19 @@ fn run_with_worker_bin_and_progress(
         .unwrap_or(false);
     let plan = match plan_path {
         Some(path) => load_plan(path, max_tasks)?,
-        None => run_planner(
-            goal,
-            cwd,
-            coordinator_provider,
-            coordinator_model,
-            max_tasks,
-            permission_mode,
-            cancel,
-        )?,
+        None => {
+            let available = available_providers(coordinator_provider);
+            run_planner(
+                goal,
+                cwd,
+                coordinator_provider,
+                coordinator_model,
+                max_tasks,
+                permission_mode,
+                cancel,
+                &available,
+            )?
+        }
     };
     let run_id = uuid::Uuid::new_v4().to_string();
     let summary = plan.summary.clone();
@@ -1206,6 +1285,47 @@ pub fn task_rows(store: &BatonStore, run_id: &str) -> Result<Vec<OrchestrationTa
 mod tests {
     use super::*;
     use crate::store::BatonStore;
+
+    #[test]
+    fn empty_planner_plan_falls_back_to_one_worker() {
+        let plan = fallback_plan("hi", ProviderId::Claude);
+        assert_eq!(plan.tasks.len(), 1);
+        assert_eq!(plan.tasks[0].provider, "claude");
+        assert_eq!(plan.tasks[0].prompt, "hi");
+        assert!(plan_is_empty(&anyhow::anyhow!("planner returned no tasks")));
+        assert!(!plan_is_empty(&anyhow::anyhow!("some other failure")));
+    }
+
+    #[test]
+    fn planner_prompt_asks_for_the_smallest_plan_and_lists_available_harnesses() {
+        let prompt = planner_prompt(
+            "fix the bug",
+            Path::new("/repo"),
+            4,
+            &[ProviderId::Codex, ProviderId::Claude],
+            ProviderId::Codex,
+        );
+        assert!(prompt.contains("smallest number of tasks"), "{prompt}");
+        assert!(prompt.contains("exactly one task"), "{prompt}");
+        assert!(prompt.contains("codex, claude"), "{prompt}");
+        assert!(prompt.contains("Prefer codex"), "{prompt}");
+        assert!(prompt.contains("Never ask a worker to coordinate"), "{prompt}");
+    }
+
+    #[test]
+    fn plan_validation_rejects_uninstalled_harnesses() {
+        let plan = parse_plan(
+            r#"{"tasks":[{"title":"audit","provider":"grok","prompt":"do it"}]}"#,
+            4,
+        )
+        .unwrap();
+        let error = validate_plan_providers(&plan, &[ProviderId::Codex, ProviderId::Claude])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("not installed"),
+            "unexpected error: {error}"
+        );
+    }
 
     #[test]
     fn parses_fenced_plan_and_caps_tasks() {

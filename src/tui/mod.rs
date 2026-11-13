@@ -263,6 +263,7 @@ pub struct TuiState {
     transcript_anchor: std::cell::Cell<Option<usize>>,
     transcript_total: std::cell::Cell<usize>,
     model_request_id: u64,
+    banner_cache: std::cell::RefCell<Option<(String, Vec<Line<'static>>)>>,
     orchestration_pending: bool,
     orchestration_cancel: Arc<AtomicBool>,
     orchestration_cancelling: bool,
@@ -348,6 +349,7 @@ pub fn run_tui(
         transcript_anchor: std::cell::Cell::new(None),
         transcript_total: std::cell::Cell::new(0),
         model_request_id: 0,
+        banner_cache: std::cell::RefCell::new(None),
         orchestration_pending: false,
         orchestration_cancel: Arc::new(AtomicBool::new(false)),
         orchestration_cancelling: false,
@@ -1869,6 +1871,29 @@ fn enqueue_message(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, text: S
     state.queued_messages.push(text);
 }
 
+fn is_conversational_greeting(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .trim_end_matches(|character: char| {
+            character.is_ascii_punctuation() || character.is_whitespace()
+        })
+        .to_lowercase();
+    matches!(
+        normalized.as_str(),
+        "hi"
+            | "hello"
+            | "hey"
+            | "yo"
+            | "hi there"
+            | "hello there"
+            | "good morning"
+            | "good afternoon"
+            | "good evening"
+            | "thanks"
+            | "thank you"
+    )
+}
+
 fn dispatch_message(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -1888,6 +1913,10 @@ fn dispatch_message(
         }
         if state.orchestration_pending {
             state.notice = Some("an orchestration is already running".into());
+            return;
+        }
+        if is_conversational_greeting(&text) {
+            submit(state, store, engine_command_sender, text);
             return;
         }
         if crate::worktree::repo_root(std::path::Path::new(&state.thread.cwd)).is_err() {
@@ -4259,6 +4288,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         return;
     }
 
+    let banner = state.banner_lines();
     if state.history.is_empty()
         && !state.running
         && state.streaming_text.is_empty()
@@ -4266,21 +4296,38 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         && area.height >= 12
     {
         hide_transcript_view(state);
+        let banner_height = (banner.len() as u16).min(area.height);
+        let banner_area = Rect {
+            height: banner_height,
+            ..area
+        };
+        frame.render_widget(Paragraph::new(banner.clone()), banner_area);
+        let remaining = Rect {
+            y: area.y + banner_height,
+            height: area.height.saturating_sub(banner_height),
+            ..area
+        };
         let logo_height = LOGO_ROWS.len() as u16 + 2;
-        let top = area.height.saturating_sub(logo_height) / 2;
-        let logo_area = Rect { y: area.y + top, height: logo_height, ..area };
-        let lines: Vec<Line> = LOGO_ROWS
-            .iter()
-            .map(|row| Line::styled(*row, Style::default().fg(COLORS.accent)))
-            .chain([Line::styled(
-                "one thread · every harness · pass the baton",
-                Style::default().fg(COLORS.muted),
-            )])
-            .collect();
-        frame.render_widget(
-            Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
-            logo_area,
-        );
+        if remaining.height >= logo_height {
+            let top = remaining.height.saturating_sub(logo_height) / 2;
+            let logo_area = Rect {
+                y: remaining.y + top,
+                height: logo_height,
+                ..remaining
+            };
+            let lines: Vec<Line> = LOGO_ROWS
+                .iter()
+                .map(|row| Line::styled(*row, Style::default().fg(COLORS.accent)))
+                .chain([Line::styled(
+                    "one thread · every harness · pass the baton",
+                    Style::default().fg(COLORS.muted),
+                )])
+                .collect();
+            frame.render_widget(
+                Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+                logo_area,
+            );
+        }
         return;
     }
 
@@ -4310,8 +4357,9 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
             .collect()
     };
 
-    // Build all terminal lines (each element = exactly 1 rendered row)
-    let mut all_lines: Vec<Line> = Vec::new();
+    // Build all terminal lines (each element = exactly 1 rendered row).
+    // The banner scrolls with the conversation, like Codex and Claude Code.
+    let mut all_lines: Vec<Line> = banner;
     for message in &state.history {
         if message.role == "tool" {
             let style = if message.text.starts_with("✗") {
@@ -4840,6 +4888,117 @@ impl TuiState {
         self.persist_thread_state(store);
     }
 
+    fn banner_lines(&self) -> Vec<Line<'static>> {
+        let provider = self.thread.current_provider;
+        let key = format!(
+            "{}|{:?}|{}|{}|{:?}",
+            self.thread.cwd,
+            self.thread.session_mode,
+            provider,
+            self.thread.current_model.as_deref().unwrap_or(""),
+            self.permission_mode,
+        );
+        if let Some((cached_key, lines)) = &*self.banner_cache.borrow() {
+            if cached_key == &key {
+                return lines.clone();
+            }
+        }
+        let resolved = resolve_config(&self.home, std::path::Path::new(&self.thread.cwd));
+        let model = self
+            .thread
+            .current_model
+            .clone()
+            .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
+        let provider_config = resolved.for_provider(provider);
+        let home = std::env::var("HOME").unwrap_or_default();
+        let cwd = if !home.is_empty() && self.thread.cwd.starts_with(&home) {
+            self.thread.cwd.replacen(&home, "~", 1)
+        } else {
+            self.thread.cwd.clone()
+        };
+        let mode = match self.thread.session_mode {
+            SessionMode::Orchestrate => "orchestrate",
+            SessionMode::Single => "single",
+        };
+        let (permission, permission_color) = match self.permission_mode {
+            PermissionMode::Default => ("default", COLORS.muted),
+            PermissionMode::AcceptEdits => ("auto-accept edits", COLORS.secondary),
+            PermissionMode::BypassPermissions => ("YOLO mode", COLORS.warning),
+            PermissionMode::Plan => ("plan mode", COLORS.secondary),
+        };
+        let auth = describe_auth(&provider_config);
+        let auth_color = if auth.contains("MISSING") {
+            COLORS.warning
+        } else {
+            COLORS.muted
+        };
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(
+                    ">_ baton",
+                    Style::default()
+                        .fg(COLORS.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" v{}", env!("CARGO_PKG_VERSION")),
+                    Style::default().fg(COLORS.muted),
+                ),
+                Span::styled(
+                    "  one thread · every harness · pass the baton",
+                    Style::default().fg(COLORS.muted),
+                ),
+            ]),
+            Line::styled(format!("   {cwd}"), Style::default().fg(COLORS.muted)),
+            Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    mode,
+                    Style::default()
+                        .fg(COLORS.secondary)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if self.thread.session_mode == SessionMode::Orchestrate {
+                        " · coordinator "
+                    } else {
+                        " · "
+                    },
+                    Style::default().fg(COLORS.muted),
+                ),
+                Span::styled(
+                    format!("{provider}/{model}"),
+                    Style::default().fg(COLORS.text),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("   "),
+                Span::styled(
+                    format!("permissions: {permission}"),
+                    Style::default().fg(permission_color),
+                ),
+                Span::styled(
+                    format!(" · billing: {auth}"),
+                    Style::default().fg(auth_color),
+                ),
+            ]),
+        ];
+        if provider == ProviderId::Claude
+            && provider_config.mode == crate::config::AuthMode::Subscription
+            && std::env::var("ANTHROPIC_API_KEY")
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        {
+            lines.push(Line::styled(
+                "   warning: ANTHROPIC_API_KEY is set while billing is subscription; auth may be ambiguous",
+                Style::default().fg(COLORS.warning),
+            ));
+        }
+        lines.push(Line::raw(""));
+        *self.banner_cache.borrow_mut() = Some((key, lines.clone()));
+        lines
+    }
+
     fn set_session_mode(&mut self, store: &Arc<Mutex<BatonStore>>, mode: SessionMode) {
         self.thread.session_mode = mode;
         let guard = store.lock().unwrap();
@@ -5008,6 +5167,7 @@ mod tests {
             transcript_anchor: std::cell::Cell::new(None),
             transcript_total: std::cell::Cell::new(0),
             model_request_id: 0,
+            banner_cache: std::cell::RefCell::new(None),
             orchestration_pending: false,
             orchestration_cancel: Arc::new(AtomicBool::new(false)),
             orchestration_cancelling: false,
@@ -6806,6 +6966,35 @@ mod tests {
     }
 
     #[test]
+    fn banner_shows_version_cwd_mode_and_permissions() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.session_mode = SessionMode::Orchestrate;
+        state.permission_mode = PermissionMode::BypassPermissions;
+        let buffer = render_state(&state, 120, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains(">_ baton v"), "{text}");
+        assert!(text.contains("permissions: YOLO mode"), "{text}");
+        assert!(text.contains("orchestrate"), "{text}");
+        assert!(text.contains("coordinator"), "{text}");
+        assert!(text.contains(&state.thread.cwd), "{text}");
+    }
+
+    #[test]
+    fn banner_shows_single_harness_and_billing() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.session_mode = SessionMode::Single;
+        let buffer = render_state(&state, 120, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains("single"), "{text}");
+        assert!(text.contains("codex") || text.contains("claude"), "{text}");
+        assert!(text.contains("billing:"), "{text}");
+    }
+
+    #[test]
     fn orchestrate_mode_shows_badge_and_placeholder() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -6862,6 +7051,44 @@ mod tests {
     }
 
     #[test]
+    fn greeting_detection_is_narrow() {
+        assert!(is_conversational_greeting("hi"));
+        assert!(is_conversational_greeting(" hello! "));
+        assert!(is_conversational_greeting("thanks."));
+        assert!(!is_conversational_greeting("hi, fix the tests"));
+        assert!(!is_conversational_greeting("fix the bug"));
+    }
+
+    #[test]
+    fn greeting_in_orchestrate_mode_uses_a_single_turn() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        state.thread.session_mode = SessionMode::Orchestrate;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "hi".to_string(),
+            false,
+        );
+        assert!(!state.orchestration_pending);
+        assert!(
+            matches!(receiver.try_recv(), Ok(EngineCommand::Submit { .. })),
+            "a greeting should run a normal single turn"
+        );
+    }
+
+    #[test]
     fn orchestrate_mode_falls_back_to_single_outside_git() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -6872,7 +7099,7 @@ mod tests {
             &mut state,
             &store,
             &engine_command_sender,
-            "hello".to_string(),
+            "fix the bug".to_string(),
             false,
         );
         assert!(!state.orchestration_pending);

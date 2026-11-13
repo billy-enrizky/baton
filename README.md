@@ -1,6 +1,6 @@
 # baton
 
-One terminal CLI for every coding agent harness. Same thread, any model, native prompt caching.
+One terminal CLI for every coding agent harness. Same thread, any model, native prompt caching. The TUI opens with a Codex-style header showing the baton version, working directory, session mode, coordinator or harness model, permissions, and billing.
 
 New sessions orchestrate by default: the prompt is the goal, a coordinator splits it, and independent workers run in separate git worktrees, each on the harness that fits the task. `/switch` moves to a single harness when one agent is the right shape. Hit a wall in that harness, switch to another, and keep going in the same thread with Claude Code or Codex holding the context.
 
@@ -8,6 +8,7 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 
 ## What it does
 
+- **A clear start.** The banner shows version, cwd, session mode, model, permissions, and billing before the first prompt. Greetings go to one harness; real work goes to the planner.
 - **Orchestrated by default.** A first prompt starts a coordinator, which plans independent tasks and picks a harness for each. Workers run in isolated worktrees with live progress, commit their changes to their own branches, and can be merged back with a confirmation.
 - **One CLI, many harnesses.** Codex, Claude Code, Grok Build, OpenCode, Cursor, and Antigravity, driven through their supported programmatic surfaces (app-server JSON-RPC, headless stream-json, ACP, HTTP).
 - **The thread is the product.** Switching harness or model mid-thread is a dropdown: `/switch` opens the provider picker, then the model picker. First turn on a new harness carries a token-budgeted context handoff; after that each harness keeps its own native session.

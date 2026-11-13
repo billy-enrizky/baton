@@ -212,6 +212,8 @@ def main() -> int:
     parser.add_argument("--height", type=int, default=34)
     parser.add_argument("--ready", default="Ask anything")
     parser.add_argument("--after-escape", action="store_true")
+    parser.add_argument("--home", default=None)
+    parser.add_argument("--cwd", default=None)
     parser.add_argument("--warmup", type=float, default=3.0)
     parser.add_argument("--timeout", type=float, default=12.0)
     parser.add_argument("--evidence-dir", default="local_docs/verification/evidence")
@@ -222,8 +224,10 @@ def main() -> int:
         print(f"missing binary: {binary}", file=sys.stderr)
         return 2
 
-    home = tempfile.mkdtemp(prefix="baton-verify-home-")
-    workdir = tempfile.mkdtemp(prefix="baton-verify-cwd-")
+    home = args.home or tempfile.mkdtemp(prefix="baton-verify-home-")
+    workdir = args.cwd or tempfile.mkdtemp(prefix="baton-verify-cwd-")
+    Path(home).mkdir(parents=True, exist_ok=True)
+    Path(workdir).mkdir(parents=True, exist_ok=True)
     evidence = Path(args.evidence_dir) / f"verify-baton-{int(time.time())}"
     evidence.mkdir(parents=True, exist_ok=True)
 

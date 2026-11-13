@@ -132,7 +132,7 @@ fn build_with_lookup(
             ));
         } else if !process.command_matches || !process.start_matches {
             warnings.push(format!(
-                "tracked {} process {} no longer matches its recorded identity",
+                "tracked {} process {} failed its recorded identity check (command or start time changed, or no start recorded)",
                 process.provider, process.pid
             ));
         }

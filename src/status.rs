@@ -1,6 +1,6 @@
 //! Stable, line-oriented thread status for humans and agents.
 
-use crate::types::{PermissionMode, ProviderId, TurnPhase};
+use crate::types::{PermissionMode, ProviderId, SessionMode, TurnPhase};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const STALE_HINT: &str = "if no baton process is attached, this turn is stale and will be marked unverified on the next open";
@@ -22,6 +22,7 @@ pub struct ThreadStatus {
     pub provider: ProviderId,
     pub model: String,
     pub permission_mode: PermissionMode,
+    pub session_mode: SessionMode,
     pub goal: Option<String>,
     pub goal_paused: bool,
     pub latest_turn: Option<TurnStatus>,
@@ -65,6 +66,7 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
         "provider": status.provider.as_str(),
         "model": status.model,
         "permission_mode": status.permission_mode.as_str(),
+        "session_mode": status.session_mode.as_str(),
         "goal": status.goal,
         "goal_paused": status.goal_paused,
         "latest_turn": latest_turn,
@@ -81,6 +83,7 @@ pub fn render(status: &ThreadStatus) -> String {
     let mut lines = Vec::new();
     lines.push(format!("thread: {}  {}", status.thread_id, status.title));
     lines.push(format!("provider: {}/{}", status.provider, status.model));
+    lines.push(format!("session: {}", status.session_mode));
     lines.push(format!("mode: {}", status.permission_mode));
     match &status.goal {
         Some(goal) => {
@@ -140,6 +143,7 @@ mod tests {
             provider: ProviderId::Codex,
             model: "model-1".into(),
             permission_mode: PermissionMode::Plan,
+            session_mode: SessionMode::Orchestrate,
             goal: Some("ship the fix".into()),
             goal_paused: true,
             latest_turn: Some(TurnStatus {

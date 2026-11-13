@@ -8,8 +8,17 @@
 - Durable run/task records
 - `--list` and `--run` inspection
 - `--plan-file` for deterministic plans
+- Orchestrate mode as the default for new interactive sessions
+- Worker commits, `--integrate`, and `worktrees --clean`
+- Live per-worker progress in the TUI and with `--progress`
 
 ## How to get to it (user POV)
+
+New interactive sessions start in orchestrate mode: type the goal in the composer.
+`/orchestrate off` or `/switch` moves to a single harness; `/orchestrate on` moves back.
+`baton --mode single` starts a single-harness session; `baton --mode orchestrate`
+forces orchestration. Set `"defaultMode": "single"` in `~/.baton/config.json` to opt out.
+
 ```sh
 baton orchestrate --max-tasks 3 "Audit billing, add tests, update docs"
 baton orchestrate --list

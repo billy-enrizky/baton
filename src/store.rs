@@ -3,7 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
 use uuid::Uuid;
 
-use crate::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
+use crate::types::{PermissionMode, ProviderId, SessionMode, TurnPhase, TurnUsage};
 
 #[derive(Debug, Clone)]
 pub struct ThreadRow {
@@ -15,6 +15,7 @@ pub struct ThreadRow {
     pub permission_mode: PermissionMode,
     pub goal: Option<String>,
     pub goal_paused: bool,
+    pub session_mode: SessionMode,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -170,6 +171,7 @@ CREATE TABLE IF NOT EXISTS threads (
   permission_mode TEXT NOT NULL DEFAULT 'default',
   goal TEXT,
   goal_paused INTEGER NOT NULL DEFAULT 0,
+  session_mode TEXT NOT NULL DEFAULT 'single',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -318,6 +320,7 @@ fn ensure_thread_columns(db: &Connection) -> Result<()> {
     ensure_column(db, "threads", "permission_mode", "TEXT NOT NULL DEFAULT 'default'")?;
     ensure_column(db, "threads", "goal", "TEXT")?;
     ensure_column(db, "threads", "goal_paused", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(db, "threads", "session_mode", "TEXT NOT NULL DEFAULT 'single'")?;
     Ok(())
 }
 
@@ -378,6 +381,7 @@ fn map_review_note(row: &rusqlite::Row) -> rusqlite::Result<ReviewNoteRow> {
 fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
     let provider: String = row.get(3)?;
     let permission_mode: String = row.get(7)?;
+    let session_mode: String = row.get(10)?;
     Ok(ThreadRow {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -387,12 +391,13 @@ fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
         permission_mode: PermissionMode::parse(&permission_mode).unwrap_or(PermissionMode::Default),
         goal: row.get(8)?,
         goal_paused: row.get::<_, i64>(9)? != 0,
+        session_mode: SessionMode::parse(&session_mode).unwrap_or(SessionMode::Single),
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
     })
 }
 
-const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused";
+const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode";
 
 /// Per-project prompt history cap, Claude Code style.
 pub const PROMPT_HISTORY_LIMIT: i64 = 100;
@@ -427,11 +432,28 @@ impl BatonStore {
         self.create_thread_with_id(input, Uuid::new_v4().to_string())
     }
 
+    pub fn create_thread_with_mode(
+        &self,
+        input: NewThread,
+        session_mode: SessionMode,
+    ) -> Result<ThreadRow> {
+        self.create_thread_with_id_and_mode(input, Uuid::new_v4().to_string(), session_mode)
+    }
+
     pub fn create_thread_with_id(&self, input: NewThread, id: String) -> Result<ThreadRow> {
+        self.create_thread_with_id_and_mode(input, id, SessionMode::Single)
+    }
+
+    pub fn create_thread_with_id_and_mode(
+        &self,
+        input: NewThread,
+        id: String,
+        session_mode: SessionMode,
+    ) -> Result<ThreadRow> {
         let now = now_iso();
         self.db.execute(
-            "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'default', NULL, 0, ?, ?)",
-            params![id, input.title, input.cwd, input.current_provider.as_str(), input.current_model, now, now],
+            "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, session_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'default', NULL, 0, ?, ?, ?)",
+            params![id, input.title, input.cwd, input.current_provider.as_str(), input.current_model, session_mode.as_str(), now, now],
         )?;
         Ok(ThreadRow {
             id,
@@ -442,6 +464,7 @@ impl BatonStore {
             permission_mode: PermissionMode::Default,
             goal: None,
             goal_paused: false,
+            session_mode,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -520,7 +543,7 @@ impl BatonStore {
         let now = now_iso();
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
-            "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, session_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 id,
                 title,
@@ -530,6 +553,7 @@ impl BatonStore {
                 source.permission_mode.as_str(),
                 source.goal,
                 source.goal_paused as i64,
+                source.session_mode.as_str(),
                 now,
                 now,
             ],
@@ -580,6 +604,7 @@ impl BatonStore {
             permission_mode: PermissionMode::Default,
             goal: None,
             goal_paused: false,
+            session_mode: SessionMode::Single,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -642,6 +667,22 @@ impl BatonStore {
     }
 
     pub fn rename_thread(&self, id: &str, title: &str) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET title = ?, updated_at = ? WHERE id = ?",
+            params![title, now_iso(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_session_mode(&self, id: &str, mode: SessionMode) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET session_mode = ?, updated_at = ? WHERE id = ?",
+            params![mode.as_str(), now_iso(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_title(&self, id: &str, title: &str) -> Result<()> {
         self.db.execute(
             "UPDATE threads SET title = ?, updated_at = ? WHERE id = ?",
             params![title, now_iso(), id],
@@ -864,11 +905,12 @@ impl BatonStore {
     pub fn find_thread_by_native_session(&self, provider: ProviderId, native_session_id: &str) -> Result<Option<ThreadRow>> {
         self.db
             .query_row(
-                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
+                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
                 params![provider.as_str(), native_session_id],
                 |row| {
                     let provider: String = row.get(3)?;
                     let permission_mode: String = row.get(7)?;
+                    let session_mode: String = row.get(10)?;
                     Ok(ThreadRow {
                         id: row.get(0)?,
                         title: row.get(1)?,
@@ -879,6 +921,8 @@ impl BatonStore {
                             .unwrap_or(PermissionMode::Default),
                         goal: row.get(8)?,
                         goal_paused: row.get::<_, i64>(9)? != 0,
+                        session_mode: SessionMode::parse(&session_mode)
+                            .unwrap_or(SessionMode::Single),
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
                     })

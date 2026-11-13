@@ -17,7 +17,7 @@ use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
-use crate::types::{ApprovalDecision, PermissionMode, ProviderId, TurnPhase};
+use crate::types::{ApprovalDecision, PermissionMode, ProviderId, SessionMode, TurnPhase};
 use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 
 pub mod viewport;
@@ -66,7 +66,7 @@ const LOGO_ROWS: [&str; 6] = [
 ];
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/switch", "switch harness: /switch <provider> [model]"),
+    ("/switch", "switch to a single harness: /switch <provider> [model]"),
     ("/model", "set model for this thread"),
     ("/mode", "permission mode: default|acceptEdits|bypassPermissions|plan"),
     ("/auth", "billing mode: /auth <provider> <subscription|api>"),
@@ -82,7 +82,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/goal", "set a multi-turn objective the agent works toward"),
     ("/find", "search the conversation"),
     ("/multi", "send the same prompt to multiple providers"),
-    ("/orchestrate", "coordinator and worker harnesses in isolated worktrees"),
+    ("/orchestrate", "orchestrate mode or one-off: /orchestrate [on|off] [goal]"),
     ("/queue", "show or clear queued follow-ups"),
     ("/turns", "list durable turn phases"),
     ("/status", "show thread phase, goal, queue, and adapter states"),
@@ -368,7 +368,6 @@ pub fn run_tui(
     }
 
     if let Some(prompt) = initial_prompt {
-        state.prompt_history.push(prompt.clone());
         let thread_id = state.thread.id.clone();
         let result = {
             let guard = store.lock().unwrap();
@@ -384,12 +383,7 @@ pub fn run_tui(
                     state.goal_paused,
                 );
             }
-            let _ = engine_command_sender.send(EngineCommand::Submit {
-                thread_id,
-                text: prompt,
-                permission_mode: state.permission_mode,
-            });
-            state.running = true;
+            dispatch_message(&mut state, &store, &engine_command_sender, prompt, false);
         }
     }
 
@@ -817,6 +811,25 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             state.orchestration_pending = false;
             state.orchestration_workers.clear();
             state.orchestration_scroll = 0;
+            let mut summary = format!(
+                "run {} · {}\n{}",
+                &report.run_id[..8.min(report.run_id.len())],
+                report.status,
+                report.goal
+            );
+            for (index, task) in report.tasks.iter().enumerate() {
+                summary.push_str(&format!(
+                    "\n  [{}] {} · {} · {}",
+                    index + 1,
+                    task.title,
+                    task.provider,
+                    task.status
+                ));
+                if let Some(commit) = &task.commit {
+                    summary.push_str(&format!(" · {}", &commit[..8.min(commit.len())]));
+                }
+            }
+            record_orchestration_message(state, summary);
             state.notice = Some(format!(
                 "orchestration {}: {} worker(s)",
                 report.status,
@@ -830,6 +843,7 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             state.orchestration_report = None;
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
+            record_orchestration_message(state, format!("run failed · {error}"));
             state.notice = Some(format!("orchestration failed: {error}"));
         }
         OrchestrationEvent::Progress(progress) => match progress {
@@ -901,11 +915,13 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
                     report.skipped.len()
                 ),
             };
+            record_orchestration_message(state, format!("integration · {notice}"));
             state.notice = Some(notice);
             state.orchestration_integrate_report = Some(*report);
         }
         OrchestrationEvent::IntegrateFailed(error) => {
             state.orchestration_integrating = false;
+            record_orchestration_message(state, format!("integration failed · {error}"));
             state.notice = Some(format!("integration failed: {error}"));
         }
     }
@@ -1014,6 +1030,29 @@ fn parse_orchestrate_args(args: &[String]) -> std::result::Result<OrchestrateArg
     Ok(OrchestrateArgs { goal, max_tasks, plan_file })
 }
 
+fn record_orchestration_message(state: &mut TuiState, text: String) {
+    let result = state.store.lock().unwrap().add_message(
+        &state.thread.id,
+        0,
+        "orchestration",
+        None,
+        None,
+        &text,
+    );
+    if let Ok(id) = result {
+        state.history.push(MessageRow {
+            id,
+            thread_id: state.thread.id.clone(),
+            turn: 0,
+            role: "orchestration".to_string(),
+            provider: None,
+            model: None,
+            text,
+            created_at: String::new(),
+        });
+    }
+}
+
 fn start_orchestration(
     state: &mut TuiState,
     goal: String,
@@ -1045,6 +1084,39 @@ fn start_orchestration(
             std::path::Path::new(&cwd).join(path)
         }
     });
+    let effective_goal = if goal.trim().is_empty() {
+        plan_path
+            .as_ref()
+            .map(|path| format!("plan file {}", path.display()))
+            .unwrap_or_else(|| "orchestration".to_string())
+    } else {
+        goal.clone()
+    };
+    let result = {
+        let guard = state.store.lock().unwrap();
+        ensure_persisted(&guard, &mut state.thread)
+    };
+    if let Err(error) = result {
+        state.notice = Some(format!("cannot start orchestration: {error}"));
+        return;
+    }
+    if state.thread.title == "New thread" {
+        let title = crate::handoff::derive_title(&effective_goal);
+        state.thread.title = title.clone();
+        let _ = state
+            .store
+            .lock()
+            .unwrap()
+            .set_thread_title(&state.thread.id, &title);
+    }
+    state.prompt_history.push(effective_goal.clone());
+    state.prompt_history_index = None;
+    {
+        let guard = state.store.lock().unwrap();
+        let _ = guard.record_prompt(&state.thread.cwd, &effective_goal);
+    }
+    let goal_message = format!("goal · {effective_goal}");
+    record_orchestration_message(state, goal_message);
     state.orchestration_pending = true;
     state.orchestration_workers.clear();
     state.orchestration_report = None;
@@ -1060,7 +1132,7 @@ fn start_orchestration(
         };
         let result = BatonStore::open(&home.join("baton.sqlite")).and_then(|store| {
             orchestrate::run_with_progress(
-                &goal,
+                &effective_goal,
                 std::path::Path::new(&cwd),
                 &home,
                 provider,
@@ -1241,6 +1313,12 @@ fn handle_key(
         if state.running {
             let _ = engine_command_sender.send(EngineCommand::Interrupt { thread_id: state.thread.id.clone() });
             state.notice = Some("interrupting...".into());
+            return;
+        }
+        if state.orchestration_pending {
+            state.notice = Some(
+                "orchestration is running; wait for the report before exiting".into(),
+            );
             return;
         }
         let now = Instant::now();
@@ -1776,6 +1854,35 @@ fn dispatch_message(
 ) {
     if allow_commands && text.starts_with('/') {
         handle_command(state, store, engine_command_sender, &text);
+    } else if state.thread.session_mode == SessionMode::Orchestrate {
+        if state.running {
+            state.notice = Some(
+                "a single turn is still running; finish it before starting an orchestration"
+                    .into(),
+            );
+            return;
+        }
+        if state.orchestration_pending {
+            state.notice = Some("an orchestration is already running".into());
+            return;
+        }
+        if crate::worktree::repo_root(std::path::Path::new(&state.thread.cwd)).is_err() {
+            state.notice = Some(
+                "orchestrate needs a git repository; this prompt runs on a single harness".into(),
+            );
+            submit(state, store, engine_command_sender, text);
+            return;
+        }
+        let text = if let Some(goal) = &state.goal {
+            if state.goal_paused {
+                text
+            } else {
+                format!("[goal: {goal}]\n{text}")
+            }
+        } else {
+            text
+        };
+        start_orchestration(state, text, 4, None);
     } else if state.running {
         let _ = engine_command_sender.send(EngineCommand::Steer {
             thread_id: state.thread.id.clone(),
@@ -2505,10 +2612,29 @@ fn handle_command(
                 valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
             ));
         }
-        "/orchestrate" => match parse_orchestrate_args(&args) {
-            Ok(parsed) => start_orchestration(state, parsed.goal, parsed.max_tasks, parsed.plan_file),
-            Err(message) => state.notice = Some(message),
-        },
+        "/orchestrate" => {
+            match args.first().map(String::as_str) {
+                Some("on") => {
+                    state.set_session_mode(store, SessionMode::Orchestrate);
+                    state.notice =
+                        Some("orchestrate mode: prompts spawn worker harnesses".into());
+                    return;
+                }
+                Some("off") => {
+                    state.set_session_mode(store, SessionMode::Single);
+                    state.notice =
+                        Some("single harness mode: prompts run on the current provider".into());
+                    return;
+                }
+                _ => {}
+            }
+            match parse_orchestrate_args(&args) {
+                Ok(parsed) => {
+                    start_orchestration(state, parsed.goal, parsed.max_tasks, parsed.plan_file)
+                }
+                Err(message) => state.notice = Some(message),
+            }
+        }
         "/status" => {
             let turns = store
                 .lock()
@@ -2518,11 +2644,12 @@ fn handle_command(
             let turn_count = turns.len();
             let latest = turns.into_iter().last();
             let mut text = format!(
-                "thread: {} {}\nprovider: {}/{}\nmode: {}",
+                "thread: {} {}\nprovider: {}/{}\nsession: {}\nmode: {}",
                 &state.thread.id[..8.min(state.thread.id.len())],
                 state.thread.title,
                 state.thread.current_provider,
                 state.thread.current_model.as_deref().unwrap_or("-"),
+                state.thread.session_mode,
                 state.permission_mode
             );
             match &state.goal {
@@ -2832,6 +2959,7 @@ fn handle_command(
                     current_model: None,
                 })
             };
+            state.thread.session_mode = crate::config::get_default_session_mode(&state.home);
             state.thread.permission_mode = state.permission_mode;
             state.history.clear();
             state.queued_messages.clear();
@@ -3833,6 +3961,7 @@ fn perform_switch(
         Ok(()) => {
             state.thread.current_provider = provider;
             state.thread.current_model = model.clone();
+            state.set_session_mode(store, SessionMode::Single);
             state.permission_mode = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd))
                 .for_provider(provider)
                 .permission_mode;
@@ -3843,10 +3972,12 @@ fn perform_switch(
                 .unwrap_or(None);
             state.notice = Some(match existing {
                 Some(session) => format!(
-                    "switched to {provider}/{display_model}, resuming native session {}",
+                    "single harness: {provider}/{display_model}, resuming native session {}",
                     &session.native_session_id[..8.min(session.native_session_id.len())]
                 ),
-                None => format!("switched to {provider}/{display_model}. First turn carries a context handoff."),
+                None => format!(
+                    "single harness: {provider}/{display_model}. First turn carries a context handoff."
+                ),
             });
         }
         Err(error) => state.notice = Some(format!("switch failed: {error}")),
@@ -4170,6 +4301,20 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
             }
             continue;
         }
+        if message.role == "orchestration" {
+            let style = if message.text.starts_with("goal") {
+                Style::default()
+                    .fg(COLORS.secondary)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLORS.muted)
+            };
+            for line in wrap(&message.text) {
+                all_lines.push(Line::styled(line, style));
+            }
+            all_lines.push(Line::from(vec![Span::raw(" ")]));
+            continue;
+        }
         if message.role == "diff" {
             let rendered = state
                 .diff_cache
@@ -4489,8 +4634,13 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
             let end = (start + input_width).min(line_end);
             let mut spans: Vec<Span> = Vec::new();
             if state.input.is_empty() && line_index == 0 {
+                let placeholder = if state.thread.session_mode == SessionMode::Orchestrate {
+                    "Ask anything; baton will split the work across harnesses"
+                } else {
+                    "Ask anything..."
+                };
                 spans.push(Span::styled(
-                    "Ask anything...",
+                    placeholder,
                     Style::default().fg(COLORS.muted),
                 ));
             } else {
@@ -4581,7 +4731,22 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
             Some(branch) => format!("{location}:{branch}"),
             None => location,
         };
-        Line::styled(format!("{location} · {}", state.thread.title), Style::default().fg(COLORS.muted))
+        let (mode_label, mode_color) = match state.thread.session_mode {
+            SessionMode::Orchestrate => ("orchestrate".to_string(), COLORS.secondary),
+            SessionMode::Single => (state.thread.current_provider.to_string(), COLORS.muted),
+        };
+        Line::from(vec![
+            Span::styled(
+                mode_label,
+                Style::default()
+                    .fg(mode_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" · {location} · {}", state.thread.title),
+                Style::default().fg(COLORS.muted),
+            ),
+        ])
     };
 
     let usage_rows = state.store_rows();
@@ -4635,6 +4800,12 @@ impl TuiState {
         self.permission_mode = mode;
         self.thread.permission_mode = mode;
         self.persist_thread_state(store);
+    }
+
+    fn set_session_mode(&mut self, store: &Arc<Mutex<BatonStore>>, mode: SessionMode) {
+        self.thread.session_mode = mode;
+        let guard = store.lock().unwrap();
+        let _ = guard.set_thread_session_mode(&self.thread.id, mode);
     }
 
     fn set_goal_state(
@@ -6358,6 +6529,9 @@ mod tests {
             guard
                 .set_thread_goal(&other.id, Some("other goal"), true)
                 .unwrap();
+            guard
+                .set_thread_session_mode(&other.id, SessionMode::Orchestrate)
+                .unwrap();
         }
         state.overlay = Overlay::ThreadPicker {
             selected: 0,
@@ -6378,6 +6552,7 @@ mod tests {
         assert_eq!(state.permission_mode, PermissionMode::BypassPermissions);
         assert_eq!(state.goal.as_deref(), Some("other goal"));
         assert!(state.goal_paused);
+        assert_eq!(state.thread.session_mode, SessionMode::Orchestrate);
     }
 
     #[test]
@@ -6588,6 +6763,194 @@ mod tests {
             skipped: Vec::new(),
             conflict: None,
         }
+    }
+
+    #[test]
+    fn orchestrate_mode_shows_badge_and_placeholder() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.session_mode = SessionMode::Orchestrate;
+        let buffer = render_state(&state, 120, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(text.contains("orchestrate"), "{text}");
+        assert!(text.contains("baton will split the work"), "{text}");
+
+        state.thread.session_mode = SessionMode::Single;
+        let buffer = render_state(&state, 120, 30);
+        let text = buffer_lines(&buffer).join("\n");
+        assert!(!text.contains("baton will split the work"), "{text}");
+        assert!(text.contains("Ask anything..."), "{text}");
+    }
+
+    #[test]
+    fn orchestrate_mode_routes_git_prompts_away_from_single_turns() {
+        let repo = tempfile::tempdir().unwrap();
+        let init = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(init.success());
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        state.thread.session_mode = SessionMode::Orchestrate;
+        state.orchestration_pending = true;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "hello".to_string(),
+            false,
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("already running"),
+            "notice: {:?}",
+            state.notice
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "a git repository prompt must not fall through to the single-harness engine"
+        );
+    }
+
+    #[test]
+    fn orchestrate_mode_falls_back_to_single_outside_git() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.session_mode = SessionMode::Orchestrate;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "hello".to_string(),
+            false,
+        );
+        assert!(!state.orchestration_pending);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("needs a git repository"),
+            "notice: {:?}",
+            state.notice
+        );
+        assert!(
+            matches!(receiver.try_recv(), Ok(EngineCommand::Submit { .. })),
+            "the prompt falls back to the single-harness engine"
+        );
+    }
+
+    #[test]
+    fn ctrl_c_does_not_exit_while_orchestration_is_running() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_pending = true;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::empty(),
+            },
+        );
+        assert!(!state.quit);
+        assert!(state.exit_armed.is_none());
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("wait for the report"),
+            "notice: {:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn orchestrate_mode_toggles_and_is_persisted() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(state.thread.session_mode, SessionMode::Single);
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/orchestrate on",
+        );
+        assert_eq!(state.thread.session_mode, SessionMode::Orchestrate);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_thread(&state.thread.id)
+                .unwrap()
+                .unwrap()
+                .session_mode,
+            SessionMode::Orchestrate
+        );
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/orchestrate off",
+        );
+        assert_eq!(state.thread.session_mode, SessionMode::Single);
+    }
+
+    #[test]
+    fn new_thread_defaults_to_orchestrate_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/new");
+        assert_eq!(state.thread.session_mode, SessionMode::Orchestrate);
+    }
+
+    #[test]
+    fn switching_harness_returns_to_single_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.set_session_mode(&store, SessionMode::Orchestrate);
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/switch claude",
+        );
+        assert_eq!(state.thread.session_mode, SessionMode::Single);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .get_thread(&state.thread.id)
+                .unwrap()
+                .unwrap()
+                .session_mode,
+            SessionMode::Single
+        );
     }
 
     #[test]

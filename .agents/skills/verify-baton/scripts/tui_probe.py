@@ -206,9 +206,11 @@ def main() -> int:
     parser.add_argument("--binary", default="target/debug/baton")
     parser.add_argument("--command", default="/status")
     parser.add_argument("--expect", action="append", default=[])
+    parser.add_argument("--reject", action="append", default=[])
+    parser.add_argument("--arg", action="append", default=[])
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=34)
-    parser.add_argument("--ready", default="Ask anything...")
+    parser.add_argument("--ready", default="Ask anything")
     parser.add_argument("--warmup", type=float, default=3.0)
     parser.add_argument("--timeout", type=float, default=12.0)
     parser.add_argument("--evidence-dir", default="local_docs/verification/evidence")
@@ -230,7 +232,7 @@ def main() -> int:
         env = os.environ.copy()
         env["BATON_HOME"] = home
         env["TERM"] = "xterm-256color"
-        os.execvpe(str(binary), [str(binary)], env)
+        os.execvpe(str(binary), [str(binary), *args.arg], env)
 
     set_size(master, args.width, args.height)
     transcript = bytearray()
@@ -257,7 +259,8 @@ def main() -> int:
         joined = "\n".join(lines)
         expectations = args.expect or ["thread:", "adapters:"]
         missing = [expect for expect in expectations if expect not in joined]
-        passed = not missing
+        rejected = [reject for reject in args.reject if reject in joined]
+        passed = not missing and not rejected
         (evidence / "screen.txt").write_text(joined + "\n")
         (evidence / "transcript.raw").write_bytes(bytes(transcript))
         debug("screen captured")
@@ -269,6 +272,7 @@ def main() -> int:
             "command": args.command,
             "expect": expectations,
             "missing": missing,
+            "rejected": rejected,
             "exit_code": exit_code,
             "passed": passed and exit_code == 0,
             "evidence": str(evidence),
@@ -276,6 +280,7 @@ def main() -> int:
         print(json.dumps({
             "passed": passed and exit_code == 0,
             "missing": missing,
+            "rejected": rejected,
             "exit_code": exit_code,
             "evidence": str(evidence),
         }, indent=2))

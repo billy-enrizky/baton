@@ -11,7 +11,7 @@ use adapters::{AcpAdapter, BatonAdapter, ClaudeAdapter, OpenCodeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use runtime::{run_engine, EngineCommand, EngineEvent, SharedAdapter, SharedStore};
 use store::{BatonStore, ImportedMessage, NewThread};
-use types::{PermissionMode, ProviderId, TurnPhase};
+use types::{PermissionMode, ProviderId, SessionMode, TurnPhase};
 use adapters::TurnEvent;
 use usage::{cache_hit_rate, format_usage_line, sum_usage};
 
@@ -48,6 +48,11 @@ fn main_result() -> Result<()> {
 
     match command {
         cli::Commands::Exec { prompt, json } => {
+            if cli.mode.is_some() {
+                anyhow::bail!(
+                    "--mode applies to the interactive TUI; use `baton orchestrate` for a non-interactive run"
+                );
+            }
             let prompt = prompt.join(" ");
             if prompt.is_empty() {
                 anyhow::bail!("usage: baton exec <prompt>");
@@ -314,6 +319,7 @@ fn main_result() -> Result<()> {
                         "title": thread.title,
                         "provider": thread.current_provider.as_str(),
                         "model": model,
+                        "session_mode": thread.session_mode.as_str(),
                         "permission_mode": thread.permission_mode.as_str(),
                         "goal": thread.goal,
                         "goal_paused": thread.goal_paused,
@@ -354,10 +360,11 @@ fn main_result() -> Result<()> {
                     .unwrap_or_else(|| "idle".to_string());
                 let queued = store.list_queued_messages(&thread.id)?.len();
                 println!(
-                    "{}  {}/{}  {}  turns:{}  queue:{}  {}",
+                    "{}  {}/{}  session:{}  {}  turns:{}  queue:{}  {}",
                     &thread.id[..8],
                     thread.current_provider,
                     model,
+                    thread.session_mode,
                     phase,
                     turn_count,
                     queued,
@@ -386,21 +393,31 @@ fn main_result() -> Result<()> {
             } else {
                 title.join(" ")
             };
-            let mut thread = store.create_thread(NewThread {
-                title: thread_title,
-                cwd: cwd.to_string_lossy().to_string(),
-                current_provider: provider,
-                current_model: cli.model.clone(),
-            })?;
+            let session_mode = match cli.mode.as_deref() {
+                Some(value) => SessionMode::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!("unknown mode \"{value}\"; use single or orchestrate")
+                })?,
+                None => config::get_default_session_mode(home.as_path()),
+            };
+            let mut thread = store.create_thread_with_mode(
+                NewThread {
+                    title: thread_title,
+                    cwd: cwd.to_string_lossy().to_string(),
+                    current_provider: provider,
+                    current_model: cli.model.clone(),
+                },
+                session_mode,
+            )?;
             if let Some(mode) = permission_override {
                 store.set_thread_permission_mode(&thread.id, mode)?;
                 thread.permission_mode = mode;
             }
             println!(
-                "created thread {} ({}/{}) mode {}",
+                "created thread {} ({}/{}) session {} mode {}",
                 &thread.id[..8],
                 provider,
                 model.unwrap_or_default(),
+                thread.session_mode,
                 thread.permission_mode
             );
             Ok(())
@@ -1328,6 +1345,7 @@ fn main_result() -> Result<()> {
                 provider: thread.current_provider,
                 model,
                 permission_mode: thread.permission_mode,
+                session_mode: thread.session_mode,
                 goal: thread.goal.clone(),
                 goal_paused: thread.goal_paused,
                 latest_turn,
@@ -1627,8 +1645,14 @@ fn resolve_thread(store: &BatonStore, thread_id: &str) -> Result<store::ThreadRo
 fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: Option<PermissionMode>, initial_prompt: Option<String>) -> Result<()> {
     let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
     let resolved = resolve_config(home, cwd);
+    let requested_mode = match cli.mode.as_deref() {
+        Some(value) => Some(SessionMode::parse(value).ok_or_else(|| {
+            anyhow::anyhow!("unknown mode \"{value}\"; use single or orchestrate")
+        })?),
+        None => None,
+    };
 
-    let thread = match &cli.thread {
+    let mut thread = match &cli.thread {
         Some(thread_id) => {
             let guard = store.lock().unwrap();
             resolve_thread(&guard, thread_id)?
@@ -1643,9 +1667,18 @@ fn run_chat(cli: cli::Cli, home: &PathBuf, cwd: &PathBuf, permission_override: O
                 .model
                 .clone()
                 .or_else(|| Some(resolved.for_provider(provider).model.clone()));
-            guard_draft_thread(&store, provider, model, cwd)?
+            let mut thread = guard_draft_thread(&store, provider, model, cwd)?;
+            thread.session_mode = config::get_default_session_mode(home);
+            thread
         }
     };
+    if let Some(mode) = requested_mode {
+        thread.session_mode = mode;
+        let guard = store.lock().unwrap();
+        if guard.get_thread(&thread.id)?.is_some() {
+            guard.set_thread_session_mode(&thread.id, mode)?;
+        }
+    }
 
     let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()

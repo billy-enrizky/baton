@@ -22,6 +22,8 @@ pub struct BatonConfigFile {
     pub default_models: Option<BTreeMap<String, String>>,
     #[serde(default, rename = "defaultProvider")]
     pub default_provider: Option<String>,
+    #[serde(default, rename = "defaultMode")]
+    pub default_mode: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +118,16 @@ pub fn resolve_provider_config(
         model: file_model.or(harness.model).unwrap_or(fallback_model),
         permission_mode: harness.permission_mode.unwrap_or(PermissionMode::Default),
     }
+}
+
+/// New sessions orchestrate by default. A harness is still used as the
+/// coordinator, but the prompt is split into worker tasks and each worker can
+/// run a different provider. Set `defaultMode` to `single` to opt out.
+pub fn get_default_session_mode(home: &Path) -> crate::types::SessionMode {
+    load_config_file(home)
+        .and_then(|file| file.default_mode)
+        .and_then(|value| crate::types::SessionMode::parse(&value))
+        .unwrap_or(crate::types::SessionMode::Orchestrate)
 }
 
 pub fn get_default_provider(home: &Path) -> Option<ProviderId> {

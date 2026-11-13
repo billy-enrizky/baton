@@ -2,12 +2,13 @@
 
 One terminal CLI for every coding agent harness. Same thread, any model, native prompt caching.
 
-Start a thread with codex. Hit a wall. `/switch`, pick claude, and keep going in the same thread with Claude Code holding the context. Switch back later and the Codex session, and its provider-side prompt cache, resumes where you left off.
+New sessions orchestrate by default: the prompt is the goal, a coordinator splits it, and independent workers run in separate git worktrees, each on the harness that fits the task. `/switch` moves to a single harness when one agent is the right shape. Hit a wall in that harness, switch to another, and keep going in the same thread with Claude Code or Codex holding the context.
 
 baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t3code). Adapter protocol knowledge and the native session scanner are ported from t3code (MIT). The Rust implementation follows codex-rs patterns (ratatui TUI, sequential session loop, split line transports).
 
 ## What it does
 
+- **Orchestrated by default.** A first prompt starts a coordinator, which plans independent tasks and picks a harness for each. Workers run in isolated worktrees with live progress, commit their changes to their own branches, and can be merged back with a confirmation.
 - **One CLI, many harnesses.** Codex, Claude Code, Grok Build, OpenCode, Cursor, and Antigravity, driven through their supported programmatic surfaces (app-server JSON-RPC, headless stream-json, ACP, HTTP).
 - **The thread is the product.** Switching harness or model mid-thread is a dropdown: `/switch` opens the provider picker, then the model picker. First turn on a new harness carries a token-budgeted context handoff; after that each harness keeps its own native session.
 - **High prompt cache hit rates.** baton never replays history into a harness. The cache hit rate is always visible in the status bar.
@@ -46,8 +47,9 @@ API-rate billing: set the provider's key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`,
 ## Usage
 
 ```
-baton                    # fresh thread in the TUI (unsaved until the first message)
-baton -t <id>            # open an existing thread
+baton                    # fresh orchestrated session in the TUI
+baton --mode single      # fresh session on one harness
+baton -t <id>            # open an existing thread and its saved session mode
 baton threads [--json]   # list threads with phase, turns, goal, queue
 baton status [-t id] [--json]  # phase, goal, queue, usage
 baton turns [-t id] [--json]   # full durable turn history
@@ -65,18 +67,21 @@ baton auth [provider] [subscription|api]
 baton diff <id> [turn]   # checkpoint diff against the working tree
 baton restore <id> <turn>
 baton rewind [-t id] --turn N [--native] [--json]  # remove a turn and later turns; Codex can revert natively
-baton orchestrate [--max-tasks N] [--plan-file path] [--json] "goal"  # coordinator + workers in worktrees
+baton orchestrate [--max-tasks N] [--plan-file path] [--progress] [--json] "goal"  # coordinator + workers in worktrees
 baton orchestrate --list [--json]
 baton orchestrate --run <run-id> [--json]
+baton orchestrate --integrate <run-id> [--task N] [--json]  # merge completed worker branches
+baton worktrees [--json] [--run <id>]  # list managed worktrees
+baton worktrees --clean [--force] [--run <id>]  # remove clean, merged worktrees
 ```
 
-In the TUI: `/help /status /switch /model /mode /auth /new /fork /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /queue /turns /copy /clear /quit`. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn, press twice to exit. Drag in the transcript to select and copy rendered lines; `/copy` copies the latest assistant reply. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably. `/fork [--turn N] [title]` branches the conversation into a new thread; both threads share the same working tree, and the fork starts with a transcript handoff instead of the source provider session.
+In the TUI: `/help /status /switch /model /mode /auth /new /fork /threads /open /usage /checkpoints /diff /review /rewind /goal /find /multi /orchestrate /queue /turns /copy /clear /quit`. New threads start in orchestrate mode; `/orchestrate off` switches the current thread to a single harness, `/orchestrate on` switches back, and `/switch` also returns to single-harness mode. In orchestrate mode a composer prompt launches a coordinator run instead of a single turn. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn; while an orchestration is active it waits for the report so workers are not orphaned, and press twice to exit when idle. Drag in the transcript to select and copy rendered lines; `/copy` copies the latest assistant reply. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably. `/fork [--turn N] [title]` branches the conversation into a new thread; both threads share the same working tree, and the fork starts with a transcript handoff instead of the source provider session.
 
 For Codex, `baton fork --native` asks the Codex app-server for a native `thread/fork`, then attaches the new provider session to the baton fork. The source thread is unchanged, and `--turn N` forks through that completed provider turn. Without `--native`, baton copies the transcript and starts the fork with a handoff.
 
 ## Orchestration
 
-`baton orchestrate` is a small Orca-style multi-agent loop. A coordinator harness receives the goal, splits it into independent tasks, and chooses the best available harness for each task. Baton then creates a real git worktree per worker under `~/.baton/worktrees/<run>/<task>`, runs each worker through the normal `baton exec` path in parallel, and records the run and task results durably.
+`baton orchestrate` is a small Orca-style multi-agent loop. A coordinator harness receives the goal, splits it into independent tasks, and chooses the best available harness for each task. Baton then creates a real git worktree per worker under `~/.baton/worktrees/<run>/<task>`, runs each worker through the normal `baton exec` path in parallel, and records the run and task results durably. New interactive sessions use this path by default; `--mode single`, `/orchestrate off`, or `"defaultMode": "single"` in `~/.baton/config.json` restores single-harness startup.
 
 ```sh
 baton --yolo orchestrate --max-tasks 3 "Audit billing settings, add the missing tests, and update the docs"
@@ -86,7 +91,7 @@ baton orchestrate --run <run-id> --json
 
 Workers are ordinary baton threads in their own worktrees, so they keep the same turn phases, adapter lifecycle, process tracking, and native-session behavior as single-thread runs. The global `--yolo`, `--full-auto`, and `--plan` flags apply to the coordinator and worker processes. Use `--plan-file` to supply a plan directly, which is useful for agents and repeatable tests. The coordinator retries once if its first plan is not valid JSON.
 
-Worktrees are kept after the run for review. Baton does not merge worker branches or clean them up automatically yet. A dirty source checkout is branched from `HEAD`, so uncommitted source changes are not present in worker worktrees.
+Worktrees are kept after the run for review. A successful worker commits its changes to its branch as `baton worker: <title>`; `baton orchestrate --integrate <run-id>` merges completed branches in plan order, refuses a dirty source checkout, aborts a conflicting merge with the affected files, and skips workers that are already merged. `baton worktrees --clean` removes only clean worktrees whose branch is merged; dirty or unmerged work needs the explicit `--force`. A dirty source checkout is branched from `HEAD`, so uncommitted source changes are not present in worker worktrees.
 
 ## MCP
 

@@ -347,6 +347,22 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+/// A plain-language install hint for a provider whose CLI is not on PATH.
+pub fn provider_install_hint(provider: ProviderId) -> String {
+    format!(
+        "{} is not installed. Install the {} CLI, then run `baton doctor` to check it.",
+        provider.binary_name(),
+        provider
+    )
+}
+
+/// Returns the install hint only when the provider binary is missing.
+pub fn missing_provider_hint(provider: ProviderId) -> Option<String> {
+    find_executable(provider.binary_name())
+        .is_none()
+        .then(|| provider_install_hint(provider))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -426,5 +442,12 @@ mod tests {
         assert!(!is_executable_file(&plain));
         std::fs::set_permissions(&plain, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert!(is_executable_file(&plain));
+    }
+
+    #[test]
+    fn missing_provider_hint_names_the_binary_and_the_next_step() {
+        let hint = provider_install_hint(ProviderId::Cursor);
+        assert!(hint.contains("cursor-agent"), "{hint}");
+        assert!(hint.contains("baton doctor"), "{hint}");
     }
 }

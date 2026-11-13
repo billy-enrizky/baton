@@ -5231,6 +5231,10 @@ fn perform_switch(
     provider: ProviderId,
     model: Option<String>,
 ) {
+    if let Some(hint) = crate::doctor::missing_provider_hint(provider) {
+        state.notice = Some(hint);
+        return;
+    }
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
     let default_model = resolved.for_provider(provider).model.clone();
     let display_model = model.clone().unwrap_or(default_model);
@@ -6375,6 +6379,12 @@ impl TuiState {
                 ),
             ]),
         ];
+        if let Some(hint) = crate::doctor::missing_provider_hint(provider) {
+            lines.push(Line::styled(
+                format!("   {hint}"),
+                Style::default().fg(COLORS.warning),
+            ));
+        }
         if provider == ProviderId::Claude
             && provider_config.mode == crate::config::AuthMode::Subscription
             && std::env::var("ANTHROPIC_API_KEY")

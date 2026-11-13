@@ -6,6 +6,7 @@ Start here:
   baton \"fix the failing test\"        start with a prompt
   baton exec \"summarize this repo\"    one non-interactive turn
   baton orchestrate \"split this task\" workers in isolated worktrees
+  baton spawn \"fix the failing test\"   one isolated worker in a worktree
   baton doctor                       check installed harnesses and config
 
 Inside the workspace, type what you want to do, or /help for common paths.";
@@ -82,6 +83,13 @@ pub enum Commands {
         /// Emit one JSON event per line, then the final result object
         #[arg(long, conflicts_with = "json")]
         stream_json: bool,
+    },
+    /// Run one task in an isolated worktree and return the worker thread
+    Spawn {
+        prompt: Vec<String>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
     },
     /// Update baton to the latest version
     Update,
@@ -297,6 +305,18 @@ mod tests {
         assert!(text.contains("Start here:"), "{text}");
         assert!(text.contains("baton orchestrate"), "{text}");
         assert!(text.contains("baton doctor"), "{text}");
+    }
+
+    #[test]
+    fn spawn_accepts_a_task() {
+        let cli = Cli::try_parse_from(["baton", "spawn", "fix", "the", "test"]).unwrap();
+        match cli.command {
+            Some(Commands::Spawn { prompt, json }) => {
+                assert_eq!(prompt, vec!["fix", "the", "test"]);
+                assert!(!json);
+            }
+            _ => panic!("expected the spawn command"),
+        }
     }
 
     #[test]

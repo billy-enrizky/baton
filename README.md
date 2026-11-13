@@ -65,6 +65,7 @@ baton doctor [--json]    # ready and missing harnesses, configs, database, and p
 baton resume [-t id] [--fork] [--print] [--force]  # open the native CLI
 baton exec -p <provider> [--effort level] [--json | --stream-json] "prompt"  # one non-interactive turn
 baton exec -t <worker-thread> [--json] "answer"  # answer an orchestration worker question
+baton spawn [-p provider] [--json] "task"  # one isolated worker in a worktree
 
 `--json` prints one final result object. `--stream-json` prints one compact JSON object per line for provider session and turn ids, text deltas, tool start and finish, usage, and turn completion, then a final `type: "result"` row. Use it when an agent needs live progress; stdout stays parseable JSONL and progress text stays off stderr.
 baton mcp                # MCP stdio server for agent access to the thread store
@@ -92,6 +93,8 @@ For OpenCode, `baton rewind --native` stages and commits a history-only revert a
 For Codex, `baton fork --native` asks the Codex app-server for a native `thread/fork`, then attaches the new provider session to the baton fork. The source thread is unchanged, and `--turn N` forks through that completed provider turn. For OpenCode, `--native` forks the whole native session through `/session/<id>/fork`; `--turn` is refused until Baton can map a turn to an OpenCode message boundary. Without `--native`, baton copies the transcript and starts the fork with a handoff.
 
 ## Orchestration
+
+For one task, `baton spawn "task"` skips the coordinator and runs a single worker in an isolated worktree through the same run, task, commit, and report records. `--json` returns the run, task, thread, worktree, branch, commit, text, and question, so an agent can follow up with `baton exec -t <thread>`.
 
 `baton orchestrate` is a small Orca-style multi-agent loop. A coordinator harness receives the goal, splits it into independent tasks, and chooses the best available harness for each task. Baton then creates a real git worktree per worker under `~/.baton/worktrees/<run>/<task>`, runs each worker through the normal `baton exec` path in parallel, and records the run and task results durably. New interactive sessions use this path by default; `--mode single`, `/orchestrate off`, or `"defaultMode": "single"` in `~/.baton/config.json` restores single-harness startup.
 

@@ -32,6 +32,15 @@ BATON_HOME="$tmp" target/debug/baton -C "$cwd" ps --json | jq -e '.processes == 
 
 The resume line must contain the same native session id returned in the fork JSON.
 
+MCP uses the same helper:
+
+```sh
+printf '%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"baton_fork","arguments":{"thread":"<source>","turn":1,"native":true,"title":"mcp native"}}}' \
+  | BATON_HOME="$tmp" target/debug/baton -C "$cwd" mcp | tail -1 | jq -r '.result.content[0].text' | jq -e '.native == true and .native_session_id'
+```
+
 ## Gotchas
 - `--native` is Codex-only today. Claude and OpenCode fail loudly rather than silently falling back.
 - A source thread needs a Codex provider session and, for `--turn N`, a recorded provider turn id.

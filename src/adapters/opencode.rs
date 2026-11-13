@@ -667,6 +667,23 @@ impl BatonAdapter for OpenCodeAdapter {
             native_session_id: session_id.clone(),
             rollout_path: None,
         });
+        // A crash between revert/stage and revert/commit would leave a staged
+        // revert that the next prompt commits. Baton owns this session, so
+        // clear any stale stage before prompting. Bound it so an unresponsive
+        // server cannot delay the turn.
+        if runtime.version == OpenCodeVersion::V2 {
+            let _ = runtime
+                .http
+                .post(format!(
+                    "{}/api/session/{session_id}/revert/clear",
+                    runtime.base_url
+                ))
+                .header("Authorization", &runtime.auth_header)
+                .timeout(std::time::Duration::from_secs(5))
+                .json(&json!({}))
+                .send()
+                .await;
+        }
 
         match runtime.version {
             OpenCodeVersion::V2 => {

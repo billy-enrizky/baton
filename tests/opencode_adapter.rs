@@ -338,6 +338,20 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
     .expect("text delta arrives while the turn is in flight");
     assert_eq!(first_delta, "streamed ");
     assert!(!turn_task.is_finished(), "a tool-calls step must not complete the turn");
+    {
+        let requests = requests.lock().unwrap();
+        let clear = requests
+            .iter()
+            .position(|(path, _)| path.ends_with("/revert/clear"));
+        let prompt = requests
+            .iter()
+            .position(|(path, _)| path == "/api/session/ses_test/prompt");
+        assert!(
+            clear.is_some() && clear < prompt,
+            "a stale staged revert is cleared before the prompt: {:?}",
+            *requests
+        );
+    }
 
     assert!(steer("change direction".into()), "steering is accepted during the live turn");
     let steer_body = tokio::time::timeout(Duration::from_secs(10), async {

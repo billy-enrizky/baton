@@ -13,7 +13,11 @@ async fn send(write: &mut tokio::io::DuplexStream, value: Value) {
     write.flush().await.unwrap();
 }
 
-async fn fake_server_full_turn(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
+async fn fake_server_full_turn(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    params_sender: tokio::sync::mpsc::UnboundedSender<Value>,
+) {
     let mut lines = BufReader::new(read);
     let mut line = String::new();
     loop {
@@ -43,6 +47,7 @@ async fn fake_server_full_turn(read: tokio::io::DuplexStream, mut write: tokio::
                 .await;
             }
             "turn/start" => {
+                let _ = params_sender.send(frame.get("params").cloned().unwrap_or(Value::Null));
                 send(
                     &mut write,
                     json!({
@@ -375,9 +380,14 @@ async fn codex_adapter_forks_a_native_thread() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_adapter_runs_a_full_turn() {
+    let (params_sender, mut params_receiver) = tokio::sync::mpsc::unbounded_channel();
     let spawner = Arc::new(move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
         let (halves, server_read, server_write) = duplex_halves(64 * 1024);
-        tokio::spawn(fake_server_full_turn(server_read, server_write));
+        tokio::spawn(fake_server_full_turn(
+            server_read,
+            server_write,
+            params_sender.clone(),
+        ));
         Ok(halves)
     });
     let mut adapter = CodexAdapter::new(spawner);
@@ -388,6 +398,7 @@ async fn codex_adapter_runs_a_full_turn() {
             thread_id: "baton-thread".into(),
             cwd: "/work".into(),
             model: "gpt-6.1-sol".into(),
+            effort: Some("high".into()),
             prompt: "hello".into(),
             permission_mode: PermissionMode::Default,
             auth_env: vec![],
@@ -400,6 +411,11 @@ async fn codex_adapter_runs_a_full_turn() {
     .expect("turn should complete");
 
     let _ = result;
+    let params = tokio::time::timeout(Duration::from_secs(2), params_receiver.recv())
+        .await
+        .expect("turn/start params arrive")
+        .expect("turn/start params channel");
+    assert_eq!(params["effort"], "high");
     let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
     let completed = events
         .iter()
@@ -537,6 +553,7 @@ async fn codex_adapter_streams_deltas_before_turn_completion() {
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "gpt-6.1-sol".into(),
+                    effort: None,
                     prompt: "hello".into(),
                     permission_mode: PermissionMode::Default,
                     auth_env: vec![],
@@ -602,6 +619,7 @@ async fn codex_adapter_resumes_sessions_and_maps_approvals() {
                     thread_id: "bt".into(),
                     cwd: "/work".into(),
                     model: "m".into(),
+                    effort: None,
                     prompt: "p".into(),
                     permission_mode: PermissionMode::Default,
                     auth_env: vec![],
@@ -712,6 +730,7 @@ async fn codex_adapter_reports_failed_turn_status() {
                 thread_id: "baton-thread".into(),
                 cwd: "/work".into(),
                 model: "m".into(),
+                effort: None,
                 prompt: "hello".into(),
                 permission_mode: PermissionMode::Default,
                 auth_env: vec![],
@@ -832,6 +851,7 @@ async fn codex_interrupt_sends_turn_id_and_reports_interruption() {
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "m".into(),
+                    effort: None,
                     prompt: "hello".into(),
                     permission_mode: PermissionMode::Default,
                     auth_env: vec![],
@@ -984,6 +1004,7 @@ async fn codex_steer_injects_into_the_active_turn() {
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "m".into(),
+                    effort: None,
                     prompt: "hello".into(),
                     permission_mode: PermissionMode::Default,
                     auth_env: vec![],

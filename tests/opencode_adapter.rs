@@ -217,6 +217,7 @@ async fn opencode_adapter_streams_deltas_and_completes_on_next_flow() {
                     thread_id: "baton-thread".into(),
                     cwd: "/work".into(),
                     model: "myprovider/rits-zai-org/glm-5-3".into(),
+                    effort: None,
                     prompt: "hello".into(),
                     permission_mode: PermissionMode::Default,
                     auth_env: vec![],

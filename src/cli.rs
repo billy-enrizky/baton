@@ -27,6 +27,10 @@ pub struct Cli {
     #[arg(short = 'm', long, global = true)]
     pub model: Option<String>,
 
+    /// Reasoning effort for exec, new, or interactive threads (low, medium, high, xhigh, max; default clears)
+    #[arg(long, global = true, value_name = "LEVEL")]
+    pub effort: Option<String>,
+
     /// Session mode: single or orchestrate
     #[arg(long, global = true, value_name = "MODE")]
     pub mode: Option<String>,

@@ -61,6 +61,10 @@ impl ClaudeAdapter {
             "--model".to_string(),
             input.model.clone(),
         ];
+        if let Some(effort) = input.effort.as_deref() {
+            args.push("--effort".to_string());
+            args.push(effort.to_string());
+        }
         if let Some(session) = session {
             args.push("--resume".to_string());
             args.push(session.native_session_id.clone());
@@ -490,12 +494,15 @@ mod tests {
             thread_id: "t".into(),
             cwd: "/work".into(),
             model: "claude-sonnet-4-5".into(),
+            effort: Some("max".into()),
             prompt: "p".into(),
             permission_mode: PermissionMode::Default,
             auth_env: vec![],
         };
         let args = ClaudeAdapter::command_args(&input, None);
         assert!(args.contains(&"--include-partial-messages".to_string()));
+        let effort = args.iter().position(|arg| arg == "--effort").expect("effort flag");
+        assert_eq!(args[effort + 1], "max");
         assert!(args.contains(&"--output-format".to_string()));
         assert!(args.contains(&"stream-json".to_string()));
 

@@ -204,6 +204,7 @@ pub struct TurnStartInput {
     pub thread_id: String,
     pub cwd: String,
     pub model: String,
+    pub effort: Option<String>,
     pub prompt: String,
     pub permission_mode: PermissionMode,
     pub auth_env: Vec<(String, String)>,

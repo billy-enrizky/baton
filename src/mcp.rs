@@ -428,6 +428,7 @@ impl McpServer {
             title: thread.title.clone(),
             provider: thread.current_provider,
             model,
+            reasoning_effort: thread.reasoning_effort.clone(),
             permission_mode: thread.permission_mode,
             session_mode: thread.session_mode,
             goal: thread.goal.clone(),
@@ -840,6 +841,7 @@ mod tests {
                 None,
                 "2026-11-13T00:00:00Z",
                 Some("2026-11-13T00:00:01Z"),
+                None,
                 None,
                 None,
             )

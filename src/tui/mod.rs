@@ -18,7 +18,10 @@ use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
-use crate::types::{ApprovalDecision, PermissionMode, ProviderId, SessionMode, TurnPhase};
+use crate::types::{
+    normalize_reasoning_effort, ApprovalDecision, PermissionMode, ProviderId, SessionMode,
+    TurnPhase,
+};
 use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 
 pub mod viewport;
@@ -69,6 +72,7 @@ const LOGO_ROWS: [&str; 6] = [
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/switch", "switch to a single harness: /switch <provider> [model]"),
     ("/model", "set model for this thread"),
+    ("/effort", "set reasoning effort: /effort low|medium|high|xhigh|max|default"),
     ("/mode", "permission mode: default|acceptEdits|bypassPermissions|plan"),
     ("/auth", "billing mode: /auth <provider> <subscription|api>"),
     ("/new", "start a new thread"),
@@ -3194,6 +3198,7 @@ fn multi_worktree_plan(providers: &[ProviderId], prompt: &str) -> orchestrate::P
                 title: format!("multi {provider}"),
                 provider: provider.as_str().to_string(),
                 model: None,
+                effort: None,
                 prompt: prompt.to_string(),
             })
             .collect(),
@@ -3578,11 +3583,12 @@ fn handle_command(
             let turn_count = turns.len();
             let latest = turns.into_iter().last();
             let mut text = format!(
-                "thread: {} {}\nprovider: {}/{}\nsession: {}\nmode: {}",
+                "thread: {} {}\nprovider: {}/{}\neffort: {}\nsession: {}\nmode: {}",
                 &state.thread.id[..8.min(state.thread.id.len())],
                 state.thread.title,
                 state.thread.current_provider,
                 state.thread.current_model.as_deref().unwrap_or("-"),
+                state.thread.reasoning_effort.as_deref().unwrap_or("default"),
                 state.thread.session_mode,
                 state.permission_mode
             );
@@ -3824,6 +3830,68 @@ fn handle_command(
                 }
             }
         }
+        "/effort" => {
+            match args.first().map(String::as_str) {
+                None => {
+                    state.notice = Some(format!(
+                        "reasoning effort: {}",
+                        state
+                            .thread
+                            .reasoning_effort
+                            .as_deref()
+                            .unwrap_or("harness default")
+                    ));
+                }
+                Some(value) if matches!(value, "off" | "default" | "none") => {
+                    let result = {
+                        let guard = store.lock().unwrap();
+                        ensure_persisted(&guard, &mut state.thread)
+                            .and_then(|()| guard.set_thread_effort(&state.thread.id, None))
+                    };
+                    match result {
+                        Ok(()) => {
+                            state.thread.reasoning_effort = None;
+                            state.banner_cache.borrow_mut().take();
+                            state.notice = Some("reasoning effort cleared".into());
+                        }
+                        Err(error) => {
+                            state.notice = Some(format!("cannot clear effort: {error}"))
+                        }
+                    }
+                }
+                Some(value) => match normalize_reasoning_effort(value) {
+                    Some(effort) if state.thread.current_provider.supports_effort() => {
+                        let result = {
+                            let guard = store.lock().unwrap();
+                            ensure_persisted(&guard, &mut state.thread).and_then(|()| {
+                                guard.set_thread_effort(&state.thread.id, Some(&effort))
+                            })
+                        };
+                        match result {
+                            Ok(()) => {
+                                state.thread.reasoning_effort = Some(effort.clone());
+                                state.banner_cache.borrow_mut().take();
+                                state.notice = Some(format!("reasoning effort set to {effort}"));
+                            }
+                            Err(error) => {
+                                state.notice = Some(format!("cannot set effort: {error}"))
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        state.notice = Some(format!(
+                            "{} does not support reasoning effort; use codex or claude",
+                            state.thread.current_provider
+                        ));
+                    }
+                    None => {
+                        state.notice = Some(
+                            "usage: /effort low|medium|high|xhigh|max|default".into(),
+                        );
+                    }
+                },
+            }
+        }
         "/mode" => {
             if let Some(mode) = args.first().map(String::as_str).and_then(PermissionMode::parse) {
                 state.apply_permission_mode(store, mode);
@@ -3898,6 +3966,7 @@ fn handle_command(
             state.thread.permission_mode = state.permission_mode;
             state.history.clear();
             state.queued_messages.clear();
+            state.thread.reasoning_effort = None;
             state.goal = None;
             state.goal_paused = false;
             state.thread.goal = None;
@@ -4050,6 +4119,7 @@ fn handle_command(
                     title: "thread worktree".to_string(),
                     provider: source_provider.as_str().to_string(),
                     model: None,
+                    effort: None,
                     prompt: title.clone(),
                 }],
             };
@@ -4088,6 +4158,7 @@ fn handle_command(
                             None,
                             &now,
                             Some(&now),
+                            None,
                             None,
                             None,
                         )
@@ -4700,11 +4771,15 @@ fn draw_orchestration_report(
             Span::styled(
                 truncate_chars(
                     &format!(
-                        "[{}] {} · {}/{} · {}",
+                        "[{}] {} · {}/{}{} · {}",
                         index + 1,
                         task.title,
                         task.provider,
                         task.model,
+                        task.effort
+                            .as_deref()
+                            .map(|effort| format!("@{effort}"))
+                            .unwrap_or_default(),
                         task.status
                     ),
                     width.saturating_sub(4),
@@ -5180,13 +5255,22 @@ fn perform_switch(
     let display_model = model.clone().unwrap_or(default_model);
     let result = {
         let guard = store.lock().unwrap();
-        ensure_persisted(&guard, &mut state.thread)
-            .and_then(|()| guard.set_thread_provider(&state.thread.id, provider, model.clone()))
+        let result = ensure_persisted(&guard, &mut state.thread)
+            .and_then(|()| guard.set_thread_provider(&state.thread.id, provider, model.clone()));
+        if result.is_ok() && !provider.supports_effort() {
+            guard.set_thread_effort(&state.thread.id, None)
+        } else {
+            result
+        }
     };
     match result {
         Ok(()) => {
             state.thread.current_provider = provider;
             state.thread.current_model = model.clone();
+            if !provider.supports_effort() {
+                state.thread.reasoning_effort = None;
+            }
+            state.banner_cache.borrow_mut().take();
             state.set_session_mode(store, SessionMode::Single);
             state.permission_mode = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd))
                 .for_provider(provider)
@@ -5893,11 +5977,15 @@ fn draw_orchestration_preview(
             .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
         lines.push(Line::styled(
             format!(
-                "  [{}] {} · {}/{}",
+                "  [{}] {} · {}/{}{}",
                 index + 1,
                 task.title,
                 provider,
-                effective_model
+                effective_model,
+                task.effort
+                    .as_deref()
+                    .map(|effort| format!("@{effort}"))
+                    .unwrap_or_default()
             ),
             Style::default().fg(COLORS.text),
         ));
@@ -6202,11 +6290,12 @@ impl TuiState {
     fn banner_lines(&self) -> Vec<Line<'static>> {
         let provider = self.thread.current_provider;
         let key = format!(
-            "{}|{:?}|{}|{}|{:?}",
+            "{}|{:?}|{}|{}|{}|{:?}",
             self.thread.cwd,
             self.thread.session_mode,
             provider,
             self.thread.current_model.as_deref().unwrap_or(""),
+            self.thread.reasoning_effort.as_deref().unwrap_or(""),
             self.permission_mode,
         );
         if let Some((cached_key, lines)) = &*self.banner_cache.borrow() {
@@ -6280,7 +6369,14 @@ impl TuiState {
                     Style::default().fg(COLORS.muted),
                 ),
                 Span::styled(
-                    format!("{provider}/{model}"),
+                    format!(
+                        "{provider}/{model}{}",
+                        self.thread
+                            .reasoning_effort
+                            .as_deref()
+                            .map(|effort| format!("@{effort}"))
+                            .unwrap_or_default()
+                    ),
                     Style::default().fg(COLORS.text),
                 ),
             ]),
@@ -6526,12 +6622,12 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 32);
+        assert_eq!(suggestions.len(), 33);
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/32"), "position indicator must reflect the selection");
+        assert!(text.contains("11/33"), "position indicator must reflect the selection");
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -7091,6 +7187,26 @@ mod tests {
     }
 
     #[test]
+    fn effort_command_persists_and_clears() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/effort High");
+        assert_eq!(state.thread.reasoning_effort.as_deref(), Some("high"));
+        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(persisted.reasoning_effort.as_deref(), Some("high"));
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("@high"), "banner must show the effort immediately: {text}");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/effort default");
+        assert_eq!(state.thread.reasoning_effort, None);
+        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(persisted.reasoning_effort, None);
+    }
+
+    #[test]
     fn input_selection_renders_orange_highlight() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -7394,6 +7510,7 @@ mod tests {
                     Some("now"),
                     None,
                     None,
+                    None,
                 )
                 .unwrap();
             guard
@@ -7466,6 +7583,7 @@ mod tests {
                     None,
                     "now",
                     Some("now"),
+                    None,
                     None,
                     None,
                 )
@@ -7570,6 +7688,7 @@ mod tests {
                     None,
                     "now",
                     Some("now"),
+                    None,
                     None,
                     None,
                 )
@@ -8944,12 +9063,14 @@ mod tests {
                         title: "worker one".to_string(),
                         provider: "codex".to_string(),
                         model: None,
+                        effort: None,
                         prompt: "do one".to_string(),
                     },
                     crate::orchestrate::PlanTask {
                         title: "worker two".to_string(),
                         provider: "claude".to_string(),
                         model: None,
+                        effort: None,
                         prompt: "do two".to_string(),
                     },
                 ],
@@ -8964,6 +9085,7 @@ mod tests {
                     title: "worker one".to_string(),
                     provider: ProviderId::Codex,
                     model: "gpt-test".to_string(),
+                    effort: None,
                     prompt: "do one".to_string(),
                     worktree: Some(crate::worktree::WorktreeInfo {
                         repo_root: std::path::PathBuf::from("/tmp/repo"),
@@ -8987,6 +9109,7 @@ mod tests {
                     title: "worker two".to_string(),
                     provider: ProviderId::Claude,
                     model: "claude-test".to_string(),
+                    effort: None,
                     prompt: "do two".to_string(),
                     worktree: None,
                     commit: None,
@@ -9150,6 +9273,7 @@ mod tests {
                     None,
                     now,
                     Some(now),
+                    None,
                     None,
                     None,
                 )
@@ -9779,12 +9903,14 @@ mod tests {
                         title: "first task".to_string(),
                         provider: "codex".to_string(),
                         model: None,
+                        effort: None,
                         prompt: "one".to_string(),
                     },
                     crate::orchestrate::PlanTask {
                         title: "second task".to_string(),
                         provider: "claude".to_string(),
                         model: None,
+                        effort: None,
                         prompt: "two".to_string(),
                     },
                 ],

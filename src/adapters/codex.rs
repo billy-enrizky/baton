@@ -666,7 +666,7 @@ impl BatonAdapter for CodexAdapter {
                 json!({ "type": "workspaceWrite", "writableRoots": [], "networkAccess": false }),
             ),
         };
-        let turn_params = json!({
+        let mut turn_params = json!({
             "threadId": thread_id,
             "cwd": input.cwd,
             "model": input.model,
@@ -676,6 +676,9 @@ impl BatonAdapter for CodexAdapter {
             "approvalsReviewer": "user",
             "summary": "detailed"
         });
+        if let Some(effort) = input.effort.as_deref() {
+            turn_params["effort"] = json!(effort);
+        }
         let started = self.request(&runtime, "turn/start", turn_params).await?;
         let turn_id = started
             .get("turn")

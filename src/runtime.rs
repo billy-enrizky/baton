@@ -657,12 +657,18 @@ async fn execute_turn(
     engine_event_sender: &std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: &ThreadTurnEventSender,
 ) -> Result<()> {
-    let (provider, cwd, thread_title, thread_model) = {
+    let (provider, cwd, thread_title, thread_model, reasoning_effort) = {
         let store = store.lock().unwrap();
         let thread = store
             .get_thread(thread_id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
-        (thread.current_provider, thread.cwd, thread.title, thread.current_model)
+        (
+            thread.current_provider,
+            thread.cwd,
+            thread.title,
+            thread.current_model,
+            thread.reasoning_effort,
+        )
     };
     let adapter_index = adapter_indices
         .get(&provider)
@@ -726,6 +732,7 @@ async fn execute_turn(
         thread_id: thread_id.to_string(),
         cwd,
         model: model.clone(),
+        effort: reasoning_effort,
         prompt,
         permission_mode,
         auth_env,
@@ -948,6 +955,10 @@ pub fn ensure_persisted(store: &BatonStore, thread: &mut ThreadRow) -> Result<()
             store.set_thread_permission_mode(&created.id, desired_permission)?;
             created.permission_mode = desired_permission;
         }
+        if thread.reasoning_effort.is_some() {
+            store.set_thread_effort(&created.id, thread.reasoning_effort.as_deref())?;
+            created.reasoning_effort = thread.reasoning_effort.clone();
+        }
         *thread = created;
     }
     Ok(())
@@ -968,10 +979,12 @@ mod tests {
             current_model: None,
         });
         thread.permission_mode = PermissionMode::BypassPermissions;
+        thread.reasoning_effort = Some("high".to_string());
         ensure_persisted(&store, &mut thread).unwrap();
         assert_eq!(thread.permission_mode, PermissionMode::BypassPermissions);
         let stored = store.get_thread(&thread.id).unwrap().expect("thread persisted");
         assert_eq!(stored.permission_mode, PermissionMode::BypassPermissions);
+        assert_eq!(stored.reasoning_effort.as_deref(), Some("high"));
     }
 
     #[derive(Clone, Copy)]

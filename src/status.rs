@@ -21,6 +21,7 @@ pub struct ThreadStatus {
     pub title: String,
     pub provider: ProviderId,
     pub model: String,
+    pub reasoning_effort: Option<String>,
     pub permission_mode: PermissionMode,
     pub session_mode: SessionMode,
     pub goal: Option<String>,
@@ -65,6 +66,7 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
         "title": status.title,
         "provider": status.provider.as_str(),
         "model": status.model,
+        "reasoning_effort": status.reasoning_effort,
         "permission_mode": status.permission_mode.as_str(),
         "session_mode": status.session_mode.as_str(),
         "goal": status.goal,
@@ -83,6 +85,9 @@ pub fn render(status: &ThreadStatus) -> String {
     let mut lines = Vec::new();
     lines.push(format!("thread: {}  {}", status.thread_id, status.title));
     lines.push(format!("provider: {}/{}", status.provider, status.model));
+    if let Some(effort) = &status.reasoning_effort {
+        lines.push(format!("effort: {effort}"));
+    }
     lines.push(format!("session: {}", status.session_mode));
     lines.push(format!("mode: {}", status.permission_mode));
     match &status.goal {
@@ -142,6 +147,7 @@ mod tests {
             title: "fix login".into(),
             provider: ProviderId::Codex,
             model: "model-1".into(),
+            reasoning_effort: Some("high".into()),
             permission_mode: PermissionMode::Plan,
             session_mode: SessionMode::Orchestrate,
             goal: Some("ship the fix".into()),
@@ -165,6 +171,7 @@ mod tests {
         let text = render(&status());
         assert!(text.contains("thread: thread-1  fix login"));
         assert!(text.contains("provider: codex/model-1"));
+        assert!(text.contains("effort: high"));
         assert!(text.contains("mode: plan"));
         assert!(text.contains("goal: ship the fix (paused)"));
         assert!(text.contains("turns: 3"));
@@ -182,6 +189,7 @@ mod tests {
         let value = to_json(&status());
         assert_eq!(value["schema_version"], 1);
         assert_eq!(value["thread_id"], "thread-1");
+        assert_eq!(value["reasoning_effort"], "high");
         assert_eq!(value["permission_mode"], "plan");
         assert_eq!(value["latest_turn"]["phase"], "failed");
         assert_eq!(value["turn_count"], 3);

@@ -2,7 +2,7 @@
 
 ## Sub-features
 - Coordinator splits a goal into tasks
-- Per-task harness selection
+- Per-task harness selection and optional reasoning effort (Codex/Claude)
 - One git worktree per worker
 - Parallel worker execution
 - Durable run/task records
@@ -17,10 +17,10 @@
 
 ## How to get to it (user POV)
 
-New interactive sessions start in orchestrate mode: type the goal in the composer. If the source checkout is dirty, baton asks first: Enter snapshots the working tree into each worker, `s` runs a single harness in the live checkout, Esc cancels. The startup banner shows the version, cwd, mode, model, permissions, and billing. Exact greetings run one normal turn; a plan with no tasks falls back to one worker. `/orchestrate --plan-only <goal>` previews the resolved plan in an overlay without creating a run; Enter starts that exact plan, Esc returns the goal to the composer.
+New interactive sessions start in orchestrate mode: type the goal in the composer. If the source checkout is dirty, baton asks first: Enter snapshots the working tree into each worker, `s` runs a single harness in the live checkout, Esc cancels. The startup banner shows the version, cwd, mode, model, reasoning effort when set, permissions, and billing. `/effort high` sets the current thread effort and `/effort default` clears it. Exact greetings run one normal turn; a plan with no tasks falls back to one worker. `/orchestrate --plan-only <goal>` previews the resolved plan in an overlay without creating a run; Enter starts that exact plan, Esc returns the goal to the composer.
 `/orchestrate off` or `/switch` moves to a single harness; `/orchestrate on` moves back. `/runs` lists recent runs, `/runs --all` includes archived runs, and `/runs <id>` reopens a stored worker report. MCP exposes the same durable history through `baton_orchestration_runs` and `baton_orchestration_report`.
 `baton --mode single` starts a single-harness session; `baton --mode orchestrate`
-forces orchestration. Set `"defaultMode": "single"` in `~/.baton/config.json` to opt out.
+forces orchestration. `baton --effort high` applies effort to an exec, new, or interactive thread; it is global only where the harness supports it. Set `"defaultMode": "single"` in `~/.baton/config.json` to opt out.
 
 ```sh
 baton orchestrate --max-tasks 3 "Audit billing, add tests, update docs"
@@ -68,7 +68,7 @@ echo base > "$repo/a.txt"
 git -C "$repo" add .
 git -C "$repo" commit -qm init
 cat > "$repo/plan.json" <<'JSON'
-{"summary":"one worker","tasks":[{"title":"pwd check","provider":"codex","model":"optional-model-override","prompt":"Run pwd and reply with the exact output. Do not modify files."}]}
+{"summary":"one worker","tasks":[{"title":"pwd check","provider":"codex","model":"optional-model-override","effort":"high","prompt":"Run pwd and reply with the exact output. Do not modify files."}]}
 JSON
 BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --plan-file "$repo/plan.json" --json "verify worker cwd" > /tmp/orchestrate.json
 jq -e '.status == "completed" and .tasks[0].text and .tasks[0].worktree.path' /tmp/orchestrate.json
@@ -88,8 +88,8 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 
 ## Gotchas
 - Worker worktrees branch from `HEAD`, then receive a snapshot of tracked and untracked non-ignored source changes. The worker commit contains only paths the worker changed relative to that snapshot, so untouched dirty files stay out of the branch. The report sets `dirty_source` and exposes the snapshot base/tree per task. Integration rebuilds the worker result over the snapshot and uses it as a three-way merge against the source, so committing dirty source edits after the run does not produce a false same-file conflict.
-- `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan. A task `model` overrides the provider config; omit it to use the configured default.
-- `--plan-only` resolves and prints the plan with effective models but creates no run, task rows, worktrees, or provider worker processes. Use it to review a coordinator plan or validate a plan file before spending worker turns. In the TUI, the same flag opens a preview overlay; Enter writes that exact plan and starts the normal runner, while Esc restores the goal to the composer.
+- `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan. A task `model` overrides the provider config; omit it to use the configured default. A task `effort` is a lowercase reasoning level such as `low`, `medium`, `high`, `xhigh`, or `max`; omit it for the harness default. Only Codex and Claude support explicit effort in this release. The worker thread persists the effort, and the report exposes `tasks[].effort`.
+- `--plan-only` resolves and prints the plan with effective models and efforts but creates no run, task rows, worktrees, or provider worker processes. Use it to review a coordinator plan or validate a plan file before spending worker turns. In the TUI, the same flag opens a preview overlay; Enter writes that exact plan and starts the normal runner, while Esc restores the goal to the composer.
 - A run with one success and one failure is `partial`; all failures is `failed` and exits non-zero.
 - Worktrees are kept for review under `$BATON_HOME/worktrees/<run>/<task>`. Successful workers commit their changes as `baton worker: <title>`; the report and `--run --json` expose the SHA. `--integrate` merges completed branches into a clean source checkout, aborts on conflict, and skips already-merged workers. Use `baton worktrees` to list managed worktrees; JSON includes `shipped`, and the text state shows `clean · shipped` for a branch with a PR. `baton worktrees --clean` removes clean worktrees whose branch is merged or shipped; dirty worktrees, and unmerged branches without a recorded PR, require `--force`.
 - `baton.json` `worktree.sharedDirectories` symlinks existing, gitignored directories such as `node_modules` or `target` into each worker worktree. Shared paths appear in the report; edits inside them affect the primary checkout.

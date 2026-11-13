@@ -423,6 +423,9 @@ impl BatonAdapter for AcpAdapter {
     ) -> Result<()> {
         let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
         self.lifecycle.starting(&input.thread_id);
+        if input.effort.is_some() {
+            anyhow::bail!("{} does not support reasoning effort; use codex or claude", self.provider);
+        }
         let runtime = self.ensure_runtime(&input.auth_env).await?;
         self.ensure_initialized(&runtime).await?;
         self.lifecycle.turn_running(&input.thread_id);

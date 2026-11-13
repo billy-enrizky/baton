@@ -20,7 +20,7 @@ pub struct ReapReport {
     pub reaped: Vec<ProviderProcessRow>,
     pub already_gone: usize,
     pub live_owners: usize,
-    pub command_mismatches: Vec<(ProviderProcessRow, String)>,
+    pub identity_mismatches: Vec<(ProviderProcessRow, String)>,
     pub unverifiable: usize,
     pub errors: Vec<String>,
 }
@@ -113,16 +113,17 @@ pub fn probe(row: &ProviderProcessRow) -> ProcessState {
         start_matches: row
             .process_start
             .as_deref()
-            .map_or(true, |start| process_start.as_deref() == Some(start)),
+            .map_or(false, |start| process_start.as_deref() == Some(start)),
         process_start,
         command,
     }
 }
 
 /// Reaps provider children whose owning baton process is gone. A row is only
-/// eligible when the live process's command line still matches the command
-/// line recorded at spawn time. A reused PID or a different process is left
-/// alone.
+/// eligible when the live process's command line and recorded start time both
+/// still match. A missing start time is not proof of identity, so that row is
+/// kept and reported instead of killed. A reused PID or a different process is
+/// left alone.
 #[cfg(unix)]
 pub fn reap_orphans(store: &BatonStore) -> Result<ReapReport> {
     let mut report = ReapReport::default();
@@ -138,30 +139,34 @@ pub fn reap_orphans(store: &BatonStore) -> Result<ReapReport> {
             continue;
         }
         let command = command_line(row.pid);
-        let process_start = process_start(row.pid);
-        let identity_matches = command.as_deref() == Some(row.command.as_str())
-            && row
-                .process_start
-                .as_deref()
-                .map_or(true, |start| process_start.as_deref() == Some(start));
         match command {
-            Some(_) if identity_matches => {
-                if terminate_verified(row.pid) {
+            Some(actual) if actual != row.command => {
+                // The PID now belongs to a different command. The row is
+                // stale, but the process is not ours to stop.
+                store.remove_provider_process(row.pid)?;
+                report.identity_mismatches.push((row, actual));
+            }
+            Some(_) if row.process_start.is_none() => {
+                // Without a recorded start time, KILL could hit a reused PID.
+                // Keep the row for a human, and never signal it.
+                report.unverifiable += 1;
+            }
+            Some(actual) => match terminate_verified(&row) {
+                TerminateOutcome::Gone => {
                     store.remove_provider_process(row.pid)?;
                     report.reaped.push(row);
-                } else {
+                }
+                TerminateOutcome::IdentityChanged => {
+                    store.remove_provider_process(row.pid)?;
+                    report.identity_mismatches.push((row, actual));
+                }
+                TerminateOutcome::Failed => {
                     report.errors.push(format!(
                         "could not stop provider process {} ({})",
                         row.pid, row.provider
                     ));
                 }
-            }
-            Some(actual) => {
-                // The PID now belongs to a different command. The row is
-                // stale, but the process is not ours to stop.
-                store.remove_provider_process(row.pid)?;
-                report.command_mismatches.push((row, actual));
-            }
+            },
             None => {
                 // The process exists but its command line is not readable.
                 // Keep the row and do nothing; guessing here is unsafe.
@@ -335,27 +340,75 @@ pub fn terminate_group(_pgid: u32) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminateOutcome {
+    Gone,
+    IdentityChanged,
+    Failed,
+}
+
+/// True only when the row records a start time and the live PID still has the
+/// same command line and the same start time. Without a recorded start there
+/// is no proof that the PID is the original child.
 #[cfg(unix)]
-fn terminate_verified(pid: u32) -> bool {
+fn recorded_identity_matches(row: &ProviderProcessRow) -> bool {
+    let Some(expected_start) = row.process_start.as_deref() else {
+        return false;
+    };
+    command_line(row.pid).as_deref() == Some(row.command.as_str())
+        && process_start(row.pid).as_deref() == Some(expected_start)
+}
+
+/// Stops one verified child. Identity is checked again before TERM and again
+/// before KILL: the original process can exit and its PID be reused during the
+/// grace period, and KILL must never hit a stranger.
+#[cfg(unix)]
+fn terminate_verified(row: &ProviderProcessRow) -> TerminateOutcome {
+    let pid = row.pid;
+    if !pid_alive(pid) {
+        return TerminateOutcome::Gone;
+    }
+    if !recorded_identity_matches(row) {
+        return if pid_alive(pid) {
+            TerminateOutcome::IdentityChanged
+        } else {
+            TerminateOutcome::Gone
+        };
+    }
     if !send_signal(pid, "-TERM") {
-        return !pid_alive(pid);
+        return if pid_alive(pid) {
+            TerminateOutcome::Failed
+        } else {
+            TerminateOutcome::Gone
+        };
     }
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
         if !pid_alive(pid) {
-            return true;
+            return TerminateOutcome::Gone;
         }
         std::thread::sleep(Duration::from_millis(25));
+    }
+    if !recorded_identity_matches(row) {
+        return if pid_alive(pid) {
+            TerminateOutcome::IdentityChanged
+        } else {
+            TerminateOutcome::Gone
+        };
     }
     let _ = send_signal(pid, "-KILL");
     let deadline = Instant::now() + Duration::from_millis(250);
     while Instant::now() < deadline {
         if !pid_alive(pid) {
-            return true;
+            return TerminateOutcome::Gone;
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    !pid_alive(pid)
+    if pid_alive(pid) {
+        TerminateOutcome::Failed
+    } else {
+        TerminateOutcome::Gone
+    }
 }
 
 /// Kills a provider child when its Baton parent disappears. `kill_on_drop`
@@ -488,10 +541,64 @@ mod tests {
 
         let report = reap_orphans(&store).unwrap();
 
-        assert_eq!(report.command_mismatches.len(), 1);
+        assert_eq!(report.identity_mismatches.len(), 1);
         assert!(report.reaped.is_empty());
         assert!(store.list_provider_processes().unwrap().is_empty());
         assert!(child.0.try_wait().unwrap().is_none());
+    }
+
+    #[test]
+    fn probe_does_not_claim_a_missing_start_matches() {
+        let (mut child, pid, command, _) = sleeper();
+        let row = ProviderProcessRow {
+            pid,
+            provider: ProviderId::Codex,
+            port: None,
+            command,
+            process_start: None,
+            cwd: "/tmp/project".to_string(),
+            owner_pid: u32::MAX,
+            started_at: String::new(),
+        };
+
+        let state = probe(&row);
+
+        assert!(state.alive);
+        assert!(state.command_matches);
+        assert!(!state.start_matches, "a missing start is not an identity match");
+        let _ = child.0.try_wait();
+    }
+
+    #[test]
+    fn keeps_a_row_with_no_recorded_start_instead_of_killing_it() {
+        let store = BatonStore::memory().unwrap();
+        let (mut child, pid, command, _) = sleeper();
+        store
+            .record_provider_process(
+                pid,
+                ProviderId::Codex,
+                None,
+                &command,
+                None,
+                "/tmp/project",
+                u32::MAX,
+            )
+            .unwrap();
+
+        let report = reap_orphans(&store).unwrap();
+
+        assert_eq!(report.unverifiable, 1);
+        assert!(report.reaped.is_empty());
+        assert!(report.errors.is_empty());
+        assert_eq!(
+            store.list_provider_processes().unwrap().len(),
+            1,
+            "an unverifiable row is kept for a human, not silently dropped"
+        );
+        assert!(
+            child.0.try_wait().unwrap().is_none(),
+            "a row without a recorded start must never be signaled"
+        );
     }
 
     #[test]
@@ -512,7 +619,7 @@ mod tests {
 
         let report = reap_orphans(&store).unwrap();
 
-        assert_eq!(report.command_mismatches.len(), 1);
+        assert_eq!(report.identity_mismatches.len(), 1);
         assert!(report.errors.is_empty());
         assert!(store.list_provider_processes().unwrap().is_empty());
         assert!(child.0.try_wait().unwrap().is_none());

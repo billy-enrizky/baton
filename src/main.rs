@@ -1791,7 +1791,7 @@ fn main_result() -> Result<()> {
                     "gone"
                 } else if !state.owner_running {
                     "orphan"
-                } else if state.command_matches {
+                } else if state.command_matches && state.start_matches {
                     "live"
                 } else {
                     "mismatch"
@@ -2008,11 +2008,11 @@ fn reap_startup_processes() {
             report.reaped.len(),
             report.already_gone,
             report.live_owners,
-            report.command_mismatches.len(),
+            report.identity_mismatches.len(),
             report.unverifiable,
             report.errors.len()
         );
-        for (row, actual) in &report.command_mismatches {
+        for (row, actual) in &report.identity_mismatches {
             eprintln!(
                 "baton process mismatch: pid={} provider={} expected={:?} actual={:?}",
                 row.pid, row.provider, row.command, actual

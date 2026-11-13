@@ -19,7 +19,7 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 - **Live catalogs.** `/switch` loads the provider's current model list (Codex, OpenCode, and ACP providers), with type-to-filter search.
 - **Parallel, then merged.** `/multi` fans one prompt across providers and opens a merged live view; press Enter to inspect any child thread. `/multi --worktrees` runs the same fan-out as isolated orchestration workers, so `i` merges and `p` opens PRs through the existing worker flows.
 - **Queued by provider.** If two threads target the same provider at once, the second waits in a durable `queued` phase and starts when the adapter is free instead of failing.
-- **Agent-readable state.** `status`, `threads`, `turns`, `queue`, and `exec` have versioned JSON output. `baton exec --stream-json` emits one JSON event per line for live progress and ends with a result row. `baton mcp` exposes the same durable state over MCP stdio.
+- **Agent-readable state.** `status`, `threads`, `turns`, `queue`, `exec`, and `orchestrate` have versioned JSON output. `exec --stream-json` and `orchestrate --stream-json` emit one JSON event per line and end with a result row. `baton mcp` exposes the same durable state over MCP stdio.
 - **Subscription or API billing.** Each provider runs on its harness login or an API key, switchable per provider (`baton auth <provider> api`).
 - **codex-style keys.** Esc interrupts, Esc-Esc backtracks to a previous prompt, streaming Markdown with tables and aligned columns, tinted diffs, and per-tool activity rows.
 
@@ -76,12 +76,14 @@ baton auth [provider] [subscription|api]
 baton diff <id> [turn]   # checkpoint diff against the working tree
 baton restore <id> <turn>
 baton rewind [-t id] --turn N [--native] [--json]  # remove a turn and later turns; Codex and OpenCode can revert natively, with durable recovery
-baton orchestrate [--max-tasks N] [--plan-file path] [--plan-only] [--progress] [--json] "goal"  # coordinator + workers in worktrees
+baton orchestrate [--max-tasks N] [--plan-file path] [--plan-only] [--progress | --stream-json | --json] "goal"  # coordinator + workers in worktrees
 baton orchestrate --list [--all] [--json]
 baton orchestrate --run <run-id> [--json]
 baton orchestrate --integrate <run-id> [--task N] [--json]  # merge completed worker branches
 baton orchestrate --open-prs <run-id> [--task N] [--json]  # push branches and open worker PRs
 baton orchestrate --archive <run-id> [--json]  # hide a finished run without deleting it
+
+`orchestrate --stream-json` writes one compact JSON row for the plan, each worker start, each worker finish, then the full final report with `type: "result"`. It conflicts with `--json` and `--progress` and applies only to a live run.
 baton worktrees [--json] [--run <id>]  # list managed worktrees
 baton worktrees --clean [--force] [--run <id>]  # remove clean, merged worktrees
 ```

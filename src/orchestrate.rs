@@ -215,6 +215,53 @@ pub fn render_progress(event: &OrchestrationProgress) -> String {
     }
 }
 
+/// One JSONL row for `baton orchestrate --stream-json`.
+pub fn progress_json(event: &OrchestrationProgress) -> serde_json::Value {
+    let mut value = match event {
+        OrchestrationProgress::PlanReady { summary, tasks } => serde_json::json!({
+            "type": "plan",
+            "summary": summary,
+            "tasks": tasks.iter().map(|task| serde_json::json!({
+                "title": task.title,
+                "provider": task.provider,
+                "model": task.model,
+                "effort": task.effort,
+                "prompt": task.prompt,
+            })).collect::<Vec<_>>(),
+        }),
+        OrchestrationProgress::WorkerStarted {
+            index,
+            title,
+            provider,
+            model,
+            worktree,
+        } => serde_json::json!({
+            "type": "worker_started",
+            "index": index,
+            "title": title,
+            "provider": provider.as_str(),
+            "model": model,
+            "worktree": worktree.as_ref().map(|path| path.display().to_string()),
+        }),
+        OrchestrationProgress::WorkerFinished {
+            index,
+            title,
+            status,
+            commit,
+            error,
+        } => serde_json::json!({
+            "type": "worker_finished",
+            "index": index,
+            "title": title,
+            "status": status,
+            "commit": commit,
+            "error": error,
+        }),
+    };
+    value["schema_version"] = serde_json::json!(SCHEMA_VERSION);
+    value
+}
+
 #[derive(Debug, Clone)]
 pub struct RunReport {
     pub run_id: String,
@@ -2296,6 +2343,45 @@ pub fn task_rows(store: &BatonStore, run_id: &str) -> Result<Vec<OrchestrationTa
 mod tests {
     use super::*;
     use crate::store::BatonStore;
+
+    #[test]
+    fn progress_json_covers_each_orchestration_event() {
+        let plan = progress_json(&OrchestrationProgress::PlanReady {
+            summary: Some("two tasks".into()),
+            tasks: vec![PlanTask {
+                title: "one".into(),
+                provider: "codex".into(),
+                model: Some("model".into()),
+                effort: None,
+                prompt: "do one".into(),
+            }],
+        });
+        assert_eq!(plan["schema_version"], SCHEMA_VERSION);
+        assert_eq!(plan["type"], "plan");
+        assert_eq!(plan["tasks"][0]["provider"], "codex");
+
+        let started = progress_json(&OrchestrationProgress::WorkerStarted {
+            index: 1,
+            title: "one".into(),
+            provider: ProviderId::OpenCode,
+            model: "model".into(),
+            worktree: Some(PathBuf::from("/tmp/worktree")),
+        });
+        assert_eq!(started["type"], "worker_started");
+        assert_eq!(started["provider"], "opencode");
+        assert_eq!(started["worktree"], "/tmp/worktree");
+
+        let finished = progress_json(&OrchestrationProgress::WorkerFinished {
+            index: 1,
+            title: "one".into(),
+            status: "completed".into(),
+            commit: Some("abc123".into()),
+            error: None,
+        });
+        assert_eq!(finished["type"], "worker_finished");
+        assert_eq!(finished["status"], "completed");
+        assert_eq!(finished["commit"], "abc123");
+    }
 
     #[test]
     fn single_task_plan_keeps_the_provider_and_overrides() {

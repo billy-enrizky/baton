@@ -157,6 +157,9 @@ pub enum Commands {
         /// Print worker progress lines to stderr
         #[arg(long)]
         progress: bool,
+        /// Emit one JSON progress event per line, then the final report
+        #[arg(long, conflicts_with_all = ["json", "progress"])]
+        stream_json: bool,
         /// Emit a JSON object instead of lines
         #[arg(long)]
         json: bool,
@@ -305,6 +308,23 @@ mod tests {
         assert!(text.contains("Start here:"), "{text}");
         assert!(text.contains("baton orchestrate"), "{text}");
         assert!(text.contains("baton doctor"), "{text}");
+    }
+
+    #[test]
+    fn orchestrate_stream_json_conflicts_with_json_and_progress() {
+        for extra in ["--json", "--progress"] {
+            let error = match Cli::try_parse_from([
+                "baton",
+                "orchestrate",
+                "--stream-json",
+                extra,
+                "do work",
+            ]) {
+                Ok(_) => panic!("--stream-json cannot mix with {extra}"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

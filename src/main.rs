@@ -886,23 +886,52 @@ fn main_result() -> Result<()> {
                     .next()
                     .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
             };
+            let mut provider_retry_skipped = false;
             let native_reverted = if native {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()?;
-                let recorder_store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
-                let recorder = process::ProcessRecorder::new(recorder_store, source.cwd.clone());
-                let reverted = runtime.block_on(provider_runtime::revert_codex_session(
-                    &store,
-                    &home,
-                    &source,
-                    turn,
-                    recorder,
-                ))?;
-                if !reverted {
-                    anyhow::bail!("codex did not confirm native rewind");
+                if let Some(pending) = store.native_rewind_pending(&source.id)? {
+                    if pending.turn != turn {
+                        anyhow::bail!(
+                            "thread has a pending {} native rewind to turn {}; run `baton rewind -t {} --turn {}` without --native to finish it first",
+                            pending.provider,
+                            pending.turn,
+                            &source.id[..8.min(source.id.len())],
+                            pending.turn
+                        );
+                    }
+                    provider_retry_skipped = true;
+                } else {
+                    let runtime = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()?;
+                    let recorder_store =
+                        Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
+                    let recorder = process::ProcessRecorder::new(recorder_store, source.cwd.clone());
+                    let reverted = runtime.block_on(provider_runtime::revert_codex_session(
+                        &store,
+                        &home,
+                        &source,
+                        turn,
+                        recorder,
+                    ))?;
+                    if !reverted {
+                        anyhow::bail!("codex did not confirm native rewind");
+                    }
+                    if let Err(error) = store.set_native_rewind_pending(
+                        &source.id,
+                        ProviderId::Codex,
+                        turn,
+                    ) {
+                        anyhow::bail!(
+                            "codex history was reverted, but baton could not record the recovery marker: {error}. Rerun `baton rewind -t {} --turn {turn}` without --native to finish it.",
+                            &source.id[..8.min(source.id.len())]
+                        );
+                    }
                 }
-                store.rewind_thread_keeping_provider_sessions(&source.id, turn)?;
+                if let Err(error) = store.rewind_thread_keeping_provider_sessions(&source.id, turn) {
+                    anyhow::bail!(
+                        "codex history was reverted, but baton state was not: {error}. Rerun the same command to finish the store rewind."
+                    );
+                }
                 true
             } else {
                 store.rewind_thread(&source.id, turn)?;
@@ -917,14 +946,16 @@ fn main_result() -> Result<()> {
                         "from_turn": turn,
                         "native": native_reverted,
                         "provider_session_preserved": native_reverted,
+                        "provider_retry_skipped": provider_retry_skipped,
                     }))?
                 );
             } else {
                 println!(
-                    "rewound {} from turn {}{}",
+                    "rewound {} from turn {}{}{}",
                     &source.id[..8.min(source.id.len())],
                     turn,
-                    if native_reverted { " (native, provider session preserved)" } else { "" }
+                    if native_reverted { " (native, provider session preserved)" } else { "" },
+                    if provider_retry_skipped { " (completed pending store rewind)" } else { "" }
                 );
             }
             Ok(())

@@ -449,6 +449,20 @@ pub fn run_tui(
     };
 
     let mut startup_notes = Vec::new();
+    let recent_threads = {
+        let guard = store.lock().unwrap();
+        let is_new = guard.get_thread(&state.thread.id).ok().flatten().is_none();
+        recent_thread_notice(
+            &guard,
+            &state.thread.cwd,
+            &state.thread.id,
+            is_new,
+            initial_prompt.is_some(),
+        )
+    };
+    if let Some(notice) = recent_threads {
+        startup_notes.push(notice);
+    }
     if let Some(run) = recovered_runs.last() {
         startup_notes.push(format!(
             "recovered abandoned orchestration {} ({})",
@@ -1345,6 +1359,27 @@ fn parse_orchestrate_args(args: &[String]) -> std::result::Result<OrchestrateArg
         max_tasks,
         plan_file,
         plan_only,
+    })
+}
+
+fn recent_thread_notice(
+    store: &BatonStore,
+    cwd: &str,
+    current_thread_id: &str,
+    is_new: bool,
+    has_prompt: bool,
+) -> Option<String> {
+    if !is_new || has_prompt {
+        return None;
+    }
+    let count = store
+        .list_threads_for_path(std::path::Path::new(cwd))
+        .ok()?
+        .iter()
+        .filter(|thread| thread.id != current_thread_id)
+        .count();
+    (count > 0).then(|| {
+        format!("{count} recent thread(s) in this folder · /threads to open one")
     })
 }
 
@@ -8951,6 +8986,28 @@ mod tests {
         assert_eq!(state.thread.id, source_id);
         let worktrees = home.path().join("worktrees");
         assert!(!worktrees.exists() || std::fs::read_dir(worktrees).unwrap().next().is_none());
+    }
+
+    #[test]
+    fn recent_thread_notice_only_appears_for_a_new_empty_session() {
+        let store = BatonStore::memory().unwrap();
+        for title in ["one", "two"] {
+            store
+                .create_thread(NewThread {
+                    title: title.to_string(),
+                    cwd: "/work".to_string(),
+                    current_provider: ProviderId::Codex,
+                    current_model: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            recent_thread_notice(&store, "/work", "draft", true, false).as_deref(),
+            Some("2 recent thread(s) in this folder · /threads to open one")
+        );
+        assert!(recent_thread_notice(&store, "/work", "draft", true, true).is_none());
+        assert!(recent_thread_notice(&store, "/work", "draft", false, false).is_none());
+        assert!(recent_thread_notice(&store, "/empty", "draft", true, false).is_none());
     }
 
     #[test]

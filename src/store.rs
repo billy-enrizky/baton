@@ -1284,6 +1284,25 @@ impl BatonStore {
     }
 
     pub fn rewind_thread(&self, thread_id: &str, from_turn: i64) -> Result<()> {
+        self.rewind_thread_inner(thread_id, from_turn, false)
+    }
+
+    /// Rewinds Baton's copy but keeps the native provider session. Use this
+    /// after a provider-native rollback has already truncated provider history.
+    pub fn rewind_thread_keeping_provider_sessions(
+        &self,
+        thread_id: &str,
+        from_turn: i64,
+    ) -> Result<()> {
+        self.rewind_thread_inner(thread_id, from_turn, true)
+    }
+
+    fn rewind_thread_inner(
+        &self,
+        thread_id: &str,
+        from_turn: i64,
+        keep_provider_sessions: bool,
+    ) -> Result<()> {
         let tx = self.db.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM messages WHERE thread_id = ? AND turn >= ?",
@@ -1305,7 +1324,9 @@ impl BatonStore {
             "DELETE FROM review_notes WHERE thread_id = ? AND turn >= ?",
             params![thread_id, from_turn],
         )?;
-        tx.execute("DELETE FROM provider_sessions WHERE thread_id = ?", params![thread_id])?;
+        if !keep_provider_sessions {
+            tx.execute("DELETE FROM provider_sessions WHERE thread_id = ?", params![thread_id])?;
+        }
         tx.execute(
             "UPDATE threads SET updated_at = ? WHERE id = ?",
             params![now_iso(), thread_id],

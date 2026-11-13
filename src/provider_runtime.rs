@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::adapters::{
-    BatonAdapter, CodexAdapter, ForkSessionInput, TransportHalves,
+    BatonAdapter, CodexAdapter, ForkSessionInput, RevertSessionInput, TransportHalves,
 };
 use crate::config::{provider_auth_env, resolve_config};
 use crate::process::{self, ProcessRecorder};
@@ -66,6 +66,47 @@ pub fn build_codex_adapter_with_recorder(
     Arc::new(tokio::sync::Mutex::new(
         Box::new(CodexAdapter::new(spawner)) as Box<dyn BatonAdapter>,
     ))
+}
+
+/// Revert the source Codex session before a completed provider turn. The
+/// caller must keep the provider session row when it rewinds Baton state.
+pub async fn revert_codex_session(
+    store: &BatonStore,
+    home: &Path,
+    source: &ThreadRow,
+    from_turn: i64,
+    recorder: ProcessRecorder,
+) -> Result<bool> {
+    if source.current_provider != ProviderId::Codex {
+        anyhow::bail!("native rewind is implemented for codex only");
+    }
+    let session = store
+        .get_provider_session(&source.id, ProviderId::Codex)?
+        .ok_or_else(|| anyhow::anyhow!("source thread has no codex session"))?;
+    let turn = store
+        .get_turn_record(&source.id, from_turn)?
+        .ok_or_else(|| anyhow::anyhow!("turn {from_turn} not found in thread"))?;
+    if !turn.phase.is_terminal() {
+        anyhow::bail!("turn {from_turn} is not terminal; interrupt it or use the transcript rewind");
+    }
+    let before_turn_id = turn
+        .provider_turn_id
+        .ok_or_else(|| anyhow::anyhow!("turn {from_turn} has no codex provider turn id"))?;
+    let resolved = resolve_config(home, Path::new(&source.cwd));
+    let adapter = build_codex_adapter_with_recorder(&PathBuf::from(&source.cwd), recorder);
+    let mut adapter = adapter.lock().await;
+    let result = adapter
+        .revert_session(RevertSessionInput {
+            session: NativeSessionRef {
+                native_session_id: session.native_session_id,
+                rollout_path: session.rollout_path,
+            },
+            before_turn_id,
+            auth_env: provider_auth_env(resolved.for_provider(ProviderId::Codex)),
+        })
+        .await;
+    let _ = adapter.dispose().await;
+    result
 }
 
 /// Fork the source Codex session through an optional provider turn. Returns the

@@ -486,6 +486,62 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Rewind { thread_id, turn, native, json } => {
+            if turn < 1 {
+                anyhow::bail!("--turn must be at least 1");
+            }
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let source = match thread_id.as_deref().or(cli.thread.as_deref()) {
+                Some(thread_id) => resolve_thread(&store, thread_id)?,
+                None => store
+                    .list_threads_for_path(&cwd)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
+            };
+            let native_reverted = if native {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .build()?;
+                let recorder_store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
+                let recorder = process::ProcessRecorder::new(recorder_store, source.cwd.clone());
+                let reverted = runtime.block_on(provider_runtime::revert_codex_session(
+                    &store,
+                    &home,
+                    &source,
+                    turn,
+                    recorder,
+                ))?;
+                if !reverted {
+                    anyhow::bail!("codex did not confirm native rewind");
+                }
+                store.rewind_thread_keeping_provider_sessions(&source.id, turn)?;
+                true
+            } else {
+                store.rewind_thread(&source.id, turn)?;
+                false
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "thread_id": source.id,
+                        "from_turn": turn,
+                        "native": native_reverted,
+                        "provider_session_preserved": native_reverted,
+                    }))?
+                );
+            } else {
+                println!(
+                    "rewound {} from turn {}{}",
+                    &source.id[..8.min(source.id.len())],
+                    turn,
+                    if native_reverted { " (native, provider session preserved)" } else { "" }
+                );
+            }
+            Ok(())
+        }
         cli::Commands::Import => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let resolved = resolve_config(&home, &cwd);

@@ -705,59 +705,54 @@ fn main_result() -> Result<()> {
             }
             if let Some(run_id) = run {
                 let run_id = orchestrate::resolve_run_id(&store, &run_id)?;
-                let tasks = orchestrate::task_rows(&store, &run_id)?;
+                let report = orchestrate::report_from_rows(&store, &cwd, &run_id)?;
                 if json {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&serde_json::json!({
-                            "schema_version": orchestrate::SCHEMA_VERSION,
-                            "run_id": run_id,
-                            "tasks": tasks.iter().map(|task| serde_json::json!({
-                                "id": task.id,
-                                "task": task.position,
-                                "title": task.title,
-                                "provider": task.provider.as_str(),
-                                "model": task.model,
-                                "status": task.status,
-                                "thread_id": task.thread_id,
-                                "text": task.text,
-                                "error": task.error,
-                                "worktree_path": task.worktree_path,
-                                "branch": task.branch,
-                                "commit": task.commit_sha,
-                                "merged_at": task.merged_at,
-                                "pr_url": task.pr_url,
-                                "created_at": task.created_at,
-                                "finished_at": task.finished_at,
-                            })).collect::<Vec<_>>(),
-                        }))?
+                        serde_json::to_string_pretty(&orchestrate::to_json(&report))?
                     );
-                } else if tasks.is_empty() {
-                    println!("no tasks for run {run_id}");
                 } else {
-                    for task in tasks {
-                        println!(
-                            "{}  {:<9}  {}/{}  {}",
-                            task.id,
-                            task.status,
-                            task.provider,
-                            task.model,
-                            task.title
-                        );
-                        if let Some(worktree) = task.worktree_path {
-                            println!("  worktree: {worktree}");
-                        }
-                        if let Some(commit) = task.commit_sha {
-                            println!("  commit: {}", &commit[..8.min(commit.len())]);
-                        }
-                        if let Some(merged_at) = task.merged_at {
-                            println!("  merged: {merged_at}");
-                        }
-                        if let Some(pr_url) = task.pr_url {
-                            println!("  pr: {pr_url}");
-                        }
-                        if let Some(error) = task.error {
-                            println!("  error: {error}");
+                    println!(
+                        "run {}  {}",
+                        &run_id[..8.min(run_id.len())],
+                        report.status
+                    );
+                    println!("goal: {}", report.goal);
+                    if let Some(summary) = report.summary.as_deref() {
+                        println!("summary: {summary}");
+                    }
+                    if report.tasks.is_empty() {
+                        println!("no tasks for run {run_id}");
+                    } else {
+                        for task in &report.tasks {
+                            println!(
+                                "{}  {:<9}  {}/{}  {}",
+                                task.id,
+                                task.status,
+                                task.provider,
+                                task.model,
+                                task.title
+                            );
+                            if let Some(worktree) = &task.worktree {
+                                println!("  worktree: {}", worktree.path.display());
+                            }
+                            if let Some(commit) = &task.commit {
+                                println!("  commit: {}", &commit[..8.min(commit.len())]);
+                            }
+                            if let Some(merged_at) = &task.merged_at {
+                                println!("  merged: {merged_at}");
+                            }
+                            if let Some(pr_url) = &task.pr_url {
+                                println!("  pr: {pr_url}");
+                            }
+                            if let Some(error) = &task.error {
+                                println!("  error: {error}");
+                            }
+                            if let Some(question) =
+                                task.text.as_deref().and_then(orchestrate::worker_question)
+                            {
+                                println!("  question: {question}");
+                            }
                         }
                     }
                 }

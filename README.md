@@ -94,6 +94,20 @@ Workers are ordinary baton threads in their own worktrees, so they keep the same
 
 If the source checkout has uncommitted changes, baton asks before starting: Enter orchestrates anyway from HEAD, `s` runs a single harness so it sees the edits, and Esc cancels and restores the prompt. Worktrees are kept after the run for review. A successful worker commits its changes to its branch as `baton worker: <title>`; `baton orchestrate --integrate <run-id>` merges completed branches in plan order, refuses a dirty source checkout, aborts a conflicting merge with the affected files, and skips workers that are already merged. `baton worktrees --clean` removes only clean worktrees whose branch is merged; dirty or unmerged work needs the explicit `--force`. A dirty source checkout is branched from `HEAD`, so uncommitted source changes are not present in worker worktrees.
 
+### Shared worktree directories
+
+Dependencies and caches that live in gitignored paths can be shared from the primary checkout. Add `baton.json` at the repository root:
+
+```json
+{
+  "worktree": {
+    "sharedDirectories": ["node_modules", "target"]
+  }
+}
+```
+
+Only entries that exist as directories in the primary checkout and pass `git check-ignore` are shared. Each becomes a symlink in the new worktree; missing, tracked, absolute, or `..` paths are skipped. Shared directories are the same files, so edits inside them affect the primary checkout. `baton worktrees --clean` removes the symlink with the worktree and leaves the source directory intact.
+
 ## MCP
 
 `baton mcp` serves the local baton store over MCP stdio. It is intended for coding agents that need to inspect the threads they are working alongside.

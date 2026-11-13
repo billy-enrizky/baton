@@ -76,5 +76,6 @@ BATON_HOME="$home" target/debug/baton -C "$repo" --yolo orchestrate --max-tasks 
 - `--plan` is global plan permission mode. Use `--plan-file` for the orchestration plan.
 - A run with one success and one failure is `partial`; all failures is `failed` and exits non-zero.
 - Worktrees are kept for review under `$BATON_HOME/worktrees/<run>/<task>`. Successful workers commit their changes as `baton worker: <title>`; the report and `--run --json` expose the SHA. `--integrate` merges completed branches into a clean source checkout, aborts on conflict, and skips already-merged workers. Use `baton worktrees` to list managed worktrees and `baton worktrees --clean` to remove clean, merged ones; dirty or unmerged worktrees require `--force`.
+- `baton.json` `worktree.sharedDirectories` symlinks existing, gitignored directories such as `node_modules` or `target` into each worker worktree. Shared paths appear in the report; edits inside them affect the primary checkout.
 - The coordinator retries once on invalid JSON. A second invalid plan fails the run before workers start.
 - The multi-harness path costs real provider turns; use `--plan-file` for smoke tests.

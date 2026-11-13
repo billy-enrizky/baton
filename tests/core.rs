@@ -95,6 +95,107 @@ fn shipped_worktree_branches_are_only_the_ones_with_pr_urls() {
 }
 
 #[test]
+fn worker_followup_updates_task_and_clears_merge_and_pr_markers() {
+    let store = BatonStore::memory().unwrap();
+    store
+        .create_orchestration_run(
+            "run-followup",
+            "goal",
+            ProviderId::Codex,
+            "model",
+            None,
+            "{}",
+            false,
+        )
+        .unwrap();
+    store
+        .add_orchestration_task(
+            "task-followup",
+            "run-followup",
+            1,
+            "worker task",
+            ProviderId::Codex,
+            "model",
+            "prompt",
+            Some("/tmp/worktree"),
+            Some("baton/run-followup/worker-task"),
+            Some("old-commit"),
+            Some("thread-worker"),
+            "completed",
+            Some("old text"),
+            None,
+            "now",
+            Some("now"),
+        )
+        .unwrap();
+    store
+        .mark_orchestration_task_merged("task-followup", "merged")
+        .unwrap();
+    store
+        .mark_orchestration_task_pr("task-followup", "https://example.test/pr/1")
+        .unwrap();
+    store
+        .finish_orchestration_run("run-followup", "completed")
+        .unwrap();
+
+    let task = store
+        .orchestration_task_for_thread("thread-worker")
+        .unwrap()
+        .unwrap();
+    store
+        .update_orchestration_task_success(
+            &task.id,
+            Some("follow-up text"),
+            Some("new-commit"),
+            true,
+        )
+        .unwrap();
+    store
+        .refresh_orchestration_run_status("run-followup")
+        .unwrap();
+
+    let task = store
+        .orchestration_task_for_thread("thread-worker")
+        .unwrap()
+        .unwrap();
+    assert_eq!(task.status, "completed");
+    assert_eq!(task.text.as_deref(), Some("follow-up text"));
+    assert_eq!(task.commit_sha.as_deref(), Some("new-commit"));
+    assert!(task.merged_at.is_none(), "a new commit is no longer merged");
+    assert!(task.pr_url.is_none(), "a new commit must be pushed again");
+    assert_eq!(
+        store.list_orchestration_runs(10).unwrap()[0].status,
+        "completed"
+    );
+
+    store
+        .mark_orchestration_task_merged("task-followup", "merged")
+        .unwrap();
+    store
+        .mark_orchestration_task_pr("task-followup", "https://example.test/pr/2")
+        .unwrap();
+    store
+        .update_orchestration_task_success(
+            &task.id,
+            Some("no file changes"),
+            None,
+            false,
+        )
+        .unwrap();
+    let task = store
+        .orchestration_task_for_thread("thread-worker")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        task.commit_sha.as_deref(),
+        Some("new-commit"),
+        "a no-change follow-up keeps the existing commit"
+    );
+    assert!(task.merged_at.is_some());
+    assert!(task.pr_url.is_some());
+}
+
+#[test]
 fn store_crud_and_thread_lifecycle() {
     let store = BatonStore::memory().unwrap();
     let thread = store

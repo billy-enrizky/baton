@@ -15,6 +15,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Native rewind | CLI | `baton rewind --native` truncates Codex or OpenCode history and keeps the session |
 | Review | TUI | `/review` shows the turn diff, saves a line note, and leaves it unsent |
 | TUI native rewind | TUI | `/rewind --native` truncates the provider and store history and prefills the message |
+| Greeting | TUI | `hi` in default orchestrate mode answers directly, with no planner run |
 | Process registry | CLI | `baton ps --json` returns a stable schema and no false live processes |
 | Orchestration | CLI | `baton orchestrate` creates worktrees, runs harnesses, and records runs |
 | Orchestrate stream | CLI | `--stream-json` emits plan, worker, and result JSONL rows |

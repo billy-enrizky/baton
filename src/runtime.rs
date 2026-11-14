@@ -720,6 +720,8 @@ async fn execute_turn(
     let config = resolve_config(home, std::path::Path::new(&cwd));
     let provider_config = config.for_provider(provider);
     let model = thread_model.clone().unwrap_or_else(|| provider_config.model.clone());
+    let memories = store.lock().unwrap().list_memories(&cwd)?;
+    let prompt_text = crate::memory::expand_memories(&memories, text);
     let auth_env = provider_auth_env(provider_config);
 
     let (prior_messages, turn, session) = {
@@ -747,7 +749,7 @@ async fn execute_turn(
         store.lock().unwrap().rename_thread(thread_id, &title)?;
     }
 
-    let mut prompt = text.to_string();
+    let mut prompt = prompt_text.clone();
     if session.is_none() && !prior_messages.is_empty() {
         let mut handoff_messages: Vec<HandoffMessage> = prior_messages
             .iter()
@@ -762,11 +764,11 @@ async fn execute_turn(
             role: "user".to_string(),
             provider: Some(provider.as_str().to_string()),
             model: Some(model.clone()),
-            text: text.to_string(),
+            text: prompt_text.clone(),
         });
         let git_status = git_status_summary(std::path::Path::new(&cwd), 50);
         let handoff = build_handoff(&cwd, &thread_title, &handoff_messages, git_status.as_deref(), None);
-        prompt = wrap_prompt_with_handoff(&handoff, text);
+        prompt = wrap_prompt_with_handoff(&handoff, &prompt_text);
     }
 
     let cwd_for_checkpoint = cwd.clone();
@@ -1159,6 +1161,108 @@ mod tests {
         )
         .await;
         (store, thread.id, result)
+    }
+
+    struct CapturingAdapter {
+        prompt: Arc<Mutex<Option<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl BatonAdapter for CapturingAdapter {
+        fn id(&self) -> ProviderId {
+            ProviderId::Codex
+        }
+
+        fn interrupt_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
+            Arc::new(|| {})
+        }
+
+        async fn list_models(&mut self, _input: ModelListInput) -> Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        async fn start_turn(
+            &mut self,
+            input: TurnStartInput,
+            _session: Option<crate::types::NativeSessionRef>,
+            emit: TurnEventSender,
+        ) -> Result<()> {
+            *self.prompt.lock().unwrap() = Some(input.prompt);
+            let _ = emit.send(TurnEvent::TurnCompleted {
+                final_text: "done".into(),
+                usage: None,
+                native_session_id: None,
+                rollout_path: None,
+            });
+            Ok(())
+        }
+
+        async fn dispose(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn memories_expand_for_the_harness_but_the_raw_prompt_is_stored() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let cwd = home.path().to_string_lossy().to_string();
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "memories".into(),
+                cwd: cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_memory("project", &cwd, "Use tabs")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .add_memory("global", &cwd, "Answer briefly")
+            .unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
+            Box::new(CapturingAdapter {
+                prompt: captured.clone(),
+            }) as Box<dyn BatonAdapter>,
+        ))];
+        let adapter_indices = HashMap::from([(ProviderId::Codex, 0)]);
+        let provider_claims: ProviderClaims = Arc::new(Mutex::new(HashMap::new()));
+        let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let result = execute_turn(
+            &store,
+            &home.path().to_path_buf(),
+            &adapters,
+            &adapter_indices,
+            &provider_claims,
+            cancel_receiver,
+            &thread.id,
+            "hello $memories",
+            PermissionMode::Default,
+            &engine_sender,
+            &turn_sender,
+        )
+        .await;
+        assert!(result.is_ok());
+        let prompt = captured.lock().unwrap().clone().expect("prompt captured");
+        assert!(prompt.contains("[memories]"), "{prompt}");
+        assert!(prompt.contains("- (project) Use tabs"), "{prompt}");
+        assert!(prompt.contains("- (global) Answer briefly"), "{prompt}");
+        assert!(!prompt.contains("$memories"), "{prompt}");
+        let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
+        assert!(
+            messages.iter().any(|message| message.role == "user" && message.text == "hello $memories"),
+            "the transcript keeps the raw prompt"
+        );
     }
 
     struct IdleAdapter;

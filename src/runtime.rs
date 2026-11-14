@@ -720,7 +720,10 @@ async fn execute_turn(
     let config = resolve_config(home, std::path::Path::new(&cwd));
     let provider_config = config.for_provider(provider);
     let model = thread_model.clone().unwrap_or_else(|| provider_config.model.clone());
-    let memories = store.lock().unwrap().list_memories(&cwd)?;
+    let memories = store
+        .lock()
+        .unwrap()
+        .list_memories(&crate::memory::project_key(&cwd))?;
     let prompt_text = crate::memory::expand_memories(&memories, text);
     let auth_env = provider_auth_env(provider_config);
 
@@ -1217,15 +1220,16 @@ mod tests {
                 current_model: Some("m".into()),
             })
             .unwrap();
+        let project = crate::memory::project_key(&cwd);
         store
             .lock()
             .unwrap()
-            .add_memory("project", &cwd, "Use tabs")
+            .add_memory("project", &project, "Use tabs")
             .unwrap();
         store
             .lock()
             .unwrap()
-            .add_memory("global", &cwd, "Answer briefly")
+            .add_memory("global", &project, "Answer briefly")
             .unwrap();
         let captured = Arc::new(Mutex::new(None));
         let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(

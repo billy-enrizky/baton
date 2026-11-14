@@ -73,6 +73,30 @@ pub fn load_config_file(home: &Path) -> Option<BatonConfigFile> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Rejects provider overrides the harness cannot honor before a turn starts.
+pub fn validate_provider_overrides(home: &Path) -> Result<()> {
+    let Some(file) = load_config_file(home) else {
+        return Ok(());
+    };
+    for (name, auth) in &file.providers {
+        let Some(provider) = ProviderId::parse(name) else {
+            continue;
+        };
+        if auth.api_base_url.is_some() && !crate::models::capabilities(provider).custom_base_url {
+            match provider {
+                ProviderId::Cursor => anyhow::bail!(
+                    "Cursor does not support a custom endpoint; remove the cursor apiBaseUrl and run `cursor-agent login`"
+                ),
+                _ => anyhow::bail!(
+                    "{} does not support a custom endpoint; remove its apiBaseUrl",
+                    provider
+                ),
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn save_config_file(home: &Path, file: &BatonConfigFile) -> Result<()> {
     std::fs::create_dir_all(home)?;
     std::fs::write(config_path(home), format!("{}\n", serde_json::to_string_pretty(file)?))?;

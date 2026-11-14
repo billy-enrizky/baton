@@ -5,6 +5,17 @@ use crate::store::MemoryRow;
 
 const MEMORY_INJECTION_LIMIT: usize = 4000;
 
+/// Stable project key for memory storage. A git worktree resolves to its main
+/// checkout, and a symlink resolves to its canonical target.
+pub fn project_key(cwd: &str) -> String {
+    let path = Path::new(cwd);
+    let root = crate::worktree::project_identity_root(path).unwrap_or_else(|| path.to_path_buf());
+    std::fs::canonicalize(&root)
+        .unwrap_or(root)
+        .to_string_lossy()
+        .to_string()
+}
+
 /// Formats the governed memories as one prompt block. Project entries come
 /// first because the store orders them before global entries.
 pub fn format_memories(memories: &[MemoryRow]) -> String {
@@ -133,6 +144,47 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_key_is_stable_across_a_worktree() {
+        let main = tempfile::tempdir().unwrap();
+        let worktree_parent = tempfile::tempdir().unwrap();
+        let worktree = worktree_parent.path().join("worker");
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(main.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        std::fs::write(main.path().join("a.txt"), "a").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        git(&["worktree", "add", worktree.to_str().unwrap(), "-b", "worker"]);
+        assert_eq!(
+            project_key(main.path().to_str().unwrap()),
+            project_key(worktree.to_str().unwrap()),
+            "a worker worktree shares the main checkout's memory project"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_key_is_stable_across_a_symlink() {
+        let project = tempfile::tempdir().unwrap();
+        let links = tempfile::tempdir().unwrap();
+        let link = links.path().join("project-link");
+        std::os::unix::fs::symlink(project.path(), &link).unwrap();
+        assert_eq!(
+            project_key(project.path().to_str().unwrap()),
+            project_key(link.to_str().unwrap())
+        );
     }
 
     #[test]

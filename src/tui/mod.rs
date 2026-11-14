@@ -91,7 +91,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/multi", "same prompt to multiple providers; --worktrees isolates them"),
     ("/orchestrate", "orchestrate mode or one-off: /orchestrate [on|off] [goal]"),
     ("/runs", "list or reopen orchestration runs"),
-    ("/commands", "deep dive into every command this thread ran"),
+    ("/activity", "inspect every turn, its tool calls, diff, and usage"),
+    ("/commands", "deep dive into every command this thread ran; /commands <turn>"),
     ("/queue", "show or clear queued follow-ups"),
     ("/turns", "list durable turn phases"),
     ("/status", "show thread phase, goal, queue, and adapter states"),
@@ -116,6 +117,7 @@ Common
   /new                        start a new thread
   /threads                    list threads here
   /status                     what is happening now
+  /activity                   every turn, tool call, diff, and usage
   /commands                   every command this thread ran
   /memories                   project and global notes ($memories)
   /effort                     reasoning effort picker
@@ -177,6 +179,12 @@ struct ReviewState {
     selected: usize,
     notes: Vec<ReviewNote>,
     note_input: Option<String>,
+}
+
+struct ActivityView {
+    rows: Vec<crate::activity::ActivityRow>,
+    selected: usize,
+    expanded: bool,
 }
 
 struct ApprovalState {
@@ -287,7 +295,7 @@ enum Overlay {
     CheckpointPicker { selected: usize, checkpoints: Vec<(i64, String)> },
     DirtyConfirm { goal: String, max_tasks: usize, plan_file: Option<String> },
     OrchestrationPreview { preview: Box<OrchestrationPreview> },
-    CommandList { selected: usize, expanded: bool },
+    CommandList { selected: usize, expanded: bool, turn: Option<i64> },
     EffortPicker { selected: usize },
 }
 
@@ -322,6 +330,7 @@ pub struct TuiState {
     overlay: Overlay,
     approvals: Vec<ApprovalState>,
     review: Option<ReviewState>,
+    activity: Option<ActivityView>,
     multi: Option<MultiView>,
     notice: Option<String>,
     diff_output: Option<String>,
@@ -416,6 +425,7 @@ pub fn run_tui(
         overlay: Overlay::None,
         approvals: Vec::new(),
         review: None,
+        activity: None,
         multi: None,
         notice: None,
         diff_output: None,
@@ -970,6 +980,24 @@ fn apply_engine_event(
                 let waiting = state.queued_messages.len();
                 let prefix = state.notice.take().unwrap_or_default();
                 state.notice = Some(format!("{prefix} · {waiting} queued message(s) kept; press enter to send"));
+            }
+            if ok && state.queued_messages.is_empty() {
+                let latest = state.history.iter().map(|message| message.turn).max().unwrap_or(0);
+                let tools = state
+                    .history
+                    .iter()
+                    .filter(|message| message.turn == latest && message.role == "tool")
+                    .count();
+                let has_diff = state
+                    .history
+                    .iter()
+                    .any(|message| message.turn == latest && message.role == "diff");
+                if latest > 0 && (tools > 0 || has_diff) {
+                    state.notice = Some(format!(
+                        "turn {latest} done · {tools} tool calls · {} · /activity to inspect",
+                        if has_diff { "1 diff" } else { "no diff" }
+                    ));
+                }
             }
         }
         EngineEvent::ModelsLoaded {
@@ -2008,6 +2036,11 @@ fn handle_key(
         return;
     }
 
+    if state.activity.is_some() {
+        handle_activity_key(state, store, engine_command_sender, key);
+        return;
+    }
+
     if state.orchestration_report.is_some() {
         handle_orchestration_key(state, store, key);
         return;
@@ -2053,12 +2086,8 @@ fn handle_key(
                 }
             }
         }
-        Overlay::CommandList { mut selected, mut expanded } => {
-            let commands: Vec<&MessageRow> = state
-                .history
-                .iter()
-                .filter(|message| message.role == "tool")
-                .collect();
+        Overlay::CommandList { mut selected, mut expanded, turn } => {
+            let commands = tool_messages(state, turn);
             let mut keep = true;
             match key.code {
                 KeyCode::Esc => keep = false,
@@ -2069,22 +2098,22 @@ fn handle_key(
                     }
                 }
                 KeyCode::Enter => expanded = !expanded,
-                KeyCode::Char('c') => {
+                KeyCode::Char('y') => {
                     if let Some(message) = commands.get(selected.min(commands.len().saturating_sub(1))) {
                         let provider = message.provider.as_deref().unwrap_or("-");
                         match crate::clipboard::copy(&format!(
                             "turn {} · {} · {}",
                             message.turn, provider, message.text
                         )) {
-                            Ok(()) => state.notice = Some("command copied".into()),
-                            Err(error) => state.notice = Some(format!("cannot copy command: {error}")),
+                            Ok(()) => state.notice = Some("tool call copied".into()),
+                            Err(error) => state.notice = Some(format!("cannot copy tool call: {error}")),
                         }
                     }
                 }
                 _ => {}
             }
             if keep {
-                state.overlay = Overlay::CommandList { selected, expanded };
+                state.overlay = Overlay::CommandList { selected, expanded, turn };
             }
         }
         Overlay::EffortPicker { mut selected } => {
@@ -2817,6 +2846,58 @@ fn next_file_row(rows: &[diff_render::DiffRowRef], selected: usize) -> Option<us
         .map(|(index, _)| index)
 }
 
+fn handle_activity_key(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    key: KeyEvent,
+) {
+    let Some(mut view) = state.activity.take() else {
+        return;
+    };
+    let len = view.rows.len();
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') => return,
+        KeyCode::Up | KeyCode::Char('k') => {
+            view.selected = view.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if len > 0 {
+                view.selected = (view.selected + 1).min(len - 1);
+            }
+        }
+        KeyCode::Enter => view.expanded = !view.expanded,
+        KeyCode::Char('y') => {
+            if let Some(row) = view.rows.get(view.selected) {
+                match crate::clipboard::copy(&crate::activity::summary(row)) {
+                    Ok(()) => state.notice = Some("activity summary copied".into()),
+                    Err(error) => state.notice = Some(format!("cannot copy activity: {error}")),
+                }
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(row) = view.rows.get(view.selected) {
+                if row.has_diff {
+                    let turn = row.turn;
+                    state.activity = Some(view);
+                    handle_command(
+                        state,
+                        store,
+                        engine_command_sender,
+                        &format!("/review {turn}"),
+                    );
+                } else {
+                    state.notice = Some(format!("no diff for turn {}", row.turn));
+                    state.activity = Some(view);
+                }
+            }
+            return;
+        }
+        _ => {}
+    }
+    state.activity = Some(view);
+}
+
 fn handle_review_key(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -2861,6 +2942,12 @@ fn handle_review_key(
             KeyCode::Backspace => {
                 input.pop();
             }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match crate::clipboard::copy(input) {
+                    Ok(()) => state.notice = Some("note copied".into()),
+                    Err(error) => state.notice = Some(format!("cannot copy note: {error}")),
+                }
+            }
             KeyCode::Char(character) => {
                 if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
                     input.push(character);
@@ -2888,6 +2975,22 @@ fn handle_review_key(
         KeyCode::PageDown => {
             if !review.rows.is_empty() {
                 review.selected = (review.selected + 10).min(review.rows.len() - 1);
+            }
+        }
+        KeyCode::Char('y') => {
+            if let Some(row) = review.rows.get(review.selected) {
+                let sign = if row.added {
+                    "+"
+                } else if row.removed {
+                    "-"
+                } else {
+                    " "
+                };
+                let text = format!("{}:{} {} {}", row.path, row.line_number, sign, row.text);
+                match crate::clipboard::copy(&text) {
+                    Ok(()) => state.notice = Some("review row copied".into()),
+                    Err(error) => state.notice = Some(format!("cannot copy review row: {error}")),
+                }
             }
         }
         KeyCode::Char('n') => {
@@ -3471,7 +3574,7 @@ fn handle_command(
             state.notice = None;
         }
         "/memories" => {
-            let cwd = state.thread.cwd.clone();
+            let cwd = crate::memory::project_key(&state.thread.cwd);
             match args.first().map(String::as_str) {
                 None | Some("list") => {
                     let memories = store.lock().unwrap().list_memories(&cwd).unwrap_or_default();
@@ -3947,21 +4050,48 @@ fn handle_command(
                 state.notice = Some(text);
             }
         }
+        "/activity" => {
+            let rows = {
+                let store = store.lock().unwrap();
+                let turns = store.list_turn_records(&state.thread.id).unwrap_or_default();
+                let messages = store.list_messages(&state.thread.id).unwrap_or_default();
+                let usage = store.list_usage(Some(&state.thread.id)).unwrap_or_default();
+                crate::activity::build(&state.thread, &turns, &messages, &usage)
+            };
+            if rows.is_empty() {
+                state.notice = Some("no turns yet; run a turn, then /activity".into());
+            } else {
+                state.activity = Some(ActivityView {
+                    selected: rows.len() - 1,
+                    expanded: false,
+                    rows,
+                });
+            }
+        }
         "/commands" => {
-            let commands: Vec<&MessageRow> = state
-                .history
-                .iter()
-                .filter(|message| message.role == "tool")
-                .collect();
+            let turn = match args.first() {
+                None => None,
+                Some(value) => match value.parse::<i64>() {
+                    Ok(turn) => Some(turn),
+                    Err(_) => {
+                        state.notice = Some("usage: /commands [turn]".into());
+                        return;
+                    }
+                },
+            };
+            let commands = tool_messages(state, turn);
             if commands.is_empty() {
-                state.notice = Some(
-                    "no commands recorded yet; run a turn, then /commands to inspect every command"
-                        .into(),
-                );
+                state.notice = Some(match turn {
+                    Some(turn) => format!("no tool calls for turn {turn}"),
+                    None => {
+                        "no tool calls recorded yet; run a turn, then /commands".to_string()
+                    }
+                });
             } else {
                 state.overlay = Overlay::CommandList {
                     selected: commands.len() - 1,
                     expanded: false,
+                    turn,
                 };
             }
         }
@@ -4756,6 +4886,114 @@ fn handle_command(
     }
 }
 
+fn draw_activity(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    view: &ActivityView,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    let inner = block.inner(area);
+    let width = inner.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!(
+            "activity · {} · {} turns · ↑↓ select · enter expand · y copy · d review · esc close",
+            state.thread.title,
+            view.rows.len()
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    if view.expanded {
+        if let Some(row) = view.rows.get(view.selected) {
+            lines.push(Line::styled(
+                format!(
+                    "turn {} · {} · {} · {}",
+                    row.turn,
+                    row.provider.as_str(),
+                    row.model.as_deref().unwrap_or("harness default"),
+                    row.phase
+                ),
+                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD),
+            ));
+            lines.push(Line::styled(
+                format!(
+                    "source: {} · started {} · ended {}",
+                    row.source,
+                    row.started_at.as_deref().unwrap_or("?"),
+                    row.ended_at.as_deref().unwrap_or("open")
+                ),
+                Style::default().fg(COLORS.muted),
+            ));
+            if row.phase == "running" {
+                lines.push(Line::styled(
+                    "details are recorded when the turn ends; live rows are in the transcript",
+                    Style::default().fg(COLORS.warning),
+                ));
+            }
+            if row.phase == "imported" {
+                lines.push(Line::styled(
+                    "imported conversation; no native tool records",
+                    Style::default().fg(COLORS.muted),
+                ));
+            }
+            lines.push(Line::styled("tool calls", Style::default().fg(COLORS.muted)));
+            if row.tool_calls.is_empty() {
+                lines.push(Line::styled("  none", Style::default().fg(COLORS.muted)));
+            } else {
+                let room = inner.height.saturating_sub(8) as usize;
+                for call in row.tool_calls.iter().take(room.max(1)) {
+                    lines.push(Line::styled(
+                        truncate_chars(&format!("  {}", call.text), width),
+                        Style::default().fg(COLORS.text),
+                    ));
+                }
+                if row.tool_calls.len() > room.max(1) {
+                    lines.push(Line::styled(
+                        format!("  ... {} more", row.tool_calls.len() - room.max(1)),
+                        Style::default().fg(COLORS.muted),
+                    ));
+                }
+            }
+            lines.push(Line::styled(
+                if row.has_diff {
+                    format!("diff: 1 · /review {} · press d", row.turn)
+                } else {
+                    "diff: none".to_string()
+                },
+                Style::default().fg(COLORS.secondary),
+            ));
+            lines.push(Line::styled(
+                crate::activity::summary(row),
+                Style::default().fg(COLORS.muted),
+            ));
+        }
+    } else {
+        let visible = inner.height.saturating_sub(1) as usize;
+        let visible = visible.max(1);
+        let selected = view.selected.min(view.rows.len().saturating_sub(1));
+        let start = if view.rows.len() <= visible {
+            0
+        } else {
+            selected
+                .saturating_sub(visible / 2)
+                .min(view.rows.len() - visible)
+        };
+        for (index, row) in view.rows.iter().enumerate().skip(start).take(visible) {
+            let marker = if index == selected { "›" } else { " " };
+            let text = format!("{marker} {}", crate::activity::summary(row));
+            let style = if index == selected {
+                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLORS.text)
+            };
+            lines.push(Line::styled(truncate_chars(&text, width), style));
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review: &ReviewState) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4766,7 +5004,7 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::styled(
         format!(
-            "review turn {} · {} changed lines · ↑↓ move · [ ] file · n note · d delete · s send · esc close",
+            "review turn {} · {} changed lines · ↑↓ move · [ ] file · n note · y copy · ctrl+y copy note · d delete · s send · esc close",
             review.turn,
             review.rows.iter().filter(|row| row.added || row.removed).count()
         ),
@@ -5339,6 +5577,12 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         draw_floating_approval(frame, area, state);
         return;
     }
+    if let Some(activity) = &state.activity {
+        hide_transcript_view(state);
+        draw_activity(frame, area, state, activity);
+        draw_floating_approval(frame, area, state);
+        return;
+    }
     let suggestions = suggestions_for(&state.input);
     let composer_rows = 4u16
         + state.visible_input_lines().saturating_sub(1) as u16
@@ -5474,8 +5718,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 checkpoints,
             } => draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected),
             Overlay::DirtyConfirm { .. } => draw_dirty_confirm(frame, chunks[1]),
-            Overlay::CommandList { selected, expanded } => {
-                draw_command_list(frame, chunks[1], state, *selected, *expanded)
+            Overlay::CommandList { selected, expanded, turn } => {
+                draw_command_list(frame, chunks[1], state, *selected, *expanded, *turn)
             }
             Overlay::EffortPicker { selected } => {
                 draw_effort_picker(frame, chunks[1], state, *selected)
@@ -5857,22 +6101,33 @@ fn draw_effort_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn tool_messages(state: &TuiState, turn: Option<i64>) -> Vec<&MessageRow> {
+    state
+        .history
+        .iter()
+        .filter(|message| {
+            message.role == "tool" && turn.map_or(true, |turn| message.turn == turn)
+        })
+        .collect()
+}
+
 fn draw_command_list(
     frame: &mut ratatui::Frame,
     area: Rect,
     state: &TuiState,
     selected: usize,
     expanded: bool,
+    turn: Option<i64>,
 ) {
-    let commands: Vec<&MessageRow> = state
-        .history
-        .iter()
-        .filter(|message| message.role == "tool")
-        .collect();
+    let commands = tool_messages(state, turn);
     let width = area.width.saturating_sub(2) as usize;
+    let scope = match turn {
+        Some(turn) => format!("turn {turn}"),
+        None => "all turns".to_string(),
+    };
     let mut lines: Vec<Line> = vec![Line::styled(
         format!(
-            "commands · {} · ↑↓ select · enter expand · c copy · esc close",
+            "tool calls · {scope} · {} · ↑↓ select · enter expand · y copy · esc close",
             commands.len()
         ),
         Style::default().fg(COLORS.muted),
@@ -7068,6 +7323,7 @@ mod tests {
             overlay: Overlay::None,
             approvals: Vec::new(),
             review: None,
+            activity: None,
             multi: None,
             notice: None,
             diff_output: None,
@@ -9773,9 +10029,10 @@ mod tests {
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &engine_command_sender, "/commands");
         match &state.overlay {
-            Overlay::CommandList { selected, expanded } => {
+            Overlay::CommandList { selected, expanded, turn } => {
                 assert_eq!(*selected, 1, "the newest command is selected");
                 assert!(!expanded);
+                assert_eq!(*turn, None);
             }
             _ => panic!("expected the command list"),
         }
@@ -9792,16 +10049,148 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
         );
         match &state.overlay {
-            Overlay::CommandList { selected, expanded } => {
+            Overlay::CommandList { selected, expanded, .. } => {
                 assert_eq!(*selected, 0);
                 assert!(expanded);
             }
             _ => panic!("expected the command list"),
         }
         let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
-        assert!(text.contains("commands · 2"), "{text}");
+        assert!(text.contains("tool calls · all turns · 2"), "{text}");
         assert!(text.contains("turn 1"), "{text}");
         assert!(text.contains("cargo test"), "{text}");
+    }
+
+    #[test]
+    fn review_copy_does_not_steal_note_text() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.review = Some(ReviewState {
+            turn: 1,
+            fingerprint: "fingerprint".into(),
+            rows: vec![diff_render::DiffRowRef {
+                path: "src/lib.rs".into(),
+                line_number: 7,
+                added: true,
+                removed: false,
+                text: "let value = 1;".into(),
+            }],
+            selected: 0,
+            notes: Vec::new(),
+            note_input: Some("ab".into()),
+        });
+        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()));
+        assert_eq!(
+            state.review.as_ref().unwrap().note_input.as_deref(),
+            Some("abc"),
+            "c remains note text"
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        );
+        assert_eq!(
+            state.review.as_ref().unwrap().note_input.as_deref(),
+            Some("abc"),
+            "ctrl+y copies without typing"
+        );
+        state.review.as_mut().unwrap().note_input = None;
+        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+        assert!(state.notice.as_deref().unwrap_or("").contains("copied"));
+    }
+
+    #[test]
+    fn activity_opens_expands_and_returns_after_review() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        {
+            let guard = store.lock().unwrap();
+            guard.start_turn_record(&thread_id, 1, ProviderId::Codex, Some("model")).unwrap();
+            guard.finish_turn_record(&thread_id, 1, TurnPhase::Completed, None).unwrap();
+            guard.add_message(&thread_id, 1, "tool", Some("codex"), Some("model"), "✓ shell cargo test").unwrap();
+            guard.add_message(
+                &thread_id,
+                1,
+                "diff",
+                None,
+                None,
+                "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n",
+            ).unwrap();
+        }
+        state.history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/activity");
+        assert!(matches!(state.activity, Some(ActivityView { expanded: false, .. })));
+        assert_eq!(state.activity.as_ref().unwrap().rows.len(), 1);
+        assert!(crate::activity::summary(&state.activity.as_ref().unwrap().rows[0]).contains("1 tool call"));
+        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(state.activity.as_ref().unwrap().expanded);
+        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
+        assert!(state.review.is_some(), "d opens the turn diff");
+        assert!(state.activity.is_some(), "activity stays behind review");
+        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        assert!(state.review.is_none());
+        assert!(state.activity.is_some(), "closing review returns to activity");
+    }
+
+    #[test]
+    fn commands_can_be_filtered_to_one_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        state.history = vec![
+            tool_message(1, &thread_id, 1, "✓ shell cargo test"),
+            tool_message(2, &thread_id, 2, "✓ shell cargo build"),
+        ];
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/commands 1");
+        match &state.overlay {
+            Overlay::CommandList { selected, expanded, turn } => {
+                assert_eq!(*turn, Some(1));
+                assert_eq!(*selected, 0);
+                assert!(!expanded);
+            }
+            _ => panic!("expected the command list"),
+        }
+        handle_command(&mut state, &store, &sender, "/commands 99");
+        assert!(state.notice.as_deref().unwrap_or("").contains("no tool calls for turn 99"));
+    }
+
+    #[test]
+    fn a_settled_turn_hints_at_activity() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        {
+            let guard = store.lock().unwrap();
+            guard.start_turn_record(&thread_id, 1, ProviderId::Codex, Some("model")).unwrap();
+            guard.finish_turn_record(&thread_id, 1, TurnPhase::Completed, None).unwrap();
+            guard.add_message(&thread_id, 1, "tool", Some("codex"), Some("model"), "✓ shell cargo test").unwrap();
+        }
+        state.history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id,
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &sender,
+        );
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("/activity to inspect"), "{notice}");
+        assert!(notice.contains("1 tool calls"), "{notice}");
     }
 
     #[test]
@@ -9846,14 +10235,14 @@ mod tests {
         assert!(listed.contains("Use tabs"), "{listed}");
         assert!(listed.contains("project"), "{listed}");
 
-        let id = store.lock().unwrap().list_memories(&state.thread.cwd).unwrap()[0].id;
+        let id = store.lock().unwrap().list_memories(&crate::memory::project_key(&state.thread.cwd)).unwrap()[0].id;
         handle_command(
             &mut state,
             &store,
             &engine_command_sender,
             &format!("/memories remove {id}"),
         );
-        assert!(store.lock().unwrap().list_memories(&state.thread.cwd).unwrap().is_empty());
+        assert!(store.lock().unwrap().list_memories(&crate::memory::project_key(&state.thread.cwd)).unwrap().is_empty());
 
         handle_command(
             &mut state,
@@ -9861,7 +10250,7 @@ mod tests {
             &engine_command_sender,
             "/memories add --global Answer briefly",
         );
-        let memories = store.lock().unwrap().list_memories(&state.thread.cwd).unwrap();
+        let memories = store.lock().unwrap().list_memories(&crate::memory::project_key(&state.thread.cwd)).unwrap();
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].scope, "global");
         assert_eq!(memories[0].text, "Answer briefly");
@@ -9872,7 +10261,7 @@ mod tests {
             &engine_command_sender,
             "/memories clear --global",
         );
-        assert!(store.lock().unwrap().list_memories(&state.thread.cwd).unwrap().is_empty());
+        assert!(store.lock().unwrap().list_memories(&crate::memory::project_key(&state.thread.cwd)).unwrap().is_empty());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use baton::{adapters, checkpoints, cli, config, doctor, exec_events, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, scanner, status, store, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, scanner, status, store, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::Parser;
@@ -33,6 +33,7 @@ fn main_result() -> Result<()> {
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir()?);
     let home = paths::baton_home();
+    config::validate_provider_overrides(&home)?;
     let requested_effort = match cli.effort.as_deref() {
         Some(value) if is_effort_clear(value) => None,
         Some(value) => Some(normalize_reasoning_effort(value).ok_or_else(|| {
@@ -1514,6 +1515,106 @@ fn main_result() -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Memories { action, json } => {
+            if cli.thread.is_some() {
+                anyhow::bail!("memories uses -C/--cwd for a project; -t/--thread is only for threads");
+            }
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let project = baton::memory::project_key(&cwd.to_string_lossy());
+            match action {
+                None => {
+                    let rows = store.list_memories(&project)?;
+                    if json {
+                        let memories: Vec<_> = rows
+                            .iter()
+                            .map(|memory| serde_json::json!({
+                                "id": memory.id,
+                                "scope": memory.scope,
+                                "cwd": memory.cwd,
+                                "text": memory.text,
+                                "created_at": memory.created_at,
+                                "updated_at": memory.updated_at,
+                            }))
+                            .collect();
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "schema_version": 1,
+                                "count": rows.len(),
+                                "memories": memories,
+                            })
+                        );
+                    } else if rows.is_empty() {
+                        println!("memories: none");
+                    } else {
+                        println!("memories: {}", rows.len());
+                        for memory in rows {
+                            println!("  {}. {} · {}", memory.id, memory.scope, memory.text);
+                        }
+                    }
+                }
+                Some(cli::MemoriesCommand::Add { global, text }) => {
+                    let text = text.join(" ");
+                    if text.trim().is_empty() {
+                        anyhow::bail!("usage: baton memories add [--global] <text>");
+                    }
+                    let scope = if global { "global" } else { "project" };
+                    let id = store.add_memory(scope, &project, &text)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "schema_version": 1,
+                                "action": "add",
+                                "id": id,
+                                "scope": scope,
+                            })
+                        );
+                    } else {
+                        println!("memory {id} saved ({scope})");
+                    }
+                }
+                Some(cli::MemoriesCommand::Remove { id }) => {
+                    if !store.remove_memory(&project, id)? {
+                        anyhow::bail!("memory {id} not found for this project");
+                    }
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "schema_version": 1,
+                                "action": "remove",
+                                "id": id,
+                                "removed": true,
+                            })
+                        );
+                    } else {
+                        println!("memory {id} removed");
+                    }
+                }
+                Some(cli::MemoriesCommand::Clear { global, yes }) => {
+                    if global && !yes {
+                        anyhow::bail!("refusing to clear every global memory without --yes");
+                    }
+                    let cleared = store.clear_memories(&project, global)?;
+                    let scope = if global { "global" } else { "project" };
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "schema_version": 1,
+                                "action": "clear",
+                                "scope": scope,
+                                "cleared": cleared,
+                            })
+                        );
+                    } else {
+                        println!("cleared {cleared} {scope} memory(s)");
+                    }
+                }
+            }
+            Ok(())
+        }
         cli::Commands::Default { provider } => {
             let parsed = ProviderId::parse(&provider)
                 .ok_or_else(|| anyhow::anyhow!("unknown provider {provider}, expected claude, codex, cursor, grok, opencode, or antigravity"))?;
@@ -1526,19 +1627,12 @@ fn main_result() -> Result<()> {
         cli::Commands::Login { provider } => {
             let provider = ProviderId::parse(&provider)
                 .ok_or_else(|| anyhow::anyhow!("unknown provider {provider}, expected claude, codex, cursor, grok, opencode, or antigravity"))?;
-            let command: Vec<&str> = match provider {
-                ProviderId::Codex => vec!["codex", "login"],
-                ProviderId::Claude => vec!["claude", "auth", "login"],
-                ProviderId::Cursor => vec!["agent", "login"],
-                ProviderId::Grok => vec!["grok", "login"],
-                ProviderId::OpenCode => vec!["opencode", "auth", "login"],
-                ProviderId::Antigravity => {
-                    println!("Antigravity has no CLI login.");
-                    println!("1. Install Antigravity and enable it in its settings.");
-                    println!("2. Sign in with Google when prompted.");
-                    println!("For API-rate billing set GEMINI_API_KEY and run: baton auth antigravity api");
-                    return Ok(());
-                }
+            let Some(command) = cli::login_command(provider) else {
+                println!("Antigravity has no CLI login.");
+                println!("1. Install Antigravity and enable it in its settings.");
+                println!("2. Sign in with Google when prompted.");
+                println!("For API-rate billing set GEMINI_API_KEY and run: baton auth antigravity api");
+                return Ok(());
             };
             println!("running: {}", command.join(" "));
             let status = std::process::Command::new(command[0])
@@ -1548,7 +1642,7 @@ fn main_result() -> Result<()> {
                 anyhow::bail!("{} failed with {status}", command.join(" "));
             }
             if provider == ProviderId::Cursor {
-                println!("cursor login complete (if the agent command was not found, install Cursor CLI and try `cursor-agent login`)");
+                println!("cursor login complete");
             }
             Ok(())
         }
@@ -1600,6 +1694,32 @@ fn main_result() -> Result<()> {
                     result.role,
                     search_snippet(&result.text, &query)
                 );
+            }
+            Ok(())
+        }
+        cli::Commands::Activity { json } => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let thread = match cli.thread.as_deref() {
+                Some(thread_id) => resolve_thread(&store, thread_id)?,
+                None => store
+                    .list_threads_for_path(&cwd)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
+            };
+            let turns = store.list_turn_records(&thread.id)?;
+            let messages = store.list_messages(&thread.id)?;
+            let usage = store.list_usage(Some(&thread.id))?;
+            let rows = activity::build(&thread, &turns, &messages, &usage);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&activity::to_json(&thread.id, &rows))?);
+            } else if rows.is_empty() {
+                println!("activity: no turns");
+            } else {
+                println!("thread: {} {}", &thread.id[..8.min(thread.id.len())], thread.title);
+                for row in &rows {
+                    println!("{}", activity::summary(row));
+                }
             }
             Ok(())
         }

@@ -253,6 +253,18 @@ fn resolve_config_precedence() {
 }
 
 #[test]
+fn cursor_custom_endpoint_is_rejected_before_a_turn() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        r#"{"cursor":{"mode":"api","apiKeyEnv":"CODEX_ICA_API_KEY","apiBaseUrl":"https://api.servicesessentials.ibm.com/v1"}}"#,
+    )
+    .unwrap();
+    let error = baton::config::validate_provider_overrides(home.path()).unwrap_err();
+    assert!(error.to_string().contains("Cursor does not support a custom endpoint"), "{error}");
+}
+
+#[test]
 fn provider_config_accepts_camel_case_key_env_and_base_url() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(

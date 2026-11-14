@@ -2051,13 +2051,19 @@ fn build_all_adapters(
     let antigravity_recorder = process_recorder.clone();
     let cwd_for_antigravity = cwd.clone();
     let antigravity_home = home.join("antigravity");
+    let antigravity_gemini = antigravity_home.join("gemini");
     let antigravity_spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
-            std::fs::create_dir_all(&antigravity_home)?;
-            let mut command = tokio::process::Command::new("antigravity");
+            std::fs::create_dir_all(&antigravity_gemini)?;
+            // The agy CLI serves ACP itself. The explicit gemini dir and app
+            // data dir keep baton's profile isolated from the user's IDE.
+            let mut command = tokio::process::Command::new("agy");
+            command.arg("acp");
+            command.arg("--gemini-dir").arg(&antigravity_gemini);
+            command.arg("--app-data-dir").arg("antigravity-acp");
             command.current_dir(&cwd_for_antigravity);
             command.env("AGY_ACP_FORCE_FILE_STORAGE", "1");
-            command.env("GEMINI_HOME", &antigravity_home);
+            command.env("GEMINI_HOME", &antigravity_gemini);
             if !auth_env.iter().any(|(key, _)| key == "GEMINI_API_KEY" || key == "GOOGLE_API_KEY") {
                 command.env_remove("GEMINI_API_KEY");
                 command.env_remove("GOOGLE_API_KEY");

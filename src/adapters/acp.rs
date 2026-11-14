@@ -173,6 +173,17 @@ fn collect_model_values(value: &Value, models: &mut Vec<String>) {
     }
 }
 
+/// Antigravity exposes model families as config values and encodes the
+/// thinking level in the variant id. The ACP config option accepts the family.
+fn antigravity_model_family(model: &str) -> &str {
+    for suffix in ["-xhigh", "-high", "-medium", "-low"] {
+        if let Some(family) = model.strip_suffix(suffix) {
+            return family;
+        }
+    }
+    model
+}
+
 fn model_options(setup: &Value) -> Vec<String> {
     let mut models = Vec::new();
     let Some(options) = setup.get("configOptions").and_then(Value::as_array) else {
@@ -327,7 +338,11 @@ impl AcpAdapter {
         }
     }
 
-    async fn ensure_initialized(&self, runtime: &Arc<AcpRuntime>) -> Result<()> {
+    async fn ensure_initialized(
+        &self,
+        runtime: &Arc<AcpRuntime>,
+        auth_env: &[(String, String)],
+    ) -> Result<()> {
         let params = json!({
             "protocolVersion": 2,
             "clientCapabilities": {
@@ -342,10 +357,35 @@ impl AcpAdapter {
             "_meta": { "clientType": "extension" }
         });
         self.request(runtime, "initialize", params).await?;
+        // Antigravity's ACP server keeps credentials per profile. An API-key
+        // run must select the gemini-api-key method explicitly; a stored OAuth
+        // login (no auth env) needs no call.
+        if self.provider == ProviderId::Antigravity
+            && auth_env.iter().any(|(key, _)| key == "GEMINI_API_KEY")
+        {
+            self.request(
+                runtime,
+                "authenticate",
+                json!({ "methodId": "gemini-api-key" }),
+            )
+            .await?;
+        }
         Ok(())
     }
 
     async fn select_model(&self, runtime: &Arc<AcpRuntime>, session_id: &str, model: &str) -> Result<()> {
+        if self.provider == ProviderId::Antigravity {
+            // Antigravity models are config families (`gemini-3.7-flash`), and
+            // `session/set_model` silently ignores the `-high`/`-low` ids that
+            // the print-mode catalog advertises.
+            let set_option = json!({
+                "sessionId": session_id,
+                "configId": "model",
+                "value": antigravity_model_family(model),
+            });
+            self.request(runtime, "session/set_config_option", set_option).await?;
+            return Ok(());
+        }
         let set_model = json!({ "sessionId": session_id, "modelId": model });
         if self.request(runtime, "session/set_model", set_model).await.is_err() {
             let set_config = json!({ "sessionId": session_id, "configId": "model", "value": model });
@@ -404,7 +444,7 @@ impl BatonAdapter for AcpAdapter {
         let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
         self.lifecycle.starting("model-list");
         let runtime = self.ensure_runtime(&input.auth_env).await?;
-        self.ensure_initialized(&runtime).await?;
+        self.ensure_initialized(&runtime, &input.auth_env).await?;
         let created = self
             .request(
                 &runtime,
@@ -427,7 +467,7 @@ impl BatonAdapter for AcpAdapter {
             anyhow::bail!("{} does not support reasoning effort; use codex or claude", self.provider);
         }
         let runtime = self.ensure_runtime(&input.auth_env).await?;
-        self.ensure_initialized(&runtime).await?;
+        self.ensure_initialized(&runtime, &input.auth_env).await?;
         self.lifecycle.turn_running(&input.thread_id);
         *runtime.current_emit.lock().await = Some(emit.clone());
 
@@ -567,5 +607,17 @@ impl BatonAdapter for AcpAdapter {
         }
         self.lifecycle.disposed();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::antigravity_model_family;
+
+    #[test]
+    fn antigravity_model_families_strip_thinking_suffixes() {
+        assert_eq!(antigravity_model_family("gemini-3.8-flash-high"), "gemini-3.8-flash");
+        assert_eq!(antigravity_model_family("gemini-4-hydrogen-xhigh"), "gemini-4-hydrogen");
+        assert_eq!(antigravity_model_family("gemini-3.7-flash"), "gemini-3.7-flash");
     }
 }

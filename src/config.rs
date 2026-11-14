@@ -12,6 +12,13 @@ pub use crate::types::AuthMode;
 pub struct ProviderAuthFile {
     pub mode: Option<AuthMode>,
     pub api_key: Option<String>,
+    /// Where baton reads the key. The child still receives the harness-native
+    /// variable, for example `GEMINI_API_KEY` for Antigravity.
+    #[serde(default, alias = "apiKeyEnv", alias = "api_key_env")]
+    pub api_key_env: Option<String>,
+    /// Endpoint root for harnesses that accept a custom base URL.
+    #[serde(default, alias = "apiBaseUrl", alias = "api_base_url")]
+    pub api_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -28,9 +35,13 @@ pub struct BatonConfigFile {
 
 #[derive(Debug, Clone)]
 pub struct EffectiveProviderConfig {
+    pub provider: ProviderId,
     pub mode: AuthMode,
     pub api_key: Option<String>,
+    /// Source variable name for the key, which may be a provider-neutral name
+    /// such as `CODEX_ICA_API_KEY`.
     pub api_key_env_name: String,
+    pub api_base_url: Option<String>,
     pub model: String,
     pub permission_mode: PermissionMode,
 }
@@ -78,14 +89,16 @@ pub fn resolve_provider_config(
 ) -> EffectiveProviderConfig {
     let file = load_config_file(home);
     let harness = read_harness_config(provider, Some(cwd), claude_dir, codex_home, opencode_dir);
-    let env_key_name = harness
-        .api_key_env_name
-        .clone()
-        .unwrap_or_else(|| crate::models::api_key_env(provider).to_string());
     let file_provider = file
         .as_ref()
         .and_then(|file| file.providers.get(provider.as_str()))
         .cloned();
+    let env_key_name = file_provider
+        .as_ref()
+        .and_then(|auth| auth.api_key_env.clone())
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| harness.api_key_env_name.clone())
+        .unwrap_or_else(|| crate::models::api_key_env(provider).to_string());
     let file_model = file
         .as_ref()
         .and_then(|file| file.default_models.as_ref())
@@ -104,7 +117,8 @@ pub fn resolve_provider_config(
         .unwrap_or(AuthMode::Subscription);
 
     let api_key = file_provider
-        .and_then(|auth| auth.api_key)
+        .as_ref()
+        .and_then(|auth| auth.api_key.clone())
         .filter(|key| !key.trim().is_empty())
         .or(harness.api_key)
         .or_else(|| std::env::var(&env_key_name).ok().filter(|key| !key.trim().is_empty()));
@@ -112,9 +126,14 @@ pub fn resolve_provider_config(
     let fallback_model = crate::models::default_model(provider).to_string();
 
     EffectiveProviderConfig {
+        provider,
         mode,
         api_key: api_key.filter(|key| !key.trim().is_empty()),
         api_key_env_name: env_key_name,
+        api_base_url: file_provider
+            .as_ref()
+            .and_then(|auth| auth.api_base_url.clone())
+            .filter(|base| !base.trim().is_empty()),
         model: file_model.or(harness.model).unwrap_or(fallback_model),
         permission_mode: harness.permission_mode.unwrap_or(PermissionMode::Default),
     }
@@ -206,10 +225,26 @@ pub fn provider_auth_env(auth: &EffectiveProviderConfig) -> Vec<(String, String)
                 .ok()
                 .filter(|value| !value.trim().is_empty())
         });
-    match key {
-        Some(key) => vec![(auth.api_key_env_name.clone(), key)],
-        None => Vec::new(),
+    let mut env = Vec::new();
+    if let Some(key) = key {
+        // The child expects the harness-native variable even when the key was
+        // read from a provider-neutral one such as CODEX_ICA_API_KEY.
+        env.push((
+            crate::models::native_api_key_env(auth.provider).to_string(),
+            key,
+        ));
     }
+    if let Some(base) = auth
+        .api_base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(name) = crate::models::base_url_env(auth.provider) {
+            env.push((name.to_string(), base.to_string()));
+        }
+    }
+    env
 }
 
 pub fn auth_signature(env_additions: &[(String, String)]) -> String {

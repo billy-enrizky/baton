@@ -41,7 +41,7 @@ impl ProviderId {
             ProviderId::Cursor => "cursor-agent",
             ProviderId::Grok => "grok",
             ProviderId::OpenCode => "opencode",
-            ProviderId::Antigravity => "antigravity",
+            ProviderId::Antigravity => "agy",
         }
     }
 

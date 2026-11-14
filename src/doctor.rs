@@ -336,7 +336,7 @@ fn provider_executable(provider: ProviderId) -> &'static str {
         ProviderId::Cursor => "cursor-agent",
         ProviderId::Grok => "grok",
         ProviderId::OpenCode => "opencode",
-        ProviderId::Antigravity => "antigravity",
+        ProviderId::Antigravity => "agy",
     }
 }
 

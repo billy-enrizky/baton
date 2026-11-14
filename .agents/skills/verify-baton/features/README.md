@@ -17,6 +17,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | TUI native rewind | TUI | `/rewind --native` truncates the provider and store history and prefills the message |
 | Greeting | TUI | `hi` in default orchestrate mode answers directly, with no planner run |
 | MCP stdio | CLI | `baton mcp` handshakes, lists 12 tools, and answers status, turns, threads, and doctor |
+| Antigravity | CLI | `agy acp` completes one turn with the ICA key and custom base URL |
 | Process registry | CLI | `baton ps --json` returns a stable schema and no false live processes |
 | Orchestration | CLI | `baton orchestrate` creates worktrees, runs harnesses, and records runs |
 | Orchestrate stream | CLI | `--stream-json` emits plan, worker, and result JSONL rows |

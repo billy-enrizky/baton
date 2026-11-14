@@ -45,6 +45,21 @@ baton login antigravity  # prints the Google sign-in instructions
 
 API-rate billing: set the provider's key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CURSOR_API_KEY`, `XAI_API_KEY`, `OPENCODE_API_KEY`, `GEMINI_API_KEY`) and run `baton auth <provider> api`.
 
+Antigravity runs as `agy acp`. To use an API key and a custom Gemini endpoint, add this to `~/.baton/config.json`:
+
+```json
+{
+  "antigravity": {
+    "mode": "api",
+    "apiKeyEnv": "CODEX_ICA_API_KEY",
+    "apiBaseUrl": "https://api.servicesessentials.ibm.com"
+  },
+  "defaultModels": { "antigravity": "gemini-3.7-flash" }
+}
+```
+
+`apiKeyEnv` is the variable baton reads; the child receives `GEMINI_API_KEY`. The base URL is the endpoint root because `agy` appends `/v1beta` itself, so do not add `/v1`. Cursor and Grok still use their own binaries (`cursor-agent` and `grok`); install them before `baton doctor` can mark them ready.
+
 ## Start here
 
 Run `baton` with no arguments. The workspace opens in orchestrate mode. Type what you want to do in plain language and press Enter. Baton picks a harness or splits the work. `/help` shows the common paths, `/help all` lists every command, and `baton doctor` checks what is installed.

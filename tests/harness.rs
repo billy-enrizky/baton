@@ -223,7 +223,7 @@ fn resolve_config_precedence() {
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
         "claude".to_string(),
-        baton::config::ProviderAuthFile { mode: Some(AuthMode::Api), api_key: Some("sk-ant-file".into()) },
+        baton::config::ProviderAuthFile { mode: Some(AuthMode::Api), api_key: Some("sk-ant-file".into()), api_key_env: None, api_base_url: None },
     );
     save_config_file(
         home.path(),
@@ -253,17 +253,49 @@ fn resolve_config_precedence() {
 }
 
 #[test]
-fn provider_auth_env_uses_resolved_key_name() {
+fn provider_config_accepts_camel_case_key_env_and_base_url() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        r#"{"antigravity":{"mode":"api","apiKeyEnv":"CODEX_ICA_API_KEY","apiBaseUrl":"https://api.servicesessentials.ibm.com"}}"#,
+    )
+    .unwrap();
+    let resolved = baton::config::resolve_config_in(
+        home.path(),
+        std::path::Path::new("/nowhere"),
+        None,
+        None,
+        None,
+    );
+    let config = resolved.for_provider(baton::types::ProviderId::Antigravity);
+    assert_eq!(config.mode, AuthMode::Api);
+    assert_eq!(config.api_key_env_name, "CODEX_ICA_API_KEY");
+    assert_eq!(
+        config.api_base_url.as_deref(),
+        Some("https://api.servicesessentials.ibm.com")
+    );
+}
+
+#[test]
+fn provider_auth_env_maps_a_neutral_source_to_the_harness_native_names() {
     let config = baton::config::EffectiveProviderConfig {
+        provider: baton::types::ProviderId::Antigravity,
         mode: AuthMode::Api,
         api_key: Some("ica-key".into()),
         api_key_env_name: "CODEX_ICA_API_KEY".into(),
-        model: "m".into(),
+        api_base_url: Some("https://api.servicesessentials.ibm.com".into()),
+        model: "gemini-3.7-flash".into(),
         permission_mode: baton::types::PermissionMode::Default,
     };
     assert_eq!(
         provider_auth_env(&config),
-        vec![("CODEX_ICA_API_KEY".to_string(), "ica-key".to_string())]
+        vec![
+            ("GEMINI_API_KEY".to_string(), "ica-key".to_string()),
+            (
+                "GOOGLE_GEMINI_BASE_URL".to_string(),
+                "https://api.servicesessentials.ibm.com".to_string()
+            )
+        ]
     );
     let subscription = baton::config::EffectiveProviderConfig { mode: AuthMode::Subscription, ..config };
     assert!(provider_auth_env(&subscription).is_empty());

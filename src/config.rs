@@ -240,7 +240,7 @@ pub fn provider_auth_env(auth: &EffectiveProviderConfig) -> Vec<(String, String)
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        if let Some(name) = crate::models::base_url_env(auth.provider) {
+        for name in crate::models::base_url_envs(auth.provider) {
             env.push((name.to_string(), base.to_string()));
         }
     }

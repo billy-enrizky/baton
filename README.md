@@ -58,7 +58,22 @@ Antigravity runs as `agy acp`. To use an API key and a custom Gemini endpoint, a
 }
 ```
 
-`apiKeyEnv` is the variable baton reads; the child receives `GEMINI_API_KEY`. The base URL is the endpoint root because `agy` appends `/v1beta` itself, so do not add `/v1`. Cursor and Grok still use their own binaries (`cursor-agent` and `grok`); install them before `baton doctor` can mark them ready.
+`apiKeyEnv` is the variable baton reads; the child receives `GEMINI_API_KEY`. The base URL is the endpoint root because `agy` appends `/v1beta` itself, so do not add `/v1`.
+
+Grok uses the same override shape with the OpenAI-compatible `/v1` base. Baton spawns `grok agent stdio` and maps the base URL to `GROK_XAI_API_BASE_URL` and `GROK_MODELS_BASE_URL`:
+
+```json
+{
+  "grok": {
+    "mode": "api",
+    "apiKeyEnv": "CODEX_ICA_API_KEY",
+    "apiBaseUrl": "https://api.servicesessentials.ibm.com/v1"
+  },
+  "defaultModels": { "grok": "gemini-3.7-flash" }
+}
+```
+
+Cursor is installed as `cursor-agent` and baton spawns `cursor-agent acp`. Cursor validates its own API keys, so the ICA key is rejected; run `cursor-agent login` and use subscription auth instead. Cursor cannot use the ICA endpoint.
 
 ## Start here
 

@@ -119,6 +119,79 @@ async fn fake_acp_agent(read: tokio::io::DuplexStream, mut write: tokio::io::Dup
     }
 }
 
+async fn fake_acp_session_error(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": 2 } })).await;
+            }
+            "session/new" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32000, "message": "Authentication required" }
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_acp_error_before_the_prompt_releases_the_event_sender() {
+    let spawner: Arc<dyn Fn(&[(String, String)]) -> anyhow::Result<TransportHalves> + Send + Sync> =
+        Arc::new(|_auth_env: &[(String, String)]| {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_acp_session_error(server_read, server_write));
+            Ok(halves)
+        });
+    let mut adapter = AcpAdapter::new(ProviderId::Grok, spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_turn(
+            baton::adapters::TurnStartInput {
+                thread_id: "thread".into(),
+                turn: 1,
+                cwd: "/work".into(),
+                model: "model".into(),
+                effort: None,
+                prompt: "hello".into(),
+                permission_mode: PermissionMode::Default,
+                auth_env: vec![],
+            },
+            None,
+            event_sender,
+        ),
+    )
+    .await
+    .expect("the adapter returns instead of hanging");
+    assert!(result.is_err(), "the session error is reported");
+    assert!(
+        matches!(
+            event_receiver.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Disconnected)
+        ),
+        "the adapter must drop its event sender on the error path"
+    );
+}
+
 async fn fake_acp_models(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
     let mut lines = BufReader::new(read);
     let mut line = String::new();

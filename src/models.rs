@@ -22,13 +22,16 @@ pub fn native_api_key_env(provider: ProviderId) -> &'static str {
     api_key_env(provider)
 }
 
-/// The environment variable a harness reads for a custom API base URL, when
-/// the harness supports one. Antigravity appends its own `/v1beta` paths, so
-/// the value is the endpoint root, not the OpenAI `/v1` base.
-pub fn base_url_env(provider: ProviderId) -> Option<&'static str> {
+/// The environment variables a harness reads for a custom API base URL. Some
+/// CLIs use separate chat and model-list variables. Antigravity appends its
+/// own `/v1beta` paths, so its value is the endpoint root; Cursor and Grok
+/// use the OpenAI-compatible `/v1` base.
+pub fn base_url_envs(provider: ProviderId) -> &'static [&'static str] {
     match provider {
-        ProviderId::Antigravity => Some("GOOGLE_GEMINI_BASE_URL"),
-        _ => None,
+        ProviderId::Antigravity => &["GOOGLE_GEMINI_BASE_URL"],
+        ProviderId::Cursor => &["CURSOR_API_ENDPOINT"],
+        ProviderId::Grok => &["GROK_XAI_API_BASE_URL", "GROK_MODELS_BASE_URL"],
+        _ => &[],
     }
 }
 

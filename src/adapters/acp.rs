@@ -21,6 +21,28 @@ struct AcpRuntime {
 
 pub type HalvesSpawner = Arc<dyn Fn(&[(String, String)]) -> Result<TransportHalves> + Send + Sync>;
 
+/// Clears the live event sender on every exit path, including an error before
+/// the prompt exists. A leaked sender clone makes the engine's forwarder wait
+/// forever for a turn that already failed.
+struct EmitScope {
+    runtime: Arc<AcpRuntime>,
+}
+
+impl EmitScope {
+    async fn set(runtime: &Arc<AcpRuntime>, emit: TurnEventSender) -> Self {
+        *runtime.current_emit.lock().await = Some(emit);
+        Self { runtime: runtime.clone() }
+    }
+}
+
+impl Drop for EmitScope {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = self.runtime.current_emit.try_lock() {
+            *slot = None;
+        }
+    }
+}
+
 pub struct AcpAdapter {
     provider: ProviderId,
     spawner: HalvesSpawner,
@@ -29,6 +51,12 @@ pub struct AcpAdapter {
     next_id: Arc<AtomicU32>,
     auth_signature: Arc<Mutex<Option<String>>>,
     lifecycle: AdapterLifecycle,
+}
+
+fn acp_debug(message: &str) {
+    if std::env::var_os("BATON_DEBUG_ACP").is_some() {
+        eprintln!("baton acp: {message}");
+    }
 }
 
 fn spawn_reader(runtime: Arc<AcpRuntime>) {
@@ -46,6 +74,7 @@ fn spawn_reader(runtime: Arc<AcpRuntime>) {
                 Err(_) => continue,
             };
             let method = frame.get("method").and_then(Value::as_str).map(str::to_string);
+            acp_debug(&format!("frame method={method:?} id={:?}", frame.get("id")));
             let id = frame.get("id").cloned();
             let response_id = id.clone();
             match (method, id) {
@@ -323,6 +352,7 @@ impl AcpAdapter {
     }
 
     async fn request(&self, runtime: &Arc<AcpRuntime>, method: &str, params: Value) -> Result<Value> {
+        acp_debug(&format!("request {method}"));
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = oneshot::channel();
         runtime.pending.lock().unwrap().insert(id, sender);
@@ -332,9 +362,18 @@ impl AcpAdapter {
             writer.write_line(&serde_json::to_string(&frame)?).await?;
         }
         match tokio::time::timeout(std::time::Duration::from_secs(120), receiver).await {
-            Ok(Ok(Ok(value))) => Ok(value),
-            Ok(Ok(Err(error))) => anyhow::bail!("acp error: {error}"),
-            _ => anyhow::bail!("acp request timed out: {method}"),
+            Ok(Ok(Ok(value))) => {
+                acp_debug(&format!("response {method} ok"));
+                Ok(value)
+            }
+            Ok(Ok(Err(error))) => {
+                acp_debug(&format!("response {method} error={error}"));
+                anyhow::bail!("acp error: {error}")
+            }
+            _ => {
+                acp_debug(&format!("response {method} timeout"));
+                anyhow::bail!("acp request timed out: {method}")
+            }
         }
     }
 
@@ -343,18 +382,15 @@ impl AcpAdapter {
         runtime: &Arc<AcpRuntime>,
         auth_env: &[(String, String)],
     ) -> Result<()> {
+        // The standard ACP shape. Cursor's schema rejects extra clientInfo
+        // fields and duplicate info/capabilities blocks with Invalid params.
         let params = json!({
             "protocolVersion": 2,
             "clientCapabilities": {
                 "fs": { "readTextFile": true, "writeTextFile": true },
                 "terminal": false
             },
-            "clientInfo": { "name": "baton", "title": "baton", "version": env!("CARGO_PKG_VERSION") },
-            "capabilities": {
-                "fs": { "readTextFile": true, "writeTextFile": true }
-            },
-            "info": { "name": "baton", "title": "baton", "version": env!("CARGO_PKG_VERSION") },
-            "_meta": { "clientType": "extension" }
+            "clientInfo": { "name": "baton", "version": env!("CARGO_PKG_VERSION") }
         });
         self.request(runtime, "initialize", params).await?;
         // Antigravity's ACP server keeps credentials per profile. An API-key
@@ -367,6 +403,16 @@ impl AcpAdapter {
                 runtime,
                 "authenticate",
                 json!({ "methodId": "gemini-api-key" }),
+            )
+            .await?;
+        }
+        // Cursor's ACP server uses the stored `cursor-agent login` session.
+        // API-key runs authenticate through the environment and skip this.
+        if self.provider == ProviderId::Cursor && auth_env.is_empty() {
+            self.request(
+                runtime,
+                "authenticate",
+                json!({ "methodId": "cursor_login" }),
             )
             .await?;
         }
@@ -469,7 +515,7 @@ impl BatonAdapter for AcpAdapter {
         let runtime = self.ensure_runtime(&input.auth_env).await?;
         self.ensure_initialized(&runtime, &input.auth_env).await?;
         self.lifecycle.turn_running(&input.thread_id);
-        *runtime.current_emit.lock().await = Some(emit.clone());
+        let _emit_scope = EmitScope::set(&runtime, emit.clone()).await;
 
         let session_id = match session {
             Some(session) => {

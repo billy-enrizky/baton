@@ -2081,7 +2081,27 @@ fn build_all_adapters(
     let cwd_for_cursor = cwd.clone();
     let cursor_spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
+            // Cursor's ACP authenticate opens a browser login. Fail fast with
+            // a clear hint instead of hanging a headless turn.
+            if auth_env.is_empty() {
+                let status = std::process::Command::new("cursor-agent")
+                    .arg("status")
+                    .output()?;
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&status.stdout),
+                    String::from_utf8_lossy(&status.stderr)
+                );
+                if !status.status.success()
+                    || text.to_ascii_lowercase().contains("not logged in")
+                {
+                    anyhow::bail!(
+                        "cursor-agent is not logged in; run `cursor-agent login`, then retry"
+                    );
+                }
+            }
             let mut command = tokio::process::Command::new("cursor-agent");
+            command.arg("acp");
             command.current_dir(&cwd_for_cursor);
             command.stdin(std::process::Stdio::piped());
             command.stdout(std::process::Stdio::piped());

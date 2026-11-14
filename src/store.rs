@@ -953,6 +953,27 @@ impl BatonStore {
         Ok(rows)
     }
 
+    /// Every memory row, used by the read-only MCP `all` view.
+    pub fn list_all_memories(&self) -> Result<Vec<MemoryRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, scope, cwd, text, created_at, updated_at
+             FROM memories ORDER BY scope, cwd, id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(MemoryRow {
+                    id: row.get(0)?,
+                    scope: row.get(1)?,
+                    cwd: row.get(2)?,
+                    text: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Removes a memory only when it is global or belongs to this project.
     pub fn remove_memory(&self, cwd: &str, id: i64) -> Result<bool> {
         let changed = self.db.execute(

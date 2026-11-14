@@ -116,6 +116,38 @@ impl McpServer {
                     "turns": turns.iter().map(turn_json).collect::<Vec<_>>(),
                 }))
             }
+            "baton_activity" => {
+                let thread = self.resolve_thread(argument_thread(arguments))?;
+                let turns = self.store.list_turn_records(&thread.id)?;
+                let messages = self.store.list_messages(&thread.id)?;
+                let usage = self.store.list_usage(Some(&thread.id))?;
+                let rows = crate::activity::build(&thread, &turns, &messages, &usage);
+                Ok(crate::activity::to_json(&thread.id, &rows))
+            }
+            "baton_memories" => {
+                let all = arguments.get("all").and_then(Value::as_bool).unwrap_or(false);
+                let cwd = arguments
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .or_else(|| {
+                        argument_thread(arguments)
+                            .and_then(|id| self.store.get_thread(id).ok().flatten())
+                            .map(|thread| thread.cwd)
+                    })
+                    .unwrap_or_else(|| self.cwd.to_string_lossy().to_string());
+                let rows = if all {
+                    self.store.list_all_memories()?
+                } else {
+                    self.store
+                        .list_memories(&crate::memory::project_key(&cwd))?
+                };
+                Ok(json!({
+                    "schema_version": 1,
+                    "count": rows.len(),
+                    "memories": rows.iter().map(memory_json).collect::<Vec<_>>(),
+                }))
+            }
             "baton_queue" => {
                 let thread = self.resolve_thread(argument_thread(arguments))?;
                 if arguments.get("clear").and_then(Value::as_bool).unwrap_or(false) {
@@ -466,6 +498,17 @@ fn tool_content(value: &Value, is_error: bool) -> Value {
     })
 }
 
+fn memory_json(memory: &crate::store::MemoryRow) -> Value {
+    json!({
+        "id": memory.id,
+        "scope": memory.scope,
+        "cwd": memory.cwd,
+        "text": memory.text,
+        "created_at": memory.created_at,
+        "updated_at": memory.updated_at,
+    })
+}
+
 fn turn_json(turn: &TurnRow) -> Value {
     let open = !turn.phase.is_terminal();
     json!({
@@ -527,6 +570,26 @@ fn tool_descriptors() -> Vec<Value> {
             "name": "baton_turns",
             "description": "List durable turn phases for a thread, including provider turn ids, timestamps, and errors.",
             "inputSchema": thread_schema(),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "baton_activity",
+            "description": "Inspect every turn's provider, model, phase, tool calls, diff presence, and usage. Imported message-only turns are marked imported.",
+            "inputSchema": thread_schema(),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
+            "name": "baton_memories",
+            "description": "List governed project and global memories. Defaults to the server cwd's project; all lists every scope.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "thread": { "type": "string", "description": "Thread id or unique prefix; its cwd selects the project." },
+                    "cwd": { "type": "string", "description": "Project cwd to look up. Defaults to the thread or the server cwd." },
+                    "all": { "type": "boolean", "description": "List every memory across projects." }
+                },
+                "additionalProperties": false
+            },
             "annotations": { "readOnlyHint": true }
         }),
         json!({
@@ -738,6 +801,8 @@ mod tests {
         assert!(names.contains(&"baton_orchestration_runs"));
         assert!(names.contains(&"baton_orchestration_report"));
         assert!(names.contains(&"baton_fork"));
+        assert!(names.contains(&"baton_activity"));
+        assert!(names.contains(&"baton_memories"));
         let fork_tool = listed["result"]["tools"]
             .as_array()
             .unwrap()
@@ -745,6 +810,31 @@ mod tests {
             .find(|tool| tool["name"] == "baton_fork")
             .unwrap();
         assert!(fork_tool["inputSchema"]["properties"]["native"].is_object());
+    }
+
+    #[test]
+    fn activity_and_memories_are_read_only_views() {
+        let server = server();
+        let activity = tool_json(&server, "baton_activity", json!({}));
+        assert_eq!(activity["schema_version"], 1);
+        assert_eq!(activity["count"], 1);
+        assert_eq!(activity["turns"][0]["provider"], "codex");
+        assert_eq!(activity["turns"][0]["phase"], "completed");
+        assert_eq!(activity["turns"][0]["has_diff"], true);
+
+        server
+            .store
+            .add_memory(
+                "project",
+                &crate::memory::project_key(&server.cwd.to_string_lossy()),
+                "Use tabs",
+            )
+            .unwrap();
+        let memories = tool_json(&server, "baton_memories", json!({}));
+        assert_eq!(memories["count"], 1);
+        assert_eq!(memories["memories"][0]["text"], "Use tabs");
+        let all = tool_json(&server, "baton_memories", json!({ "all": true }));
+        assert_eq!(all["count"], 1);
     }
 
     #[test]

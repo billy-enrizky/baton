@@ -139,6 +139,20 @@ pub fn repo_root(cwd: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(root))
 }
 
+/// The stable root of the project containing `cwd`. A linked worktree shares
+/// the main checkout's root, so memories and other project state do not split
+/// between the main tree and its workers.
+pub fn project_identity_root(cwd: &Path) -> Option<PathBuf> {
+    if let Ok(common) = git(cwd, &["rev-parse", "--path-format=absolute", "--git-common-dir"]) {
+        let common = PathBuf::from(common.trim());
+        if common.file_name().and_then(|name| name.to_str()) == Some(".git") {
+            return common.parent().map(Path::to_path_buf);
+        }
+        return Some(common);
+    }
+    repo_root(cwd).ok()
+}
+
 pub fn is_dirty(repo_root: &Path) -> Result<bool> {
     Ok(!git(repo_root, &["status", "--porcelain"])?.trim().is_empty())
 }

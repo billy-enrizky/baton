@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand};
 
+use crate::types::ProviderId;
+
 const QUICK_START: &str = "\
 Start here:
   baton                              open the interactive workspace
@@ -97,6 +99,12 @@ pub enum Commands {
     Chat,
     /// Serve the local thread store over MCP stdio for coding agents
     Mcp,
+    /// Inspect every turn's tool calls, diff, and usage
+    Activity {
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
     #[command(visible_alias = "list")]
     Threads {
         /// Emit a JSON array
@@ -106,6 +114,14 @@ pub enum Commands {
     /// Start a new thread with a title
     New {
         title: Vec<String>,
+    },
+    /// List, add, remove, or clear governed project and global memories
+    Memories {
+        #[command(subcommand)]
+        action: Option<MemoriesCommand>,
+        /// Emit JSON
+        #[arg(long, global = true)]
+        json: bool,
     },
     /// Branch a thread's conversation into a new thread
     Fork {
@@ -285,6 +301,38 @@ pub enum Commands {
     },
 }
 
+/// The interactive login command for a provider. Antigravity has no CLI
+/// login; it uses Google sign-in or an API key.
+pub fn login_command(provider: ProviderId) -> Option<Vec<&'static str>> {
+    match provider {
+        ProviderId::Codex => Some(vec!["codex", "login"]),
+        ProviderId::Claude => Some(vec!["claude", "auth", "login"]),
+        ProviderId::Cursor => Some(vec!["cursor-agent", "login"]),
+        ProviderId::Grok => Some(vec!["grok", "login"]),
+        ProviderId::OpenCode => Some(vec!["opencode", "auth", "login"]),
+        ProviderId::Antigravity => None,
+    }
+}
+
+#[derive(Subcommand, Clone)]
+pub enum MemoriesCommand {
+    /// Add a memory; project scope unless --global is set
+    Add {
+        #[arg(long)]
+        global: bool,
+        text: Vec<String>,
+    },
+    /// Remove a memory by id
+    Remove { id: i64 },
+    /// Clear all project memories, or all global memories with --global --yes
+    Clear {
+        #[arg(long)]
+        global: bool,
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -336,6 +384,42 @@ mod tests {
                 assert!(!json);
             }
             _ => panic!("expected the spawn command"),
+        }
+    }
+
+    #[test]
+    fn login_uses_the_installed_cursor_binary() {
+        assert_eq!(
+            login_command(ProviderId::Cursor),
+            Some(vec!["cursor-agent", "login"])
+        );
+        assert_eq!(login_command(ProviderId::Antigravity), None);
+    }
+
+    #[test]
+    fn activity_uses_the_global_thread_and_json_flags() {
+        let cli = Cli::try_parse_from(["baton", "-t", "thread-1", "activity", "--json"]).unwrap();
+        assert_eq!(cli.thread.as_deref(), Some("thread-1"));
+        match cli.command {
+            Some(Commands::Activity { json: true }) => {}
+            _ => panic!("expected activity"),
+        }
+    }
+
+    #[test]
+    fn memories_use_the_global_cwd_and_json_flag() {
+        let cli = Cli::try_parse_from(["baton", "-C", "/tmp/project", "memories", "--json"]).unwrap();
+        assert_eq!(cli.cwd.as_deref(), Some("/tmp/project"));
+        match cli.command {
+            Some(Commands::Memories { action: None, json: true }) => {}
+            _ => panic!("expected memories list"),
+        }
+        let cli = Cli::try_parse_from(["baton", "memories", "add", "--global", "Use", "tabs", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Memories { action: Some(MemoriesCommand::Add { global: true, text }), json: true }) => {
+                assert_eq!(text, vec!["Use", "tabs"]);
+            }
+            _ => panic!("expected memories add"),
         }
     }
 

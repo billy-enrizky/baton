@@ -1142,6 +1142,34 @@ fn prompt_history_is_project_scoped_capped_and_deduped() {
 }
 
 #[test]
+fn memories_are_scoped_deduped_and_removable() {
+    let store = BatonStore::memory().unwrap();
+    let project = store.add_memory("project", "/proj-a", "Use tabs").unwrap();
+    assert_eq!(
+        store.add_memory("project", "/proj-a", "Use tabs").unwrap(),
+        project,
+        "an identical project memory is returned as-is"
+    );
+    let global = store.add_memory("global", "/proj-a", "Answer briefly").unwrap();
+    let other = store.add_memory("project", "/proj-b", "Other project").unwrap();
+
+    let a = store.list_memories("/proj-a").unwrap();
+    assert_eq!(a.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), vec!["Use tabs", "Answer briefly"]);
+    assert_eq!(a[0].scope, "project");
+    let b = store.list_memories("/proj-b").unwrap();
+    assert_eq!(b.iter().map(|m| m.text.as_str()).collect::<Vec<_>>(), vec!["Other project", "Answer briefly"]);
+
+    assert!(!store.remove_memory("/proj-a", other).unwrap(), "another project's memory is protected");
+    assert!(store.remove_memory("/proj-a", project).unwrap());
+    assert_eq!(store.list_memories("/proj-a").unwrap().len(), 1);
+    assert!(store.remove_memory("/proj-a", global).unwrap());
+    assert!(store.list_memories("/proj-a").unwrap().is_empty());
+
+    assert!(store.add_memory("project", "/proj-a", &"x".repeat(2001)).is_err());
+    assert!(store.add_memory("nonsense", "/proj-a", "x").is_err());
+}
+
+#[test]
 fn abandoned_orchestration_is_reconciled_without_losing_completed_tasks() {
     let store = BatonStore::memory().unwrap();
     store

@@ -72,7 +72,7 @@ const LOGO_ROWS: [&str; 6] = [
 const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/switch", "switch to a single harness: /switch <provider> [model]"),
     ("/model", "set model for this thread"),
-    ("/effort", "set reasoning effort: /effort low|medium|high|xhigh|max|default"),
+    ("/effort", "set reasoning effort: /effort opens a picker or takes low|medium|high|xhigh|max|default"),
     ("/mode", "permission mode: default|acceptEdits|bypassPermissions|plan"),
     ("/auth", "billing mode: /auth <provider> <subscription|api>"),
     ("/new", "start a new thread"),
@@ -86,10 +86,12 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/diff", "diff a checkpoint against the working tree"),
     ("/rewind", "rewind to a previous message"),
     ("/goal", "set a multi-turn objective the agent works toward"),
+    ("/memories", "list, add, remove, or clear governed memories"),
     ("/find", "search the conversation"),
     ("/multi", "same prompt to multiple providers; --worktrees isolates them"),
     ("/orchestrate", "orchestrate mode or one-off: /orchestrate [on|off] [goal]"),
     ("/runs", "list or reopen orchestration runs"),
+    ("/commands", "deep dive into every command this thread ran"),
     ("/queue", "show or clear queued follow-ups"),
     ("/turns", "list durable turn phases"),
     ("/status", "show thread phase, goal, queue, and adapter states"),
@@ -114,6 +116,9 @@ Common
   /new                        start a new thread
   /threads                    list threads here
   /status                     what is happening now
+  /commands                   every command this thread ran
+  /memories                   project and global notes ($memories)
+  /effort                     reasoning effort picker
   /orchestrate [on|off] [goal]  split work across harnesses
   /runs                       orchestration history
   /review                     line notes on the latest diff
@@ -282,6 +287,8 @@ enum Overlay {
     CheckpointPicker { selected: usize, checkpoints: Vec<(i64, String)> },
     DirtyConfirm { goal: String, max_tasks: usize, plan_file: Option<String> },
     OrchestrationPreview { preview: Box<OrchestrationPreview> },
+    CommandList { selected: usize, expanded: bool },
+    EffortPicker { selected: usize },
 }
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -2046,6 +2053,66 @@ fn handle_key(
                 }
             }
         }
+        Overlay::CommandList { mut selected, mut expanded } => {
+            let commands: Vec<&MessageRow> = state
+                .history
+                .iter()
+                .filter(|message| message.role == "tool")
+                .collect();
+            let mut keep = true;
+            match key.code {
+                KeyCode::Esc => keep = false,
+                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !commands.is_empty() {
+                        selected = (selected + 1).min(commands.len() - 1);
+                    }
+                }
+                KeyCode::Enter => expanded = !expanded,
+                KeyCode::Char('c') => {
+                    if let Some(message) = commands.get(selected.min(commands.len().saturating_sub(1))) {
+                        let provider = message.provider.as_deref().unwrap_or("-");
+                        match crate::clipboard::copy(&format!(
+                            "turn {} · {} · {}",
+                            message.turn, provider, message.text
+                        )) {
+                            Ok(()) => state.notice = Some("command copied".into()),
+                            Err(error) => state.notice = Some(format!("cannot copy command: {error}")),
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if keep {
+                state.overlay = Overlay::CommandList { selected, expanded };
+            }
+        }
+        Overlay::EffortPicker { mut selected } => {
+            let levels = ["default", "low", "medium", "high", "xhigh", "max"];
+            let mut keep = true;
+            match key.code {
+                KeyCode::Esc => keep = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = (selected + levels.len() - 1) % levels.len()
+                }
+                KeyCode::Down | KeyCode::Char('j') => selected = (selected + 1) % levels.len(),
+                KeyCode::Enter => {
+                    if let Some(level) = levels.get(selected) {
+                        handle_command(
+                            state,
+                            store,
+                            engine_command_sender,
+                            &format!("/effort {level}"),
+                        );
+                    }
+                    keep = false;
+                }
+                _ => {}
+            }
+            if keep {
+                state.overlay = Overlay::EffortPicker { selected };
+            }
+        }
         Overlay::SwitchPicker { mut selected } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
@@ -3389,7 +3456,7 @@ fn handle_command(
                     "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · esc: clear · drag transcript to copy",
                 );
                 help.push_str(
-                    "\npaste a multi-line prompt: it stays in the composer · typing during a turn steers it · enter on an empty composer sends the next queued message",
+                    "\npaste a multi-line prompt: it stays in the composer · typing during a turn steers it · enter on an empty composer sends the next queued message · $memories injects saved memories",
                 );
                 help
             } else {
@@ -3402,6 +3469,94 @@ fn handle_command(
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
             state.notice = None;
+        }
+        "/memories" => {
+            let cwd = state.thread.cwd.clone();
+            match args.first().map(String::as_str) {
+                None | Some("list") => {
+                    let memories = store.lock().unwrap().list_memories(&cwd).unwrap_or_default();
+                    if memories.is_empty() {
+                        state.notice = Some(
+                            "memories: none · /memories add <text> · /memories add --global <text> · use $memories in a prompt"
+                                .into(),
+                        );
+                    } else {
+                        let mut text = format!(
+                            "memories: {} · $memories injects them into a prompt",
+                            memories.len()
+                        );
+                        for memory in &memories {
+                            let preview: String = memory
+                                .text
+                                .lines()
+                                .next()
+                                .unwrap_or("")
+                                .chars()
+                                .take(80)
+                                .collect();
+                            text.push_str(&format!("\n  {}. {} · {preview}", memory.id, memory.scope));
+                        }
+                        text.push_str("\n\n/memories add [--global] <text> · /memories remove <id> · /memories clear [--global]");
+                        state.notice = Some(text);
+                    }
+                }
+                Some("add") => {
+                    let global = args.iter().any(|arg| arg == "--global");
+                    let text = args
+                        .iter()
+                        .skip(1)
+                        .filter(|arg| *arg != "--global")
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if text.trim().is_empty() {
+                        state.notice = Some("usage: /memories add [--global] <text>".into());
+                    } else {
+                        let scope = if global { "global" } else { "project" };
+                        match store.lock().unwrap().add_memory(scope, &cwd, &text) {
+                            Ok(id) => {
+                                state.notice = Some(format!(
+                                    "memory {id} saved ({scope}) · use $memories in a prompt"
+                                ));
+                            }
+                            Err(error) => state.notice = Some(format!("cannot save memory: {error}")),
+                        }
+                    }
+                }
+                Some("remove") => {
+                    let id = args.get(1).and_then(|value| value.parse::<i64>().ok());
+                    match id {
+                        Some(id) => match store.lock().unwrap().remove_memory(&cwd, id) {
+                            Ok(true) => state.notice = Some(format!("memory {id} removed")),
+                            Ok(false) => {
+                                state.notice = Some(format!(
+                                    "memory {id} not found for this project (global memories are removable too)"
+                                ))
+                            }
+                            Err(error) => state.notice = Some(format!("cannot remove memory: {error}")),
+                        },
+                        None => state.notice = Some("usage: /memories remove <id>".into()),
+                    }
+                }
+                Some("clear") => {
+                    let global = args.iter().any(|arg| arg == "--global");
+                    match store.lock().unwrap().clear_memories(&cwd, global) {
+                        Ok(count) => {
+                            state.notice = Some(format!(
+                                "cleared {count} {} memory(s)",
+                                if global { "global" } else { "project" }
+                            ));
+                        }
+                        Err(error) => state.notice = Some(format!("cannot clear memories: {error}")),
+                    }
+                }
+                Some(_) => {
+                    state.notice = Some(
+                        "usage: /memories · /memories add [--global] <text> · /memories remove <id> · /memories clear [--global]"
+                            .into(),
+                    );
+                }
+            }
         }
         "/goal" => {
             if let Some(action) = args.first().map(String::as_str) {
@@ -3792,6 +3947,24 @@ fn handle_command(
                 state.notice = Some(text);
             }
         }
+        "/commands" => {
+            let commands: Vec<&MessageRow> = state
+                .history
+                .iter()
+                .filter(|message| message.role == "tool")
+                .collect();
+            if commands.is_empty() {
+                state.notice = Some(
+                    "no commands recorded yet; run a turn, then /commands to inspect every command"
+                        .into(),
+                );
+            } else {
+                state.overlay = Overlay::CommandList {
+                    selected: commands.len() - 1,
+                    expanded: false,
+                };
+            }
+        }
         "/queue" => {
             if args.first().map(String::as_str) == Some("clear") {
                 state.queued_messages.clear();
@@ -3951,14 +4124,14 @@ fn handle_command(
         "/effort" => {
             match args.first().map(String::as_str) {
                 None => {
-                    state.notice = Some(format!(
-                        "reasoning effort: {}",
-                        state
-                            .thread
-                            .reasoning_effort
-                            .as_deref()
-                            .unwrap_or("harness default")
-                    ));
+                    let levels = ["default", "low", "medium", "high", "xhigh", "max"];
+                    let selected = state
+                        .thread
+                        .reasoning_effort
+                        .as_deref()
+                        .and_then(|effort| levels.iter().position(|level| *level == effort))
+                        .unwrap_or(0);
+                    state.overlay = Overlay::EffortPicker { selected };
                 }
                 Some(value) if matches!(value, "off" | "default" | "none") => {
                     let result = {
@@ -5219,6 +5392,17 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
             Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
             Overlay::DirtyConfirm { .. } => 5,
+            Overlay::CommandList { expanded, .. } => {
+                state
+                    .history
+                    .iter()
+                    .filter(|message| message.role == "tool")
+                    .count()
+                    .min(8)
+                    + 4
+                    + if *expanded { 4 } else { 0 }
+            }
+            Overlay::EffortPicker { .. } => 10,
             Overlay::OrchestrationPreview { preview } => {
                 preview.plan.tasks.len().min(8) * 2 + 8
             }
@@ -5290,6 +5474,12 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 checkpoints,
             } => draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected),
             Overlay::DirtyConfirm { .. } => draw_dirty_confirm(frame, chunks[1]),
+            Overlay::CommandList { selected, expanded } => {
+                draw_command_list(frame, chunks[1], state, *selected, *expanded)
+            }
+            Overlay::EffortPicker { selected } => {
+                draw_effort_picker(frame, chunks[1], state, *selected)
+            }
             Overlay::OrchestrationPreview { preview } => {
                 draw_orchestration_preview(frame, chunks[1], state, preview)
             }
@@ -5632,6 +5822,105 @@ fn draw_mode_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ {marker} {mode}"), style));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_effort_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
+    let levels = ["default", "low", "medium", "high", "xhigh", "max"];
+    let current = state
+        .thread
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or("default");
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "reasoning effort · enter select · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, level) in levels.iter().enumerate() {
+        let marker = if *level == current { "●" } else { " " };
+        let style = if index == selected {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(format!("❯ {marker} {level}"), style));
+    }
+    if !state.thread.current_provider.supports_effort() {
+        lines.push(Line::styled(
+            format!("{} uses the harness default", state.thread.current_provider),
+            Style::default().fg(COLORS.warning),
+        ));
+    }
+    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_command_list(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    selected: usize,
+    expanded: bool,
+) {
+    let commands: Vec<&MessageRow> = state
+        .history
+        .iter()
+        .filter(|message| message.role == "tool")
+        .collect();
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!(
+            "commands · {} · ↑↓ select · enter expand · c copy · esc close",
+            commands.len()
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    let extra = if expanded { 4 } else { 0 };
+    let visible = area
+        .height
+        .saturating_sub(3 + extra) as usize;
+    let visible = visible.max(1);
+    let selected = selected.min(commands.len().saturating_sub(1));
+    let start = if commands.len() <= visible {
+        0
+    } else {
+        selected
+            .saturating_sub(visible / 2)
+            .min(commands.len() - visible)
+    };
+    for (index, message) in commands.iter().enumerate().skip(start).take(visible) {
+        let marker = if index == selected { "›" } else { " " };
+        let provider = message.provider.as_deref().unwrap_or("-");
+        let text = format!(
+            "{marker} turn {} · {provider} · {}",
+            message.turn, message.text
+        );
+        let style = if index == selected {
+            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.text)
+        };
+        lines.push(Line::styled(truncate_chars(&text, width), style));
+    }
+    if expanded {
+        if let Some(message) = commands.get(selected) {
+            lines.push(Line::styled("── expanded ──", Style::default().fg(COLORS.muted)));
+            for line in message.text.lines().take(3) {
+                lines.push(Line::styled(truncate_chars(line, width), Style::default().fg(COLORS.text)));
+            }
+            if state
+                .history
+                .iter()
+                .any(|candidate| candidate.role == "diff" && candidate.turn == message.turn)
+            {
+                lines.push(Line::styled(
+                    format!("diff available · /review {}", message.turn),
+                    Style::default().fg(COLORS.secondary),
+                ));
+            }
+        }
     }
     let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -6379,9 +6668,15 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
         ),
         Span::styled(
             format!(
-                " · {effective_model} · {} · mode {}",
+                " · {effective_model} · {} · mode {}{}",
                 describe_auth(provider_config),
-                effective_permission_mode(state.permission_mode, provider_config.permission_mode)
+                effective_permission_mode(state.permission_mode, provider_config.permission_mode),
+                state
+                    .thread
+                    .reasoning_effort
+                    .as_deref()
+                    .map(|effort| format!(" · effort {effort}"))
+                    .unwrap_or_default()
             ),
             Style::default().fg(COLORS.muted),
         ),
@@ -6835,12 +7130,16 @@ mod tests {
         state.suggestion_index = 10;
 
         let suggestions = suggestions_for(&state.input);
-        assert_eq!(suggestions.len(), 33);
+        let count = suggestions.len();
+        assert!(count >= 33, "the built-in command list is available");
 
         let buffer = render_state(&state, 100, 30);
         let text = buffer_lines(&buffer).join("\n");
 
-        assert!(text.contains("11/33"), "position indicator must reflect the selection");
+        assert!(
+            text.contains(&format!("11/{count}")),
+            "position indicator must reflect the selection"
+        );
         let selected = suggestions[10].0;
         assert!(text.contains(selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
@@ -9446,6 +9745,134 @@ mod tests {
             "cursor (not installed)"
         );
         assert_eq!(provider_label_with(ProviderId::Cursor, true), "cursor");
+    }
+
+    fn tool_message(id: i64, thread_id: &str, turn: i64, text: &str) -> MessageRow {
+        MessageRow {
+            id,
+            thread_id: thread_id.to_string(),
+            turn,
+            role: "tool".into(),
+            provider: Some("codex".into()),
+            model: None,
+            text: text.to_string(),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn commands_overlay_lists_expands_and_scrolls() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        state.history = vec![
+            tool_message(1, &thread_id, 1, "✓ shell cargo test"),
+            tool_message(2, &thread_id, 2, "✓ shell cargo build"),
+        ];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/commands");
+        match &state.overlay {
+            Overlay::CommandList { selected, expanded } => {
+                assert_eq!(*selected, 1, "the newest command is selected");
+                assert!(!expanded);
+            }
+            _ => panic!("expected the command list"),
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::empty()),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        match &state.overlay {
+            Overlay::CommandList { selected, expanded } => {
+                assert_eq!(*selected, 0);
+                assert!(expanded);
+            }
+            _ => panic!("expected the command list"),
+        }
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("commands · 2"), "{text}");
+        assert!(text.contains("turn 1"), "{text}");
+        assert!(text.contains("cargo test"), "{text}");
+    }
+
+    #[test]
+    fn effort_picker_sets_and_shows_effort() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/effort");
+        assert!(matches!(state.overlay, Overlay::EffortPicker { .. }));
+        for _ in 0..3 {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(state.thread.reasoning_effort.as_deref(), Some("high"));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("effort high"), "{text}");
+    }
+
+    #[test]
+    fn memories_command_adds_lists_and_removes() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/memories add Use tabs");
+        assert!(state.notice.as_deref().unwrap_or("").contains("saved"));
+        handle_command(&mut state, &store, &engine_command_sender, "/memories");
+        let listed = state.notice.as_deref().unwrap_or("");
+        assert!(listed.contains("Use tabs"), "{listed}");
+        assert!(listed.contains("project"), "{listed}");
+
+        let id = store.lock().unwrap().list_memories(&state.thread.cwd).unwrap()[0].id;
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            &format!("/memories remove {id}"),
+        );
+        assert!(store.lock().unwrap().list_memories(&state.thread.cwd).unwrap().is_empty());
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/memories add --global Answer briefly",
+        );
+        let memories = store.lock().unwrap().list_memories(&state.thread.cwd).unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0].scope, "global");
+        assert_eq!(memories[0].text, "Answer briefly");
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/memories clear --global",
+        );
+        assert!(store.lock().unwrap().list_memories(&state.thread.cwd).unwrap().is_empty());
     }
 
     #[test]

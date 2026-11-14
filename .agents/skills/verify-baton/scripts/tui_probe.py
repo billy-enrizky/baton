@@ -224,6 +224,8 @@ def main() -> int:
         print(f"missing binary: {binary}", file=sys.stderr)
         return 2
 
+    created_home = args.home is None
+    created_workdir = args.cwd is None
     home = args.home or tempfile.mkdtemp(prefix="baton-verify-home-")
     workdir = args.cwd or tempfile.mkdtemp(prefix="baton-verify-cwd-")
     Path(home).mkdir(parents=True, exist_ok=True)
@@ -310,8 +312,10 @@ def main() -> int:
         except OSError:
             pass
         import shutil
-        shutil.rmtree(home, ignore_errors=True)
-        shutil.rmtree(workdir, ignore_errors=True)
+        if created_home:
+            shutil.rmtree(home, ignore_errors=True)
+        if created_workdir:
+            shutil.rmtree(workdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

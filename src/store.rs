@@ -142,6 +142,21 @@ pub struct CheckpointRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct MemoryRow {
+    pub id: i64,
+    /// `global` or `project`.
+    pub scope: String,
+    /// Empty for global memories.
+    pub cwd: String,
+    pub text: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+const MEMORY_TEXT_LIMIT: usize = 2000;
+const MEMORY_SCOPE_LIMIT: i64 = 200;
+
+#[derive(Debug, Clone)]
 pub struct ProviderProcessRow {
     pub pid: u32,
     pub provider: ProviderId,
@@ -252,6 +267,16 @@ CREATE TABLE IF NOT EXISTS prompt_history (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS prompt_history_cwd_idx ON prompt_history (cwd, id);
+CREATE TABLE IF NOT EXISTS memories (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  scope TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  text TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(scope, cwd, text)
+);
+CREATE INDEX IF NOT EXISTS memories_scope_cwd_idx ON memories (scope, cwd, id);
 CREATE TABLE IF NOT EXISTS checkpoints (
   thread_id TEXT NOT NULL,
   turn INTEGER NOT NULL,
@@ -866,6 +891,88 @@ impl BatonStore {
             params![cwd, cwd, PROMPT_HISTORY_LIMIT],
         )?;
         Ok(())
+    }
+
+    /// Adds a governed memory. Project memories are scoped to one cwd; global
+    /// memories apply everywhere. An identical memory is returned as-is.
+    pub fn add_memory(&self, scope: &str, cwd: &str, text: &str) -> Result<i64> {
+        let scope = scope.trim();
+        if scope != "global" && scope != "project" {
+            anyhow::bail!("memory scope must be global or project");
+        }
+        let text = text.trim();
+        if text.is_empty() {
+            anyhow::bail!("memory text is empty");
+        }
+        if text.chars().count() > MEMORY_TEXT_LIMIT {
+            anyhow::bail!("memory text is longer than {MEMORY_TEXT_LIMIT} characters");
+        }
+        let cwd = if scope == "global" { "" } else { cwd };
+        let count: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM memories WHERE scope = ? AND cwd = ?",
+            params![scope, cwd],
+            |row| row.get(0),
+        )?;
+        if count >= MEMORY_SCOPE_LIMIT {
+            anyhow::bail!("memory limit reached ({MEMORY_SCOPE_LIMIT}); remove one first");
+        }
+        self.db.execute(
+            "INSERT OR IGNORE INTO memories (scope, cwd, text, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?)",
+            params![scope, cwd, text, now_iso(), now_iso()],
+        )?;
+        let id = self.db.query_row(
+            "SELECT id FROM memories WHERE scope = ? AND cwd = ? AND text = ?",
+            params![scope, cwd, text],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
+    /// Project memories for this cwd plus every global memory. Project entries
+    /// come first because they are more specific.
+    pub fn list_memories(&self, cwd: &str) -> Result<Vec<MemoryRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, scope, cwd, text, created_at, updated_at
+             FROM memories
+             WHERE scope = 'global' OR (scope = 'project' AND cwd = ?)
+             ORDER BY CASE scope WHEN 'project' THEN 0 ELSE 1 END, id ASC",
+        )?;
+        let rows = statement
+            .query_map(params![cwd], |row| {
+                Ok(MemoryRow {
+                    id: row.get(0)?,
+                    scope: row.get(1)?,
+                    cwd: row.get(2)?,
+                    text: row.get(3)?,
+                    created_at: row.get(4)?,
+                    updated_at: row.get(5)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Removes a memory only when it is global or belongs to this project.
+    pub fn remove_memory(&self, cwd: &str, id: i64) -> Result<bool> {
+        let changed = self.db.execute(
+            "DELETE FROM memories WHERE id = ? AND (scope = 'global' OR cwd = ?)",
+            params![id, cwd],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Clears either the project memories for this cwd or every global memory.
+    pub fn clear_memories(&self, cwd: &str, global: bool) -> Result<usize> {
+        let changed = if global {
+            self.db.execute("DELETE FROM memories WHERE scope = 'global'", [])?
+        } else {
+            self.db.execute(
+                "DELETE FROM memories WHERE scope = 'project' AND cwd = ?",
+                params![cwd],
+            )?
+        };
+        Ok(changed)
     }
 
     /// Project prompt history, oldest first.

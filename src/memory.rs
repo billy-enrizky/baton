@@ -1,6 +1,38 @@
 use anyhow::Result;
 use std::path::Path;
 
+use crate::store::MemoryRow;
+
+const MEMORY_INJECTION_LIMIT: usize = 4000;
+
+/// Formats the governed memories as one prompt block. Project entries come
+/// first because the store orders them before global entries.
+pub fn format_memories(memories: &[MemoryRow]) -> String {
+    if memories.is_empty() {
+        return "[memories]\n(none saved)\n[/memories]".to_string();
+    }
+    let mut block = String::from("[memories]\n");
+    for memory in memories {
+        let line = format!("- ({}) {}\n", memory.scope, memory.text.replace('\n', " "));
+        if block.len() + line.len() > MEMORY_INJECTION_LIMIT {
+            block.push_str("- (truncated at the memory injection limit)\n");
+            break;
+        }
+        block.push_str(&line);
+    }
+    block.push_str("[/memories]");
+    block
+}
+
+/// Replaces every `$memories` token with the current project and global
+/// memories. A prompt without the token is unchanged.
+pub fn expand_memories(memories: &[MemoryRow], text: &str) -> String {
+    if !text.contains("$memories") {
+        return text.to_string();
+    }
+    text.replace("$memories", &format_memories(memories))
+}
+
 pub fn find_memory_file(cwd: &Path) -> Option<(String, std::path::PathBuf)> {
     let candidates = [
         ("CLAUDE.md", cwd.join("CLAUDE.md")),
@@ -86,4 +118,43 @@ pub fn build_compact_summary(
     sections.push(String::new());
     sections.push("[end compaction]".to_string());
     sections.join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(id: i64, scope: &str, text: &str) -> MemoryRow {
+        MemoryRow {
+            id,
+            scope: scope.to_string(),
+            cwd: String::new(),
+            text: text.to_string(),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn expands_project_and_global_memories_in_order() {
+        let memories = vec![row(1, "project", "Use tabs"), row(2, "global", "Answer briefly")];
+        let expanded = expand_memories(&memories, "hello $memories world");
+        assert!(expanded.starts_with("hello [memories]"));
+        assert!(expanded.contains("- (project) Use tabs"));
+        assert!(expanded.contains("- (global) Answer briefly"));
+        assert!(expanded.contains("[/memories] world"));
+        assert!(!expanded.contains("$memories"));
+    }
+
+    #[test]
+    fn a_prompt_without_the_token_is_unchanged() {
+        let memories = vec![row(1, "project", "Use tabs")];
+        assert_eq!(expand_memories(&memories, "hello"), "hello");
+    }
+
+    #[test]
+    fn an_empty_memory_set_leaves_a_visible_marker() {
+        let expanded = expand_memories(&[], "$memories");
+        assert_eq!(expanded, "[memories]\n(none saved)\n[/memories]");
+    }
 }

@@ -108,6 +108,17 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/quit", "exit baton"),
 ];
 
+const EFFORT_VALUES: [&str; 6] = ["default", "low", "medium", "high", "xhigh", "max"];
+const PERMISSION_MODE_VALUES: [&str; 4] = ["default", "acceptEdits", "bypassPermissions", "plan"];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CommandSuggestion {
+    insert: String,
+    description: String,
+}
+
+type SuggestionCacheKey = (String, String, ProviderId, Option<String>, usize);
+
 const HELP_SUMMARY: &str = "\
 Type what you want to do. Baton picks a harness.
 
@@ -323,6 +334,7 @@ pub struct TuiState {
     input: String,
     input_cursor: usize,
     input_layout: std::cell::RefCell<Vec<InputRow>>,
+    suggestion_cache: std::cell::RefCell<Option<(SuggestionCacheKey, Vec<CommandSuggestion>)>>,
     running: bool,
     queued_provider: Option<ProviderId>,
     streaming_text: String,
@@ -418,6 +430,7 @@ pub fn run_tui(
         input: String::new(),
         input_cursor: 0,
         input_layout: std::cell::RefCell::new(Vec::new()),
+        suggestion_cache: std::cell::RefCell::new(None),
         running: false,
         queued_provider: None,
         streaming_text: String::new(),
@@ -1921,15 +1934,386 @@ fn model_filter_indices(models: &[String], filter: &str) -> Vec<usize> {
         .collect()
 }
 
-fn suggestions_for(input: &str) -> Vec<&'static (&'static str, &'static str)> {
-    if input.starts_with('/') && !input.contains(' ') {
-        SLASH_COMMANDS
-            .iter()
-            .filter(|(command, _)| command.starts_with(input))
-            .collect()
-    } else {
-        Vec::new()
+fn suggestions_for(state: &TuiState) -> Vec<CommandSuggestion> {
+    let key = (
+        state.input.clone(),
+        state.thread.id.clone(),
+        state.thread.current_provider,
+        state.thread.current_model.clone(),
+        state.history.len(),
+    );
+    if let Some((cached_key, suggestions)) = state.suggestion_cache.borrow().as_ref() {
+        if cached_key == &key {
+            return suggestions.clone();
+        }
     }
+    let suggestions = compute_suggestions(state);
+    *state.suggestion_cache.borrow_mut() = Some((key, suggestions.clone()));
+    suggestions
+}
+
+fn compute_suggestions(state: &TuiState) -> Vec<CommandSuggestion> {
+    let input = state.input.as_str();
+    if !input.starts_with('/') {
+        return Vec::new();
+    }
+    if let Some(space) = input.find(' ') {
+        let token = &input[..space];
+        let command = if let Some((command, _)) =
+            SLASH_COMMANDS.iter().find(|(command, _)| *command == token)
+        {
+            *command
+        } else {
+            let mut matches = SLASH_COMMANDS
+                .iter()
+                .filter(|(command, _)| command.starts_with(token));
+            let Some((command, _)) = matches.next() else {
+                return Vec::new();
+            };
+            if matches.next().is_some() {
+                return Vec::new();
+            }
+            *command
+        };
+        let prefix = format!("{command} {}", &input[space + 1..]);
+        let prefix = prefix.trim_end();
+        let mut suggestions = argument_suggestions(state, command);
+        suggestions.retain(|suggestion| suggestion.insert.starts_with(prefix));
+        return suggestions;
+    }
+    SLASH_COMMANDS
+        .iter()
+        .filter(|(command, _)| command.starts_with(input))
+        .map(|(command, description)| CommandSuggestion {
+            insert: (*command).to_string(),
+            description: (*description).to_string(),
+        })
+        .collect()
+}
+
+fn push_suggestion(
+    suggestions: &mut Vec<CommandSuggestion>,
+    command: &str,
+    value: &str,
+    description: impl Into<String>,
+) {
+    suggestions.push(CommandSuggestion {
+        insert: format!("{command} {value}"),
+        description: description.into(),
+    });
+}
+
+fn turn_choices(state: &TuiState, role: Option<&str>, limit: usize) -> Vec<i64> {
+    let mut turns = Vec::new();
+    for message in state.history.iter().rev() {
+        if message.turn <= 0 || role.is_some_and(|role| message.role != role) {
+            continue;
+        }
+        if !turns.contains(&message.turn) {
+            turns.push(message.turn);
+            if turns.len() == limit {
+                break;
+            }
+        }
+    }
+    turns
+}
+
+fn assistant_reply_count(state: &TuiState) -> usize {
+    state
+        .history
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .count()
+}
+
+fn command_usage(input: &str) -> Option<&'static str> {
+    let space = input.find(' ')?;
+    let command = &input[..space];
+    let action = input[space + 1..]
+        .split_whitespace()
+        .next()
+        .unwrap_or_default();
+    match (command, action) {
+        ("/switch", _) => Some("switch <provider> [model]"),
+        ("/model", _) => Some("model <id>"),
+        ("/effort", _) => Some("effort default|low|medium|high|xhigh|max"),
+        ("/mode", _) => Some("mode default|acceptEdits|bypassPermissions|plan"),
+        ("/auth", _) => Some("auth <provider> subscription|api"),
+        ("/new", _) => Some("new [title]"),
+        ("/fork", _) => Some("fork [--turn N] [title]"),
+        ("/worktree", _) => Some("worktree [title]"),
+        ("/open", _) => Some("open <thread id prefix>"),
+        ("/review", _) => Some("review [turn]"),
+        ("/diff", _) => Some("diff [turn]"),
+        ("/rewind", _) => Some("rewind [--native]"),
+        ("/goal", _) => Some("goal pause|resume|clear|<done criteria>"),
+        ("/memories", "add") => Some("memories add [--global] <text>"),
+        ("/memories", "remove") => Some("memories remove <id>"),
+        ("/memories", "clear") => Some("memories clear [--global]"),
+        ("/memories", _) => Some("memories list|add|remove|clear"),
+        ("/find", _) => Some("find <text>"),
+        ("/multi", _) => Some("multi [--worktrees] [provider ...] <prompt>"),
+        ("/orchestrate", _) => Some("orchestrate on|off|--plan-only|<goal>"),
+        ("/runs", _) => Some("runs --all|<run id>"),
+        ("/commands", _) => Some("commands [turn]"),
+        ("/queue", _) => Some("queue [clear]"),
+        ("/mcp", "add") => Some("mcp add <name> <command> [args...]"),
+        ("/mcp", "remove") => Some("mcp remove <name>"),
+        ("/mcp", _) => Some("mcp list|add|remove|sync"),
+        ("/copy", _) => Some("copy [reply number, 1 = latest]"),
+        ("/help", _) => Some("help [all]"),
+        _ => None,
+    }
+}
+
+fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestion> {
+    let mut suggestions = Vec::new();
+    match command {
+        "/switch" => {
+            for provider in PROVIDERS {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    provider.as_str(),
+                    format!("single harness: {provider}"),
+                );
+                for model in crate::models::catalog(provider) {
+                    push_suggestion(
+                        &mut suggestions,
+                        command,
+                        &format!("{} {model}", provider.as_str()),
+                        format!("switch to {provider}/{model}"),
+                    );
+                }
+            }
+        }
+        "/model" => {
+            let provider = state.thread.current_provider;
+            let mut seen = Vec::new();
+            for model in crate::models::catalog(provider).iter().copied() {
+                seen.push(model);
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    model,
+                    format!("set {provider} model"),
+                );
+            }
+            if let Some(model) = &state.thread.current_model {
+                if !seen.contains(&model.as_str()) {
+                    push_suggestion(&mut suggestions, command, model, "current thread model");
+                }
+            }
+        }
+        "/effort" => {
+            for effort in EFFORT_VALUES {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    effort,
+                    if effort == "default" {
+                        "clear thread effort".to_string()
+                    } else {
+                        format!("reasoning effort {effort}")
+                    },
+                );
+            }
+        }
+        "/mode" => {
+            for mode in PERMISSION_MODE_VALUES {
+                push_suggestion(&mut suggestions, command, mode, format!("permission mode {mode}"));
+            }
+        }
+        "/auth" => {
+            for provider in PROVIDERS {
+                for mode in ["subscription", "api"] {
+                    push_suggestion(
+                        &mut suggestions,
+                        command,
+                        &format!("{} {mode}", provider.as_str()),
+                        format!("{provider} billing {mode}"),
+                    );
+                }
+            }
+        }
+        "/goal" => {
+            for action in ["pause", "resume", "clear"] {
+                push_suggestion(&mut suggestions, command, action, format!("goal {action}"));
+            }
+        }
+        "/memories" => {
+            for (action, description) in [
+                ("list", "list project memories"),
+                ("add", "add a project memory"),
+                ("add --global", "add a global memory"),
+                ("remove", "remove a memory by id"),
+                ("clear", "clear project memories"),
+                ("clear --global", "clear global memories"),
+            ] {
+                push_suggestion(&mut suggestions, command, action, description);
+            }
+            let cwd = crate::memory::project_key(&state.thread.cwd);
+            let memories = state
+                .store
+                .lock()
+                .unwrap()
+                .list_memories(&cwd)
+                .unwrap_or_default();
+            for memory in memories.into_iter().take(10) {
+                let preview: String = memory.text.lines().next().unwrap_or("").chars().take(60).collect();
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &format!("remove {}", memory.id),
+                    format!("remove {} memory: {preview}", memory.scope),
+                );
+            }
+        }
+        "/multi" => {
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "--worktrees",
+                "isolated orchestration workers",
+            );
+            for provider in PROVIDERS {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    provider.as_str(),
+                    format!("include {provider}"),
+                );
+            }
+        }
+        "/orchestrate" => {
+            for (action, description) in [
+                ("on", "enable orchestrate mode"),
+                ("off", "switch to single-harness mode"),
+                ("--plan-only", "preview the plan without starting workers"),
+            ] {
+                push_suggestion(&mut suggestions, command, action, description);
+            }
+        }
+        "/runs" => {
+            push_suggestion(&mut suggestions, command, "--all", "include archived runs");
+            let runs = state
+                .store
+                .lock()
+                .unwrap()
+                .list_orchestration_runs(10)
+                .unwrap_or_default();
+            for run in runs {
+                let id = run.id[..8.min(run.id.len())].to_string();
+                let archived = if run.archived_at.is_some() { " (archived)" } else { "" };
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &id,
+                    format!("open {} run: {}{archived}", run.status, run.goal),
+                );
+            }
+        }
+        "/queue" => {
+            push_suggestion(&mut suggestions, command, "clear", "remove all queued follow-ups");
+        }
+        "/copy" => {
+            for index in 1..=assistant_reply_count(state).min(10) {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &index.to_string(),
+                    format!("assistant reply {index} from the end"),
+                );
+            }
+        }
+        "/mcp" => {
+            for (action, description) in [
+                ("list", "list configured servers"),
+                ("add", "add a server"),
+                ("remove", "remove a server"),
+                ("sync", "sync to all harnesses"),
+            ] {
+                push_suggestion(&mut suggestions, command, action, description);
+            }
+            let registry = crate::sync::load_mcp_registry(&state.home);
+            for name in registry.servers.keys().take(10) {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &format!("remove {name}"),
+                    format!("remove MCP server {name}"),
+                );
+            }
+        }
+        "/fork" => {
+            push_suggestion(&mut suggestions, command, "--turn", "fork through a turn");
+            for turn in turn_choices(state, None, 5) {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &format!("--turn {turn}"),
+                    format!("fork through turn {turn}"),
+                );
+            }
+        }
+        "/review" => {
+            for turn in turn_choices(state, Some("diff"), 6) {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &turn.to_string(),
+                    format!("review turn {turn}"),
+                );
+            }
+        }
+        "/commands" => {
+            for turn in turn_choices(state, Some("tool"), 6) {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &turn.to_string(),
+                    format!("inspect turn {turn}"),
+                );
+            }
+        }
+        "/diff" => {
+            let checkpoints = state
+                .store
+                .lock()
+                .unwrap()
+                .list_checkpoints(&state.thread.id)
+                .unwrap_or_default();
+            for checkpoint in checkpoints.into_iter().rev().take(6) {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &checkpoint.turn.to_string(),
+                    format!("diff turn {} against the working tree", checkpoint.turn),
+                );
+            }
+        }
+        "/rewind" => {
+            push_suggestion(&mut suggestions, command, "--native", "use native provider rewind");
+        }
+        "/help" => {
+            push_suggestion(&mut suggestions, command, "all", "show every command");
+        }
+        "/open" => {
+            let threads = state
+                .store
+                .lock()
+                .unwrap()
+                .list_threads(None)
+                .unwrap_or_default();
+            for thread in threads.into_iter().take(8) {
+                let id = thread.id[..8.min(thread.id.len())].to_string();
+                push_suggestion(&mut suggestions, command, &id, thread.title);
+            }
+        }
+        _ => {}
+    }
+    suggestions
 }
 
 fn handle_key(
@@ -3248,7 +3632,7 @@ fn handle_composer_key(
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     key: KeyEvent,
 ) {
-    let suggestions = suggestions_for(&state.input);
+    let suggestions = suggestions_for(state);
     let clamped = state.suggestion_index.min(suggestions.len().saturating_sub(1));
     let force_newline = (key.code == KeyCode::Enter
         && key
@@ -3278,20 +3662,19 @@ fn handle_composer_key(
                 return;
             }
             KeyCode::Tab => {
-                if let Some((command, _)) = suggestions.get(clamped) {
-                    state.set_input(format!("{command} "));
+                if let Some(suggestion) = suggestions.get(clamped) {
+                    state.set_input(format!("{} ", suggestion.insert));
                     state.suggestion_index = 0;
                 }
                 return;
             }
             KeyCode::Enter => {
                 let typed = state.input.trim().to_string();
-                if let Some((command, _)) = suggestions.iter().find(|(command, _)| *command == typed) {
-                    let command = command.to_string();
+                if suggestions.iter().any(|suggestion| suggestion.insert == typed) {
                     state.set_input(String::new());
-                    handle_command(state, store, engine_command_sender, &command);
-                } else if let Some((command, _)) = suggestions.get(clamped) {
-                    state.set_input(format!("{command} "));
+                    handle_command(state, store, engine_command_sender, &typed);
+                } else if let Some(suggestion) = suggestions.get(clamped) {
+                    state.set_input(format!("{} ", suggestion.insert));
                     state.suggestion_index = 0;
                 }
                 return;
@@ -5583,7 +5966,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         draw_floating_approval(frame, area, state);
         return;
     }
-    let suggestions = suggestions_for(&state.input);
+    let suggestions = suggestions_for(state);
     let composer_rows = 4u16
         + state.visible_input_lines().saturating_sub(1) as u16
         + if composer_hint(state).is_some() { 1 } else { 0 }
@@ -6784,12 +7167,19 @@ fn composer_hint(state: &TuiState) -> Option<String> {
             "enter sends the next queued message ({} waiting) · shift+enter adds a newline",
             state.queued_messages.len()
         ))
+    } else if let Some(usage) = command_usage(&state.input) {
+        Some(format!("/{usage} · tab or enter completes the selected choice"))
     } else {
         None
     }
 }
 
-fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, suggestions: &[&(&str, &str)]) {
+fn draw_composer(
+    frame: &mut ratatui::Frame,
+    state: &TuiState,
+    area: Rect,
+    suggestions: &[CommandSuggestion],
+) {
     let mut rows: Vec<Line> = Vec::new();
     if !suggestions.is_empty() {
         let clamped = state.suggestion_index.min(suggestions.len() - 1);
@@ -6805,14 +7195,17 @@ fn draw_composer(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, sugge
 
         let end = (start + visible_count).min(suggestions.len());
 
-        for (index, (command, description)) in suggestions[start..end].iter().enumerate() {
+        for (index, suggestion) in suggestions[start..end].iter().enumerate() {
             let actual_index = start + index;
             let style = if actual_index == clamped {
                 Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(COLORS.muted)
             };
-            rows.push(Line::styled(format!("❯ {command:<14} {description}"), style));
+            rows.push(Line::styled(
+                format!("❯ {:<36} {}", suggestion.insert, suggestion.description),
+                style,
+            ));
         }
         let position = format!("{}/{}", clamped + 1, suggestions.len());
         rows.push(Line::styled(
@@ -7316,6 +7709,7 @@ mod tests {
             input: String::new(),
             input_cursor: 0,
             input_layout: std::cell::RefCell::new(Vec::new()),
+            suggestion_cache: std::cell::RefCell::new(None),
             running: false,
             queued_provider: None,
             streaming_text: String::new(),
@@ -7378,6 +7772,179 @@ mod tests {
     }
 
     #[test]
+    fn slash_arguments_expose_choices_and_filter_by_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "/mode ".to_string();
+        let modes = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            modes,
+            PERMISSION_MODE_VALUES
+                .iter()
+                .map(|mode| format!("/mode {mode}"))
+                .collect::<Vec<_>>()
+        );
+
+        state.input = "/eff h".to_string();
+        let efforts = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .collect::<Vec<_>>();
+        assert_eq!(efforts, vec!["/effort high".to_string()]);
+    }
+
+    #[test]
+    fn every_provider_has_slash_command_choices() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        for command in ["/switch ", "/auth ", "/multi "] {
+            state.input = command.to_string();
+            let rendered = suggestions_for(&state)
+                .into_iter()
+                .map(|suggestion| suggestion.insert)
+                .collect::<Vec<_>>();
+            for provider in PROVIDERS {
+                assert!(
+                    rendered.iter().any(|value| value.contains(provider.as_str())),
+                    "{command} must offer {provider}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_argument_command_has_choices_or_a_usage_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        for command in [
+            "/switch",
+            "/model",
+            "/effort",
+            "/mode",
+            "/auth",
+            "/new",
+            "/fork",
+            "/worktree",
+            "/open",
+            "/review",
+            "/diff",
+            "/rewind",
+            "/goal",
+            "/memories",
+            "/find",
+            "/multi",
+            "/orchestrate",
+            "/runs",
+            "/commands",
+            "/queue",
+            "/mcp",
+            "/copy",
+            "/help",
+        ] {
+            state.input = format!("{command} ");
+            assert!(
+                !suggestions_for(&state).is_empty() || command_usage(&state.input).is_some(),
+                "{command} must expose choices or usage after its trailing space"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_choices_include_store_backed_values() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let cwd = crate::memory::project_key(&state.thread.cwd);
+        let memory_id = store
+            .lock()
+            .unwrap()
+            .add_memory("project", &cwd, "prefer focused tests")
+            .unwrap();
+        state.input = "/memories remove ".to_string();
+        assert!(suggestions_for(&state)
+            .iter()
+            .any(|suggestion| suggestion.insert == format!("/memories remove {memory_id}")));
+
+        state.history = vec![
+            MessageRow {
+                id: 1,
+                thread_id: state.thread.id.clone(),
+                turn: 1,
+                role: "user".into(),
+                provider: None,
+                model: None,
+                text: "question".into(),
+                created_at: String::new(),
+            },
+            MessageRow {
+                id: 2,
+                thread_id: state.thread.id.clone(),
+                turn: 1,
+                role: "assistant".into(),
+                provider: None,
+                model: None,
+                text: "answer".into(),
+                created_at: String::new(),
+            },
+        ];
+        state.input = "/copy ".to_string();
+        assert_eq!(
+            suggestions_for(&state)
+                .into_iter()
+                .map(|suggestion| suggestion.insert)
+                .collect::<Vec<_>>(),
+            vec!["/copy 1".to_string()]
+        );
+    }
+
+    #[test]
+    fn free_form_commands_show_their_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "/find ".to_string();
+        assert_eq!(
+            composer_hint(&state).as_deref(),
+            Some("/find <text> · tab or enter completes the selected choice")
+        );
+        state.input = "/mcp add ".to_string();
+        assert_eq!(
+            composer_hint(&state).as_deref(),
+            Some("/mcp add <name> <command> [args...] · tab or enter completes the selected choice")
+        );
+    }
+
+    #[test]
+    fn tab_completes_slash_argument_and_enter_runs_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/mode ".to_string();
+        handle_composer_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()),
+        );
+        assert_eq!(state.input, "/mode default ");
+        handle_composer_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(state.permission_mode, PermissionMode::Default);
+        assert_eq!(state.input, "");
+    }
+
+    #[test]
     fn suggestion_window_follows_selection() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -7385,7 +7952,7 @@ mod tests {
         state.input = "/".to_string();
         state.suggestion_index = 10;
 
-        let suggestions = suggestions_for(&state.input);
+        let suggestions = suggestions_for(&state);
         let count = suggestions.len();
         assert!(count >= 33, "the built-in command list is available");
 
@@ -7396,14 +7963,14 @@ mod tests {
             text.contains(&format!("11/{count}")),
             "position indicator must reflect the selection"
         );
-        let selected = suggestions[10].0;
-        assert!(text.contains(selected), "selected command {selected} must be visible");
+        let selected = suggestions[10].insert.clone();
+        assert!(text.contains(&selected), "selected command {selected} must be visible");
         assert!(!text.contains("/switch"), "commands above the window must be hidden");
         assert!(!text.contains("/clear"), "commands below the window must be hidden");
 
         let row = buffer_lines(&buffer)
             .iter()
-            .position(|line| line.contains(selected))
+            .position(|line| line.contains(&selected))
             .expect("selected row rendered");
         let styled = (0..buffer.area.width).any(|x| {
             let cell = buffer.get(x, row as u16);

@@ -93,6 +93,7 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 | Greeting in default orchestrate mode | `scripts/greeting_probe.py` | one small Codex turn |
 | MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, uses the OpenCode 401 seed |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |
+| Slash argument choices and completion | `scripts/slash_probe.py` | zero |
 
 Every probe accepts `--binary` (default `~/.cargo/bin/baton`) and `--evidence-dir`. To run it against a change before merge, pass `--binary target/debug/baton`.
 

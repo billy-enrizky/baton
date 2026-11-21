@@ -65,7 +65,7 @@ while IFS= read -r file; do
     .github/workflows/*|ci/*|docs/ci.md|docs/parity.md)
       meta=true
       ;;
-    docs/*|*.md|LICENSE|.gitignore)
+    docs/*|*.md|LICENSE)
       ;;
     *)
       unknown=true

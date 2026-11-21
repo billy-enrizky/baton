@@ -23,20 +23,25 @@ jobs:
       has_tests: ${{ steps.classify.outputs.has_tests }}
       docs_only: ${{ steps.classify.outputs.docs_only }}
     steps:
-      - run: echo classify
+      - run: |
+          base/ci/classify-paths.sh . base
+          base/ci/selftest.sh
+          base/ci/check-ci.sh .github/workflows/ci.yml
   selection:
     needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - run: echo selection
+      - run: |
+          base/ci/classify-paths.sh . base
+          base/ci/check-ci.sh --base base/.github/workflows/ci.yml .github/workflows/ci.yml
   check:
     needs: changes
     if: needs.changes.outputs.check_needed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - run: echo check
+      - run: cargo check --locked --all-targets
   build:
     needs: changes
     if: needs.changes.outputs.build_needed == 'true'
@@ -57,11 +62,15 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - run: echo debt
+      - run: |
+          base/ci/fmt-debt.sh . base/ci/fmt-baseline.txt
+          base/ci/clippy-debt.sh . base/ci/clippy-baseline.txt
   verify:
     if: always()
     needs: [changes, selection, check, build, test, debt]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
-      - run: echo verify
+      - run: |
+          check_gate() { :; }
+          check_gate

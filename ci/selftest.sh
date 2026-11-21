@@ -13,14 +13,36 @@ for fixture in "$root"/fixtures/paths/*.txt; do
   fi
 done
 
-bash "$root/check-ci.sh" "$root/fixtures/check-ci/valid.yml" >/dev/null
+valid="$root/fixtures/check-ci/valid.yml"
+bash "$root/check-ci.sh" --bootstrap "$valid" >/dev/null
 
 for invalid in "$root"/fixtures/check-ci/invalid-*.yml; do
-  if bash "$root/check-ci.sh" "$invalid" >/dev/null 2>&1; then
+  expected_file="${invalid%.yml}.expected"
+  expected_rule=$(tr -d '[:space:]' < "$expected_file")
+  set +e
+  output=$(bash "$root/check-ci.sh" --bootstrap "$invalid" 2>&1)
+  code=$?
+  set -e
+  if [[ $code -eq 0 ]]; then
     echo "invalid workflow passed: $invalid" >&2
     exit 1
   fi
+  if ! grep -q "ERROR: $expected_rule " <<< "$output"; then
+    echo "invalid workflow failed without $expected_rule: $invalid" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
 done
+
+set +e
+bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/changed-test-command.yml" >/dev/null 2>&1
+code=$?
+set -e
+if [[ $code -eq 0 ]]; then
+  echo "changed test command passed without ci-change" >&2
+  exit 1
+fi
+bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/changed-test-command.yml" --allow-change >/dev/null
 
 set +e
 bash "$root/budget.sh" 1 sleep 2

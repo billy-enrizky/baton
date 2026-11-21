@@ -17,6 +17,12 @@ if [[ $code -ne 0 && $code -ne 101 ]]; then
   exit 1
 fi
 
+if [[ $code -eq 101 ]] && ! grep -q 'clippy::' <<< "$output"; then
+  echo "clippy failed without a clippy lint diagnostic" >&2
+  printf '%s\n' "$output" | tail -80 >&2
+  exit 1
+fi
+
 count=$(printf '%s\n' "$output" | grep -c '^error:' || true)
 count=${count:-0}
 

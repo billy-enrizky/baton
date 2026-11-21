@@ -1,0 +1,66 @@
+name: CI fixture
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      check_needed: ${{ steps.classify.outputs.check_needed }}
+      build_needed: ${{ steps.classify.outputs.build_needed }}
+      test_needed: ${{ steps.classify.outputs.test_needed }}
+      debt_needed: ${{ steps.classify.outputs.debt_needed }}
+      full_suite_reason: ${{ steps.classify.outputs.full_suite_reason }}
+      has_tests: ${{ steps.classify.outputs.has_tests }}
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - run: echo classify
+  selection:
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo selection
+  check:
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: echo check
+  build:
+    needs: changes
+    if: needs.changes.outputs.build_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: cargo build --locked --bin baton
+  test:
+    needs: changes
+    if: needs.changes.outputs.test_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - run: cargo test --locked
+  debt:
+    needs: changes
+    if: needs.changes.outputs.debt_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - run: echo debt
+  verify:
+    if: always()
+    needs: [changes, selection, check, build, test, debt]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: echo verify

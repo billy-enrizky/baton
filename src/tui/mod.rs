@@ -2759,6 +2759,7 @@ fn handle_key(
                     if !models.contains(&default_model) {
                         models.insert(0, default_model);
                     }
+                    let _ = ensure_persisted(&store.lock().unwrap(), &mut state.thread);
                     state.model_request_id = state.model_request_id.wrapping_add(1);
                     let _ = engine_command_sender.send(EngineCommand::ListModels {
                         thread_id: state.thread.id.clone(),
@@ -5255,7 +5256,12 @@ fn handle_command(
             }
         }
         "/model" => match args.first() {
-            None => open_model_picker(state, engine_command_sender, state.thread.current_provider),
+            None => open_model_picker(
+                state,
+                store,
+                engine_command_sender,
+                state.thread.current_provider,
+            ),
             Some(model) => {
                 let result = {
                     let guard = store.lock().unwrap();
@@ -6930,9 +6936,13 @@ fn handle_mcp_command(state: &mut TuiState, action: &str, args: &[String]) {
 /// not change the session mode.
 fn open_model_picker(
     state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     provider: ProviderId,
 ) {
+    // The live catalog request targets this thread, so it has to exist first.
+    // A new thread is only persisted on submit.
+    let _ = ensure_persisted(&store.lock().unwrap(), &mut state.thread);
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
     let configured = resolved.for_provider(provider).model.clone();
     let current = if provider == state.thread.current_provider {
@@ -9486,6 +9496,39 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("copied assistant reply 1"));
+    }
+
+    #[test]
+    fn model_on_a_new_thread_persists_it_before_asking_for_the_catalog() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread = store.lock().unwrap().draft_thread(NewThread {
+            title: "draft".into(),
+            cwd: home.path().to_string_lossy().to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        });
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get_thread(&state.thread.id)
+                .unwrap()
+                .is_none(),
+            "a new thread starts unpersisted, which is what the catalog request trips over"
+        );
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/model");
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get_thread(&state.thread.id)
+                .unwrap()
+                .is_some(),
+            "the catalog request targets this thread, so it must exist"
+        );
     }
 
     #[test]

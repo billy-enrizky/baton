@@ -11,14 +11,32 @@ pub struct HandoffMessage {
     pub text: String,
 }
 
+pub const NEW_HARNESS_INTRO: &str = "You are continuing an existing task in a new harness. The prior conversation below is your context. Pick up where it left off.";
+pub const RESUME_INTRO: &str = "You are resuming this task in your own harness after other harnesses continued it. The messages below happened since your last turn. Pick up where they left off.";
+
 pub fn build_handoff(cwd: &str, thread_title: &str, messages: &[HandoffMessage], git_status: Option<&str>, char_budget: Option<usize>) -> String {
+    build_handoff_with_intro(
+        cwd,
+        thread_title,
+        messages,
+        git_status,
+        char_budget,
+        NEW_HARNESS_INTRO,
+    )
+}
+
+pub fn build_handoff_with_intro(
+    cwd: &str,
+    thread_title: &str,
+    messages: &[HandoffMessage],
+    git_status: Option<&str>,
+    char_budget: Option<usize>,
+    intro: &str,
+) -> String {
     let budget = char_budget.unwrap_or(DEFAULT_HANDOFF_CHAR_BUDGET);
     let mut sections: Vec<String> = Vec::new();
     sections.push("[baton context handoff]".to_string());
-    sections.push(
-        "You are continuing an existing task in a new harness. The prior conversation below is your context. Pick up where it left off."
-            .to_string(),
-    );
+    sections.push(intro.to_string());
     sections.push(String::new());
     sections.push("## Project".to_string());
     sections.push(format!("Title: {thread_title}"));
@@ -56,7 +74,34 @@ pub fn handoff_prompt(
     prompt: &str,
     char_budget: Option<usize>,
 ) -> String {
-    let handoff = build_handoff(cwd, thread_title, prior_messages, git_status, char_budget);
+    handoff_prompt_with_intro(
+        cwd,
+        thread_title,
+        prior_messages,
+        git_status,
+        prompt,
+        char_budget,
+        NEW_HARNESS_INTRO,
+    )
+}
+
+pub fn handoff_prompt_with_intro(
+    cwd: &str,
+    thread_title: &str,
+    prior_messages: &[HandoffMessage],
+    git_status: Option<&str>,
+    prompt: &str,
+    char_budget: Option<usize>,
+    intro: &str,
+) -> String {
+    let handoff = build_handoff_with_intro(
+        cwd,
+        thread_title,
+        prior_messages,
+        git_status,
+        char_budget,
+        intro,
+    );
     wrap_prompt_with_handoff(&handoff, prompt)
 }
 

@@ -42,6 +42,8 @@ pub struct ProviderSessionRow {
     pub model: Option<String>,
     pub rollout_path: Option<String>,
     pub updated_at: String,
+    /// Highest turn this provider's native session has already seen.
+    pub covered_turn: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -227,6 +229,7 @@ CREATE TABLE IF NOT EXISTS provider_sessions (
   model TEXT,
   rollout_path TEXT,
   updated_at TEXT NOT NULL,
+  covered_turn INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (thread_id, provider)
 );
 CREATE TABLE IF NOT EXISTS messages (
@@ -354,6 +357,34 @@ CREATE TABLE IF NOT EXISTS orchestration_tasks (
 );
 CREATE INDEX IF NOT EXISTS orchestration_tasks_run_idx ON orchestration_tasks (run_id, created_at);
 "#;
+
+/// One schema path for on-disk and in-memory stores. A test store that skips a
+/// migration drifts from production, which hides exactly the bugs these tests
+/// are meant to catch.
+fn apply_schema(db: &Connection) -> Result<()> {
+    db.execute_batch(MIGRATIONS)?;
+    migrate_thread_model_nullable(db)?;
+    ensure_thread_columns(db)?;
+    ensure_column(
+        db,
+        "provider_sessions",
+        "covered_turn",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    ensure_column(db, "provider_processes", "process_start", "TEXT")?;
+    ensure_column(db, "orchestration_tasks", "commit_sha", "TEXT")?;
+    ensure_column(db, "orchestration_tasks", "merged_at", "TEXT")?;
+    ensure_column(db, "orchestration_tasks", "position", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(db, "orchestration_tasks", "pr_url", "TEXT")?;
+    ensure_column(db, "orchestration_tasks", "snapshot_base", "TEXT")?;
+    ensure_column(db, "orchestration_tasks", "snapshot_tree", "TEXT")?;
+    ensure_column(db, "orchestration_tasks", "reasoning_effort", "TEXT")?;
+    ensure_column(db, "orchestration_runs", "dirty_source", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(db, "orchestration_runs", "archived_at", "TEXT")?;
+    ensure_column(db, "orchestration_runs", "owner_pid", "INTEGER")?;
+    ensure_column(db, "orchestration_runs", "owner_start", "TEXT")?;
+    Ok(())
+}
 
 fn ensure_column(db: &Connection, table: &str, column: &str, definition: &str) -> Result<()> {
     let exists = db
@@ -517,27 +548,13 @@ impl BatonStore {
         // project windows). Wait for another writer instead of failing the
         // command immediately with SQLITE_BUSY.
         db.busy_timeout(std::time::Duration::from_secs(5))?;
-        db.execute_batch(MIGRATIONS)?;
-        migrate_thread_model_nullable(&db)?;
-        ensure_thread_columns(&db)?;
-        ensure_column(&db, "provider_processes", "process_start", "TEXT")?;
-        ensure_column(&db, "orchestration_tasks", "commit_sha", "TEXT")?;
-        ensure_column(&db, "orchestration_tasks", "merged_at", "TEXT")?;
-        ensure_column(&db, "orchestration_tasks", "position", "INTEGER NOT NULL DEFAULT 0")?;
-        ensure_column(&db, "orchestration_tasks", "pr_url", "TEXT")?;
-        ensure_column(&db, "orchestration_tasks", "snapshot_base", "TEXT")?;
-        ensure_column(&db, "orchestration_tasks", "snapshot_tree", "TEXT")?;
-        ensure_column(&db, "orchestration_tasks", "reasoning_effort", "TEXT")?;
-        ensure_column(&db, "orchestration_runs", "dirty_source", "INTEGER NOT NULL DEFAULT 0")?;
-        ensure_column(&db, "orchestration_runs", "archived_at", "TEXT")?;
-        ensure_column(&db, "orchestration_runs", "owner_pid", "INTEGER")?;
-        ensure_column(&db, "orchestration_runs", "owner_start", "TEXT")?;
+        apply_schema(&db)?;
         Ok(BatonStore { db })
     }
 
     pub fn memory() -> Result<BatonStore> {
         let db = Connection::open_in_memory()?;
-        db.execute_batch(MIGRATIONS)?;
+        apply_schema(&db)?;
         Ok(BatonStore { db })
     }
 
@@ -1108,10 +1125,24 @@ impl BatonStore {
         Ok(())
     }
 
+    /// Records how far this provider's native session has read the thread.
+    pub fn mark_provider_session_covered(
+        &self,
+        thread_id: &str,
+        provider: ProviderId,
+        turn: i64,
+    ) -> Result<()> {
+        self.db.execute(
+            "UPDATE provider_sessions SET covered_turn = MAX(covered_turn, ?) WHERE thread_id = ? AND provider = ?",
+            params![turn, thread_id, provider.as_str()],
+        )?;
+        Ok(())
+    }
+
     pub fn get_provider_session(&self, thread_id: &str, provider: ProviderId) -> Result<Option<ProviderSessionRow>> {
         self.db
             .query_row(
-                "SELECT thread_id, provider, native_session_id, model, rollout_path, updated_at FROM provider_sessions WHERE thread_id = ? AND provider = ?",
+                "SELECT thread_id, provider, native_session_id, model, rollout_path, updated_at, covered_turn FROM provider_sessions WHERE thread_id = ? AND provider = ?",
                 params![thread_id, provider.as_str()],
                 |row| {
                     let provider: String = row.get(1)?;
@@ -1122,6 +1153,7 @@ impl BatonStore {
                         model: row.get(3)?,
                         rollout_path: row.get(4)?,
                         updated_at: row.get(5)?,
+                        covered_turn: row.get(6)?,
                     })
                 },
             )
@@ -1131,7 +1163,7 @@ impl BatonStore {
 
     pub fn list_provider_sessions(&self, thread_id: &str) -> Result<Vec<ProviderSessionRow>> {
         let mut statement = self.db.prepare(
-            "SELECT thread_id, provider, native_session_id, model, rollout_path, updated_at FROM provider_sessions WHERE thread_id = ? ORDER BY provider",
+            "SELECT thread_id, provider, native_session_id, model, rollout_path, updated_at, covered_turn FROM provider_sessions WHERE thread_id = ? ORDER BY provider",
         )?;
         let rows = statement
             .query_map(params![thread_id], |row| {
@@ -1143,6 +1175,7 @@ impl BatonStore {
                     model: row.get(3)?,
                     rollout_path: row.get(4)?,
                     updated_at: row.get(5)?,
+                    covered_turn: row.get(6)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

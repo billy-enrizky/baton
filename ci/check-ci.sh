@@ -218,9 +218,9 @@ elsif File.file?(base_path)
     changed << name
   end
   if !changed.empty? && !allow_change
-    fail!("CI013", "workflow commands, needs, or timeouts changed without ci-change: #{changed.join(", ")}")
+    fail!("CI013", "workflow commands, needs, if, timeout, or runner changed without --allow-change: #{changed.join(", ")}")
   elsif !changed.empty?
-    puts "CI013 allowed by ci-change: #{changed.join(", ")}"
+    puts "CI013 allowed by local --allow-change: #{changed.join(", ")}"
   end
 end
 

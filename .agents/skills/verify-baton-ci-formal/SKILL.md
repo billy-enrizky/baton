@@ -15,7 +15,7 @@ The model is committed at `ci/formal/ci-admission/`.
 - `ci/check-ci.sh`: command identity and workflow guard.
 - `.github/workflows/ci.yml`: `changes`, `selection`, `check`, `build`, `test`, `debt`, and `verify` gate names and relationships.
 
-The model covers selection, start, result, skip cause, command identity, explicit `ci-change` override, and the `verify` verdict. It does not cover test inventory completeness, shard union, GitHub API behavior, or the shell implementation inside a gate command beyond its identity.
+The model covers selection, start, result, skip cause, command identity, a `CommandDriftAllowed` constant, and the `verify` verdict. The real configuration sets `CommandDriftAllowed = FALSE`; there is no label override in the workflow. It does not cover test inventory completeness, shard union, GitHub API behavior, or the shell implementation inside a gate command beyond its identity.
 
 ## Properties
 
@@ -23,7 +23,7 @@ The model covers selection, start, result, skip cause, command identity, explici
 - `FullSelection`: push, merge group, and workflow dispatch select every gate.
 - `NoRetryMasking`: a failure never becomes a green run.
 - `ChangesFailOpen`: an unknown diff selects every gate.
-- `CommandsMatch`: a green run uses the base workflow commands or an explicit `ci-change` override.
+- `CommandsMatch`: with `CommandDriftAllowed = FALSE`, a green run uses the base workflow commands. The one mutation config that sets the constant to TRUE exists only to prove the property depends on it.
 
 ## Run
 
@@ -45,7 +45,7 @@ Read every failing trace with the pstack `/statechart` skill. It presents the sh
 - `BatonCiAdmissionMergeSelection.cfg`: merge group uses a partial selection. Catches `FullSelection`.
 - `BatonCiAdmissionRetryMask.cfg`: failure becomes success. Catches `NoRetryMasking`.
 - `BatonCiAdmissionUnknownSelection.cfg`: unknown path selects nothing. Catches `ChangesFailOpen`.
-- `BatonCiAdmissionCommandDrift.cfg`: changed commands pass without `ci-change`. Catches `CommandsMatch`.
+- `BatonCiAdmissionCommandDrift.cfg`: sets `CommandDriftAllowed = TRUE` so changed commands pass. Catches `CommandsMatch`.
 - `BatonCiAdmissionReportWithoutStart.cfg`: a gate reports success without starting. Catches `NoFalseGreen`.
 
 ## When to update

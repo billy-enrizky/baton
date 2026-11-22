@@ -39,7 +39,7 @@ bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/changed-test-c
 code=$?
 set -e
 if [[ $code -eq 0 ]]; then
-  echo "changed test command passed without ci-change" >&2
+  echo "changed test command passed without --allow-change" >&2
   exit 1
 fi
 bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/changed-test-command.yml" --allow-change >/dev/null
@@ -97,6 +97,28 @@ set -e
 if [[ $code -eq 0 ]] || ! grep -q "TI001" <<< "$output"; then
   echo "test inventory accepted a crate with no tests" >&2
   printf '%s\n' "$output" >&2
+  exit 1
+fi
+
+low_log=$(mktemp)
+printf 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$low_log"
+set +e
+output=$(bash "$root/test-inventory.sh" "$root/../.." "$root/test-inventory-floor.txt" "$low_log" 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q "TI002" <<< "$output"; then
+  echo "test inventory accepted fewer executed tests than the floor" >&2
+  exit 1
+fi
+
+ignored_log=$(mktemp)
+printf 'test result: ok. 400 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$ignored_log"
+set +e
+output=$(bash "$root/test-inventory.sh" "$root/../.." "$root/test-inventory-floor.txt" "$ignored_log" 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q "TI003" <<< "$output"; then
+  echo "test inventory accepted ignored tests" >&2
   exit 1
 fi
 

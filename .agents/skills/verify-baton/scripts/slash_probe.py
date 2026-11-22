@@ -92,6 +92,14 @@ def main() -> int:
 
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
+        os.write(master, b"/model\r")
+        pump(master, 1.5, transcript)
+        model_picker = screen_text(transcript, args.width, args.height)
+        model_required = ["models ·", "type to filter", "enter", "esc"]
+        missing.extend(value for value in model_required if value not in model_picker)
+        (evidence / "model-picker-screen.txt").write_text(model_picker + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
         os.write(master, b"/quit\r")
         pump(master, 0.5, transcript)
         exit_code = reap(pid, 5)

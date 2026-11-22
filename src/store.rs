@@ -1420,6 +1420,46 @@ impl BatonStore {
         Ok(text)
     }
 
+    /// Removes and returns the queued message at `index`, counted from zero.
+    pub fn take_queued_message(&self, thread_id: &str, index: usize) -> Result<Option<String>> {
+        let tx = self.db.unchecked_transaction()?;
+        let id: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM queued_messages WHERE thread_id = ? ORDER BY id LIMIT 1 OFFSET ?",
+                params![thread_id, index as i64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(id) = id else {
+            return Ok(None);
+        };
+        let text: String = tx.query_row(
+            "SELECT text FROM queued_messages WHERE id = ?",
+            params![id],
+            |row| row.get(0),
+        )?;
+        tx.execute("DELETE FROM queued_messages WHERE id = ?", params![id])?;
+        tx.commit()?;
+        Ok(Some(text))
+    }
+
+    /// Rewrites the whole queue in one transaction, preserving the given order.
+    pub fn replace_queued_messages(&self, thread_id: &str, messages: &[String]) -> Result<()> {
+        let tx = self.db.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM queued_messages WHERE thread_id = ?",
+            params![thread_id],
+        )?;
+        for text in messages {
+            tx.execute(
+                "INSERT INTO queued_messages (thread_id, text, created_at) VALUES (?, ?, ?)",
+                params![thread_id, text, now_iso()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn clear_queued_messages(&self, thread_id: &str) -> Result<()> {
         self.db.execute(
             "DELETE FROM queued_messages WHERE thread_id = ?",

@@ -205,6 +205,7 @@ fn main_result(started: Instant) -> Result<()> {
                 thread_id: thread.id.clone(),
                 text: prompt,
                 permission_mode,
+                skip_handoff: false,
             });
 
             let mut stream = exec_events::TurnStreamState::default();

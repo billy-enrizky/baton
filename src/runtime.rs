@@ -15,10 +15,24 @@ pub type SharedAdapter = Arc<tokio::sync::Mutex<Box<dyn BatonAdapter>>>;
 pub type ThreadTurnEventSender = std::sync::mpsc::Sender<(String, TurnEvent)>;
 
 pub enum EngineCommand {
-    Submit { thread_id: String, text: String, permission_mode: PermissionMode },
-    Steer { thread_id: String, text: String },
-    ListModels { thread_id: String, provider: ProviderId, request_id: u64 },
-    Interrupt { thread_id: String },
+    Submit {
+        thread_id: String,
+        text: String,
+        permission_mode: PermissionMode,
+        skip_handoff: bool,
+    },
+    Steer {
+        thread_id: String,
+        text: String,
+    },
+    ListModels {
+        thread_id: String,
+        provider: ProviderId,
+        request_id: u64,
+    },
+    Interrupt {
+        thread_id: String,
+    },
     Quit,
 }
 
@@ -539,11 +553,13 @@ pub async fn run_engine(
                     }
                 }
             }
-            EngineCommand::Submit { thread_id, text, permission_mode } => {
-                let accepted = active_threads
-                    .lock()
-                    .unwrap()
-                    .insert(thread_id.clone());
+            EngineCommand::Submit {
+                thread_id,
+                text,
+                permission_mode,
+                skip_handoff,
+            } => {
+                let accepted = active_threads.lock().unwrap().insert(thread_id.clone());
                 if !accepted {
                     let _ = engine_event_sender.send(EngineEvent::TurnRejected {
                         thread_id,
@@ -568,6 +584,7 @@ pub async fn run_engine(
                     thread_id,
                     text,
                     permission_mode,
+                    skip_handoff,
                     engine_event_sender.clone(),
                     turn_event_sender.clone(),
                     active_threads.clone(),
@@ -589,6 +606,7 @@ async fn run_turn(
     thread_id: String,
     text: String,
     permission_mode: PermissionMode,
+    skip_handoff: bool,
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: ThreadTurnEventSender,
     active_threads: Arc<Mutex<HashSet<String>>>,
@@ -616,6 +634,7 @@ async fn run_turn(
         &thread_id,
         &text,
         permission_mode,
+        skip_handoff,
         &engine_event_sender,
         &turn_event_sender,
     )
@@ -696,6 +715,7 @@ async fn execute_turn(
     thread_id: &str,
     text: &str,
     permission_mode: PermissionMode,
+    skip_handoff: bool,
     engine_event_sender: &std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: &ThreadTurnEventSender,
 ) -> Result<()> {
@@ -766,7 +786,7 @@ async fn execute_turn(
         .iter()
         .filter(|message| message.turn > covered_turn)
         .collect();
-    if !unseen.is_empty() {
+    if !skip_handoff && !unseen.is_empty() {
         let handoff_messages: Vec<HandoffMessage> = unseen
             .iter()
             .map(|message| HandoffMessage {
@@ -1193,6 +1213,7 @@ mod tests {
             &thread.id,
             "hello",
             PermissionMode::Default,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -1288,6 +1309,7 @@ mod tests {
             &thread.id,
             "hello $memories",
             PermissionMode::Default,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -1362,6 +1384,7 @@ mod tests {
             &thread.id,
             "next",
             PermissionMode::Default,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -1384,6 +1407,74 @@ mod tests {
             .unwrap()
             .covered_turn;
         assert_eq!(covered, 3, "a completed turn advances the marker");
+    }
+
+    #[tokio::test]
+    async fn a_skipped_handoff_sends_the_raw_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let cwd = home.path().to_string_lossy().to_string();
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "handoff".into(),
+                cwd: cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        {
+            let store = store.lock().unwrap();
+            store.add_message(&thread.id, 1, "user", Some("codex"), Some("m"), "first question").unwrap();
+            store.add_message(&thread.id, 1, "assistant", Some("codex"), Some("m"), "first answer").unwrap();
+            store.add_message(&thread.id, 2, "user", Some("claude"), Some("m"), "claude question").unwrap();
+            store.add_message(&thread.id, 2, "assistant", Some("claude"), Some("m"), "claude answer").unwrap();
+            store
+                .upsert_provider_session(
+                    &thread.id,
+                    ProviderId::Codex,
+                    "s1",
+                    Some("m".into()),
+                    None,
+                )
+                .unwrap();
+            store
+                .mark_provider_session_covered(&thread.id, ProviderId::Codex, 1)
+                .unwrap();
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
+            CapturingAdapter {
+                prompt: captured.clone(),
+                session_id: Some("s1".into()),
+            },
+        ) as Box<dyn BatonAdapter>))];
+        let adapter_indices = HashMap::from([(ProviderId::Codex, 0)]);
+        let provider_claims: ProviderClaims = Arc::new(Mutex::new(HashMap::new()));
+        let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        execute_turn(
+            &store,
+            &home.path().to_path_buf(),
+            &adapters,
+            &adapter_indices,
+            &provider_claims,
+            cancel_receiver,
+            &thread.id,
+            "next",
+            PermissionMode::Default,
+            true,
+            &engine_sender,
+            &turn_sender,
+        )
+        .await
+        .expect("turn completes");
+
+        let prompt = captured.lock().unwrap().clone().expect("prompt captured");
+        assert_eq!(prompt, "next", "a skipped handoff sends the prompt alone");
     }
 
     #[tokio::test]
@@ -1445,6 +1536,7 @@ mod tests {
             &thread.id,
             "next",
             PermissionMode::Default,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -1514,6 +1606,7 @@ mod tests {
             &thread.id,
             "next",
             PermissionMode::Default,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -1692,6 +1785,7 @@ mod tests {
                 thread_id: thread.id.clone(),
                 text: "hello".into(),
                 permission_mode: PermissionMode::Default,
+                skip_handoff: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started).await, thread.id);
@@ -1750,6 +1844,7 @@ mod tests {
                 thread_id: thread.id.clone(),
                 text: "hello".into(),
                 permission_mode: PermissionMode::Default,
+                skip_handoff: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started).await, thread.id);
@@ -1839,6 +1934,7 @@ mod tests {
                 thread_id: claude_thread.id.clone(),
                 text: "hello".into(),
                 permission_mode: PermissionMode::Default,
+                skip_handoff: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, claude_thread.id);
@@ -1908,6 +2004,7 @@ mod tests {
                 thread_id: first.id.clone(),
                 text: "first prompt".into(),
                 permission_mode: PermissionMode::Default,
+                skip_handoff: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, first.id);
@@ -1917,6 +2014,7 @@ mod tests {
                 thread_id: second.id.clone(),
                 text: "second prompt".into(),
                 permission_mode: PermissionMode::Default,
+                skip_handoff: false,
             })
             .unwrap();
         wait_engine_event(&event_receiver, |event| {
@@ -2037,6 +2135,7 @@ mod tests {
                 thread_id: first.id.clone(),
                 text: "first prompt".into(),
                 permission_mode: PermissionMode::Default,
+                skip_handoff: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, first.id);
@@ -2045,6 +2144,7 @@ mod tests {
                 thread_id: second.id.clone(),
                 text: "second prompt".into(),
                 permission_mode: PermissionMode::Default,
+                skip_handoff: false,
             })
             .unwrap();
         wait_engine_event(&event_receiver, |event| {
@@ -2143,6 +2243,7 @@ mod tests {
                 thread_id: thread.id.clone(),
                 text: "hello".into(),
                 permission_mode: PermissionMode::Default,
+                skip_handoff: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, thread.id);
@@ -2250,6 +2351,7 @@ mod tests {
                     thread_id: thread_id.clone(),
                     text: "hello".into(),
                     permission_mode: PermissionMode::Default,
+                    skip_handoff: false,
                 })
                 .unwrap();
         }
@@ -2372,6 +2474,7 @@ mod tests {
                     thread_id: thread.id.clone(),
                     text: text.into(),
                     permission_mode: PermissionMode::Default,
+                    skip_handoff: false,
                 })
                 .unwrap();
         }
@@ -2453,6 +2556,7 @@ mod tests {
                     thread_id: thread.id.clone(),
                     text: text.into(),
                     permission_mode: PermissionMode::Default,
+                    skip_handoff: false,
                 })
                 .unwrap();
             let event = wait_engine_event(&event_receiver, |event| {

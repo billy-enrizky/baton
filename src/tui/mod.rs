@@ -320,6 +320,9 @@ const PROVIDERS: [ProviderId; 6] = [
 ];
 
 pub struct TuiState {
+    /// Terminal bell on turn end, opt-in through config.json.
+    bell_enabled: bool,
+    bell: crate::notify::BellLimiter,
     store: Arc<Mutex<BatonStore>>,
     prompt_history: Vec<String>,
     prompt_history_index: Option<usize>,
@@ -415,7 +418,10 @@ pub fn run_tui(
     let custom_commands = discover_custom_commands(&thread.cwd);
     let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
     let (native_rewind_sender, native_rewind_receiver) = std::sync::mpsc::channel();
+    let bell_enabled = crate::config::notifications(&home).bell;
     let mut state = TuiState {
+        bell_enabled,
+        bell: crate::notify::BellLimiter::new(),
         store: store.clone(),
         prompt_history,
         prompt_history_index: None,
@@ -949,6 +955,12 @@ fn apply_engine_event(
             }
             if thread_id != state.thread.id {
                 return;
+            }
+            if state
+                .bell
+                .fire(state.bell_enabled, std::time::Instant::now())
+            {
+                let _ = crate::notify::emit_bell(&mut std::io::stdout());
             }
             state.running = false;
             state.queued_provider = None;
@@ -7699,6 +7711,8 @@ mod tests {
             .list_queued_messages(&thread.id)
             .unwrap_or_default();
         TuiState {
+            bell_enabled: crate::config::notifications(home).bell,
+            bell: crate::notify::BellLimiter::new(),
             store: store.clone(),
             prompt_history: Vec::new(),
             prompt_history_index: None,
@@ -7905,6 +7919,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/copy 1".to_string()]
         );
+    }
+
+    #[test]
+    fn bell_flag_reaches_the_tui_state_from_config() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        assert!(
+            !state.bell_enabled,
+            "the bell is off unless config turns it on"
+        );
+
+        std::fs::write(
+            crate::config::config_path(home.path()),
+            r#"{"notifications":{"bell":true}}"#,
+        )
+        .unwrap();
+        state = test_state(home.path(), &store, Vec::new());
+        assert!(state.bell_enabled);
     }
 
     #[test]

@@ -14,6 +14,7 @@ use crate::adapters::{AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
 use crate::config::{describe_auth, load_config_file, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
+use crate::inbox::{self, InboxItem};
 use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
@@ -91,6 +92,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "fork this conversation into an isolated git worktree",
     ),
     ("/threads", "list threads in this directory"),
+    ("/inbox", "all threads that need attention"),
     ("/open", "open a thread by id prefix"),
     ("/usage", "token usage and cache hit rate"),
     ("/checkpoints", "list checkpoints for this thread"),
@@ -154,6 +156,7 @@ Common
   /model                      choose a model
   /new                        start a new thread
   /threads                    list threads here
+  /inbox                      failed, unverified, needs-input, or queued work
   /status                     what is happening now
   /activity                   every turn, tool call, diff, and usage
   /commands                   every command this thread ran
@@ -381,6 +384,10 @@ enum Overlay {
     ThreadPicker {
         selected: usize,
         threads: Vec<ThreadChoice>,
+    },
+    InboxPicker {
+        selected: usize,
+        items: Vec<InboxItem>,
     },
     CheckpointPicker {
         selected: usize,
@@ -2510,6 +2517,35 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
     suggestions
 }
 
+fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread_id: &str) {
+    let found = {
+        let guard = store.lock().unwrap();
+        guard.get_thread(thread_id).ok().flatten().or_else(|| {
+            guard
+                .list_threads(None)
+                .unwrap_or_default()
+                .into_iter()
+                .find(|thread| thread.id.starts_with(thread_id))
+        })
+    };
+    let Some(thread) = found else {
+        state.notice = Some(format!("no thread matches \"{thread_id}\""));
+        return;
+    };
+    state.permission_mode = thread.permission_mode;
+    state.goal = thread.goal.clone();
+    state.goal_paused = thread.goal_paused;
+    state.thread = thread.clone();
+    let guard = store.lock().unwrap();
+    state.history = guard.list_messages(&thread.id).unwrap_or_default();
+    state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
+    state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
+    state.diff_output = None;
+    state.scroll_offset = 0;
+    state.notice = Some(format!("opened {}", thread.title));
+    state.overlay = Overlay::None;
+}
+
 fn handle_key(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -3169,33 +3205,40 @@ fn handle_key(
             }
             KeyCode::Enter => {
                 if let Some(choice) = threads.get(selected) {
-                    let thread_id = &choice.id;
-                    let found = {
-                        let guard = store.lock().unwrap();
-                        guard
-                            .list_threads(None)
-                            .unwrap_or_default()
-                            .into_iter()
-                            .find(|thread| thread.id.starts_with(thread_id.as_str()))
-                    };
-                    if let Some(thread) = found {
-                        state.permission_mode = thread.permission_mode;
-                        state.goal = thread.goal.clone();
-                        state.goal_paused = thread.goal_paused;
-                        state.thread = thread.clone();
-                        let guard = store.lock().unwrap();
-                        state.history = guard.list_messages(&thread.id).unwrap_or_default();
-                        state.queued_messages =
-                            guard.list_queued_messages(&thread.id).unwrap_or_default();
-                        state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
-                        state.diff_output = None;
-                        state.scroll_offset = 0;
-                        state.notice = Some(format!("opened {}", thread.title));
-                    }
+                    open_thread_by_id(state, store, &choice.id);
                 }
             }
             _ => {
                 state.overlay = Overlay::ThreadPicker { selected, threads };
+            }
+        },
+        Overlay::InboxPicker { selected, items } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                if !items.is_empty() {
+                    let new_selected = (selected + items.len() - 1) % items.len();
+                    state.overlay = Overlay::InboxPicker {
+                        selected: new_selected,
+                        items,
+                    };
+                }
+            }
+            KeyCode::Down => {
+                if !items.is_empty() {
+                    let new_selected = (selected + 1) % items.len();
+                    state.overlay = Overlay::InboxPicker {
+                        selected: new_selected,
+                        items,
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(item) = items.get(selected) {
+                    open_thread_by_id(state, store, &item.thread_id);
+                }
+            }
+            _ => {
+                state.overlay = Overlay::InboxPicker { selected, items };
             }
         },
         Overlay::CheckpointPicker {
@@ -5706,6 +5749,18 @@ fn handle_command(
                 };
             }
         }
+        "/inbox" => {
+            let items = {
+                let guard = store.lock().unwrap();
+                inbox::items(&guard).unwrap_or_default()
+            };
+            if items.is_empty() {
+                state.notice =
+                    Some("inbox empty · no failed, unverified, needs-input, or queued work".into());
+            } else {
+                state.overlay = Overlay::InboxPicker { selected: 0, items };
+            }
+        }
         "/open" => {
             if let Some(prefix) = args.first() {
                 let found = {
@@ -6720,6 +6775,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::ModePicker { .. } => 7,
             Overlay::AuthPicker { .. } => 9,
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
+            Overlay::InboxPicker { items, .. } => items.len().min(8) + 4,
             Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
             Overlay::DirtyConfirm { .. } => 5,
             Overlay::CommandList { expanded, .. } => {
@@ -6798,6 +6854,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::ThreadPicker { selected, threads } => {
                 draw_thread_picker(frame, chunks[1], threads, *selected)
+            }
+            Overlay::InboxPicker { selected, items } => {
+                draw_inbox_picker(frame, chunks[1], items, *selected)
             }
             Overlay::CheckpointPicker {
                 selected,
@@ -7527,6 +7586,36 @@ fn draw_thread_picker(
         };
         lines.push(Line::styled(
             format!("❯ {}  {}  [{}]", choice.id, choice.title, choice.status),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_inbox_picker(frame: &mut ratatui::Frame, area: Rect, items: &[InboxItem], selected: usize) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "inbox · enter open · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, item) in items.iter().take(8).enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let id: String = item.thread_id.chars().take(8).collect();
+        lines.push(Line::styled(
+            format!(
+                "❯ {id}  {}  [{}]  {}",
+                item.title,
+                item.status,
+                item.reasons.join(" · ")
+            ),
             style,
         ));
     }
@@ -13405,6 +13494,52 @@ mod tests {
             .join("\n");
         assert!(labels.contains("active goal"), "{labels}");
         assert!(labels.contains("archived goal (archived)"), "{labels}");
+    }
+
+    #[test]
+    fn inbox_lists_attention_threads_and_opens_the_selected_one() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let target = {
+            let guard = store.lock().unwrap();
+            let thread = guard
+                .create_thread(NewThread {
+                    title: "failed task".to_string(),
+                    cwd: home.path().to_string_lossy().to_string(),
+                    current_provider: ProviderId::Codex,
+                    current_model: None,
+                })
+                .unwrap();
+            guard
+                .start_turn_record(&thread.id, 1, ProviderId::Codex, None)
+                .unwrap();
+            guard
+                .finish_turn_record(&thread.id, 1, TurnPhase::Failed, Some("boom"))
+                .unwrap();
+            guard.enqueue_message(&thread.id, "follow-up").unwrap();
+            thread
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/inbox");
+        let Overlay::InboxPicker { items, .. } = &state.overlay else {
+            panic!("expected the inbox picker");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].thread_id, target.id);
+        assert!(items[0].reasons.contains(&"turn failed".to_string()));
+        assert!(items[0].reasons.contains(&"1 queued".to_string()));
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(state.thread.id, target.id);
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.notice.as_deref(), Some("opened failed task"));
     }
 
     #[test]

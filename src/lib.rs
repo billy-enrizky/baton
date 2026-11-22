@@ -9,6 +9,7 @@ pub mod egress;
 pub mod exec_events;
 pub mod handoff;
 pub mod harness_config;
+pub mod inbox;
 pub mod mcp;
 pub mod memory;
 pub mod models;

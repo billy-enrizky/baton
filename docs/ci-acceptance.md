@@ -79,6 +79,43 @@ PR #117 set `[profile.test] debug = "line-tables-only"`. Measured locally on a c
 
 On the runner it moved nothing: test job 160 s and 163 s across two runs, against a 155 to 171 s band on `main`. The PR was closed unmerged rather than keeping a setting whose benefit could not be shown. Local CPU time was the wrong proxy; the job is not bound by that slice.
 
+## Per-job cache keys
+
+All four Rust jobs shared one key, and the first finisher on main owned it. That finisher was a lint job, so the archive held no test build.
+
+`shared-key` now includes `github.job`. The test job restores its own 221 MB archive as an exact match, up from a shared 157 MB, and the compile count dropped from 197 crates to 119. Wall time did not move: 165 s before and 165 s after.
+
+Conclusion: the shared-key defect is fixed and worth keeping, but restoring `target` does not make Cargo reuse most of it. Whatever invalidates 119 fingerprints is a deeper problem than a cache key.
+
+## Dispatch was broken and is fixed
+
+A `workflow_dispatch` run failed every gate at `Resolve trusted base ref`. A dispatch event has no `github.event.before`, the step falls back to `HEAD~1`, and the gate jobs checked out one commit. Push and PR runs never exercise that path, so it was broken from the day the workflow landed.
+
+Fixed with `fetch-depth: 2` on the gate checkouts. Dispatch run 44991010841 is green.
+
+## Owner decision: runner size
+
+Every lever inside the job has been measured and exhausted: debug info (no change), per-job cache keys (no wall-clock change), sharding (would duplicate the 130-second compile), fewer test binaries (links are 0.1 to 0.4 seconds warm).
+
+The remaining lever is CPU. The test job is compile-bound at roughly 130 seconds on the standard four-vCPU public runner. Public-repo standard runners are free; larger runners are billed per minute:
+
+| Runner | Rate |
+|---|---|
+| Linux 4-core larger | $0.012/min |
+| Linux 8-core larger | $0.022/min |
+
+Measured job minutes per push run today: 6.6. At the 8-core rate that is about $0.145 per run if durations hold, and about $0.09 if the compile roughly halves as expected.
+
+Monthly scenarios, if the owner approves:
+
+| Runs per month | 8-core, durations hold | 8-core, compile halves |
+|---|---|---|
+| 100 | $14.50 | $9.00 |
+| 300 | $43.50 | $27.00 |
+| 600 | $87.00 | $54.00 |
+
+Recommendation: one measured 8-core run before any commitment. If it brings the test job under 100 seconds, the p95 target is reachable and the cost is bounded by the table. If it does not, the bottleneck is not CPU and the next step is profiling the compile itself.
+
 ## Cache behaviour
 
 The test job restores a 157 MB cache in about a second, reported as `full match: false`, which means it is a restore-key prefix match rather than the exact key. Dependencies are therefore mostly present and the remaining time is the crate's own compile and the linking of nine test binaries.

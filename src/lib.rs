@@ -5,6 +5,7 @@ pub mod cli;
 pub mod clipboard;
 pub mod config;
 pub mod doctor;
+pub mod egress;
 pub mod exec_events;
 pub mod handoff;
 pub mod harness_config;

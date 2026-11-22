@@ -378,15 +378,38 @@ fn matches_tokens(path: &str, tokens: &[&str]) -> bool {
     tokens.iter().all(|token| path.contains(token))
 }
 
+fn sorted_indices(entries: &[String], query: &str, tokens: &[&str]) -> Vec<usize> {
+    let mut indices = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| matches_tokens(path, tokens))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    indices.sort_by_cached_key(|index| {
+        (
+            rank_key(&entries[*index], query, tokens),
+            entries[*index].clone(),
+        )
+    });
+    indices
+}
+
+/// Ranked indices for a query, shared by the CLI and the TUI picker.
+pub fn ranked_indices(entries: &[String], query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    let tokens = query.split_whitespace().collect::<Vec<_>>();
+    sorted_indices(entries, &query, &tokens)
+}
+
 fn rank_candidates(candidates: Vec<String>, query: Option<&str>) -> Vec<String> {
     let query = query.map(str::trim).unwrap_or("").to_lowercase();
     let tokens = query.split_whitespace().collect::<Vec<_>>();
-    let mut matched = candidates
+    let indices = sorted_indices(&candidates, &query, &tokens);
+    let mut slots = candidates.into_iter().map(Some).collect::<Vec<_>>();
+    indices
         .into_iter()
-        .filter(|path| matches_tokens(path, &tokens))
-        .collect::<Vec<_>>();
-    matched.sort_by_cached_key(|path| (rank_key(path, &query, &tokens), path.clone()));
-    matched
+        .filter_map(|index| slots[index].take())
+        .collect()
 }
 
 fn rank_key(path: &str, query: &str, tokens: &[&str]) -> (u8, String) {
@@ -458,6 +481,16 @@ mod tests {
         ];
         let ranked = rank_candidates(candidates, Some("parser md"));
         assert_eq!(ranked, vec!["zzz_parser.md", "aaa/parser/notes.md"]);
+        let single = vec!["src/parser/mod.rs".to_string()];
+        assert_eq!(ranked_indices(&single, "PARSER rs"), vec![0]);
+        assert!(ranked_indices(&single, "prsr").is_empty());
+
+        let entries = vec![
+            "aaa/parser/notes.md".to_string(),
+            "zzz_parser.md".to_string(),
+        ];
+        let indices = ranked_indices(&entries, "parser md");
+        assert_eq!(indices, vec![1, 0]);
     }
 
     #[test]

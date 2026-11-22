@@ -155,6 +155,15 @@ printf '     Running unittests src/lib.rs (target/debug/deps/baton-1)\nrunning 2
 timings_out=$(mktemp)
 bash "$root/test-timings.sh" "$timings_log" "$timings_out" >/dev/null
 expected_timings=$(printf 'unittests src/lib.rs\t12.50\t2\ntests/core.rs\t0.40\t1')
+colored_log=$(mktemp)
+printf '\033[1m\033[92m     Running\033[0m tests/core.rs (target/debug/deps/core-2)\nrunning 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s\n' > "$colored_log"
+colored_out=$(mktemp)
+bash "$root/test-timings.sh" "$colored_log" "$colored_out" >/dev/null
+if [[ "$(cat "$colored_out")" != "$(printf 'tests/core.rs\t0.40\t1')" ]]; then
+  echo "test timings did not strip cargo color" >&2
+  cat "$colored_out" >&2
+  exit 1
+fi
 if [[ "$(cat "$timings_out")" != "$expected_timings" ]]; then
   echo "test timings did not parse the sample log" >&2
   cat "$timings_out" >&2

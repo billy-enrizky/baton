@@ -157,9 +157,9 @@ Rules the evidence column obeys:
 
 | Capability | Upstream evidence | Baton status | Baton evidence and proof surface | Terminal decision | First slice | Plan |
 |---|---|---|---|---|---|---|
-| Startup performance | T3: `docs/operations/development.md`, `scripts/profile-startup.mjs` | Unmeasured | `src/main.rs` startup reconciliation and `src/tui/mod.rs` startup hydrate; no benchmark exists; none | Enforce warm p50 under 250 ms and p95 under 500 ms | Add `baton bench startup --json` over an isolated home, record the baseline, then fail a regression above 10 percent. | D5 |
-| Input and render latency | Orca: `src/renderer/src/diagnostics/typing-latency/diagnostic.ts`, `src/renderer/src/diagnostics/typing-latency/renderer-long-tasks.ts` | Unmeasured | `src/tui/mod.rs` 32 ms poll loop; markdown and diff caches; no end-to-end benchmark exists; none | Enforce keystroke-to-render p95 under 50 ms | Add a PTY benchmark for typing and `/` completion, record the baseline, then fail a regression above 10 percent. | D5 |
-| Memory and process bounds | T3: `docs/internals/resource-telemetry.md`, `apps/server/src/diagnostics/ProcessResourceMonitor.ts` | Unmeasured | Provider process tracking in `src/process.rs`; no RSS measurement or budget exists; none | Bound idle RSS under 200 MB and bound the adapter process count in the benchmark fixture | Record RSS at idle, during a turn, and after quit, then fail a regression above 10 percent. | D5 |
+| Startup performance | T3: `docs/operations/development.md`, `scripts/profile-startup.mjs` | Partial | `baton bench startup --json` times config validation, store open, orphan reap, and hydrate per run, plus process time from `main` entry; `scripts/bench.py` records p50 and p95 and fails above 10 percent of a recorded baseline; `tests/cli_bench.rs`; unit | Enforce warm p50 under 250 ms and p95 under 500 ms | Recorded baseline is 16.1 ms process start p50 and 0.63 ms of in-process phases on Darwin arm64 debug. Remaining: a release-build baseline, and wiring the gate into CI once billing clears. | D5 |
+| Input and render latency | Orca: `src/renderer/src/diagnostics/typing-latency/diagnostic.ts`, `src/renderer/src/diagnostics/typing-latency/renderer-long-tasks.ts` | Unmeasured | `src/tui/mod.rs` 32 ms poll loop; markdown and diff caches; no keystroke-to-render benchmark exists; none | Enforce keystroke-to-render p95 under 50 ms | Extend `scripts/bench.py` with a PTY typing and `/` completion sample, record the baseline, then fail a regression above 10 percent. | D5 |
+| Memory and process bounds | T3: `docs/internals/resource-telemetry.md`, `apps/server/src/diagnostics/ProcessResourceMonitor.ts` | Unmeasured | Provider process tracking in `src/process.rs`; no RSS measurement or budget exists; none | Bound idle RSS under 200 MB and bound the adapter process count in the benchmark fixture | Add RSS sampling to `scripts/bench.py` at idle, during a turn, and after quit, then fail a regression above 10 percent. | D5 |
 | Shell completion | T3: `apps/server/src/cli/install.ts`, `apps/server/src/cli/install.test.ts` | Missing | `clap` is present but no completion command or install path; none | Generate from the clap command graph. | Add `baton completions <shell>`. | D17 |
 | Stdin, stdout, and exit codes | T3: `apps/server/src/binCli.test.ts`, `apps/server/src/cli/consoleStdin.ts` | Partial | `src/cli.rs` JSON and stream JSON; `src/mcp.rs` stdin server; `std::process::exit(130)` is reached only for a cancelled orchestration report, while an interrupted `exec` turn exits 1 and a TUI Ctrl+C does not exit; none | Keep machine output on stdout and progress on stderr | Define the cancellation contract explicitly, then add an integration test for `baton status --json` with a closed stdin and one for an interrupted `exec`. | D17 |
 | Terminal capability detection | T3: `apps/server/src/cli/updateProgress.ts`, `apps/server/src/cli/connect.ts` | Partial | `crossterm` and `std::io::stderr().is_terminal()`; no color or width capability model; none | Detect color and width, then degrade. | Add a `NO_COLOR` and non-TTY rendering test. | D5 |
@@ -170,6 +170,20 @@ Rules the evidence column obeys:
 | Repo-controlled hooks and actions | T3: `apps/server/src/project/ProjectSetupScriptRunner.ts`, `t3.json` | Missing | No action runner; `src/worktree.rs` reads `baton.json` for `worktree.sharedDirectories` only; none | A repo hook is executable code and needs trust before first run | Write a hook-execution ADR first: canonical repository identity, digest over the executed bytes, symlink and TOCTOU handling, default-deny sandbox or an explicit statement that none exists, process limits, environment allowlist, and audit semantics. Then add `worktree.setup` and `actions` sections to `baton.json`, not a second config file. | D22 |
 | Remote and guest authority | T3: `docs/internals/environment-auth.md`, `apps/server/src/guest/GuestShareService.ts` | Missing | No host or token store; none | One authority, short-lived tokens, TLS or SSH transport, and revocation | Define the token scope model in the D18b ownership ADR before any transport code. | D18b |
 | MCP mutation and spend | T3: `apps/server/src/mcp/McpToolAccess.ts`, `apps/server/src/mcp/toolkits/orchestrator/tools.ts` | Partial | `baton_fork` and queue clear mutate with no scope, confirmation, or audit record; no spend cap exists; none | Every mutating tool gets a scope, a confirmation, and an audit row | Add the audit event schema and the scope taxonomy, retrofit `baton_fork` and queue clear, then add `baton_send` with a thread scope, a spend confirmation, and no implicit orchestration. | D19 |
+
+### Recorded performance baseline
+
+Measured 2026-11-22 on Darwin arm64 with the debug binary, median of 11 runs, isolated `BATON_HOME`:
+
+| Metric | Baseline |
+|---|---|
+| Process start (`baton --version`, includes exec and dynamic loading) | 16.14 ms p50, 16.90 ms p95 |
+| In-process startup phases | 0.63 ms total: store 0.57 ms, config 0.003 ms, reap 0.02 ms, hydrate 0.03 ms |
+| Process time from `main` entry (warm) | 3.08 ms |
+
+`scripts/bench-baseline.json` stores these numbers with the host class. `scripts/bench.py --check` fails above 110 percent of any of them and refuses to compare across machines without `--force`, because a cross-host comparison measures the host, not the change.
+
+Release builds, keystroke-to-render, RSS, and the CI wiring are still open in D5. The absolute numbers are not a product target yet; they are the reference the next optimization PR must beat.
 
 ## Alternatives considered
 
@@ -284,7 +298,7 @@ Each row is one small PR. A row with a letter suffix is the smallest unit that c
 | D4a | Handoff correctness | Two defects are already fixed in PR #89; the returning-provider delta remains | Defect tests for the duplicate prompt, UTF-8 truncation, and a covered-turn marker |
 | D4b | Transcript redaction and the handoff egress inventory | A handoff is provider-to-provider egress; it cannot send before this exists | Fake-key transcript test and an inventory test over the Baton-owned paths |
 | D4c | Handoff preview, no-handoff, and confirmation | Makes the egress explicit to the user, on top of a redacted payload | Handoff state-machine gate plus a transcript fixture |
-| D5 | Startup, input-to-render, and memory benchmarks plus context and usage telemetry, plus the NO_COLOR, non-TTY, and 60x20 checks | Sets numeric baselines and surfaces the resource state those baselines measure | Local benchmark artifact and a regression threshold |
+| D5 | Startup benchmark, then input-to-render and memory benchmarks, plus context and usage telemetry and the NO_COLOR, non-TTY, and 60x20 checks | Sets numeric baselines and surfaces the resource state those baselines measure | `scripts/bench.py` with a recorded baseline and a 10 percent fail threshold |
 | D8a | Provider identity for non-built-in adapters | Blocks D8, D11, and Pi import; the closed enum is a hard dependency | One migration plus store, adapter, and auth-key tests |
 | D8 | PTY core and config-declared command adapter | Unlocks the long-tail CLI agents | PTY lifecycle test and process cleanup |
 | D9 | Shell overlay | Highest-value terminal surface, after the sanitizer owns the output path | PTY probe with the sanitizer fixtures |

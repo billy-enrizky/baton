@@ -21,7 +21,7 @@ The design is staged. Phase 1 creates one honest full-suite gate with hard budge
 
 Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command, and `--version` runs only after a build that is already budgeted.
 
-Phase 2 is in progress from recorded runs. The current warm Rust PR samples are 58, 60, 63, and 68 seconds; the CI-docs PR is 59 seconds. The Rust median is 61.5 seconds, above the target. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
+Phase 2 is in progress from recorded runs. The current warm Rust PR samples are 58, 60, 63, and 68 seconds; the CI-docs PR is 59 seconds. The Rust median is 61.5 seconds, above the target. A free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
 
 Budget rule, applied at every phase: Phase 1 uses three times a conservative cold estimate. Phase 2 sets each budget to the measured Linux p95 plus 20 percent. That reset is the only allowed increase. After it, a budget may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
 
@@ -45,6 +45,14 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 406 test floor is a lower bound, not a per-test lock. It blocks a drop below 406, while the inventory check requires every discovered test to execute. Deleting tests above that floor still needs review in the diff.
 
 Older local macOS measurements are historical and are not acceptance evidence. The acceptance record contains the Linux run-level data and the rejected experiments.
+
+## Runner experiment result
+
+The free `ubuntu-24.04-arm` runner is not adopted for Test. A temporary ARM job ran all 406 tests in 85 seconds cold and 33 seconds warm, with Test steps of 56 and 22 seconds. The 406-test x64 sample is [run 45011836996](https://github.com/billy-enrizky/baton/actions/runs/45011836996): a 47-second job with a 16-second step and a partial Cargo cache because it added `clap_complete`. The ARM run restored a full cache. The jobs differ in cache state and executed steps, so the timings are descriptive and not matched. No ARM performance advantage is claimed.
+
+Replacing the x64 Test job would move Linux x64 runtime tests after merge, and official merge queue is unavailable for this repository. A runtime-only x64 regression could then land without a pre-merge test. That violates the rule that no phase removes a passing check. Test stays on `ubuntu-24.04`. The option is closed unless a future proposal is additive, not a replacement, keeps an independent required x64 pre-merge Test job, and provides a matched rerun with identical steps, event shape, cache policy, and command under the 100-run or four-week policy. A merge queue alone is insufficient if it runs the same ARM job.
+
+The experiment is recorded in [ci-acceptance.md](ci-acceptance.md#rejected-arm-runner-experiment) with its runs, timings, cache sizes, and CI013 failure. The p50 miss remains; the next levers are gate integrity and measured critical-path work, not architecture substitution.
 
 ## What the gate enforces
 
@@ -131,7 +139,7 @@ This is visible in the PR, the merge API, and the next main run. It is not silen
 | 1A | Design and acceptance record | Create `docs/parity.md`, `docs/ci.md`, `docs/ci-acceptance.md`, `scripts/check_parity_paths.py`, `scripts/check_doc_links.py`; modify `README.md` | Both checkers print `0 missing`; the EGM review record has two consecutive clean rounds |
 | 1B | Trusted helpers, skills, and formal model | Create `ci/*.sh`, `ci/fixtures/**`, `ci/fmt-baseline.txt`, `ci/clippy-baseline.txt`, `ci/test-inventory-floor.txt`, `ci/formal/ci-admission/**`, `rust-toolchain.toml`, `.agents/skills/verify-baton-ci/**`, `.agents/skills/verify-baton-ci-formal/**` | `ci/selftest.sh` passes; a budget overrun exits 124; the formal gate passes locally; `cargo check`, `cargo build`, `cargo test`, and `ci/test-inventory.sh` pass |
 | 1C | Full-suite workflow | Create `.github/workflows/ci.yml`; modify `docs/ci.md` | Done: run 44982816103 executed every job with `verify` green, and run 44983114852 is the first green `main` push |
-| 2 | Record real timings and choose the test runner | `ci/test-timings.sh` records per-binary times; `docs/ci-acceptance.md` records the warm path | In progress: `cargo test` retained, nextest count shards rejected, warm PR samples at 58 and 59 seconds |
+| 2 | Record real timings and choose the test runner | `ci/test-timings.sh` records per-binary times; `docs/ci-acceptance.md` records the warm path and rejected runners | In progress: `cargo test` and the x64 runner retained; nextest count shards and the free ARM runner were rejected; the p50 miss remains |
 | 3 | Diff-aware selection and recorded-time shards | Create `ci/select-tests.sh`, `ci/plan-shards.sh`, `ci/test-groups.json`; modify `.github/workflows/ci.yml`, `ci/check-ci.sh`, `docs/ci.md` | Not started: selector fixtures and shard union proof still required |
 | 4 | Full format and lint plus local hooks | Create `.githooks/pre-commit`, `.githooks/pre-push`, `ci/install-hooks.sh`; modify `.github/workflows/ci.yml`, `docs/ci.md` | Format and Clippy baselines are zero and both are required; hooks run under budget |
 | 5 | Last-100-run audit and runner decision | Modify `docs/ci-acceptance.md` | PR p50/p95, queue p50/p95, cache hit rate, and a paid-runner decision, all from recorded runs |
@@ -296,7 +304,7 @@ Merge-candidate proof without a merge queue: when branch protection requires bra
 
 | Decision | Current state |
 |---|---|
-| Runner size | `ubuntu-24.04` hosted. No paid runner is approved |
+| Runner size | `ubuntu-24.04` hosted. No paid runner is approved; the free ARM runner was rejected for removing pre-merge x64 runtime coverage |
 | Test runner | `cargo test`; nextest count shards were rejected as unbalanced |
 | Merge queue | Blocked on repository ownership or plan |
 | Formal gate in CI | Local and recorded until the jar and JDK are pinned as artifacts |

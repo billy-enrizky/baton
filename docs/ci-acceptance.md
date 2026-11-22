@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-Status on 2026-11-22: the current warm Rust PR samples are 58, 60, 63, and 68 seconds. A separate CI-docs PR finished at 59 seconds. The Rust median is 61.5 seconds, above the target. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
+Status on 2026-11-22: the current warm Rust PR samples are 58, 60, 63, and 68 seconds. A separate CI-docs PR finished at 59 seconds. The Rust median is 61.5 seconds, above the target. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
 
 This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 
@@ -55,6 +55,23 @@ For PR 45004705055, Test job setup was 16 seconds, including 4 seconds for the r
 
 The slowest test binary was no longer a 30-second outlier. The lib binary ran 326 tests in 1.73 seconds. The seven integration binaries together ran 75 tests in 0.4 seconds.
 
+## Rejected ARM runner experiment
+
+The only Test job stays on `ubuntu-24.04` for every event. A temporary job on `ubuntu-24.04-arm` ran all 406 tests in both a cold and a warm run. The normal Test job was skipped in both experiment runs after Changes failed.
+
+| Run | State | ARM experiment job | Test step | `cargo test` real | Tests | Result |
+|---|---|---|---|---|---|---|
+| [45012384561](https://github.com/billy-enrizky/baton/actions/runs/45012384561) | cold | 85 seconds | 56 seconds | 55.43 seconds | 406 | ARM test passed; run failed Changes with CI013 |
+| [45012538857](https://github.com/billy-enrizky/baton/actions/runs/45012538857) | warm | 33 seconds | 22 seconds | 21.57 seconds | 406 | ARM test passed; run failed Changes with CI013 |
+
+The experiment omitted trusted-tool staging, the inventory step, the timing artifact, and the final cache keys. The dispatch failed at Changes, so no later gate, including the selection guard, exercised those paths. The 406-test x64 sample is [run 45011836996](https://github.com/billy-enrizky/baton/actions/runs/45011836996): a 47-second job with a 16-second test step and a partial Cargo cache because it added `clap_complete`. The warm ARM experiment was a 33-second job with a 22-second test step and a full Cargo cache. The jobs differ in both cache state and executed steps, so these timings are descriptive and not matched. No ARM performance advantage is claimed.
+
+The runner was rejected because replacing the x64 Test job would move Linux x64 runtime tests after merge, and official merge queue is unavailable for this repository. A runtime-only x64 regression could then land without a pre-merge test. The option is closed unless a future proposal is additive, not a replacement, and includes an independent required x64 pre-merge Test job. That proposal would need a matched rerun with identical steps, event shape, cache policy, and test command, and it would follow the same 100-run or four-week measurement policy. A merge queue alone is not enough if it runs the same ARM job.
+
+Both runs were `workflow_dispatch`, and `ci/check-ci.sh` rejects the temporary job-list change with CI013. `--allow-change` does not relax job-list equality.
+
+The warm ARM experiment restored 340,962,469 bytes for rustup in about 3 seconds and 248,109,421 bytes for Cargo in about 4 seconds. Those caches used a temporary key and were not adopted.
+
 ## How the critical path changed
 
 | Run | Event | Result | What changed |
@@ -94,6 +111,7 @@ Saves are restricted to `main`. A PR cannot write the cache that another PR rest
 | Put test repositories in `/dev/shm` | [45002182299](https://github.com/billy-enrizky/baton/actions/runs/45002182299) | Test 64 seconds; `/dev/shm` had 7.9 GB free | Rejected; the suite is not disk-bound |
 | Count-based nextest shards | [45002437721](https://github.com/billy-enrizky/baton/actions/runs/45002437721) | Shard 1 33 seconds, shard 2 61 seconds | Rejected; count partitions were unbalanced, and the run was red because the experiment changed the job list |
 | Install the pinned toolchain instead of restoring 391 MB | [45004219154](https://github.com/billy-enrizky/baton/actions/runs/45004219154), [45004357746](https://github.com/billy-enrizky/baton/actions/runs/45004357746) | Test 40 and 43 seconds against a 44 to 45 second baseline | Rejected; no consistent gain |
+| Temporary ARM Test job evaluated as a replacement | [45012384561](https://github.com/billy-enrizky/baton/actions/runs/45012384561), [45012538857](https://github.com/billy-enrizky/baton/actions/runs/45012538857) | Cold 85-second and warm 33-second ARM jobs; 406 tests each | Rejected; would remove x64 runtime from the pre-merge gate while merge queue is unavailable |
 
 The nextest experiment is not evidence for sharding. It showed that a count partition can put one 30-second test into a 61-second shard. After the cancellation fix the whole lib binary takes 1.73 seconds, so sharding is no longer on the critical path.
 
@@ -137,6 +155,8 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | [45009466461](https://github.com/billy-enrizky/baton/actions/runs/45009466461) | 1 | pull_request | `caa938fc89e5` | success | 60 seconds | 37 seconds | Inbox feature; 404 tests, inventory floor 404 |
 | [45010710576](https://github.com/billy-enrizky/baton/actions/runs/45010710576) | 1 | pull_request | `c2b7aedba674` | success | 68 seconds | 49 seconds | Inbox CLI; 405 tests, inventory floor 405 |
 | [45011836996](https://github.com/billy-enrizky/baton/actions/runs/45011836996) | 1 | pull_request | `0add32c101cf` | success | 63 seconds | 47 seconds | Shell completions; 406 tests |
+| [45012384561](https://github.com/billy-enrizky/baton/actions/runs/45012384561) | 1 | workflow_dispatch | `91b0d4fc3221` | failure | 96 seconds | 85 seconds | Cold ARM experiment; 406 tests passed, CI013 rejected the temporary job list |
+| [45012538857](https://github.com/billy-enrizky/baton/actions/runs/45012538857) | 1 | workflow_dispatch | `91b0d4fc3221` | failure | 44 seconds | 33 seconds | Warm ARM experiment; 406 tests passed, 21.57-second `cargo test` in a 22-second step, CI013 rejected the temporary job list |
 
 ## Proof log
 
@@ -150,6 +170,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Worker group cancellation fixed | PR #133, lib tests 30.06 to 1.69 seconds | Passed 2026-11-22 |
 | Gates start early | PR #135, dispatches 45004403409 and 45004517552 | Passed 2026-11-22 |
 | Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45010710576: 68 seconds; Rust PR 45011836996: 63 seconds; CI-docs PR 45005544007: 59 seconds | Rust median 61.5; above target |
+| ARM runner rejected | Runs 45012384561 and 45012538857: 406 tests, 85 and 33 second jobs | Rejected 2026-11-22; x64 Test retained |
 | Installer checksum rejection | `ci/installer-selftest.sh`; full selftest in 45000399622 | Passed locally and in CI |
 | Release assets and checksums | Release run 44999297170, `v0.3.0` | Passed 2026-11-22 |
 | Homebrew formula | Tap `billy-enrizky/homebrew-baton` | `brew audit`, `brew test`, and install passed locally |
@@ -158,11 +179,12 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 
 ## Review record
 
-The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as structural reviewer. Round 1 found the unsupported complete-archive claim and mixed measurement definitions. Rounds 2 through 4 found and fixed wrong Verify endpoints, retry handling, Rust and meta sample mixing, and percentile reporting inconsistencies. Round 7 caught an out-of-date-base run that the classifier labeled `unknown`; it was removed rather than counted as meta. Rounds 8 and 9 reported no Blocker or Major findings.
+The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as structural reviewer. Round 1 found the unsupported complete-archive claim and mixed measurement definitions. Rounds 2 through 4 found and fixed wrong Verify endpoints, retry handling, Rust and meta sample mixing, and percentile reporting inconsistencies. Round 7 caught an out-of-date-base run that the classifier labeled `unknown`; it was removed rather than counted as meta. Rounds 8 and 9 reported no Blocker or Major findings. Rounds 10 and 11 reviewed the ARM runner proposal with four fresh reviewers. They found test-step and job-duration conflation, mixed PR-feedback and job-duration metrics, and a blocker: an ARM-only PR Test job would remove Linux x64 runtime coverage from the pre-merge gate while merge queue is unavailable. The proposal was rejected and the x64 Test job retained.
 
 ## Open gaps
 
 - The current workflow has four warm Rust samples. The Rust median is 61.5 seconds and the maximum is 68 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist; the under-60 target is not met.
+- The free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. A future proposal must be additive, not a replacement, keep an independent required x64 pre-merge Test job, and provide a matched rerun under the 100-run or four-week measurement policy. A merge queue alone is insufficient if it runs the same ARM job.
 - The historical docs-only sample was n=1, median 44 seconds, max 44 seconds. The current workflow has no docs-only sample yet.
 - Queue p50 is 0 seconds on cited non-retry runs. Queue p95, setup p95, and cache hit rate are not established; setup has one 16-second sample against a 15-second target.
 - The repository is public. Standard GitHub-hosted runners are free. No paid-runner cost is approved or required by the current measurements.

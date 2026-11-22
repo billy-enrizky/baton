@@ -19,7 +19,7 @@ The design is staged. Phase 1 creates one honest full-suite gate with hard budge
 | Skipped required checks | Zero | Now |
 | Failed required check reported as success | Zero | Now |
 
-Phase 1 does not claim the 60/120 target. It claims a hard ceiling: every job has `timeout-minutes`, every command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command, and `--version` runs only after a build that is already budgeted. Phase 1 budgets are provisional because no GitHub Actions run exists yet, and they must shrink in Phase 2.
+Phase 1 does not claim the 60/120 target. It claims a hard ceiling: every job has `timeout-minutes`, every command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command, and `--version` runs only after a build that is already budgeted. Phase 1 budgets are provisional because no Actions run has executed a step yet: run 44969473815 scheduled every job and stopped on an account-billing error. They must shrink in Phase 2.
 
 Budget rule, applied at every phase: a budget starts at three times the measured cold p95 on the target runner, and may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
 
@@ -30,7 +30,7 @@ Measured on 2026-11-21 after PR #86 and PR #89 merged. The Baton baseline is `or
 | Measurement | `origin/main` `3b86d3c` |
 |---|---|
 | GitHub Actions workflows | None (Phase 1C adds the first one) |
-| GitHub Actions run history | None |
+| GitHub Actions run history | One run, 44969473815, which scheduled every job and executed no step because of account billing |
 | Discovered test count (`ci/test-inventory.sh`) | 358 |
 | `cargo fmt --check` `Diff in` lines | 890 |
 | Clippy `error:` lines with `-D warnings` | 61 |
@@ -45,7 +45,7 @@ Measured on 2026-11-21 after PR #86 and PR #89 merged. The Baton baseline is `or
 
 These are local macOS measurements, not GitHub Actions measurements. Phase 2 records Linux x64 queue, setup, compile, test, and verify times from real runs. No shard budget is accepted before that data exists.
 
-The formatting and Clippy counts are baseline debt. Phase 1 adds ratchets that reject growth and reject the suppression that would fake a smaller count. Full `format` and `lint` gates arrive only after the debt is cleared.
+The formatting and Clippy counts are baseline debt, 890 format diffs and 61 Clippy errors at `3b86d3c`. Phase 1 adds ratchets that reject growth and reject the suppression that would fake a smaller count. Full `format` and `lint` gates arrive only after the debt is cleared.
 
 ## What the gate enforces
 
@@ -70,7 +70,7 @@ Workflow invariants:
 | CI002 | Missing or non-numeric `timeout-minutes`, or a timeout of 360 minutes or more |
 | CI003 | A retry action, or `continue-on-error` at step or job level |
 | CI004 | `\|\| true`, `set +e`, or `set +o errexit` in a step |
-| CI005 | A missing `verify` job, `if: always()`, or a `needs` edge |
+| CI005 | A missing `verify` job, a missing `if: always()` on `verify`, or a missing `needs` edge |
 | CI006 | Top-level or job-level `permissions` other than read |
 | CI007 | A concurrency group that is not keyed by PR number and SHA, or a PR run that does not cancel |
 | CI008 | A `pull_request_target` trigger |
@@ -111,7 +111,7 @@ Head-controlled process configuration is rejected rather than compared. A workfl
 
 On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run on `main`; the PR run is where command drift is rejected.
 
-Changing a gate command is not a PR-level decision. There is no `ci-change` label and the workflow never passes `--allow-change`; that flag exists only for a local `ci-repair` run. A PR that changes a command, a `needs` edge, a gate `if`, a timeout, or a runner fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
+Changing a gate command is not a PR-level decision. There is no `ci-change` label. The workflow passes `--allow-change` only on `push`, `merge_group`, and `workflow_dispatch`, where the commit is already on a protected branch; a `pull_request` run never does. A PR that changes a command, a `needs` edge, a gate `if`, a timeout, or a runner fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
 
 The single escape hatch is `ci-repair`, and it is a human action rather than a workflow branch:
 
@@ -129,7 +129,7 @@ This is visible in the PR, the merge API, and the next main run. It is not silen
 |---|---|---|---|
 | 1A | Design and acceptance record | Create `docs/parity.md`, `docs/ci.md`, `docs/ci-acceptance.md`, `scripts/check_parity_paths.py`, `scripts/check_doc_links.py`; modify `README.md` | Both checkers print `0 missing`; the EGM review record has two consecutive clean rounds |
 | 1B | Trusted helpers, skills, and formal model | Create `ci/*.sh`, `ci/fixtures/**`, `ci/fmt-baseline.txt`, `ci/clippy-baseline.txt`, `ci/test-inventory-floor.txt`, `ci/formal/ci-admission/**`, `rust-toolchain.toml`, `.agents/skills/verify-baton-ci/**`, `.agents/skills/verify-baton-ci-formal/**` | `ci/selftest.sh` passes; a budget overrun exits 124; the formal gate passes locally; `cargo check`, `cargo build`, `cargo test`, and `ci/test-inventory.sh` pass |
-| 1C | Full-suite workflow | Create `.github/workflows/ci.yml`; modify `docs/ci.md` | One green `main` run; one PR run with every job and `verify`; the workflow guard rejects a no-op test command |
+| 1C | Full-suite workflow | Create `.github/workflows/ci.yml`; modify `docs/ci.md` | One PR run in which every job executed and `verify` completed green; one green `main` push run; the workflow guard rejects a no-op test command. Currently blocked on account billing |
 | 2 | Record real timings and choose the test runner | Create `ci/record-timings.sh`, `ci/test-timings.json`; add one non-gating `timings` job to the workflow; modify `docs/ci-acceptance.md` | At least 10 PR runs and 5 `main` pushes; nextest and `cargo test` compared on the same runner; Phase 1 budgets replaced with measured p95 plus 20 percent |
 | 3 | Diff-aware selection and recorded-time shards | Create `ci/select-tests.sh`, `ci/plan-shards.sh`, `ci/test-groups.json`; modify `.github/workflows/ci.yml`, `ci/check-ci.sh`, `docs/ci.md` | Selector fixtures including transitive and `lib.rs` cases; shard union equals the discovered inventory; Rust PR feedback p95 under 120 seconds |
 | 4 | Full format and lint plus local hooks | Create `.githooks/pre-commit`, `.githooks/pre-push`, `ci/install-hooks.sh`; modify `.github/workflows/ci.yml`, `docs/ci.md` | Format and Clippy baselines are zero and both are required; hooks run under budget |

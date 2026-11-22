@@ -8437,11 +8437,34 @@ mod tests {
             .collect()
     }
 
+    /// Provider switching refuses a harness that is not on PATH, which is
+    /// correct in the product and wrong for a test host with no harnesses.
+    /// Prepend stubs once for the whole test binary.
+    fn ensure_fake_harnesses() {
+        use std::os::unix::fs::PermissionsExt;
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let root =
+                std::env::temp_dir().join(format!("baton-fake-harnesses-{}", std::process::id()));
+            std::fs::create_dir_all(&root).unwrap();
+            for provider in ProviderId::all() {
+                let path = root.join(provider.binary_name());
+                std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut dirs = vec![root];
+            dirs.extend(std::env::split_paths(&path));
+            std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+        });
+    }
+
     fn test_state(
         home: &std::path::Path,
         store: &Arc<Mutex<BatonStore>>,
         history: Vec<MessageRow>,
     ) -> TuiState {
+        ensure_fake_harnesses();
         let thread = store
             .lock()
             .unwrap()

@@ -578,3 +578,41 @@ fn files_match_a_single_token_subsequence() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["files"], serde_json::json!([]));
 }
+
+#[cfg(unix)]
+#[test]
+fn open_records_a_recent_file_for_files_ranking() {
+    let project = init_project();
+    let home = tempfile::tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_baton");
+    let output = Command::new(binary)
+        .args([
+            "-C",
+            project.path().to_str().unwrap(),
+            "open",
+            "README.md",
+            "--print",
+        ])
+        .env("BATON_HOME", home.path())
+        .env("EDITOR", "vim")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let output = Command::new(binary)
+        .args(["-C", project.path().to_str().unwrap(), "files", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["files"][0], "README.md");
+}

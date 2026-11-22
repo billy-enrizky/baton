@@ -34,6 +34,8 @@ pub struct FileOptions<'a> {
     pub query: Option<&'a str>,
     pub limit: usize,
     pub include_ignored: bool,
+    /// Most recently picked paths, newest first.
+    pub recent: &'a [String],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -91,7 +93,13 @@ pub fn list_files(root: &Path, options: FileOptions<'_>) -> Result<FileListing> 
         )?
     };
     let capped = candidate_set.truncated;
-    let mut candidates = rank_candidates(candidate_set.items, options.query);
+    let recent = options
+        .recent
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.to_lowercase(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut candidates = rank_candidates_with_recent(candidate_set.items, options.query, &recent);
     let truncated = capped || candidates.len() > options.limit;
     candidates.truncate(options.limit);
     Ok(FileListing {
@@ -99,6 +107,14 @@ pub fn list_files(root: &Path, options: FileOptions<'_>) -> Result<FileListing> 
         truncated,
         capped,
     })
+}
+
+/// Canonical directory key for the recent-file list.
+pub fn recent_project_key(cwd: &str) -> String {
+    std::fs::canonicalize(cwd)
+        .unwrap_or_else(|_| PathBuf::from(cwd))
+        .to_string_lossy()
+        .to_string()
 }
 
 pub fn resolve_project_file(root: &Path, path: &Path) -> Result<PathBuf> {
@@ -463,7 +479,12 @@ pub fn match_positions(path: &str, query: &str) -> Vec<usize> {
     positions
 }
 
-fn sorted_indices(entries: &[String], query: &str, tokens: &[&str]) -> Vec<usize> {
+fn sorted_indices(
+    entries: &[String],
+    query: &str,
+    tokens: &[&str],
+    recent: &std::collections::HashMap<String, usize>,
+) -> Vec<usize> {
     let mut indices = entries
         .iter()
         .enumerate()
@@ -472,7 +493,7 @@ fn sorted_indices(entries: &[String], query: &str, tokens: &[&str]) -> Vec<usize
         .collect::<Vec<_>>();
     indices.sort_by_cached_key(|index| {
         (
-            rank_key(&entries[*index], query, tokens),
+            rank_key(&entries[*index], query, tokens, recent),
             entries[*index].clone(),
         )
     });
@@ -481,15 +502,38 @@ fn sorted_indices(entries: &[String], query: &str, tokens: &[&str]) -> Vec<usize
 
 /// Ranked indices for a query, shared by the CLI and the TUI picker.
 pub fn ranked_indices(entries: &[String], query: &str) -> Vec<usize> {
-    let query = query.trim().to_lowercase();
-    let tokens = query.split_whitespace().collect::<Vec<_>>();
-    sorted_indices(entries, &query, &tokens)
+    ranked_indices_with_recent(entries, query, &[])
 }
 
+/// Ranked indices with recently picked paths breaking ties.
+pub fn ranked_indices_with_recent(
+    entries: &[String],
+    query: &str,
+    recent: &[String],
+) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    let tokens = query.split_whitespace().collect::<Vec<_>>();
+    let recent = recent
+        .iter()
+        .enumerate()
+        .map(|(index, path)| (path.to_lowercase(), index))
+        .collect::<std::collections::HashMap<_, _>>();
+    sorted_indices(entries, &query, &tokens, &recent)
+}
+
+#[cfg(test)]
 fn rank_candidates(candidates: Vec<String>, query: Option<&str>) -> Vec<String> {
+    rank_candidates_with_recent(candidates, query, &std::collections::HashMap::new())
+}
+
+fn rank_candidates_with_recent(
+    candidates: Vec<String>,
+    query: Option<&str>,
+    recent: &std::collections::HashMap<String, usize>,
+) -> Vec<String> {
     let query = query.map(str::trim).unwrap_or("").to_lowercase();
     let tokens = query.split_whitespace().collect::<Vec<_>>();
-    let indices = sorted_indices(&candidates, &query, &tokens);
+    let indices = sorted_indices(&candidates, &query, &tokens, recent);
     let mut slots = candidates.into_iter().map(Some).collect::<Vec<_>>();
     indices
         .into_iter()
@@ -497,7 +541,12 @@ fn rank_candidates(candidates: Vec<String>, query: Option<&str>) -> Vec<String> 
         .collect()
 }
 
-fn rank_key(path: &str, query: &str, tokens: &[&str]) -> (u8, usize, String) {
+fn rank_key(
+    path: &str,
+    query: &str,
+    tokens: &[&str],
+    recent: &std::collections::HashMap<String, usize>,
+) -> (u8, usize, usize, String) {
     let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
     let path = path.to_lowercase();
     let score = if query.is_empty() {
@@ -515,8 +564,9 @@ fn rank_key(path: &str, query: &str, tokens: &[&str]) -> (u8, usize, String) {
     } else {
         5
     };
+    let recency = recent.get(&path).copied().unwrap_or(usize::MAX);
     let length = if score >= 4 { path.chars().count() } else { 0 };
-    (score, length, path)
+    (score, recency, length, path)
 }
 
 fn escapes_next(input: &str, index: usize) -> bool {
@@ -643,6 +693,67 @@ mod tests {
     fn invalid_utf8_paths_are_skipped() {
         let candidates = parse_null_paths(b"ok.txt\0bad\xFF.txt\0", &[]);
         assert_eq!(candidates.items, vec!["ok.txt"]);
+    }
+
+    #[test]
+    fn recent_paths_break_ties_without_beating_match_quality() {
+        let recent = ["src/main.rs".to_string()];
+        let recent_map = recent
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.to_lowercase(), index))
+            .collect::<std::collections::HashMap<_, _>>();
+        let ranked = rank_candidates_with_recent(
+            vec!["README.md".to_string(), "src/main.rs".to_string()],
+            None,
+            &recent_map,
+        );
+        assert_eq!(ranked, vec!["src/main.rs", "README.md"]);
+
+        let recent = ["src/notes_readme.rs".to_string()];
+        let recent_map = recent
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.to_lowercase(), index))
+            .collect::<std::collections::HashMap<_, _>>();
+        let ranked = rank_candidates_with_recent(
+            vec!["src/notes_readme.rs".to_string(), "README.md".to_string()],
+            Some("readme"),
+            &recent_map,
+        );
+        assert_eq!(ranked, vec!["README.md", "src/notes_readme.rs"]);
+
+        let recent = ["src/Main.rs".to_string()];
+        let recent_map = recent
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.to_lowercase(), index))
+            .collect::<std::collections::HashMap<_, _>>();
+        let ranked = rank_candidates_with_recent(
+            vec!["README.md".to_string(), "src/main.rs".to_string()],
+            None,
+            &recent_map,
+        );
+        assert_eq!(ranked, vec!["src/main.rs", "README.md"]);
+
+        let recent = ["p/m/o/d/long_name_extra.rs".to_string()];
+        let recent_map = recent
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.to_lowercase(), index))
+            .collect::<std::collections::HashMap<_, _>>();
+        let ranked = rank_candidates_with_recent(
+            vec![
+                "p/m/o/d/short.rs".to_string(),
+                "p/m/o/d/long_name_extra.rs".to_string(),
+            ],
+            Some("pmod"),
+            &recent_map,
+        );
+        assert_eq!(
+            ranked,
+            vec!["p/m/o/d/long_name_extra.rs", "p/m/o/d/short.rs"]
+        );
     }
 
     #[test]

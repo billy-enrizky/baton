@@ -173,6 +173,7 @@ pub struct MemoryRow {
 
 const MEMORY_TEXT_LIMIT: usize = 2000;
 const MEMORY_SCOPE_LIMIT: i64 = 200;
+pub const RECENT_FILE_LIMIT: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct ProviderProcessRow {
@@ -298,6 +299,14 @@ CREATE TABLE IF NOT EXISTS memories (
   UNIQUE(scope, cwd, text)
 );
 CREATE INDEX IF NOT EXISTS memories_scope_cwd_idx ON memories (scope, cwd, id);
+CREATE TABLE IF NOT EXISTS recent_files (
+  project_path TEXT NOT NULL,
+  path TEXT NOT NULL,
+  picked_at TEXT NOT NULL,
+  seq INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (project_path, path)
+);
+CREATE INDEX IF NOT EXISTS recent_files_project_idx ON recent_files (project_path, seq DESC);
 CREATE TABLE IF NOT EXISTS checkpoints (
   thread_id TEXT NOT NULL,
   turn INTEGER NOT NULL,
@@ -390,6 +399,7 @@ fn apply_schema(db: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(db, "provider_processes", "process_start", "TEXT")?;
+    ensure_column(db, "recent_files", "seq", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(db, "orchestration_tasks", "commit_sha", "TEXT")?;
     ensure_column(db, "orchestration_tasks", "merged_at", "TEXT")?;
     ensure_column(db, "orchestration_tasks", "position", "INTEGER NOT NULL DEFAULT 0")?;
@@ -1237,6 +1247,75 @@ impl BatonStore {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Records a picked project file. The newest pick moves to the front and
+    /// the table keeps only the most recent `RECENT_FILE_LIMIT` paths per project.
+    pub fn record_recent_file(&self, project_path: &str, path: &str) -> Result<()> {
+        let picked_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let transaction = self.db.unchecked_transaction()?;
+        let seq: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM recent_files WHERE project_path = ?1",
+            params![project_path],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO recent_files (project_path, path, picked_at, seq)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(project_path, path) DO UPDATE SET
+               picked_at = excluded.picked_at,
+               seq = excluded.seq",
+            params![project_path, path, picked_at, seq],
+        )?;
+        transaction.execute(
+            "DELETE FROM recent_files
+             WHERE project_path = ?1 AND path NOT IN (
+               SELECT path FROM recent_files
+               WHERE project_path = ?1
+               ORDER BY seq DESC, picked_at DESC, path ASC
+               LIMIT ?2
+             )",
+            params![project_path, RECENT_FILE_LIMIT as i64],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Most recently picked paths for one project, newest first.
+    pub fn list_recent_files(&self, project_path: &str, limit: usize) -> Result<Vec<String>> {
+        let mut statement = self.db.prepare(
+            "SELECT path FROM recent_files
+             WHERE project_path = ?1
+             ORDER BY seq DESC, picked_at DESC, path ASC
+             LIMIT ?2",
+        )?;
+        let rows = statement
+            .query_map(params![project_path, limit as i64], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        Ok(rows)
+    }
+
+    /// Removes recent-file rows whose project directory no longer exists.
+    pub fn prune_missing_recent_projects(&self) -> Result<usize> {
+        let project_paths = {
+            let mut statement = self
+                .db
+                .prepare("SELECT DISTINCT project_path FROM recent_files")?;
+            let rows = statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            rows
+        };
+        let mut removed = 0;
+        for project_path in project_paths {
+            if !Path::new(&project_path).is_dir() {
+                removed += self.db.execute(
+                    "DELETE FROM recent_files WHERE project_path = ?",
+                    params![project_path],
+                )?;
+            }
+        }
+        Ok(removed)
     }
 
     /// Every memory row, used by the read-only MCP `all` view.
@@ -2497,6 +2576,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn recent_files_upsert_and_order() {
+        let store = BatonStore::memory().unwrap();
+        store.record_recent_file("/p", "a.rs").unwrap();
+        store.record_recent_file("/p", "b.rs").unwrap();
+        store.record_recent_file("/p", "a.rs").unwrap();
+        assert_eq!(
+            store.list_recent_files("/p", 10).unwrap(),
+            vec!["a.rs".to_string(), "b.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn recent_files_are_project_scoped() {
+        let store = BatonStore::memory().unwrap();
+        store.record_recent_file("/p", "a.rs").unwrap();
+        store.record_recent_file("/q", "b.rs").unwrap();
+        assert_eq!(
+            store.list_recent_files("/p", 10).unwrap(),
+            vec!["a.rs".to_string()]
+        );
+        assert_eq!(
+            store.list_recent_files("/q", 10).unwrap(),
+            vec!["b.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn recent_files_are_capped() {
+        let store = BatonStore::memory().unwrap();
+        for index in 0..(RECENT_FILE_LIMIT + 5) {
+            store
+                .record_recent_file("/p", &format!("f{index}.rs"))
+                .unwrap();
+        }
+        let recent = store.list_recent_files("/p", 1000).unwrap();
+        assert_eq!(recent.len(), RECENT_FILE_LIMIT);
+        assert!(!recent.contains(&"f0.rs".to_string()));
+        assert!(recent.contains(&format!("f{}.rs", RECENT_FILE_LIMIT + 4)));
+    }
+
+    #[test]
+    fn missing_recent_projects_are_pruned() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir(&project).unwrap();
+        let store = BatonStore::memory().unwrap();
+        store
+            .record_recent_file(project.to_str().unwrap(), "a.rs")
+            .unwrap();
+        assert_eq!(store.prune_missing_recent_projects().unwrap(), 0);
+        std::fs::remove_dir(&project).unwrap();
+        assert_eq!(store.prune_missing_recent_projects().unwrap(), 1);
+        assert!(store
+            .list_recent_files(project.to_str().unwrap(), 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn recent_files_survive_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        {
+            let store = BatonStore::open(&path).unwrap();
+            store.record_recent_file("/p", "src/main.rs").unwrap();
+        }
+        let store = BatonStore::open(&path).unwrap();
+        assert_eq!(
+            store.list_recent_files("/p", 10).unwrap(),
+            vec!["src/main.rs".to_string()]
+        );
+    }
+
+    #[test]
     fn pin_order_keys_advance_within_one_microsecond() {
         let base = DateTime::parse_from_rfc3339("2026-01-02T03:04:05.006000Z")
             .unwrap()
@@ -2513,4 +2666,3 @@ mod tests {
         );
     }
 }
-

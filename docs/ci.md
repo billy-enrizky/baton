@@ -27,7 +27,7 @@ Budget rule, applied at every phase: Phase 1 uses three times a conservative col
 
 ## Current baseline
 
-Measured on 2026-11-22 at `origin/main` `be31fc5`, after the cancellation and gate-start changes landed.
+Measured on 2026-11-22 from the cited runs. The Rust sample was based on `be31fc5`; current main is `9112c06` after the verification probe change.
 
 | Measurement | Current value | Evidence |
 |---|---|---|

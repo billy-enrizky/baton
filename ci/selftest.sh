@@ -2,6 +2,14 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "$0")" && pwd)
+repo_root=${BATON_REPO_ROOT:-}
+if [ -z "$repo_root" ]; then
+    if [ -f "$PWD/Cargo.toml" ]; then
+        repo_root=$PWD
+    else
+        repo_root=$(cd -- "$root/.." && pwd)
+    fi
+fi
 
 for fixture in "$root"/fixtures/paths/*.txt; do
   expected="${fixture%.txt}.expected"
@@ -170,6 +178,6 @@ if [[ "$(cat "$timings_out")" != "$expected_timings" ]]; then
   exit 1
 fi
 
-bash "$root/installer-selftest.sh"
+bash "$root/installer-selftest.sh" "$repo_root"
 
 echo "ci selftest passed"

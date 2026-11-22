@@ -2,6 +2,7 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "$0")/.." && pwd)
+repo_root=${1:-$root}
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/baton-installer-selftest.XXXXXX")
 trap 'rm -rf "$tmp"' EXIT
 
@@ -68,14 +69,14 @@ chmod 755 "$fake/uname" "$fake/curl"
 BATON_TEST_RELEASE="$release" \
 BATON_INSTALL_DIR="$install" \
 PATH="$fake:$PATH" \
-    "$root/install.sh" >/dev/null
+    "$repo_root/install.sh" >/dev/null
 [ "$("$install/baton" --version)" = "baton 0.3.0" ]
 
 printf 'corrupt\n' >>"$release/baton-x86_64-unknown-linux-gnu.tar.gz"
 if BATON_TEST_RELEASE="$release" \
     BATON_INSTALL_DIR="$tmp/bad/bin" \
     PATH="$fake:$PATH" \
-    "$root/install.sh" >/dev/null 2>&1; then
+    "$repo_root/install.sh" >/dev/null 2>&1; then
     echo "installer accepted a checksum mismatch" >&2
     exit 1
 fi

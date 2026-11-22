@@ -4,6 +4,9 @@ use anyhow::Result;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
+
+static WORKTREE_CREATE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeInfo {
@@ -428,6 +431,10 @@ pub fn create_at(
     title: &str,
     base_ref: &str,
 ) -> Result<WorktreeInfo> {
+    // Git's worktree metadata and refs are shared by the repository.
+    let _create_guard = WORKTREE_CREATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let short = run_id.chars().take(8).collect::<String>();
     let slug = slugify(title);
     let branch = format!("baton/{short}/{slug}");
@@ -711,6 +718,32 @@ mod tests {
         remove(&second).unwrap();
         assert!(!first.path.exists());
         assert!(!second.path.exists());
+
+        let parallel = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..6)
+                .map(|index| {
+                    let home = home.path();
+                    let repo_root = &repo_root;
+                    scope.spawn(move || {
+                        create(
+                            home,
+                            repo_root,
+                            "run-parallel",
+                            &format!("Parallel task {index}"),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap().unwrap())
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(parallel.len(), 6);
+        for worktree in &parallel {
+            assert!(worktree.path.is_dir());
+            remove(worktree).unwrap();
+        }
     }
 
     #[test]

@@ -1,12 +1,23 @@
 //! Git worktree lifecycle for isolated worker threads.
 
 use anyhow::Result;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 
-static WORKTREE_CREATE_LOCK: Mutex<()> = Mutex::new(());
+fn worktree_create_lock(repo_root: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+    let mut locks = LOCKS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    Arc::clone(locks.entry(key).or_default())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorktreeInfo {
@@ -431,8 +442,10 @@ pub fn create_at(
     title: &str,
     base_ref: &str,
 ) -> Result<WorktreeInfo> {
-    // Git's worktree metadata and refs are shared by the repository.
-    let _create_guard = WORKTREE_CREATE_LOCK
+    // Git's worktree metadata and refs are shared within one repository, but
+    // unrelated repositories must not wait on each other.
+    let create_lock = worktree_create_lock(repo_root);
+    let _create_guard = create_lock
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let short = run_id.chars().take(8).collect::<String>();

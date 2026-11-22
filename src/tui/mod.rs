@@ -2684,6 +2684,29 @@ fn move_pinned_thread(
             return None;
         }
     };
+    let (thread, outcome) = perform_pin_move(state, store, thread_id, up)?;
+    if outcome != PinMoveOutcome::Moved {
+        return None;
+    }
+    let threads = project_thread_choices(state, store);
+    let selected = threads
+        .iter()
+        .position(|choice| choice.full_id == thread.id)
+        .unwrap_or(0);
+    state.overlay = Overlay::ThreadPicker {
+        selected,
+        threads,
+        action: ThreadPickerAction::Pin,
+    };
+    Some(())
+}
+
+fn perform_pin_move(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    thread_id: &str,
+    up: bool,
+) -> Option<(ThreadRow, PinMoveOutcome)> {
     let thread = {
         let guard = store.lock().unwrap();
         match resolve_project_thread(&guard, &state.thread.cwd, thread_id) {
@@ -2725,22 +2748,55 @@ fn move_pinned_thread(
             return None;
         }
     }
-    let threads = project_thread_choices(state, store);
-    let selected = threads
-        .iter()
-        .position(|choice| choice.full_id == thread.id)
-        .unwrap_or(0);
-    state.overlay = Overlay::ThreadPicker {
-        selected,
-        threads,
-        action: ThreadPickerAction::Pin,
-    };
     state.notice = Some(format!(
         "moved {} {}",
         thread.title,
         if up { "up" } else { "down" }
     ));
-    Some(())
+    Some((thread, outcome))
+}
+
+fn reorder_selected_pin(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    selected: usize,
+    threads: Vec<ThreadChoice>,
+    up: bool,
+) {
+    let Some(thread_id) = threads.get(selected).map(|choice| choice.full_id.clone()) else {
+        state.overlay = Overlay::ThreadPicker {
+            selected,
+            threads,
+            action: ThreadPickerAction::Pin,
+        };
+        return;
+    };
+    let Some((thread, outcome)) = perform_pin_move(state, store, &thread_id, up) else {
+        state.overlay = Overlay::ThreadPicker {
+            selected,
+            threads,
+            action: ThreadPickerAction::Pin,
+        };
+        return;
+    };
+    if outcome == PinMoveOutcome::Moved {
+        let threads = project_thread_choices(state, store);
+        let selected = threads
+            .iter()
+            .position(|choice| choice.full_id == thread.id)
+            .unwrap_or(selected);
+        state.overlay = Overlay::ThreadPicker {
+            selected,
+            threads,
+            action: ThreadPickerAction::Pin,
+        };
+    } else {
+        state.overlay = Overlay::ThreadPicker {
+            selected,
+            threads,
+            action: ThreadPickerAction::Pin,
+        };
+    }
 }
 
 fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread_id: &str) {
@@ -3415,6 +3471,25 @@ fn handle_key(
             action,
         } => match key.code {
             KeyCode::Esc => {}
+            KeyCode::Up
+                if action == ThreadPickerAction::Pin && key.modifiers == KeyModifiers::CONTROL =>
+            {
+                reorder_selected_pin(state, store, selected, threads, true);
+            }
+            KeyCode::Down
+                if action == ThreadPickerAction::Pin && key.modifiers == KeyModifiers::CONTROL =>
+            {
+                reorder_selected_pin(state, store, selected, threads, false);
+            }
+            KeyCode::Up | KeyCode::Down
+                if action == ThreadPickerAction::Pin && !key.modifiers.is_empty() =>
+            {
+                state.overlay = Overlay::ThreadPicker {
+                    selected,
+                    threads,
+                    action,
+                };
+            }
             KeyCode::Up => {
                 if !threads.is_empty() {
                     let new_selected = (selected + threads.len() - 1) % threads.len();
@@ -7809,7 +7884,7 @@ fn draw_thread_picker(
 ) {
     let heading = match action {
         ThreadPickerAction::Open => "threads · enter open · esc close",
-        ThreadPickerAction::Pin => "pin · enter toggle · esc close",
+        ThreadPickerAction::Pin => "pin · ctrl+↑/↓ move · enter toggle · esc close",
     };
     let mut lines: Vec<Line> = vec![Line::styled(heading, Style::default().fg(COLORS.muted))];
     let visible = 8;
@@ -9305,6 +9380,12 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         }
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        let mut key = key(code);
+        key.modifiers = modifiers;
+        key
     }
 
     fn state_with_prior_turn(home: &std::path::Path, store: &Arc<Mutex<BatonStore>>) -> TuiState {
@@ -12969,6 +13050,10 @@ mod tests {
             action: ThreadPickerAction::Pin,
         };
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(
+            text.contains("pin · ctrl+↑/↓ move · enter toggle · esc close"),
+            "{text}"
+        );
         assert!(text.contains("thread 9"), "{text}");
         assert!(!text.contains("thread 1  "), "{text}");
         assert_eq!(text.matches('❯').count(), 1, "{text}");
@@ -13214,6 +13299,223 @@ mod tests {
         assert!(!all.iter().any(|choice| choice == "/pin move"));
         assert!(!all.iter().any(|choice| choice.contains(&unpinned.id[..8])));
         assert!(!all.iter().any(|choice| choice.contains(&foreign.id[..8])));
+    }
+
+    #[test]
+    fn pin_picker_ctrl_arrows_reorder_without_closing() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let mut threads = Vec::new();
+        for title in ["first", "second", "third"] {
+            let thread = store
+                .lock()
+                .unwrap()
+                .create_thread(NewThread {
+                    title: title.to_string(),
+                    cwd: state.thread.cwd.clone(),
+                    current_provider: ProviderId::Codex,
+                    current_model: None,
+                })
+                .unwrap();
+            store
+                .lock()
+                .unwrap()
+                .set_thread_pinned(&thread.id, true)
+                .unwrap();
+            threads.push(thread);
+        }
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/pin");
+        let Overlay::ThreadPicker {
+            threads: picker,
+            action,
+            ..
+        } = &state.overlay
+        else {
+            panic!("expected the pin picker");
+        };
+        assert_eq!(*action, ThreadPickerAction::Pin);
+        assert_eq!(
+            picker
+                .iter()
+                .take(3)
+                .map(|choice| choice.full_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                threads[2].id.as_str(),
+                threads[1].id.as_str(),
+                threads[0].id.as_str()
+            ]
+        );
+        state.overlay = Overlay::ThreadPicker {
+            selected: 1,
+            threads: picker.clone(),
+            action: ThreadPickerAction::Pin,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            modified_key(KeyCode::Up, KeyModifiers::CONTROL),
+        );
+        let Overlay::ThreadPicker {
+            selected,
+            threads: picker,
+            action,
+        } = &state.overlay
+        else {
+            panic!("expected the pin picker after Ctrl+Up");
+        };
+        assert_eq!(*action, ThreadPickerAction::Pin);
+        assert_eq!(*selected, 0);
+        assert_eq!(picker[0].full_id, threads[1].id);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("moved second up")),
+            "{:?}",
+            state.notice
+        );
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            modified_key(KeyCode::Down, KeyModifiers::CONTROL),
+        );
+        let Overlay::ThreadPicker {
+            selected,
+            threads: picker,
+            action,
+        } = &state.overlay
+        else {
+            panic!("expected the pin picker after Ctrl+Down");
+        };
+        assert_eq!(*action, ThreadPickerAction::Pin);
+        assert_eq!(*selected, 1);
+        assert_eq!(picker[1].full_id, threads[1].id);
+        let display = store
+            .lock()
+            .unwrap()
+            .list_threads_for_path_display(std::path::Path::new(&state.thread.cwd))
+            .unwrap()
+            .into_iter()
+            .filter(|thread| thread.pinned)
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            display,
+            vec![
+                threads[2].id.clone(),
+                threads[1].id.clone(),
+                threads[0].id.clone()
+            ]
+        );
+    }
+
+    #[test]
+    fn pin_picker_ctrl_arrows_report_boundaries_and_unpinned() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let mut threads = Vec::new();
+        for title in ["first", "second"] {
+            let thread = store
+                .lock()
+                .unwrap()
+                .create_thread(NewThread {
+                    title: title.to_string(),
+                    cwd: state.thread.cwd.clone(),
+                    current_provider: ProviderId::Codex,
+                    current_model: None,
+                })
+                .unwrap();
+            store
+                .lock()
+                .unwrap()
+                .set_thread_pinned(&thread.id, true)
+                .unwrap();
+            threads.push(thread);
+        }
+        let _unpinned = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "unpinned".to_string(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/pin");
+        state.overlay = Overlay::ThreadPicker {
+            selected: 0,
+            threads: match &state.overlay {
+                Overlay::ThreadPicker { threads, .. } => threads.clone(),
+                _ => panic!("expected the pin picker"),
+            },
+            action: ThreadPickerAction::Pin,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            modified_key(KeyCode::Up, KeyModifiers::CONTROL),
+        );
+        let Overlay::ThreadPicker { selected, .. } = &state.overlay else {
+            panic!("expected the pin picker at first");
+        };
+        assert_eq!(*selected, 0);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("already first")),
+            "{:?}",
+            state.notice
+        );
+
+        state.overlay = Overlay::ThreadPicker {
+            selected: 2,
+            threads: match &state.overlay {
+                Overlay::ThreadPicker { threads, .. } => threads.clone(),
+                _ => panic!("expected the pin picker"),
+            },
+            action: ThreadPickerAction::Pin,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            modified_key(KeyCode::Down, KeyModifiers::CONTROL),
+        );
+        let Overlay::ThreadPicker { selected, .. } = &state.overlay else {
+            panic!("expected the pin picker at unpinned");
+        };
+        assert_eq!(*selected, 2);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("pin unpinned before moving")),
+            "{:?}",
+            state.notice
+        );
+
+        state.notice = None;
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            modified_key(KeyCode::Up, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        );
+        assert!(matches!(state.overlay, Overlay::ThreadPicker { .. }));
+        assert!(state.notice.is_none());
     }
 
     #[test]

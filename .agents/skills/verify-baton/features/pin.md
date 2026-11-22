@@ -3,6 +3,7 @@
 ## Sub-features
 - `/pin` opens a scrolling picker of every thread in the current project.
 - Up/Down selects a thread; Enter toggles its durable pin without opening it; Esc closes.
+- Ctrl+Up and Ctrl+Down move the selected pinned thread by one adjacent pinned thread without closing the picker.
 - Rows show the full thread ID, a single `❯` cursor on the selected row, and a `pinned` marker.
 - Pinned threads sort before unpinned threads in display order for `/threads`, `/open`, `/pin`, and `baton threads`; implicit CLI/MCP resolution stays newest-first.
 - `/pin move <id> up` and `/pin move <id> down` swap a pinned thread with the adjacent pinned thread in the current project, never across the unpinned group.
@@ -29,7 +30,7 @@ baton -C <project> threads --json
   --evidence-dir local_docs/verification/evidence
 ```
 
-The probe opens `/pin` for the TUI's current durable thread, requires the picker heading and row, presses Enter, and independently requires the pinned row marker and the pinned notice. It creates a second thread, pins it, runs a real `/pin move <second-id> down`, requires the moved notice, the refreshed picker, and the swapped row order, then runs the same move again and requires the last-position boundary notice. It exits cleanly with `/quit`.
+The probe opens `/pin` for the TUI's current durable thread, requires the picker heading and row, presses Enter, and independently requires the pinned row marker and the pinned notice. It creates a second thread, pins it, runs a real `/pin move <second-id> down`, requires the moved notice, the refreshed picker, and the swapped row order, then runs the same move again and requires the last-position boundary notice. It reopens the picker, sends Ctrl+Down, and requires the moved notice, refreshed order, selected row, and picker still open. It exits cleanly with `/quit`.
 
 For the focused store and TUI checks:
 ```sh
@@ -46,6 +47,8 @@ cargo test --locked --lib tui::tests::thread_picker_window_follows_selection_pas
 cargo test --locked --lib tui::tests::pin_prefix_rejects_foreign_and_ambiguous_matches -- --exact
 cargo test --locked --lib tui::tests::pin_move_reorders_and_refreshes_the_picker -- --exact
 cargo test --locked --lib tui::tests::pin_move_choices_are_exposed -- --exact
+cargo test --locked --lib tui::tests::pin_picker_ctrl_arrows_reorder_without_closing -- --exact
+cargo test --locked --lib tui::tests::pin_picker_ctrl_arrows_report_boundaries_and_unpinned -- --exact
 cargo test --locked --lib mcp::tests::default_status_keeps_newest_thread_when_older_is_pinned -- --exact
 ```
 
@@ -59,6 +62,7 @@ cargo test --locked --lib mcp::tests::default_status_keeps_newest_thread_when_ol
 - Backfill truncates both `updated_at` and the existing maximum to microseconds before comparison, and malformed timestamps inherit the maximum instead of reading the wall clock.
 - Direct `/pin <prefix>` resolves only within the current project and rejects an ambiguous prefix. Completion inserts an eight-character prefix; the picker shows the full ID to disambiguate.
 - The probe closes the post-toggle picker before running the move. A successful move opens a refreshed picker; a boundary move only changes the notice.
+- Ctrl+Shift and other extra modifier combinations are no-ops that keep the picker open. Only exact Ctrl+Up and Ctrl+Down reorder.
 
 ## Design record
 

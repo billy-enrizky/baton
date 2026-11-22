@@ -105,7 +105,7 @@ def main() -> int:
         os.write(master, b"/pin\r")
         pump(master, 1.5, transcript)
         pin_picker = screen_text(transcript, args.width, args.height)
-        pin_required = ["pin · enter toggle · esc close", "New thread"]
+        pin_required = ["pin · ctrl+↑/↓ move · enter toggle · esc close", "New thread"]
         missing.extend(value for value in pin_required if value not in pin_picker)
         (evidence / "pin-picker-screen.txt").write_text(pin_picker + "\n")
 
@@ -142,7 +142,7 @@ def main() -> int:
             os.write(master, b"\r")
             pump(master, 1.0, transcript)
             second_result = screen_text(transcript, args.width, args.height)
-            if "pin · enter toggle · esc close" not in second_result:
+            if "pin · ctrl+↑/↓ move · enter toggle · esc close" not in second_result:
                 missing.append("second pin picker")
             if second_result.count("  pinned") < 2:
                 missing.append("second pinned row")
@@ -161,7 +161,7 @@ def main() -> int:
                 pin_move = screen_text(transcript, args.width, args.height)
                 if "moved New thread down" not in pin_move:
                     missing.append("pin move notice")
-                if "pin · enter toggle · esc close" not in pin_move:
+                if "pin · ctrl+↑/↓ move · enter toggle · esc close" not in pin_move:
                     missing.append("refreshed pin picker")
                 order = re.findall(
                     r"(?:❯| )([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})  New thread",
@@ -181,6 +181,29 @@ def main() -> int:
                 (evidence / "pin-boundary-screen.txt").write_text(
                     pin_boundary + "\n"
                 )
+
+                os.write(master, b"/pin\r")
+                pump(master, 1.5, transcript)
+                os.write(master, b"\x1b[1;5B")
+                pump(master, 1.0, transcript)
+                ctrl_move = screen_text(transcript, args.width, args.height)
+                if "moved New thread down" not in ctrl_move:
+                    missing.append("ctrl pin move notice")
+                if "pin · ctrl+↑/↓ move · enter toggle · esc close" not in ctrl_move:
+                    missing.append("ctrl pin refreshed picker")
+                ctrl_order = re.findall(
+                    r"(?:❯| )([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})  New thread",
+                    ctrl_move,
+                )
+                if ctrl_order[:2] != [second_id, first_id]:
+                    missing.append("ctrl pin move order")
+                selected = re.search(
+                    r"❯ ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})  New thread",
+                    ctrl_move,
+                )
+                if selected is None or selected.group(1) != first_id:
+                    missing.append("ctrl pin selected row")
+                (evidence / "pin-ctrl-move-screen.txt").write_text(ctrl_move + "\n")
 
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)

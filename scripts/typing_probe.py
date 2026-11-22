@@ -53,6 +53,26 @@ def drain(fd: int, quiet_ms: float, timeout_s: float) -> float:
     return time.perf_counter() - start
 
 
+def wait_for_text(fd: int, needle: bytes, timeout_s: float) -> bool:
+    """Reads until the needle appears in the stream or the deadline passes."""
+    deadline = time.perf_counter() + timeout_s
+    buf = b""
+    while time.perf_counter() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        buf += chunk
+        if needle in buf:
+            return True
+    return False
+
+
 def reap(pid: int, timeout_s: float) -> int:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -72,6 +92,12 @@ def main() -> int:
     parser.add_argument("--binary", default="target/debug/baton")
     parser.add_argument("--runs", type=int, default=40)
     parser.add_argument("--text", default="the quick brown fox jumps over 13 lazy dogs")
+    parser.add_argument(
+        "--slash",
+        action="store_true",
+        help="measure time from `/` to the suggestion list instead of typing letters",
+    )
+    parser.add_argument("--suggestion", default="switch", help="text that proves the list rendered")
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=34)
     parser.add_argument("--ready", default="Ask anything")
@@ -116,11 +142,24 @@ def main() -> int:
         drain(master, QUIET_MS, args.timeout)
         time.sleep(args.warmup)
 
-        for index, char in enumerate(args.text):
-            if index >= args.runs:
-                break
-            os.write(master, char.encode())
-            samples.append(drain(master, QUIET_MS, args.timeout) * 1000.0)
+        if args.slash:
+            for _ in range(args.runs):
+                start = time.perf_counter()
+                os.write(master, b"/")
+                hit = wait_for_text(master, args.suggestion.encode(), args.timeout)
+                elapsed = (time.perf_counter() - start) * 1000.0
+                if not hit:
+                    print("suggestion list did not render", file=sys.stderr)
+                    return 1
+                samples.append(elapsed)
+                os.write(master, b"\x1b")
+                drain(master, QUIET_MS, 1.0)
+        else:
+            for index, char in enumerate(args.text):
+                if index >= args.runs:
+                    break
+                os.write(master, char.encode())
+                samples.append(drain(master, QUIET_MS, args.timeout) * 1000.0)
 
         # Two control-c presses within a second is the documented exit, and it
         # leaves the typed composer text alone.
@@ -148,8 +187,9 @@ def main() -> int:
         "max_ms": ordered[-1],
         "exit_code": exit_code,
     }
+    label = "slash" if args.slash else "typing"
     print(json.dumps(result, indent=2) if args.json else
-          f"typing: {result['samples']} keys, p50 {result['p50_ms']:.1f} ms, p95 {result['p95_ms']:.1f} ms, max {result['max_ms']:.1f} ms")
+          f"{label}: {result['samples']} samples, p50 {result['p50_ms']:.1f} ms, p95 {result['p95_ms']:.1f} ms, max {result['max_ms']:.1f} ms")
     if exit_code != 0:
         return 1
     if args.baseline:

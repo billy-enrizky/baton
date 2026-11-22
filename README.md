@@ -25,12 +25,32 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 
 ## Install
 
-Rust toolchain required. The harness CLIs you want to drive must be on PATH.
+macOS and Linux:
+
+```
+curl -fsSL https://raw.githubusercontent.com/billy-enrizky/baton/main/install.sh | sh
+```
+
+Windows PowerShell:
+
+```
+irm https://raw.githubusercontent.com/billy-enrizky/baton/main/install.ps1 | iex
+```
+
+Homebrew:
+
+```
+brew install billy-enrizky/baton/baton
+```
+
+From source:
 
 ```
 cargo install --path .
 baton
 ```
+
+The installer downloads the release for your OS and checks its SHA-256. If no release asset matches, it falls back to a source build when Cargo is installed. The harness CLIs you want to drive must still be on PATH.
 
 Provider login (one time each):
 

@@ -31,5 +31,6 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Exec stream | CLI | `baton exec --stream-json` emits parseable JSONL and a final result row |
 | Adapter lifecycle | TUI | `/status` shows one state and owner pair per adapter |
 | Missing harness | CLI and TUI | `exec`, `/switch`, and the banner name the binary and the next step |
+| Installers | Shell and PowerShell | `ci/installer-selftest.sh` selects the Linux asset, verifies its SHA-256, and rejects a corrupted archive |
 
 Start with the feature touched by the change. One real journey is enough for a smoke proof; the map exists so a broader change can cover the rest.

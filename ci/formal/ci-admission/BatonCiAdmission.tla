@@ -7,15 +7,16 @@ CONSTANTS Gates,
           RetryMasksFailure,
           UnknownSelectsNone,
           CommandDriftAllowed,
-          ReportWithoutStart
+          ReportWithoutStart,
+          CommandsDrifted
 
 Events == {"pull_request", "push", "merge_group", "workflow_dispatch", "unknown"}
 Results == {"pending", "success", "failure", "skipped"}
 SkipCauses == {"none", "unselected", "selected"}
 
-VARIABLES event, selected, started, result, skipCause, verify, commandsMatch, allowChange
+VARIABLES event, selected, started, result, skipCause, verify, commandsMatch
 
-vars == <<event, selected, started, result, skipCause, verify, commandsMatch, allowChange>>
+vars == <<event, selected, started, result, skipCause, verify, commandsMatch>>
 
 SelectedFor(e) ==
   [g \in Gates |->
@@ -30,13 +31,11 @@ TypeOK ==
   /\ result \in [Gates -> Results]
   /\ skipCause \in [Gates -> SkipCauses]
   /\ verify \in {"pending", "success", "failure"}
-  /\ commandsMatch \in BOOLEAN
-  /\ allowChange \in BOOLEAN
+  /\ commandsMatch = ~CommandsDrifted
 
 Init ==
   /\ event \in Events
-  /\ commandsMatch \in BOOLEAN
-  /\ allowChange \in BOOLEAN
+  /\ commandsMatch = ~CommandsDrifted
   /\ selected = SelectedFor(event)
   /\ started = [g \in Gates |-> FALSE]
   /\ result = [g \in Gates |-> "pending"]
@@ -49,7 +48,7 @@ Report(g) ==
   /\ \E outcome \in {"success", "failure"}:
        /\ result' = [result EXCEPT ![g] = outcome]
        /\ started' = [started EXCEPT ![g] = IF ReportWithoutStart THEN started[g] ELSE TRUE]
-       /\ UNCHANGED <<event, selected, skipCause, verify, commandsMatch, allowChange>>
+       /\ UNCHANGED <<event, selected, skipCause, verify, commandsMatch>>
 
 Skip(g, cause) ==
   /\ result[g] = "pending"
@@ -58,7 +57,7 @@ Skip(g, cause) ==
   /\ (cause = "selected" => selected[g])
   /\ result' = [result EXCEPT ![g] = "skipped"]
   /\ skipCause' = [skipCause EXCEPT ![g] = cause]
-  /\ UNCHANGED <<event, selected, started, verify, commandsMatch, allowChange>>
+  /\ UNCHANGED <<event, selected, started, verify, commandsMatch>>
 
 AllTerminal == \A g \in Gates: result[g] # "pending"
 
@@ -77,10 +76,10 @@ FinishVerify ==
            \/ (RetryMasksFailure /\ result[g] = "failure")
        skippedOk == \A g \in Gates:
          result[g] = "skipped" => (skipCause[g] = "unselected" \/ TreatSkippedAsSuccess)
-       commandOk == commandsMatch \/ allowChange \/ CommandDriftAllowed
+       commandOk == commandsMatch \/ CommandDriftAllowed
        ok == core /\ selectedOk /\ skippedOk /\ commandOk
      IN verify' = IF ok THEN "success" ELSE "failure"
-  /\ UNCHANGED <<event, selected, started, result, skipCause, commandsMatch, allowChange>>
+  /\ UNCHANGED <<event, selected, started, result, skipCause, commandsMatch>>
 
 Done ==
   /\ verify # "pending"
@@ -109,6 +108,6 @@ ChangesFailOpen ==
   event = "unknown" => \A g \in Gates: selected[g]
 
 CommandsMatch ==
-  verify = "success" => commandsMatch \/ allowChange
+  verify = "success" => commandsMatch
 
 ================================================================================

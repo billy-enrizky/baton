@@ -114,6 +114,7 @@ jobs.each do |name, job|
     if step.key?("continue-on-error") && step["continue-on-error"].to_s != "false"
       fail!("CI003", "job #{name} uses continue-on-error")
     end
+    fail!("CI015", "job #{name} sets a step env") if step.key?("env")
     fail!("CI015", "job #{name} sets a step shell") if step.key?("shell")
     fail!("CI015", "job #{name} sets a step working-directory") if step.key?("working-directory")
     run = step["run"].to_s

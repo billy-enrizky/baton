@@ -8,7 +8,11 @@ log_file=${3:-}
 cd -- "$repo"
 
 mode=list
-if [[ -n "$log_file" && -f "$log_file" ]]; then
+if [[ -n "$log_file" ]]; then
+  if [[ ! -f "$log_file" || -L "$log_file" ]]; then
+    echo "ERROR: TI005 test log $log_file is missing or not a regular file" >&2
+    exit 1
+  fi
   mode=run
   output=$(cat "$log_file")
 else

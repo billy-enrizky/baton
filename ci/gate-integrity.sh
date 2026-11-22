@@ -14,9 +14,9 @@ for file in rustfmt.toml .rustfmt.toml clippy.toml .clippy.toml; do
   [[ -e "$file" ]] && fail "GI001 $file is not allowed; formatting and lint settings come from pinned tool defaults"
 done
 
-for file in .cargo/config.toml .cargo/config; do
-  if [[ -f "$file" ]] && grep -qE 'rustc-wrapper|^[[:space:]]*runner[[:space:]]*=|^[[:space:]]*\[source' "$file"; then
-    fail "GI002 $file replaces the compiler, runner, or registry"
+for file in .cargo/config.toml .cargo/config .cargo/config.toml.example; do
+  if [[ -e "$file" ]]; then
+    fail "GI002 $file is not allowed; it can replace the compiler, linker, flags, or registry"
   fi
 done
 

@@ -122,4 +122,32 @@ if [[ $code -eq 0 ]] || ! grep -q "TI003" <<< "$output"; then
   exit 1
 fi
 
+link_log=$(mktemp -d)/link.log
+ln -s /dev/null "$link_log"
+set +e
+output=$(bash "$root/test-inventory.sh" "$root/../.." "$root/test-inventory-floor.txt" "$link_log" 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q "TI005" <<< "$output"; then
+  echo "test inventory accepted a symlinked log" >&2
+  exit 1
+fi
+
+for case in rustc linker; do
+  mkdir -p "$integrity_root/$case/src" "$integrity_root/$case/.cargo"
+  printf 'fn main() {}\n' > "$integrity_root/$case/src/main.rs"
+done
+printf '[build]\nrustc = "/bin/false"\n' > "$integrity_root/rustc/.cargo/config.toml"
+printf '[target.x86_64-unknown-linux-gnu]\nlinker = "/bin/false"\n' > "$integrity_root/linker/.cargo/config.toml"
+for case in rustc linker; do
+  set +e
+  output=$(bash "$root/gate-integrity.sh" "$integrity_root/$case" 2>&1)
+  code=$?
+  set -e
+  if [[ $code -eq 0 ]] || ! grep -q "GI002 " <<< "$output"; then
+    echo "gate integrity accepted a $case override" >&2
+    exit 1
+  fi
+done
+
 echo "ci selftest passed"

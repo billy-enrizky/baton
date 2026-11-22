@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-Three recorded runs: one billing failure and two green.
+All 43 runs available on 2026-11-22 are recorded. The current warm baseline is the cache v2 dispatch 44998824842.
 
 This file records actual GitHub Actions evidence for [ci.md](ci.md). Do not add estimated runs, synthetic runs, or runs from an older workflow unless the run URL, commit, and workflow revision are recorded.
 
@@ -25,6 +25,70 @@ gh run view <run-id> --log
 `--log` is required for the cache key and each step's timestamps. `ci/budget.sh` prints no budget line of its own, so a command's duration is its step's `completedAt` minus `startedAt`.
 
 For a PR run, also record the selected gate outputs from the `changes` job and the cache key from the `rust-cache` step log.
+
+## Audit: all 43 available runs (2026-11-22)
+
+The repository has produced 43 runs, not 150. Across 243 completed jobs, the buckets were:
+
+| Bucket | p50 | p95 | Max |
+|---|---|---|---|
+| Waiting, job start minus run create | 22.0s | 254.8s | 8,275s |
+| Setup, first eight setup steps | 9.0s | 25.0s | 33.0s |
+| Running, total minus setup | 15.0s | 142.0s | 178.0s |
+| Total job | 23.0s | 164.0s | 200.0s |
+
+The wait p95 includes `verify`, which waits for every gate. The 8,275s maximum is an old queued run, not the current workflow.
+
+| Job | Runs | p50 total | p95 total | p50 setup | p50 running |
+|---|---|---|---|---|---|
+| Test | 31 | 163s | 172s | 20s | 142s |
+| Build | 31 | 66s | 72.5s | 20s | 45s |
+| Debt ratchet | 31 | 56s | 67s | 18s | 36s |
+| Check | 31 | 56s | 66.5s | 20s | 33s |
+| Changes | 42 | 16s | 21s | 5s | 11s |
+| Selection guard | 34 | 10s | 13.3s | 6s | 5s |
+| Verify | 43 | 4s | 5s | 0s | 4s |
+
+The single biggest bucket was the Test job. Its own log showed 47.7s of compilation, 30.8s of tests, then a 60s gap before the next step. Cargo output was piped through `tee`; a descendant held the pipe open after the last test result.
+
+## Test job after the pipe fix
+
+PR #125 wrote the cargo log to a file and printed it after cargo exited. Run 44995838075 moved the Test job from 163s at p50 to 101s. Its setup was 26s and its test step was 67s. The 60s pipe wait was gone.
+
+## Cache v2 and the warm test job
+
+PR #127 upgraded `Swatinem/rust-cache` to v2.9.3, created a `baton-v2-*` cache key, and cached the pinned rustup toolchain per job. Cargo 1.100 stores dependency artifacts under `target/debug/build/<crate>/<hash>/out`; v2.9.1 cleaned that layout incorrectly, so a restored 221MB archive still recompiled all 119 crates.
+
+Warm dispatch 44998824842 after the v2 cache was seeded:
+
+| Job | Warm time |
+|---|---|
+| Changes | 19s |
+| Selection guard | 11s |
+| Check | 21s |
+| Build | 26s |
+| Debt ratchet | 33s |
+| Test | 62s |
+| Verify | 5s |
+| **PR feedback from run create to verify** | **95s** |
+
+The Test job breakdown was 17s setup, 42s test step, 1s inventory and upload, and 2s job overhead. The test step contains about 12s of compile and link and 30s of test execution. The cached test archive is 253MB; the rustup archive is 410MB.
+
+Main push 44999152137 reached Test 60s and total PR feedback 88s. The Test job is now at the 1-minute target; the full PR result is not yet under 1 minute because it waits 18-19s for Changes and 5s for Verify.
+
+The worktree test race found in main run 44997380622 is fixed by PR #129. That run failed `ships_completed_worker_branches_idempotently` after one worker completed without a commit. Worktree creation is now serialized per process.
+
+## Rejected: eight test threads
+
+Run 44999117575 ran `cargo test --locked -- --test-threads=8` on the experiment branch. The Test job was 63s against a 62s warm baseline. The extra threads did not reduce the 30s test execution, so the experiment was discarded.
+
+## Remaining path to PR feedback under one minute
+
+The warm path is Changes 19s, Test 60-62s, Verify 5s. The next levers, in measured order:
+
+1. Remove the Changes dependency from gate jobs, or reduce Changes to the classifier alone, so Test starts within 5s. The current start wait is 18-19s.
+2. Shard the 30s lib test execution. The four integration binaries together are under 0.4s; the lib binary is the shard.
+3. Use a larger or warm runner. Every in-job lever measured so far has been exhausted; the 8-core cost table remains an owner decision.
 
 ## Run log
 

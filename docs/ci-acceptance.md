@@ -1,238 +1,178 @@
 # Baton CI acceptance record
 
-All 43 runs available on 2026-11-22 are recorded. The current warm baseline is the cache v2 dispatch 44998824842.
+Status on 2026-11-22: the current warm Rust PR is 58 seconds. A separate CI-docs PR finished at 59 seconds. The Rust-specific p50 is not accepted until more Rust samples exist.
 
-This file records actual GitHub Actions evidence for [ci.md](ci.md). Do not add estimated runs, synthetic runs, or runs from an older workflow unless the run URL, commit, and workflow revision are recorded.
+This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 
-## Measurement rules
+## Targets and current status
 
-- PR feedback starts at the workflow run `createdAt` and ends when the required `verify` job completes.
-- Queue time is `startedAt - createdAt`.
-- Per-job setup is the job `startedAt` to the first non-setup command step `startedAt`.
-- Per-job run time is the first non-setup command step to job `completedAt`.
-- Record a cancelled or failed run. Do not remove it because it is slow or red.
-- Record the exact commit, workflow revision, event, selected gates, cache key, slowest job, failure step, and budget miss.
+| Target | Current evidence | Status |
+|---|---|---|
+| Rust PR feedback p50 under 60 seconds | PR 45004705055: 58 seconds, n=1, median 58 seconds, max 58 seconds | Provisional; one Rust sample. Accepted only at 100 runs or four weeks |
+| Rust PR feedback p95 under 120 seconds | PR 45004705055: n=1, max 58 seconds | Provisional |
+| Docs-only PR feedback p50 under 45 seconds | Current n=0; historical n=1, median 44 seconds, max 44 seconds on the pre-optimization workflow | Not established under the current workflow |
+| Queue p50 under 10 seconds | n=26 non-retry attempts, median 0 seconds, max 0 seconds; the one manual retry is excluded | Provisional met |
+| Queue p95 under 20 seconds | n=26 non-retry attempts, max 0 seconds; requires 100 runs before p95 is acceptance-bearing | Not established |
+| Setup p95 under 15 seconds | Warm Test setup was 16 seconds in PR 45004705055 | Provisional miss, n=1, max 16 seconds |
+| Hidden retries | `ci/check-ci.sh` rejects retry actions and `continue-on-error` | Enforced |
+| Skipped required checks | `verify` requires every selected job | Enforced |
+| Failed required check reported as success | `verify` and the formal admission model | Enforced |
 
-## Collection commands
+A p50 or p95 from a small sample is provisional. Until 100 runs or four weeks exist, p50 rows report n, median, and maximum; p95 rows report n and maximum. This record does not claim an accepted percentile.
 
-```sh
-gh run list --workflow ci.yml --limit 20 \
-  --json databaseId,event,headSha,createdAt,startedAt,updatedAt,conclusion,url
-gh run view <run-id> --json jobs
-gh run view <run-id> --log
-```
+## Measurement definitions
 
-`--log` is required for the cache key and each step's timestamps. `ci/budget.sh` prints no budget line of its own, so a command's duration is its step's `completedAt` minus `startedAt`.
+- PR feedback starts at the workflow run `createdAt` and ends when `verify` completes on a `pull_request` run.
+- For `push`, `merge_queue`, and `workflow_dispatch`, the same interval is called run create to verify, not PR feedback.
+- Queue time is the run-level `startedAt - createdAt`, not a job's dependency wait.
+- A retried workflow records each attempt separately. Retry queue time is not mixed with the first attempt's queue.
+- Per-job setup is the job `startedAt` to its first non-setup command step.
+- A job duration is its `startedAt` to `completedAt`.
+- Record failed and cancelled runs when they change a decision. Do not remove a slow or red run because it is inconvenient.
+- Do not infer a cache hit, commit, or step time from prose. Use the run log or Actions API.
+- The cited log is selective. It records run, attempt, event, 12-character commit prefix, result, create-to-Verify, Test duration, and the decision. The linked Actions run and API supply the workflow revision, selected gates, cache key, slowest job, failure step, and budget miss. The collection commands reproduce those fields.
+- A 12-character commit prefix is exact when the linked run resolves it; the run page carries the full SHA.
 
-For a PR run, also record the selected gate outputs from the `changes` job and the cache key from the `rust-cache` step log.
+## Current warm path
 
-## Audit: all 43 available runs (2026-11-22)
+PR 45004705055, merge candidate `fec3c862`, `ubuntu-24.04`:
 
-The repository has produced 43 runs, not 150. Across 243 completed jobs, the buckets were:
+| Checkpoint | Offset from run create |
+|---|---|
+| Run create | 0 seconds |
+| Changes complete | 17 seconds |
+| Gate jobs start | 18 seconds |
+| Test complete | 52 seconds |
+| Verify complete | 58 seconds |
 
-| Bucket | p50 | p95 | Max |
+The Changes job took 14 seconds, the Test job took 33 seconds, and the Verify job took 3 seconds. Run queue was 0 seconds because `startedAt` equaled `createdAt`; the remaining 8 seconds were job scheduling and finalization.
+
+The adjacent CI-docs PR 45005544007 took 59 seconds with a 36-second Test job. The two warm PR samples are 58 and 59 seconds.
+
+PR 45005544007 is a `meta` selection, not a Rust sample. It is recorded for the workflow but is not counted in the Rust target.
+
+For PR 45004705055, Test job setup was 16 seconds, including 4 seconds for the rustup cache, 3 seconds for the Cargo cache, and 9 seconds for checkouts and job setup. The test step contained about 13 seconds of compile and link plus 1.73 seconds of lib tests. Test inventory recorded 401 tests.
+
+The slowest test binary was no longer a 30-second outlier. The lib binary ran 326 tests in 1.73 seconds. The seven integration binaries together ran 75 tests in 0.4 seconds.
+
+## How the critical path changed
+
+| Run | Event | Result | What changed |
 |---|---|---|---|
-| Waiting, job start minus run create | 22.0s | 254.8s | 8,275s |
-| Setup, first eight setup steps | 9.0s | 25.0s | 33.0s |
-| Running, total minus setup | 15.0s | 142.0s | 178.0s |
-| Total job | 23.0s | 164.0s | 200.0s |
+| [44982816103](https://github.com/billy-enrizky/baton/actions/runs/44982816103) | pull_request | 189 seconds, cold | First green full-suite PR |
+| [44995838075](https://github.com/billy-enrizky/baton/actions/runs/44995838075) | push | 123 seconds | Cargo log no longer waits on a pipe held by a descendant |
+| [44998824842](https://github.com/billy-enrizky/baton/actions/runs/44998824842) | workflow_dispatch | 95 seconds | Rust cache v2 and a warm test target |
+| [45003589223](https://github.com/billy-enrizky/baton/actions/runs/45003589223) | pull_request | 68 seconds | Cancellation group kill removes a 30-second test |
+| [45004403409](https://github.com/billy-enrizky/baton/actions/runs/45004403409) | workflow_dispatch | 60 seconds | Gates start before the full tool self-test finishes |
+| [45004517552](https://github.com/billy-enrizky/baton/actions/runs/45004517552) | workflow_dispatch | 50 seconds | Same workflow, warm run |
+| [45004705055](https://github.com/billy-enrizky/baton/actions/runs/45004705055) | pull_request | 58 seconds | First warm Rust PR under the current workflow |
 
-The wait p95 includes `verify`, which waits for every gate. The 8,275s maximum is an old queued run, not the current workflow.
+The 30-second long pole was `orchestrate::tests::cancellation_stops_the_worker_group_and_marks_the_run_cancelled`. On Linux, `kill -TERM -PGID` was accepted but did not signal the process group. The shell leader died, its `sleep` child kept the output pipe open, and the reader threads waited the full 30 seconds. Adding `--` before the negative group operand fixed the signal. `group_alive` then used `ps` to ignore the unreaped leader zombie instead of spending another 2.5 seconds on `kill -0`.
 
-| Job | Runs | p50 total | p95 total | p50 setup | p50 running |
-|---|---|---|---|---|---|
-| Test | 31 | 163s | 172s | 20s | 142s |
-| Build | 31 | 66s | 72.5s | 20s | 45s |
-| Debt ratchet | 31 | 56s | 67s | 18s | 36s |
-| Check | 31 | 56s | 66.5s | 20s | 33s |
-| Changes | 42 | 16s | 21s | 5s | 11s |
-| Selection guard | 34 | 10s | 13.3s | 6s | 5s |
-| Verify | 43 | 4s | 5s | 0s | 4s |
+Before PR 45003589223, lib tests took 30.06 seconds and the Test job took 62 seconds. After, lib tests took 1.69 seconds and the Test job took 44 seconds.
 
-The single biggest bucket was the Test job. Its own log showed 47.7s of compilation, 30.8s of tests, then a 60s gap before the next step. Cargo output was piped through `tee`; a descendant held the pipe open after the last test result.
+## Cache state
 
-## Test job after the pipe fix
+Warm Test cache in PR 45004705055:
 
-PR #125 wrote the cargo log to a file and printed it after cargo exited. Run 44995838075 moved the Test job from 163s at p50 to 101s. Its setup was 26s and its test step was 67s. The 60s pipe wait was gone.
+| Cache | Key | Size | Match | Restore time |
+|---|---|---|---|---|
+| Rust toolchain | `rustup-1.100.0-Linux-X64-test` | 409,824,536 bytes | exact key hit | 4 seconds |
+| Cargo target and registry | `v0-rust-baton-v2-Linux-X64-test-Linux-x64-2fd77104-bc9f7da2` | 253,171,713 bytes | `full match: true` | 3 seconds |
 
-## Cache v2 and the warm test job
+Saves are restricted to `main`. A PR cannot write the cache that another PR restores.
 
-PR #127 upgraded `Swatinem/rust-cache` to v2.9.3, created a `baton-v2-*` cache key, and cached the pinned rustup toolchain per job. Cargo 1.100 stores dependency artifacts under `target/debug/build/<crate>/<hash>/out`; v2.9.1 cleaned that layout incorrectly, so a restored 221MB archive still recompiled all 119 crates.
+## Rejected experiments
 
-Warm dispatch 44998824842 after the v2 cache was seeded:
+| Experiment | Run | Result | Decision |
+|---|---|---|---|
+| Eight test threads before the cancellation fix | [44999117575](https://github.com/billy-enrizky/baton/actions/runs/44999117575) | Test 63 seconds against a 62-second warm baseline | Rejected; the 30-second test dominated |
+| Eight test threads after the scoped lock | [45001829417](https://github.com/billy-enrizky/baton/actions/runs/45001829417) | Test 77 seconds | Rejected; the cancellation bug still dominated |
+| Put test repositories in `/dev/shm` | [45002182299](https://github.com/billy-enrizky/baton/actions/runs/45002182299) | Test 64 seconds; `/dev/shm` had 7.9 GB free | Rejected; the suite is not disk-bound |
+| Count-based nextest shards | [45002437721](https://github.com/billy-enrizky/baton/actions/runs/45002437721) | Shard 1 33 seconds, shard 2 61 seconds | Rejected; count partitions were unbalanced, and the run was red because the experiment changed the job list |
+| Install the pinned toolchain instead of restoring 391 MB | [45004219154](https://github.com/billy-enrizky/baton/actions/runs/45004219154), [45004357746](https://github.com/billy-enrizky/baton/actions/runs/45004357746) | Test 40 and 43 seconds against a 44 to 45 second baseline | Rejected; no consistent gain |
 
-| Job | Warm time |
-|---|---|
-| Changes | 19s |
-| Selection guard | 11s |
-| Check | 21s |
-| Build | 26s |
-| Debt ratchet | 33s |
-| Test | 62s |
-| Verify | 5s |
-| **PR feedback from run create to verify** | **95s** |
+The nextest experiment is not evidence for sharding. It showed that a count partition can put one 30-second test into a 61-second shard. After the cancellation fix the whole lib binary takes 1.73 seconds, so sharding is no longer on the critical path.
 
-The Test job breakdown was 17s setup, 42s test step, 1s inventory and upload, and 2s job overhead. The test step contains about 12s of compile and link and 30s of test execution. The cached test archive is 253MB; the rustup archive is 410MB.
+The per-repository worktree lock in PR #132 did not change CI wall time. It is kept because one process-wide lock made unrelated repositories wait on each other; it is a scope fix, not a speed claim.
 
-Main push 44999152137 reached Test 60s and total PR feedback 88s. The Test job is now at the 1-minute target; the full PR result is not yet under 1 minute because it waits 18-19s for Changes and 5s for Verify.
+## Cited run log
 
-The worktree test race found in main run 44997380622 is fixed by PR #129. That run failed `ships_completed_worker_branches_idempotently` after one worker completed without a commit. Worktree creation is now serialized per process.
+The Test column is the Test job start to complete. Skipped means the gate did not run. Retry attempts are separate rows. The 8,138-second gap from attempt 1 `createdAt` (01:01:41Z) to attempt 2 `createdAt` (03:17:19Z) is not counted as queue for the normal runs.
 
-## Rejected: eight test threads
+Superseded runs 44981081994 and 44981120796 were cancelled without changing a decision. They remain in Actions history and are not copied here.
 
-Run 44999117575 ran `cargo test --locked -- --test-threads=8` on the experiment branch. The Test job was 63s against a 62s warm baseline. The extra threads did not reduce the 30s test execution, so the experiment was discarded.
-
-## Remaining path to PR feedback under one minute
-
-The warm path is Changes 19s, Test 60-62s, Verify 5s. The next levers, in measured order:
-
-1. Remove the Changes dependency from gate jobs, or reduce Changes to the classifier alone, so Test starts within 5s. The current start wait is 18-19s.
-2. Shard the 30s lib test execution. The four integration binaries together are under 0.4s; the lib binary is the shard.
-3. Use a larger or warm runner. Every in-job lever measured so far has been exhausted; the 8-core cost table remains an owner decision.
-
-## Run log
-
-| Run | Event | Commit | Workflow revision | Created | Queue | Feedback | Slowest job | Cache key | Selected gates | Result | Failure or budget miss |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| [44969473815](https://github.com/billy-enrizky/baton/actions/runs/44969473815) | pull_request | `cb1119bc` | Phase 1C `ci.yml` in PR #90 | 2026-11-22 01:01:42Z | not observed | 2s | none started | none | none | failure | Account billing, before any step ran. The repository is now public, which removed the billing dependency |
-| [44982816103](https://github.com/billy-enrizky/baton/actions/runs/44982816103) | pull_request | `223e5f30` | Phase 1C `ci.yml` | 2026-11-22 03:56:06Z | 0s | 190s | Test 165s | cold | all | success | none |
-| [44983114852](https://github.com/billy-enrizky/baton/actions/runs/44983114852) | push | `107ffa4` | Phase 1C `ci.yml` on main | 2026-11-22 04:00:30Z | 0s | 195s | Test 171s | cold | all | success | none |
-
-First real measurements, cold cache, `ubuntu-24.04`:
-
-| Job | PR run 44982816103 | Push run 44983114852 |
-|---|---|---|
-| Changes | 13s | 10s |
-| Selection guard | 11s | 5s |
-| Check | 55s | 69s |
-| Build | 69s | 70s |
-| Test | 165s | 171s |
-| Debt ratchet | 54s | 53s |
-| Verify | 5s | 5s |
-| **PR feedback** | **190s** | 195s |
-
-Both runs were cold: the first had no cache, and the push run saved the first one. The next code PR measures the warm number.
-
-## Recorded test timings
-
-Run 44988029960, `main` at `a18251c`, `ci/test-timings.sh` on the captured log:
-
-| Test binary | Seconds | Tests |
-|---|---|---|
-| `unittests src/lib.rs` | 30.11 | 321 |
-| `tests/cli_bench.rs` | 1.66 | 2 |
-| `tests/opencode_adapter.rs` | 0.13 | 4 |
-| `tests/core.rs` | 0.10 | 35 |
-| `tests/codex_adapter.rs` | 0.05 | 9 |
-| `tests/harness.rs` | 0.05 | 16 |
-| `tests/claude_adapter.rs` | 0.02 | 3 |
-| `tests/acp_adapter.rs` | 0.01 | 4 |
-| `unittests src/main.rs` | 0.00 | 0 |
-
-Total test execution is 32 seconds of a 161-second test job. The other ~130 seconds is compilation.
-
-That changes the optimization order. Sharding tests would move 32 seconds across runners and duplicate a 130-second compile in each, which is worse. The critical path is compile:
-1. Stop compiling four times in one run. Check, Build, Test, and Debt each build the same crate from the same cache seed.
-2. Only then consider shards, and only if the compile work per job still exceeds the budget.
-
-A per-test harness is also visible: `tests/cli_bench.rs` spawns the binary twice and costs more than 35 core tests together, so it is a candidate to fold into an existing binary rather than a shard.
-
-## Rejected: smaller test debug info
-
-PR #117 set `[profile.test] debug = "line-tables-only"`. Measured locally on a cold target it looked promising: 65.3 user seconds and a 1.0 GB target against 72.9 and 1.2 GB, and `debug = false` reached 60.9 and 821 MB.
-
-On the runner it moved nothing: test job 160 s and 163 s across two runs, against a 155 to 171 s band on `main`. The PR was closed unmerged rather than keeping a setting whose benefit could not be shown. Local CPU time was the wrong proxy; the job is not bound by that slice.
-
-## Per-job cache keys
-
-All four Rust jobs shared one key, and the first finisher on main owned it. That finisher was a lint job, so the archive held no test build.
-
-`shared-key` now includes `github.job`. The test job restores its own 221 MB archive as an exact match, up from a shared 157 MB, and the compile count dropped from 197 crates to 119. Wall time did not move: 165 s before and 165 s after.
-
-Conclusion: the shared-key defect is fixed and worth keeping, but restoring `target` does not make Cargo reuse most of it. Whatever invalidates 119 fingerprints is a deeper problem than a cache key.
-
-## Dispatch was broken and is fixed
-
-A `workflow_dispatch` run failed every gate at `Resolve trusted base ref`. A dispatch event has no `github.event.before`, the step falls back to `HEAD~1`, and the gate jobs checked out one commit. Push and PR runs never exercise that path, so it was broken from the day the workflow landed.
-
-Fixed with `fetch-depth: 2` on the gate checkouts. Dispatch run 44991010841 is green.
-
-## Owner decision: runner size
-
-Every lever inside the job has been measured and exhausted: debug info (no change), per-job cache keys (no wall-clock change), sharding (would duplicate the 130-second compile), fewer test binaries (links are 0.1 to 0.4 seconds warm).
-
-The remaining lever is CPU. The test job is compile-bound at roughly 130 seconds on the standard four-vCPU public runner. Public-repo standard runners are free; larger runners are billed per minute:
-
-| Runner | Rate |
-|---|---|
-| Linux 4-core larger | $0.012/min |
-| Linux 8-core larger | $0.022/min |
-
-Measured job minutes per push run today: 6.6. At the 8-core rate that is about $0.145 per run if durations hold, and about $0.09 if the compile roughly halves as expected.
-
-Monthly scenarios, if the owner approves:
-
-| Runs per month | 8-core, durations hold | 8-core, compile halves |
-|---|---|---|
-| 100 | $14.50 | $9.00 |
-| 300 | $43.50 | $27.00 |
-| 600 | $87.00 | $54.00 |
-
-Recommendation: one measured 8-core run before any commitment. If it brings the test job under 100 seconds, the p95 target is reachable and the cost is bounded by the table. If it does not, the bottleneck is not CPU and the next step is profiling the compile itself.
-
-## Cache behaviour
-
-The test job restores a 157 MB cache in about a second, reported as `full match: false`, which means it is a restore-key prefix match rather than the exact key. Dependencies are therefore mostly present and the remaining time is the crate's own compile and the linking of nine test binaries.
-
-That points at two unmeasured candidates, in order:
-1. Fewer test binaries. Nine links of one large crate is a structural cost that sharding cannot remove.
-2. A larger runner. Standard hosted is four vCPU; a bigger runner is an owner decision with a monthly cost, so it needs the first candidate measured before it is worth asking for.
-
-The target is 60s median and 120s p95. The gap is the test job, which compiles the suite and then runs it, and the compile is repeated in Check, Build, and Debt. Optimization order: record per-test-binary times, shard from that data, then look at sharing compilation between jobs.
-
-That is the first recorded Actions observation. It proves the workflow file parses and schedules every job. No step ran, so it is not evidence about any gate.
-
-Every later row must come from a run that executed at least the `changes` job. A run that stops before its first step is recorded here as a billing or quota event, not as a gate result.
-
-## Per-job log
-
-| Run | Job | Setup | Run | Budget | Cache | Result | Failure |
+| Run | Attempt | Event | Commit | Result | Create to Verify | Test | Decision evidence |
 |---|---|---|---|---|---|---|---|
-| None yet | | | | | | | |
-
-## Last-20 summary
-
-| Field | Value |
-|---|---|
-| PR runs sampled | 0 |
-| Rust PRs sampled | 0 |
-| Docs-only PRs sampled | 0 |
-| PR p50 | Not measured |
-| PR p95 | Not measured |
-| Queue p50 | Not measured |
-| Queue p95 | Not measured |
-| Main runs sampled | 0 |
-| Cache hit rate | Not measured |
-| Billable minute estimate | Not measured |
-| Monthly cap decision | Not approved |
-| Included Actions minutes (private repo) | Not recorded |
-| Per-minute rate above the included allowance | Not recorded |
-| Monthly minute cap | Not set |
-| Pause threshold | Not set |
-| Paid runner decision | Not evaluated |
-
-Billable minutes are summed per job as `ceil(job_seconds / 60)`. The estimate must include cancelled and superseded runs, workflow_dispatch, and the calibration runs. It must separate docs-only from Rust PR volume.
+| [44969473815 attempt 1](https://github.com/billy-enrizky/baton/actions/runs/44969473815/attempts/1) | 1 | pull_request | `cb1119bcf0fd` | failure | 5 seconds | skipped | Billing stopped the run at Changes |
+| [44969473815 attempt 2](https://github.com/billy-enrizky/baton/actions/runs/44969473815/attempts/2) | 2 | pull_request | `cb1119bcf0fd` | failure | 142 seconds from attempt 2 `createdAt` 03:17:19Z to Verify completion 03:19:41Z | 109 seconds, failed | Test failed four TUI tests; retry wait was 8,138 seconds and is excluded |
+| [44982816103](https://github.com/billy-enrizky/baton/actions/runs/44982816103) | 1 | pull_request | `223e5f301e38` | success | 189 seconds | 165 seconds | First green full-suite PR, cold cache |
+| [44983114852](https://github.com/billy-enrizky/baton/actions/runs/44983114852) | 1 | push | `107ffa4c1d10` | success | 194 seconds | 171 seconds | First green full-suite main push, cold cache |
+| [44988029960](https://github.com/billy-enrizky/baton/actions/runs/44988029960) | 1 | push | `a18251c02fb4` | success | 194 seconds | 165 seconds | Per-binary timing sample before the pipe fix |
+| [44995838075](https://github.com/billy-enrizky/baton/actions/runs/44995838075) | 1 | push | `5f44e30f82c0` | success | 123 seconds | 101 seconds | Removed the 60-second pipe wait |
+| [44997380622](https://github.com/billy-enrizky/baton/actions/runs/44997380622) | 1 | push | `bb0b195ed674` | failure | 164 seconds | 144 seconds | Worktree race reproduced under concurrent workers |
+| [44998824842](https://github.com/billy-enrizky/baton/actions/runs/44998824842) | 1 | workflow_dispatch | `978df9e7f4ce` | success | 95 seconds | 62 seconds | Warm cache v2 baseline |
+| [44999117575](https://github.com/billy-enrizky/baton/actions/runs/44999117575) | 1 | workflow_dispatch | `e5697af820c3` | success | 84 seconds | 63 seconds | Eight test threads rejected |
+| [44999152137](https://github.com/billy-enrizky/baton/actions/runs/44999152137) | 1 | push | `f93b549aa45d` | success | 88 seconds | 60 seconds | Best pre-cancellation warm push |
+| [45000304120](https://github.com/billy-enrizky/baton/actions/runs/45000304120) | 1 | pull_request | `485d53d2ecff` | success | 44 seconds | skipped | Historical docs-only path before the quick preflight |
+| [45000399622](https://github.com/billy-enrizky/baton/actions/runs/45000399622) | 1 | push | `3d6467bdc373` | success | 97 seconds | 70 seconds | 30.06-second lib tests |
+| [45001645126](https://github.com/billy-enrizky/baton/actions/runs/45001645126) | 1 | workflow_dispatch | `d4188016b053` | success | 87 seconds | 62 seconds | Per-repository lock did not move wall time |
+| [45001829417](https://github.com/billy-enrizky/baton/actions/runs/45001829417) | 1 | workflow_dispatch | `7b63aa9b6cfe` | success | 112 seconds | 77 seconds | Eight threads after scoped locking rejected |
+| [45002182299](https://github.com/billy-enrizky/baton/actions/runs/45002182299) | 1 | workflow_dispatch | `0c383f16b06d` | success | 98 seconds | 64 seconds | `/dev/shm` test directories rejected |
+| [45002437721](https://github.com/billy-enrizky/baton/actions/runs/45002437721) | 1 | workflow_dispatch | `8952eb5fa585` | failure | 70 seconds | skipped | Nextest count shards unbalanced; job list change failed CI013 |
+| [45002826292](https://github.com/billy-enrizky/baton/actions/runs/45002826292) | 1 | workflow_dispatch | `3ecb4bba45eb` | failure | 29 seconds | skipped | Cancellation diagnostic proved the 30-second pipe wait |
+| [45003043436](https://github.com/billy-enrizky/baton/actions/runs/45003043436) | 1 | workflow_dispatch | `0b3a181e7b95` | failure | 26 seconds | skipped | Process-group probe identified the missing `--` |
+| [45003589223](https://github.com/billy-enrizky/baton/actions/runs/45003589223) | 1 | pull_request | `bc76fcc916a5` | success | 68 seconds | 44 seconds | Cancellation fix, lib tests 1.69 seconds |
+| [45003991763](https://github.com/billy-enrizky/baton/actions/runs/45003991763) | 1 | workflow_dispatch | `6af6b028fbc9` | success | 71 seconds | 45 seconds | First quick-preflight dispatch, old base tools ran the full self-test |
+| [45004219154](https://github.com/billy-enrizky/baton/actions/runs/45004219154) | 1 | workflow_dispatch | `fd06715a1067` | success | 73 seconds | 40 seconds | Toolchain download experiment, first sample |
+| [45004357746](https://github.com/billy-enrizky/baton/actions/runs/45004357746) | 1 | workflow_dispatch | `fd06715a1067` | success | 73 seconds | 43 seconds | Toolchain download experiment, second sample |
+| [45004403409](https://github.com/billy-enrizky/baton/actions/runs/45004403409) | 1 | workflow_dispatch | `036f29d4e6f2` | success | 60 seconds | 43 seconds | Quick preflight with a base that supports it |
+| [45004517552](https://github.com/billy-enrizky/baton/actions/runs/45004517552) | 1 | workflow_dispatch | `036f29d4e6f2` | success | 50 seconds | 32 seconds | Same workflow, warm repeat |
+| [45004670088](https://github.com/billy-enrizky/baton/actions/runs/45004670088) | 1 | push | `1539baebb683` | success | 68 seconds | 47 seconds | Main push, full save path, not a PR sample |
+| [45004705055](https://github.com/billy-enrizky/baton/actions/runs/45004705055) | 1 | pull_request | `fec3c8623571` | success | 58 seconds | 33 seconds | Current warm Rust PR sample |
+| [45005544007](https://github.com/billy-enrizky/baton/actions/runs/45005544007) | 1 | pull_request | `4f1f5ad7822f` | success | 59 seconds | 36 seconds | Current warm CI-docs PR sample |
 
 ## Proof log
 
 | Proof | Evidence | Result |
 |---|---|---|
-| First green `main` full-suite run | Run 44983114852 | Passed 2026-11-22 |
-| First PR run with `verify` | Run 44982816103 | Passed 2026-11-22 |
-| Budget overrun fails | Phase 1B `ci/selftest.sh`, exit 124 | Passed locally on 2026-11-21; CI pending |
-| Hidden TUI change cannot skip tests | Phase 1 classifier fixture plus Phase 3 selector proof | Classifier fixture passes locally; selector proof pending |
-| No-op test command fails the workflow guard | Phase 1C `ci/check-ci.sh --base` | Passed locally against the Phase 1C workflow; CI pending |
-| Formal CI gate | `ci/formal/ci-admission/run.sh` | Passed locally on 2026-11-21; requires a JDK, not yet in CI |
-| End-to-end CI probe | `.agents/skills/verify-baton-ci/scripts/ci_probe.sh` | Pending |
-| Branch protection requires `verify` | Repository owner action | Pending |
-| Merge-queue full suite | Blocked by repository ownership and plan | Pending |
+| First green full-suite PR | Run 44982816103 | Passed 2026-11-22 |
+| First green full-suite main push | Run 44983114852 | Passed 2026-11-22 |
+| Pipe wait removed | Run 44995838075, Test 101 seconds | Passed 2026-11-22 |
+| Warm cache v2 | Run 44998824842, Test 62 seconds | Passed 2026-11-22 |
+| Worktree creation race fixed | Failure in 44997380622, green `ships_completed_worker_branches_idempotently` in 45000399622 | Passed 2026-11-22 |
+| Worker group cancellation fixed | PR #133, lib tests 30.06 to 1.69 seconds | Passed 2026-11-22 |
+| Gates start early | PR #135, dispatches 45004403409 and 45004517552 | Passed 2026-11-22 |
+| Current warm PR samples under 60 seconds | PR 45004705055: 58 seconds; PR 45005544007: 59 seconds | Passed on two samples |
+| Installer checksum rejection | `ci/installer-selftest.sh`; full selftest in 45000399622 | Passed locally and in CI |
+| Release assets and checksums | Release run 44999297170, `v0.3.0` | Passed 2026-11-22 |
+| Homebrew formula | Tap `billy-enrizky/homebrew-baton` | `brew audit`, `brew test`, and install passed locally |
+| Formal gates | All 15 suites under `local_docs/verification/*/run.sh` | Passed 2026-11-22 |
+| CI admission model | `ci/formal/ci-admission/run.sh` | Passed locally |
+
+## Review record
+
+The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as structural reviewer. Round 1 found the unsupported complete-archive claim and mixed measurement definitions. Rounds 2 through 4 found and fixed wrong Verify endpoints, retry handling, Rust and meta sample mixing, and percentile reporting inconsistencies. Round 7 caught an out-of-date-base run that the classifier labeled `unknown`; it was removed rather than counted as meta. Rounds 8 and 9 reported no Blocker or Major findings.
+
+## Open gaps
+
+- The current workflow has one warm Rust sample and one warm meta sample. All p50 and p95 rows remain provisional until 100 runs or four weeks exist.
+- The historical docs-only sample was n=1, median 44 seconds, max 44 seconds. The current workflow has no docs-only sample yet.
+- Queue p50 is 0 seconds on cited non-retry runs. Queue p95, setup p95, and cache hit rate are not established; setup has one 16-second sample against a 15-second target.
+- The repository is public. Standard GitHub-hosted runners are free. No paid-runner cost is approved or required by the current measurements.
+- A paid 8-core runner remains an unmeasured option. It is not recommended until both Rust-target metrics miss across at least 100 runs or four weeks.
+- Official merge queue requires organization ownership or GitHub Enterprise Cloud. Until then, the PR `verify` run plus the following `main` push are the merge proof.
+- Branch protection must require `verify` and block direct pushes. This remains an owner action.
+
+## Collection commands
+
+```sh
+gh run list --workflow ci.yml --limit 100 \
+  --json databaseId,attempt,event,headSha,createdAt,startedAt,updatedAt,conclusion,url
+gh run view <run-id> --attempt <n> --json jobs
+gh run view <run-id> --attempt <n> --log --job=<job-id>
+gh api repos/billy-enrizky/baton/actions/jobs/<job-id> \
+  --jq '.steps[] | [.number,.name,.started_at,.completed_at] | @tsv'
+```
+
+Read the cache key and size from the step named `Restore Cargo cache`. The action is `Swatinem/rust-cache`. Do not give the workflow a new step name unless this command changes too.

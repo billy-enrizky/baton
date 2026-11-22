@@ -11,14 +11,15 @@ if [[ ! -f "$log" ]]; then
   exit 0
 fi
 
-awk '
-  /^     Running / {
+# Cargo color is on in CI, so strip ANSI before matching or every line misses.
+sed 's/\x1b\[[0-9;]*m//g' "$log" | awk '
+  /Running / {
     label = $0
-    sub(/^     Running /, "", label)
+    sub(/.*Running /, "", label)
     sub(/ \(.*/, "", label)
     next
   }
-  /^test result: / {
+  /test result: / {
     seconds = ""
     for (i = 1; i <= NF; i++) {
       if ($i ~ /^[0-9]+(\.[0-9]+)?s$/) { seconds = $i; sub(/s$/, "", seconds) }
@@ -30,5 +31,5 @@ awk '
       label = ""
     }
   }
-' "$log" | sort -t $'\t' -k2,2gr | tee "${output:-/dev/stdout}" |
+' | sort -t $'\t' -k2,2gr | tee "${output:-/dev/null}" |
   awk -F '\t' 'BEGIN { printf "test timings (seconds):\n" } { printf "  %-34s %8ss  %s tests\n", $1, $2, $3 }'

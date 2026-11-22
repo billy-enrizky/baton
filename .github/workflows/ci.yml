@@ -372,13 +372,11 @@ jobs:
       - name: Record test timings
         run: |
           set -euo pipefail
-          script="$RUNNER_TEMP/trusted-ci/test-timings.sh"
-          if [ ! -f "$script" ]; then script="ci/test-timings.sh"; fi
-          if [ ! -f "$script" ]; then
-            echo "test-timings.sh is not in the base tools yet; skipping this run" >&2
+          if [ ! -f ci/test-timings.sh ]; then
+            echo "no timings script in the head tree; skipping" >&2
             exit 0
           fi
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 30 "$script" "$RUNNER_TEMP/test-output.log" "$RUNNER_TEMP/test-timings.tsv"
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 30 ci/test-timings.sh "$RUNNER_TEMP/test-output.log" "$RUNNER_TEMP/test-timings.tsv"
       - name: Upload test timings
         if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

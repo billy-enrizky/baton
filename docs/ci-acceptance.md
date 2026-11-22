@@ -157,6 +157,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | [45011836996](https://github.com/billy-enrizky/baton/actions/runs/45011836996) | 1 | pull_request | `0add32c101cf` | success | 63 seconds | 47 seconds | Shell completions; 406 tests |
 | [45012384561](https://github.com/billy-enrizky/baton/actions/runs/45012384561) | 1 | workflow_dispatch | `91b0d4fc3221` | failure | 96 seconds | 85 seconds | Cold ARM experiment; 406 tests passed, CI013 rejected the temporary job list |
 | [45012538857](https://github.com/billy-enrizky/baton/actions/runs/45012538857) | 1 | workflow_dispatch | `91b0d4fc3221` | failure | 44 seconds | 33 seconds | Warm ARM experiment; 406 tests passed, 21.57-second `cargo test` in a 22-second step, CI013 rejected the temporary job list |
+| [45016871008](https://github.com/billy-enrizky/baton/actions/runs/45016871008) | 1 | workflow_dispatch | `12e85cdfafe9` | success | 66 seconds | 46 seconds | Trusted floor and timing script; 406 tests; `ci-repair` dispatch proof |
 
 ## Proof log
 
@@ -172,7 +173,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45010710576: 68 seconds; Rust PR 45011836996: 63 seconds; CI-docs PR 45005544007: 59 seconds | Rust median 61.5; above target |
 | ARM runner rejected | Runs 45012384561 and 45012538857: 406 tests, 85 and 33 second jobs | Rejected 2026-11-22; x64 Test retained |
 | Test inventory integrity | `ci/selftest.sh`: matching announced/executed count, short execution, missing totals | Passed locally; CI proof pending the next PR |
-| Trusted test inputs | Test job reads `test-inventory-floor.txt` and `test-timings.sh` from `$RUNNER_TEMP/trusted-ci`; manifest reverified after the test gates | Passed locally; CI proof pending the main push |
+| Trusted test inputs | Branch dispatch [45016871008](https://github.com/billy-enrizky/baton/actions/runs/45016871008): 406 tests, trusted floor and timing script, manifest clean | Passed; main push pending |
 | Installer checksum rejection | `ci/installer-selftest.sh`; full selftest in 45000399622 | Passed locally and in CI |
 | Release assets and checksums | Release run 44999297170, `v0.3.0` | Passed 2026-11-22 |
 | Homebrew formula | Tap `billy-enrizky/homebrew-baton` | `brew audit`, `brew test`, and install passed locally |
@@ -194,7 +195,7 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 - A paid 8-core runner remains an unmeasured option. It is not recommended until both Rust-target metrics miss across at least 100 runs or four weeks.
 - Official merge queue requires organization ownership or GitHub Enterprise Cloud. Until then, the PR `verify` run plus the following `main` push are the merge proof.
 - Branch protection must require `verify` and block direct pushes. This remains an owner action.
-- The trusted-input workflow change is a `ci-repair` change. The PR `verify` run is expected to fail CI013; the local gates and the following `main` push are the proof.
+- The trusted-input workflow change is a `ci-repair` change. The PR `verify` run is expected to fail CI013; branch dispatch 45016871008 and the following `main` push are the proof.
 
 ## Collection commands
 

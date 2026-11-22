@@ -30,7 +30,11 @@ For a PR run, also record the selected gate outputs from the `changes` job and t
 
 | Run | Event | Commit | Workflow revision | Created | Queue | Feedback | Slowest job | Cache key | Selected gates | Result | Failure or budget miss |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| None yet | | | | | | | | | | | |
+| [44969473815](https://github.com/billy-enrizky/baton/actions/runs/44969473815) | pull_request | `cb1119bc` | Phase 1C `ci.yml` in PR #90 | 2026-11-22 01:01:42Z | not observed | 2s | none started | none | none | failure | Account billing: "The job was not started because recent account payments have failed or your spending limit needs to be increased" |
+
+That is the first recorded Actions observation. It proves the workflow file parses and schedules every job. No step ran, so it is not evidence about any gate.
+
+Every later row must come from a run that executed at least the `changes` job. A run that stops before its first step is recorded here as a billing or quota event, not as a gate result.
 
 ## Per-job log
 
@@ -65,8 +69,8 @@ Billable minutes are summed per job as `ceil(job_seconds / 60)`. The estimate mu
 
 | Proof | Evidence | Result |
 |---|---|---|
-| First green `main` full-suite run | Phase 1C workflow | Pending |
-| First PR run with `verify` | Phase 1C workflow | Pending |
+| First green `main` full-suite run | Phase 1C workflow | Blocked on account billing |
+| First PR run with `verify` | Phase 1C workflow | Blocked on account billing |
 | Budget overrun fails | Phase 1B `ci/selftest.sh`, exit 124 | Passed locally on 2026-11-21; CI pending |
 | Hidden TUI change cannot skip tests | Phase 1 classifier fixture plus Phase 3 selector proof | Classifier fixture passes locally; selector proof pending |
 | No-op test command fails the workflow guard | Phase 1C `ci/check-ci.sh --base` | Passed locally against the Phase 1C workflow; CI pending |

@@ -229,13 +229,19 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
-          components: rustfmt, clippy
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           shared-key: baton-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
           key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Normalize cached registry timestamps
+        run: |
+          set -euo pipefail
+          registry="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+          if [ -d "$registry" ]; then
+            "$RUNNER_TEMP/trusted-ci/budget.sh" 20 find "$registry" -type f -exec touch -t 200001010000 {} +
+          fi
       - name: Check
         run: |
           set -euo pipefail
@@ -289,13 +295,19 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
-          components: rustfmt, clippy
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           shared-key: baton-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
           key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Normalize cached registry timestamps
+        run: |
+          set -euo pipefail
+          registry="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+          if [ -d "$registry" ]; then
+            "$RUNNER_TEMP/trusted-ci/budget.sh" 20 find "$registry" -type f -exec touch -t 200001010000 {} +
+          fi
       - name: Build
         run: |
           set -euo pipefail
@@ -352,17 +364,30 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
-          components: rustfmt, clippy
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
           shared-key: baton-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
           key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Normalize cached registry timestamps
+        run: |
+          set -euo pipefail
+          registry="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+          if [ -d "$registry" ]; then
+            "$RUNNER_TEMP/trusted-ci/budget.sh" 20 find "$registry" -type f -exec touch -t 200001010000 {} +
+          fi
       - name: Test
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 300 cargo test --locked 2>&1 | tee "$RUNNER_TEMP/test-output.log"
+          log="$RUNNER_TEMP/test-output.log"
+          if "$RUNNER_TEMP/trusted-ci/budget.sh" 300 cargo test --locked >"$log" 2>&1; then
+            status=0
+          else
+            status=$?
+          fi
+          cat "$log"
+          exit "$status"
       - name: Verify trusted tools are unchanged
         run: |
           set -euo pipefail
@@ -439,6 +464,13 @@ jobs:
           shared-key: baton-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
           key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Normalize cached registry timestamps
+        run: |
+          set -euo pipefail
+          registry="${CARGO_HOME:-$HOME/.cargo}/registry/src"
+          if [ -d "$registry" ]; then
+            "$RUNNER_TEMP/trusted-ci/budget.sh" 20 find "$registry" -type f -exec touch -t 200001010000 {} +
+          fi
       - name: Format debt
         run: |
           set -euo pipefail

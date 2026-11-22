@@ -196,15 +196,34 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Worktree creation race fixed | Failure in 44997380622, green `ships_completed_worker_branches_idempotently` in 45000399622 | Passed 2026-11-22 |
 | Worker group cancellation fixed | PR #133, lib tests 30.06 to 1.69 seconds | Passed 2026-11-22 |
 | Gates start early | PR #135, dispatches 45004403409 and 45004517552 | Passed 2026-11-22 |
-| Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45011836996: 63 seconds; Rust PR 45010710576: 68 seconds; Rust PR 45021604178: 61 seconds; Rust PR 45035044248: 52 seconds; Rust PR 45037001045: 65 seconds; Rust PR 45046974039: 70 seconds; Rust PR 45051808580: 64 seconds; Rust PR 45055995298: 56 seconds; Rust PR 45060299027: 65 seconds; Rust PR 45064707055: 74 seconds; CI-docs PR 45005544007: 59 seconds | Rust median 63.5; above target |
+| Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45011836996: 63 seconds; Rust PR 45010710576: 68 seconds; Rust PR 45021604178: 61 seconds; Rust PR 45035044248: 52 seconds; Rust PR 45037001045: 65 seconds; Rust PR 45046974039: 70 seconds; Rust PR 45051808580: 64 seconds; Rust PR 45055995298: 56 seconds; Rust PR 45060299027: 65 seconds; Rust PR 45064707055: 74 seconds; CI-docs PR 45005544007: 59 seconds; Rust PR 45069517940: 55 seconds; Rust PR 45075059836: 62 seconds; Rust PR 45075683884: 69 seconds | 15-sample Rust median 62.0; above target |
 | ARM runner rejected | Runs 45012384561 and 45012538857: 406 tests, 85 and 33 second jobs | Rejected 2026-11-22; x64 Test retained |
 | Test inventory integrity | `ci/selftest.sh`: matching announced/executed count, short execution, missing totals | Passed locally; CI proof pending the next PR |
 | Trusted test inputs | Branch dispatch [45016871008](https://github.com/billy-enrizky/baton/actions/runs/45016871008) and main push [45017072401](https://github.com/billy-enrizky/baton/actions/runs/45017072401): 406 tests, trusted floor and timing script, manifest clean | Passed |
 | Installer checksum rejection | `ci/installer-selftest.sh`; full selftest in 45000399622 | Passed locally and in CI |
-| Release assets and checksums | Release run 44999297170, `v0.3.0` | Passed 2026-11-22 |
-| Homebrew formula | Tap `billy-enrizky/homebrew-baton` | `brew audit`, `brew test`, and install passed locally |
+| Release hardening | PR #160, PR run 45075059836 (62 seconds), main push 45075200247 (65 seconds) | Passed 2026-11-22 |
+| v0.4.0 version bump | PR #161, PR run 45075683884 (69 seconds), main push 45075877048 (67 seconds) | Passed 2026-11-22 |
+| Release assets and checksums | Release run [45076016585](https://github.com/billy-enrizky/baton/actions/runs/45076016585), tag `v0.4.0`, exactly five archives plus `SHA256SUMS`; all five sums verified | Passed 2026-11-22 |
+| Immutable latest release | `isDraft=false`, `isPrerelease=false`, `isImmutable=true`, `releases/latest=v0.4.0` | Passed 2026-11-22 |
+| Homebrew formula | Tap commit `03741e5`, `brew audit --strict`, reinstall, `brew test`, version 0.4.0, and stable JSON before and after push | Passed 2026-11-22 |
+| Clean curl install | Default `releases/latest` path into a clean bin, `baton 0.4.0`, no source fallback | Passed 2026-11-22 |
+| Installed feature smoke | PTY slash probe passed against the curl and Homebrew binaries; summaries in gitignored `v0.4.0-release/curl/summary.json` and `v0.4.0-release/brew/summary.json` | Passed 2026-11-22 |
 | Formal gates | All 15 suites under `local_docs/verification/*/run.sh` | Passed 2026-11-22 |
 | CI admission model | `ci/formal/ci-admission/run.sh` | Passed locally |
+
+## v0.4.0 release assets
+
+Published 2026-11-22 from tag `v0.4.0` at `b26b8824388159cf26a2539175e6d1a867d7c738`.
+
+| Asset | SHA-256 |
+|---|---|
+| `baton-aarch64-apple-darwin.tar.gz` | `86b1c79e435c127df4bc651319e4b8cc0f73e10f5f1da01eb3e8b677d689a0e5` |
+| `baton-aarch64-unknown-linux-gnu.tar.gz` | `921aac5157f1c828e0cbf9953f462f226f71d6098d7482c3a33836bf047eae37` |
+| `baton-x86_64-apple-darwin.tar.gz` | `9ab0fb6c12302fe032db742994224b0858cb6d4624435508c7689e6b93901243` |
+| `baton-x86_64-pc-windows-msvc.zip` | `5f37e1338c0c1cbcccdc73972e9f416190ac2c66cdd0585d0224c031ea3f49c3` |
+| `baton-x86_64-unknown-linux-gnu.tar.gz` | `b9b769772a67986961a68d3eda69b6cd4e788c0747b29d1f8e5f6a604df7275d` |
+
+The tap formula pins the four Unix archives to these values, and `shasum -a 256 -c SHA256SUMS` reported OK for all five downloads.
 
 ## Review record
 
@@ -213,7 +232,7 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 
 ## Open gaps
 
-- The current workflow has four warm Rust samples. The Rust median is 61.5 seconds and the maximum is 68 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist; the under-60 target is not met.
+- The current workflow has fifteen warm samples. The Rust median is 62.0 seconds and the maximum is 74 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist; the under-60 target is not met.
 - The free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. A future proposal must be additive, not a replacement, keep an independent required x64 pre-merge Test job, and provide a matched rerun under the 100-run or four-week measurement policy. A merge queue alone is insufficient if it runs the same ARM job.
 - The historical docs-only sample was n=1, median 44 seconds, max 44 seconds. The current workflow has no docs-only sample yet.
 - Queue p50 is 0 seconds on cited non-retry runs. Queue p95, setup p95, and cache hit rate are not established; setup has one 16-second sample against a 15-second target.

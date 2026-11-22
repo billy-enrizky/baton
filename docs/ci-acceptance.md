@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-Status on 2026-11-22: the current warm Rust PR samples are 58, 60, and 68 seconds. A separate CI-docs PR finished at 59 seconds. The Rust median is 60 seconds, at the target boundary rather than robustly under it. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
+Status on 2026-11-22: the current warm Rust PR samples are 58, 60, 63, and 68 seconds. A separate CI-docs PR finished at 59 seconds. The Rust median is 61.5 seconds, above the target. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
 
 This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 
@@ -8,8 +8,8 @@ This file records the runs that changed a decision. It is not a complete archive
 
 | Target | Current evidence | Status |
 |---|---|---|
-| Rust PR feedback p50 under 60 seconds | PR 45004705055: 58 seconds; PR 45009466461: 60 seconds; PR 45010710576: 68 seconds; n=3, median 60 seconds, max 68 seconds | Provisional; at the boundary, not yet met robustly. Accepted only at 100 runs or four weeks |
-| Rust PR feedback p95 under 120 seconds | Three Rust samples, n=3, max 68 seconds | Provisional |
+| Rust PR feedback p50 under 60 seconds | PR 45004705055: 58 seconds; PR 45009466461: 60 seconds; PR 45010710576: 68 seconds; PR 45011836996: 63 seconds; n=4, median 61.5 seconds, max 68 seconds | Provisional; above the target, not met. Accepted only at 100 runs or four weeks |
+| Rust PR feedback p95 under 120 seconds | Four Rust samples, n=4, max 68 seconds | Provisional |
 | Docs-only PR feedback p50 under 45 seconds | Current n=0; historical n=1, median 44 seconds, max 44 seconds on the pre-optimization workflow | Not established under the current workflow |
 | Queue p50 under 10 seconds | n=26 non-retry attempts, median 0 seconds, max 0 seconds; the one manual retry is excluded | Provisional met |
 | Queue p95 under 20 seconds | n=26 non-retry attempts, max 0 seconds; requires 100 runs before p95 is acceptance-bearing | Not established |
@@ -47,11 +47,11 @@ PR 45004705055, merge candidate `fec3c862`, `ubuntu-24.04`:
 
 The Changes job took 14 seconds, the Test job took 33 seconds, and the Verify job took 3 seconds. Run queue was 0 seconds because `startedAt` equaled `createdAt`; the remaining 8 seconds were job scheduling and finalization.
 
-The adjacent CI-docs PR 45005544007 took 59 seconds with a 36-second Test job. The inbox PR 45009466461 took 60 seconds with a 37-second Test job. The inbox CLI PR 45010710576 took 68 seconds with a 49-second Test job. The Rust samples are 58, 60, and 68 seconds; their median is 60.
+The adjacent CI-docs PR 45005544007 took 59 seconds with a 36-second Test job. The inbox PR 45009466461 took 60 seconds with a 37-second Test job. The inbox CLI PR 45010710576 took 68 seconds with a 49-second Test job. The completions PR 45011836996 took 63 seconds with a 47-second Test job. The Rust samples are 58, 60, 63, and 68 seconds; their median is 61.5.
 
 PR 45005544007 is a `meta` selection, not a Rust sample. It is recorded for the workflow but is not counted in the Rust target.
 
-For PR 45004705055, Test job setup was 16 seconds, including 4 seconds for the rustup cache, 3 seconds for the Cargo cache, and 9 seconds for checkouts and job setup. The test step contained about 13 seconds of compile and link plus 1.73 seconds of lib tests. Test inventory recorded 401 tests. The inbox PR 45009466461 recorded 404 tests. The inbox CLI PR 45010710576 recorded 405 tests; its lib binary ran 330 tests in 1.72 seconds and its integration binaries ran 75 tests in 0.38 seconds.
+For PR 45004705055, Test job setup was 16 seconds, including 4 seconds for the rustup cache, 3 seconds for the Cargo cache, and 9 seconds for checkouts and job setup. The test step contained about 13 seconds of compile and link plus 1.73 seconds of lib tests. Test inventory recorded 401 tests. The inbox PR 45009466461 recorded 404 tests. The inbox CLI PR 45010710576 recorded 405 tests. The completions PR 45011836996 recorded 406 tests; its lib binary ran 331 tests in 1.67 seconds and its integration binaries ran 75 tests in 0.40 seconds.
 
 The slowest test binary was no longer a 30-second outlier. The lib binary ran 326 tests in 1.73 seconds. The seven integration binaries together ran 75 tests in 0.4 seconds.
 
@@ -68,6 +68,7 @@ The slowest test binary was no longer a 30-second outlier. The lib binary ran 32
 | [45004705055](https://github.com/billy-enrizky/baton/actions/runs/45004705055) | pull_request | 58 seconds | First warm Rust PR under the current workflow |
 | [45009466461](https://github.com/billy-enrizky/baton/actions/runs/45009466461) | pull_request | 60 seconds | Inbox feature; 404 tests and a raised inventory floor |
 | [45010710576](https://github.com/billy-enrizky/baton/actions/runs/45010710576) | pull_request | 68 seconds | Inbox CLI and completed-worker rows; 405 tests |
+| [45011836996](https://github.com/billy-enrizky/baton/actions/runs/45011836996) | pull_request | 63 seconds | Shell completions; 406 tests and a new dependency |
 
 The 30-second long pole was `orchestrate::tests::cancellation_stops_the_worker_group_and_marks_the_run_cancelled`. On Linux, `kill -TERM -PGID` was accepted but did not signal the process group. The shell leader died, its `sleep` child kept the output pipe open, and the reader threads waited the full 30 seconds. Adding `--` before the negative group operand fixed the signal. `group_alive` then used `ps` to ignore the unreaped leader zombie instead of spending another 2.5 seconds on `kill -0`.
 
@@ -135,6 +136,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | [45005544007](https://github.com/billy-enrizky/baton/actions/runs/45005544007) | 1 | pull_request | `4f1f5ad7822f` | success | 59 seconds | 36 seconds | Current warm CI-docs PR sample |
 | [45009466461](https://github.com/billy-enrizky/baton/actions/runs/45009466461) | 1 | pull_request | `caa938fc89e5` | success | 60 seconds | 37 seconds | Inbox feature; 404 tests, inventory floor 404 |
 | [45010710576](https://github.com/billy-enrizky/baton/actions/runs/45010710576) | 1 | pull_request | `c2b7aedba674` | success | 68 seconds | 49 seconds | Inbox CLI; 405 tests, inventory floor 405 |
+| [45011836996](https://github.com/billy-enrizky/baton/actions/runs/45011836996) | 1 | pull_request | `0add32c101cf` | success | 63 seconds | 47 seconds | Shell completions; 406 tests |
 
 ## Proof log
 
@@ -147,7 +149,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Worktree creation race fixed | Failure in 44997380622, green `ships_completed_worker_branches_idempotently` in 45000399622 | Passed 2026-11-22 |
 | Worker group cancellation fixed | PR #133, lib tests 30.06 to 1.69 seconds | Passed 2026-11-22 |
 | Gates start early | PR #135, dispatches 45004403409 and 45004517552 | Passed 2026-11-22 |
-| Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45010710576: 68 seconds; CI-docs PR 45005544007: 59 seconds | Rust median 60; target is at the boundary |
+| Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45010710576: 68 seconds; Rust PR 45011836996: 63 seconds; CI-docs PR 45005544007: 59 seconds | Rust median 61.5; above target |
 | Installer checksum rejection | `ci/installer-selftest.sh`; full selftest in 45000399622 | Passed locally and in CI |
 | Release assets and checksums | Release run 44999297170, `v0.3.0` | Passed 2026-11-22 |
 | Homebrew formula | Tap `billy-enrizky/homebrew-baton` | `brew audit`, `brew test`, and install passed locally |
@@ -160,7 +162,7 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 
 ## Open gaps
 
-- The current workflow has three warm Rust samples. The Rust median is 60 seconds and the maximum is 68 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist; the under-60 target is not yet met robustly.
+- The current workflow has four warm Rust samples. The Rust median is 61.5 seconds and the maximum is 68 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist; the under-60 target is not met.
 - The historical docs-only sample was n=1, median 44 seconds, max 44 seconds. The current workflow has no docs-only sample yet.
 - Queue p50 is 0 seconds on cited non-retry runs. Queue p95, setup p95, and cache hit rate are not established; setup has one 16-second sample against a 15-second target.
 - The repository is public. Standard GitHub-hosted runners are free. No paid-runner cost is approved or required by the current measurements.

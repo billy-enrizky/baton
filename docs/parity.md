@@ -50,7 +50,7 @@ The product problem is: a terminal user should be able to start, supervise, reco
 |---|---|---|---|---|
 | T3 Code | `https://github.com/pingdotgg/t3code` | `/Users/billy/Documents/t3code` | `origin/main` | `90c028c6fc4a9ecd3af048cb52432e819af6487c` |
 | Orca | `https://github.com/stablyai/orca` | `/Users/billy/Documents/orca` | `origin/main` | `1355cc4ef30ccb370542154181b0b2864e584373` |
-| Baton baseline | `https://github.com/billy-enrizky/baton` | current working copy | `origin/main` | `471b67e` before the inbox CLI slice |
+| Baton baseline | `https://github.com/billy-enrizky/baton` | current working copy | `origin/main` | `7f18e59` before the completions slice |
 
 The upstream working trees can be dirty and behind their refs. Read upstream evidence with `git -C <checkout> show <commit>:<path>`, or verify the path exists with `git -C <checkout> cat-file -e <commit>:<path>`. Evidence paths are prefixed with `T3:` or `Orca:`. The upstream heads were refreshed on 2026-11-22; the inbox slice re-resolved every path against the current checkouts.
 

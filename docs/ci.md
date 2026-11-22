@@ -21,28 +21,28 @@ The design is staged. Phase 1 creates one honest full-suite gate with hard budge
 
 Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command, and `--version` runs only after a build that is already budgeted.
 
-Phase 2 is in progress from recorded runs. The current warm Rust PR samples are 58, 60, and 68 seconds; the CI-docs PR is 59 seconds. The Rust median is 60 seconds, which is at the target boundary rather than robustly under it. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
+Phase 2 is in progress from recorded runs. The current warm Rust PR samples are 58, 60, 63, and 68 seconds; the CI-docs PR is 59 seconds. The Rust median is 61.5 seconds, above the target. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
 
 Budget rule, applied at every phase: Phase 1 uses three times a conservative cold estimate. Phase 2 sets each budget to the measured Linux p95 plus 20 percent. That reset is the only allowed increase. After it, a budget may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
 
 ## Current baseline
 
-Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31fc5` and the inbox slice; current main is `471b67e` after the inbox slice.
+Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31fc5` and the inbox slices; current main is `7f18e59` before the completions slice.
 
 | Measurement | Current value | Evidence |
 |---|---|---|
-| Warm Rust PR feedback | 58, 60, and 68 seconds; n=3, median 60 seconds, max 68 seconds | Runs 45004705055, 45009466461, and 45010710576 |
+| Warm Rust PR feedback | 58, 60, 63, and 68 seconds; n=4, median 61.5 seconds, max 68 seconds | Runs 45004705055, 45009466461, 45010710576, and 45011836996 |
 | Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
-| Warm Test job | 33, 37, and 49 seconds | Runs 45004705055, 45009466461, and 45010710576 |
-| `cargo test --lib` | 1.72 to 3.70 seconds, 330 tests | Runs 45009466461 and 45010710576 |
-| Integration tests | 0.38 to 0.75 seconds, 75 tests across seven binaries | Runs 45009466461 and 45010710576 |
-| Discovered test count (`ci/test-inventory.sh`) | 405 | Run 45010710576 |
-| `ci/test-inventory-floor.txt` | 405 | Current floor and discovered count |
+| Warm Test job | 33, 37, 47, and 49 seconds | Runs 45004705055, 45009466461, 45010710576, and 45011836996 |
+| `cargo test --lib` | 1.67 to 3.70 seconds, 331 tests | Runs 45009466461 and 45011836996 |
+| Integration tests | 0.40 to 0.75 seconds, 75 tests across seven binaries | Runs 45009466461 and 45011836996 |
+| Discovered test count (`ci/test-inventory.sh`) | 406 | Run 45011836996 |
+| `ci/test-inventory-floor.txt` | 406 | Current floor and discovered count |
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
 
-The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 405 test floor is a lower bound, not a per-test lock. It blocks a drop below 405, while the inventory check requires every discovered test to execute. Deleting tests above that floor still needs review in the diff.
+The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 406 test floor is a lower bound, not a per-test lock. It blocks a drop below 406, while the inventory check requires every discovered test to execute. Deleting tests above that floor still needs review in the diff.
 
 Older local macOS measurements are historical and are not acceptance evidence. The acceptance record contains the Linux run-level data and the rejected experiments.
 

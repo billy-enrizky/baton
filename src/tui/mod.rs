@@ -10596,7 +10596,6 @@ mod tests {
 
     #[test]
     fn copy_command_selects_the_requested_assistant_reply() {
-        std::env::set_var("BATON_CLIPBOARD_COMMAND", "cat");
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
@@ -10636,7 +10635,6 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("no assistant reply at position 3"));
-        std::env::remove_var("BATON_CLIPBOARD_COMMAND");
     }
 
     #[test]

@@ -73,7 +73,7 @@ jobs:
       - name: Self-test trusted CI tools
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/selftest.sh"
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/selftest.sh" --quick
       - name: Validate workflow invariants
         run: |
           set -euo pipefail
@@ -152,6 +152,10 @@ jobs:
           cp -R base/ci "$dest"
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
+      - name: Full self-test trusted CI tools
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/selftest.sh"
       - name: Recompute gates and guard commands
         run: |
           set -euo pipefail

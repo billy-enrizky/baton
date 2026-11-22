@@ -19,21 +19,27 @@ else
   output=$(cargo test --locked -- --list 2>/dev/null || true)
 fi
 
-discovered=$(grep -c ': test$' <<< "$output" || true)
-discovered=${discovered:-0}
+if [[ "$mode" == list ]]; then
+  discovered=$(grep -c ': test$' <<< "$output" || true)
+  discovered=${discovered:-0}
+  if [[ "$discovered" -eq 0 ]]; then
+    echo "ERROR: TI001 no tests discovered" >&2
+    exit 1
+  fi
+  echo "test_count=$discovered"
+  exit 0
+fi
+
+announced=$(grep -oE '^running [0-9]+ tests?$' <<< "$output" | awk '{sum += $2} END {print sum + 0}' || true)
 passed=$(grep -oE '^test result: ok\. [0-9]+ passed' <<< "$output" | awk '{sum += $4} END {print sum + 0}' || true)
 ignored=$(grep -oE '[0-9]+ ignored' <<< "$output" | awk '{sum += $1} END {print sum + 0}' || true)
+announced=${announced:-0}
 passed=${passed:-0}
 ignored=${ignored:-0}
 
-if [[ "$discovered" -eq 0 && "$passed" -eq 0 ]]; then
+if [[ "$announced" -eq 0 && "$passed" -eq 0 ]]; then
   echo "ERROR: TI001 no tests discovered" >&2
   exit 1
-fi
-
-if [[ "$mode" == list ]]; then
-  echo "test_count=$discovered"
-  exit 0
 fi
 
 if [[ -n "$floor_file" && -f "$floor_file" ]]; then
@@ -49,8 +55,14 @@ if [[ "$ignored" -gt 0 ]]; then
   exit 1
 fi
 
-if [[ "$discovered" -gt 0 && "$passed" -gt 0 && $((passed + ignored)) -lt "$discovered" ]]; then
-  echo "ERROR: TI004 discovered $discovered tests but only executed $passed" >&2
+if [[ "$announced" -eq 0 ]]; then
+  echo "ERROR: TI004 test log has no running test totals" >&2
+  exit 1
+fi
+
+executed=$((passed + ignored))
+if [[ "$executed" -ne "$announced" ]]; then
+  echo "ERROR: TI004 announced $announced tests but executed $executed" >&2
   exit 1
 fi
 

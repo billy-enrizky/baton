@@ -171,6 +171,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Gates start early | PR #135, dispatches 45004403409 and 45004517552 | Passed 2026-11-22 |
 | Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45010710576: 68 seconds; Rust PR 45011836996: 63 seconds; CI-docs PR 45005544007: 59 seconds | Rust median 61.5; above target |
 | ARM runner rejected | Runs 45012384561 and 45012538857: 406 tests, 85 and 33 second jobs | Rejected 2026-11-22; x64 Test retained |
+| Test inventory integrity | `ci/selftest.sh`: matching announced/executed count, short execution, missing totals | Passed locally; CI proof pending the next PR |
 | Installer checksum rejection | `ci/installer-selftest.sh`; full selftest in 45000399622 | Passed locally and in CI |
 | Release assets and checksums | Release run 44999297170, `v0.3.0` | Passed 2026-11-22 |
 | Homebrew formula | Tap `billy-enrizky/homebrew-baton` | `brew audit`, `brew test`, and install passed locally |
@@ -191,6 +192,7 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 - A paid 8-core runner remains an unmeasured option. It is not recommended until both Rust-target metrics miss across at least 100 runs or four weeks.
 - Official merge queue requires organization ownership or GitHub Enterprise Cloud. Until then, the PR `verify` run plus the following `main` push are the merge proof.
 - Branch protection must require `verify` and block direct pushes. This remains an owner action.
+- The inventory parser is base-owned. A PR that changes it cannot exercise the new bytes until the following PR stages that merged base; local `ci/selftest.sh` is the proof for the change, and the next PR is the CI proof.
 
 ## Collection commands
 

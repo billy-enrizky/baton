@@ -1,0 +1,7 @@
+build_needed=false
+check_needed=false
+debt_needed=false
+docs_only=true
+full_suite_reason=docs
+has_tests=false
+test_needed=false

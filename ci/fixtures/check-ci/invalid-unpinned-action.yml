@@ -1,0 +1,77 @@
+name: CI fixture
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  changes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      check_needed: ${{ steps.classify.outputs.check_needed }}
+      build_needed: ${{ steps.classify.outputs.build_needed }}
+      test_needed: ${{ steps.classify.outputs.test_needed }}
+      debt_needed: ${{ steps.classify.outputs.debt_needed }}
+      full_suite_reason: ${{ steps.classify.outputs.full_suite_reason }}
+      has_tests: ${{ steps.classify.outputs.has_tests }}
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      - run: |
+          base/ci/classify-paths.sh . base
+          base/ci/selftest.sh
+          base/ci/check-ci.sh .github/workflows/ci.yml
+  selection:
+    needs: changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: |
+          base/ci/classify-paths.sh . base
+          base/ci/check-ci.sh --base base/.github/workflows/ci.yml .github/workflows/ci.yml
+  check:
+    needs: changes
+    if: needs.changes.outputs.check_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: cargo check --locked --all-targets
+  build:
+    needs: changes
+    if: needs.changes.outputs.build_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: cargo build --locked --bin baton
+  test:
+    needs: changes
+    if: needs.changes.outputs.test_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - run: cargo test --locked
+  debt:
+    needs: changes
+    if: needs.changes.outputs.debt_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - run: |
+          base/ci/fmt-debt.sh . base/ci/fmt-baseline.txt
+          base/ci/clippy-debt.sh . base/ci/clippy-baseline.txt
+  verify:
+    if: always()
+    needs: [changes, selection, check, build, test, debt]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - run: |
+          check_gate() { :; }
+          check_gate

@@ -128,6 +128,39 @@ if [[ $code -eq 0 ]] || ! grep -q "TI002" <<< "$output"; then
   exit 1
 fi
 
+small_floor=$(mktemp)
+printf '2\n' > "$small_floor"
+good_log=$(mktemp)
+printf 'running 2 tests\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$good_log"
+good_output=$(bash "$root/test-inventory.sh" "$root/../.." "$small_floor" "$good_log")
+if [[ "$good_output" != "test_count=2" ]]; then
+  echo "test inventory rejected a matching announced and executed count" >&2
+  printf '%s\n' "$good_output" >&2
+  exit 1
+fi
+
+short_log=$(mktemp)
+printf 'running 3 tests\n\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$short_log"
+set +e
+output=$(bash "$root/test-inventory.sh" "$root/../.." "$small_floor" "$short_log" 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q "TI004" <<< "$output"; then
+  echo "test inventory accepted a short executed count" >&2
+  exit 1
+fi
+
+missing_totals_log=$(mktemp)
+printf 'test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$missing_totals_log"
+set +e
+output=$(bash "$root/test-inventory.sh" "$root/../.." "$small_floor" "$missing_totals_log" 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q "TI004" <<< "$output"; then
+  echo "test inventory accepted a log without running test totals" >&2
+  exit 1
+fi
+
 ignored_log=$(mktemp)
 printf 'test result: ok. 406 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$ignored_log"
 set +e

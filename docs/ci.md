@@ -36,13 +36,13 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 | Warm Test job | 33, 37, 47, and 49 seconds | Runs 45004705055, 45009466461, 45010710576, and 45011836996 |
 | `cargo test --lib` | 1.67 to 3.70 seconds, 331 tests | Runs 45009466461 and 45011836996 |
 | Integration tests | 0.40 to 0.75 seconds, 75 tests across seven binaries | Runs 45009466461 and 45011836996 |
-| Discovered test count (`ci/test-inventory.sh`) | 406 | Run 45011836996 |
-| `ci/test-inventory-floor.txt` | 406 | Current floor and discovered count |
+| Executed test count (`ci/test-inventory.sh`) | 406 | Run 45011836996 |
+| `ci/test-inventory-floor.txt` | 406 | Current floor and executed count |
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
 
-The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 406 test floor is a lower bound, not a per-test lock. It blocks a drop below 406, while the inventory check requires every discovered test to execute. Deleting tests above that floor still needs review in the diff.
+The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 406 floor is a lower bound, not a per-test lock. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff.
 
 Older local macOS measurements are historical and are not acceptance evidence. The acceptance record contains the Linux run-level data and the rejected experiments.
 
@@ -64,10 +64,10 @@ Every check below is a real command in `ci/`, and `ci/selftest.sh` proves at lea
 | Path selection | `ci/classify-paths.sh` | `--event`, `--files`, first-match precedence `unknown` > `code` > `meta` > docs |
 | Workflow invariants | `ci/check-ci.sh` | Rules CI001 to CI015 and CI017 (CI016 is unused) |
 | Gate integrity | `ci/gate-integrity.sh` | Rules GI001 to GI006 |
-| Test inventory | `ci/test-inventory.sh` | Rules TI001 to TI005 against `ci/test-inventory-floor.txt` and the captured test log |
+| Test inventory | `ci/test-inventory.sh` | Rules TI001 to TI005. Run mode compares announced and executed totals; list mode counts discovered tests |
 | Format debt | `ci/fmt-debt.sh` | Count of `Diff in ` lines must not exceed the baseline |
 | Clippy debt | `ci/clippy-debt.sh` | Count of `error:` lines must not exceed the baseline |
-| Self-test | `ci/selftest.sh` | Runs every fixture, the budget negative test, and the inventory floor cases |
+| Self-test | `ci/selftest.sh` | Runs every fixture, the budget negative test, and the inventory floor, short-execution, and missing-total cases |
 
 Workflow invariants:
 

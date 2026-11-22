@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-Status on 2026-11-22: the current warm Rust PR samples are 52, 56, 58, 60, 61, 63, 64, 65, 65, 68, 70, and 74 seconds. A separate CI-docs PR finished at 59 seconds. The Rust median is 63.5 seconds, above the target. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The trusted-input proof main push was 54 seconds. Recent meta PRs were 51 and 64 seconds, so the p50 target is still not robustly met. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
+Status on 2026-11-22: the current warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds. A separate CI-docs PR finished at 59 seconds. The Rust median is 63.5 seconds, above the target. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The trusted-input proof main push was 54 seconds. Recent meta PRs were 51 and 64 seconds, so the p50 target is still not robustly met. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
 
 This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 
@@ -8,9 +8,9 @@ This file records the runs that changed a decision. It is not a complete archive
 
 | Target | Current evidence | Status |
 |---|---|---|
-| Rust PR feedback p50 under 60 seconds | PR 45004705055: 58 seconds; PR 45009466461: 60 seconds; PR 45011836996: 63 seconds; PR 45010710576: 68 seconds; PR 45021604178: 61 seconds; PR 45035044248: 52 seconds; PR 45037001045: 65 seconds; PR 45046974039: 70 seconds; PR 45051808580: 64 seconds; PR 45055995298: 56 seconds; PR 45060299027: 65 seconds; PR 45064707055: 74 seconds; n=12, median 63.5 seconds, max 74 seconds | Provisional; above the target, not met. Accepted only at 100 runs or four weeks |
-| Rust PR feedback p95 under 120 seconds | Twelve Rust samples, n=12, max 74 seconds | Provisional |
-| Docs-only PR feedback p50 under 45 seconds | Current n=0; historical n=1, median 44 seconds, max 44 seconds on the pre-optimization workflow | Not established under the current workflow |
+| Rust PR feedback p50 under 60 seconds | 16 warm Rust PRs: 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds; median 63.5 seconds, max 74 seconds | Provisional; above the target, not met. Accepted only at 100 runs or four weeks |
+| Rust PR feedback p95 under 120 seconds | Sixteen Rust samples, n=16, max 74 seconds | Provisional |
+| Docs-only PR feedback p50 under 45 seconds | n=2: 44 seconds historical, 38 seconds in run 45077008165; median 41 seconds, max 44 seconds | Provisional met |
 | Queue p50 under 10 seconds | n=26 non-retry attempts, median 0 seconds, max 0 seconds; the one manual retry is excluded | Provisional met |
 | Queue p95 under 20 seconds | n=26 non-retry attempts, max 0 seconds; requires 100 runs before p95 is acceptance-bearing | Not established |
 | Setup p95 under 15 seconds | Warm Test setup was 16 seconds in PR 45004705055 | Provisional miss, n=1, max 16 seconds |
@@ -47,7 +47,7 @@ PR 45004705055, merge candidate `fec3c862`, `ubuntu-24.04`:
 
 The Changes job took 14 seconds, the Test job took 33 seconds, and the Verify job took 3 seconds. Run queue was 0 seconds because `startedAt` equaled `createdAt`; the remaining 8 seconds were job scheduling and finalization.
 
-The adjacent CI-docs PR 45005544007 took 59 seconds with a 36-second Test job. The inbox PR 45009466461 took 60 seconds with a 37-second Test job. The inbox CLI PR 45010710576 took 68 seconds with a 49-second Test job. The completions PR 45011836996 took 63 seconds with a 47-second Test job. The Rust samples are 52, 56, 58, 60, 61, 63, 64, 65, 65, 68, 70, and 74 seconds; their median is 63.5.
+The adjacent CI-docs PR 45005544007 took 59 seconds with a 36-second Test job. The inbox PR 45009466461 took 60 seconds with a 37-second Test job. The inbox CLI PR 45010710576 took 68 seconds with a 49-second Test job. The completions PR 45011836996 took 63 seconds with a 47-second Test job. The Rust samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds; their median is 63.5.
 
 PR 45005544007 is a `meta` selection, not a Rust sample. It is recorded for the workflow but is not counted in the Rust target.
 
@@ -196,7 +196,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Worktree creation race fixed | Failure in 44997380622, green `ships_completed_worker_branches_idempotently` in 45000399622 | Passed 2026-11-22 |
 | Worker group cancellation fixed | PR #133, lib tests 30.06 to 1.69 seconds | Passed 2026-11-22 |
 | Gates start early | PR #135, dispatches 45004403409 and 45004517552 | Passed 2026-11-22 |
-| Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45011836996: 63 seconds; Rust PR 45010710576: 68 seconds; Rust PR 45021604178: 61 seconds; Rust PR 45035044248: 52 seconds; Rust PR 45037001045: 65 seconds; Rust PR 45046974039: 70 seconds; Rust PR 45051808580: 64 seconds; Rust PR 45055995298: 56 seconds; Rust PR 45060299027: 65 seconds; Rust PR 45064707055: 74 seconds; CI-docs PR 45005544007: 59 seconds; Rust PR 45069517940: 55 seconds; Rust PR 45075059836: 62 seconds; Rust PR 45075683884: 69 seconds | 15-sample Rust median 62.0; above target |
+| Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45011836996: 63 seconds; Rust PR 45010710576: 68 seconds; Rust PR 45021604178: 61 seconds; Rust PR 45035044248: 52 seconds; Rust PR 45037001045: 65 seconds; Rust PR 45046974039: 70 seconds; Rust PR 45051808580: 64 seconds; Rust PR 45055995298: 56 seconds; Rust PR 45060299027: 65 seconds; Rust PR 45064707055: 74 seconds; CI-docs PR 45005544007: 59 seconds; Rust PR 45069517940: 55 seconds; Rust PR 45075059836: 62 seconds; Rust PR 45075683884: 69 seconds; Rust PR 45080151770: 68 seconds; main push 45080301181: 65 seconds | 16-sample Rust median 63.5; above target |
 | ARM runner rejected | Runs 45012384561 and 45012538857: 406 tests, 85 and 33 second jobs | Rejected 2026-11-22; x64 Test retained |
 | Test inventory integrity | `ci/selftest.sh`: matching announced/executed count, short execution, missing totals | Passed locally; CI proof pending the next PR |
 | Trusted test inputs | Branch dispatch [45016871008](https://github.com/billy-enrizky/baton/actions/runs/45016871008) and main push [45017072401](https://github.com/billy-enrizky/baton/actions/runs/45017072401): 406 tests, trusted floor and timing script, manifest clean | Passed |
@@ -232,7 +232,7 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 
 ## Open gaps
 
-- The current workflow has fifteen warm samples. The Rust median is 62.0 seconds and the maximum is 74 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist; the under-60 target is not met.
+- The current workflow has sixteen warm samples. The Rust median is 63.5 seconds and the maximum is 74 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist; the under-60 target is not met.
 - The free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. A future proposal must be additive, not a replacement, keep an independent required x64 pre-merge Test job, and provide a matched rerun under the 100-run or four-week measurement policy. A merge queue alone is insufficient if it runs the same ARM job.
 - The docs-only samples are 44 seconds (historical) and 38 seconds (run 45077008165); n=2, median 41 seconds, max 44 seconds.
 - Queue p50 is 0 seconds on cited non-retry runs. Queue p95, setup p95, and cache hit rate are not established; setup has one 16-second sample against a 15-second target.

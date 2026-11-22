@@ -7,6 +7,7 @@ pub mod config;
 pub mod doctor;
 pub mod egress;
 pub mod exec_events;
+pub mod files;
 pub mod handoff;
 pub mod harness_config;
 pub mod inbox;

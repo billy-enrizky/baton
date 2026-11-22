@@ -282,6 +282,25 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List project files for terminal quick-open
+    Files {
+        /// Optional path query
+        query: Vec<String>,
+        /// Include gitignored files in the ranked results
+        #[arg(long)]
+        ignored: bool,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// Open a project file in VISUAL or EDITOR
+    Open {
+        /// Path relative to the -C directory, or absolute
+        path: String,
+        /// Print the editor command instead of running it
+        #[arg(long)]
+        print: bool,
+    },
     /// List durable turn phases for a thread
     Turns {
         thread_id: Option<String>,
@@ -427,6 +446,30 @@ mod tests {
         match cli.command {
             Some(Commands::Activity { json: true }) => {}
             _ => panic!("expected activity"),
+        }
+    }
+
+    #[test]
+    fn files_accepts_query_ignored_and_json() {
+        let cli = Cli::try_parse_from(["baton", "files", "parser", "--ignored", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Files {
+                query,
+                ignored: true,
+                json: true,
+            }) => assert_eq!(query, vec!["parser"]),
+            _ => panic!("expected files"),
+        }
+    }
+
+    #[test]
+    fn open_accepts_path_and_print() {
+        let cli = Cli::try_parse_from(["baton", "open", "src/main.rs", "--print"]).unwrap();
+        match cli.command {
+            Some(Commands::Open { path, print: true }) => {
+                assert_eq!(path, "src/main.rs");
+            }
+            _ => panic!("expected open"),
         }
     }
 

@@ -16,6 +16,7 @@ The product problem is: a terminal user should be able to start, supervise, reco
 | An agent running Baton through CLI or MCP | Inspect durable state and perform scoped actions without scraping the TUI |
 | A maintainer working across multiple harnesses | Switch providers mid-thread without stale context or lost work |
 | A contributor using CI | Get honest, fast feedback and a full verification before merge |
+| A developer referencing project files | Find and open a file from the terminal without pasting absolute paths |
 
 ## Goals
 
@@ -48,9 +49,9 @@ The product problem is: a terminal user should be able to start, supervise, reco
 
 | Repository | URL | Checkout | Ref | Commit |
 |---|---|---|---|---|
-| T3 Code | `https://github.com/pingdotgg/t3code` | `/Users/billy/Documents/t3code` | `origin/main` | `7b21adbe7cd633813eeb8a9e3ec4961ec31f98a3` |
-| Orca | `https://github.com/stablyai/orca` | `/Users/billy/Documents/orca` | `origin/main` | `52673d4e065ef6e27d0bda3be288ecb6282a2a42` |
-| Baton baseline | `https://github.com/billy-enrizky/baton` | `/Users/billy/Documents/baton/.worktrees/pin-order` | `origin/main` | `08e1003` before the manual-pin slice |
+| T3 Code | `https://github.com/pingdotgg/t3code` | `/Users/billy/Documents/t3code` | `origin/main` | `f10e1eb3825a773cf702569d2258edfdbc8b77dc` |
+| Orca | `https://github.com/stablyai/orca` | `/Users/billy/Documents/orca` | `origin/main` | `f2f0cce6e42e7cbda46eb17a16f069b8ed86b93b` |
+| Baton baseline | `https://github.com/billy-enrizky/baton` | working copy | `origin/main` | `3a0e024` before the file-navigation slice |
 
 The T3 and Orca rows were refreshed to the local `origin/main` commits shown on 2026-11-22. Read upstream evidence with `git -C <checkout> show <commit>:<path>`, or verify the path exists with `git -C <checkout> cat-file -e <commit>:<path>`. Evidence paths are prefixed with `T3:` or `Orca:`. Refresh the rows through the sync procedure when a slice changes upstream behavior.
 
@@ -118,7 +119,7 @@ Rules the evidence column obeys:
 | Cross-thread attention inbox | T3: `packages/client-runtime/src/state/threadInbox.ts` (symbol createInboxReturnTracker); Orca: `docs/site/content/docs/activity.mdx` | Equivalent | `src/inbox.rs`; `/inbox` picker and `baton inbox [--json]`; `src/tui/mod.rs` `inbox_lists_attention_threads_and_opens_the_selected_one`; `src/inbox.rs` unit tests; `src/cli.rs` `inbox_accepts_json`; unit | One inbox merges failed, unverified, interrupted, needs-input, queued, and completed-unshipped work across projects. | None for the row; later work can add archive or acknowledge actions. | D16 |
 | Usage and cost history | T3: `apps/server/src/usage/UsageService.ts`; Orca: `src/main/rate-limits/service/rate-limit-service.ts` | Partial | `src/usage.rs`; `/usage`; `baton usage`; usage tests; unit | Token, cache, and cost history belongs in JSON and the TUI. | Add `--by day`, `--by model`, and `--by provider` to `baton usage`. | D5 |
 | Quick commands | Orca: `docs/site/content/docs/terminal.mdx`, `src/shared/terminal/quick-commands/terminal-quick-commands.ts` | Partial | `src/tui/mod.rs` `discover_custom_commands`; `{{args}}` and `{{cwd}}` expansion; source only, no management test; none | Extend the existing custom command registry. | Add `/commands add <name> <template>` to the existing `.baton/commands` loader. | D17 |
-| File navigation and quick open | T3: `apps/web/src/components/search/ProjectContentSearchDialog.tsx`; Orca: `src/renderer/src/components/file-actions/quick-open/QuickOpen.tsx` | Missing | `/open` opens threads only; no source path reads `$EDITOR` or `VISUAL`; none | Use `$EDITOR`; do not embed an editor. | Add `baton files` and `baton open <path>` backed by `rg --files` and `$EDITOR`. | D17 |
+| File navigation and quick open | T3: `apps/web/src/components/files/ProjectFilePicker.tsx`, `apps/web/src/components/files/ProjectFilePicker.logic.ts`, `apps/web/src/components/CommandPalette.tsx`; Orca: `src/renderer/src/components/file-actions/quick-open/QuickOpen.tsx`, `docs/site/content/docs/model/quick-open.mdx` | Partial | `src/files.rs` `list_files`, `merge_ignored`, `resolve_project_file`, `editor_from_values`, `build_open_command`, ripgrep discovery, git fallback, cache pruning, one ranked ignored pool, token-aware filename ranking, `-C`-directory containment; `src/cli.rs` `Files` and `Open`; `tests/files_cli.rs` `files_json_reports_paths_limit_query_and_ignored`, `open_print_uses_the_editor_and_rejects_escape_paths`, `open_prefers_visual_over_editor_in_a_real_process`, `files_scope_to_the_current_directory`, `files_fall_back_to_git_when_ripgrep_is_missing`, `empty_pruned_and_ignored_only_projects_list_cleanly`, `ignored_files_reach_the_default_limit`, `file_listings_survive_a_closed_pipe`, `open_runs_the_editor_and_propagates_failure`; `files::tests` `ranking_filters_tokens_and_prefers_file_names`, `subsequence_queries_do_not_match_in_this_slice`, `invalid_utf8_paths_are_skipped`, `ignored_paths_rank_with_nonignored_paths`, `editor_commands_support_quoted_programs_and_paths`, `visual_wins_over_editor_and_blank_values_are_ignored`, `cache_paths_are_excluded_and_user_dotfiles_survive`, `null_output_is_normalized_and_deduplicated`, `unix_paths_keep_backslashes`, `project_paths_cannot_escape_the_root`, `git_fallback_lists_tracked_untracked_and_optional_ignored_files`, `merged_passes_deduplicate_and_share_one_inventory_cap`, `merged_passes_keep_extra_rows_below_the_cap`, `query_matches_survive_past_the_cap_of_unmatched_candidates`, `truncated_flag_tracks_matching_candidates_beyond_the_cap`; `cli::tests` `files_accepts_query_ignored_and_json`, `open_accepts_path_and_print`; unit | Use `$EDITOR`; do not embed an editor. | `baton files [query...] [--ignored] [--json]` and `baton open <path> [--print]` are implemented in this slice. Discovery and open are scoped to the current `-C` directory, gitignored files join the same ranked pool with `--ignored`, unmatched files do not consume the 20,001-match cap, empty directories return an empty list, and `--json` reports `capped` separately from the `--limit` cut. Remaining: fuzzy and subsequence matching, TUI `/files` picker, line targets, project-content search, and recent-file ranking. Next slice: add a `/files [query]` picker whose Enter action inserts the selected `-C`-relative path into the composer. | D17 |
 
 ## Worktrees, source control, and delivery
 
@@ -212,7 +213,9 @@ Release builds, keystroke-to-render, RSS, and the CI wiring are still open in D5
 | Remote control | `serve`, `pair`, and `attach` after an ownership ADR | Shell out to SSH and tmux with no product support | Remote work needs one authority, token scopes, and recovery |
 | Schedules | Durable schedule rows plus `run-due` | Always-running Baton daemon | System cron is simpler until the host exists |
 | Secrets | Environment and external providers first | Local encrypted store in the first PR | Key management and backups are a product of their own |
-| File navigation | `$EDITOR` and `rg --files` | Embedded editor | Editors are already installed and better than a TUI clone |
+| File navigation | `$EDITOR` and `rg --files` with a git fallback | Embedded editor | Editors are already installed and better than a TUI clone |
+| File discovery inputs | Ripgrep with a git fallback, one ranked pool, `-C` scope | Ripgrep only, repository-root scope, or ignored files after every nonignored row | Ripgrep is fastest, the git fallback keeps the command usable without it, and one pool keeps `--ignored` reachable at the default limit. `-C` scope matches `rg` and the shell |
+| File query matching | Case-insensitive substring tokens in this slice | Full fuzzy subsequence matching now | Substring tokens are predictable and cheap. Fuzzy ranking is a named remaining gap, documented by `subsequence_queries_do_not_match_in_this_slice`, not an implied behavior |
 | Quick commands | Extend `.baton/commands` | New second command registry | Two registries drift and confuse the slash menu |
 | CI first step | Full-suite bootstrap and real measurements | Shard count chosen from local macOS data | No Actions run history exists; shards must follow CI data |
 | Merge queue | Required `verify` now, official merge queue after ownership change | Fake queue with a custom bot | A fake queue can hide failures and needs its own server |
@@ -251,6 +254,9 @@ Every row above has one. A decision is reopened when its condition is met, not w
 | Running work is mistaken for background work | A closed TUI leaves a running turn unverified | Reopen visibility, failed/unverified reconciliation, and explicit retry; no local-only continuation promise | Runtime maintainer |
 | PTY and OSC output reaches the host terminal | Terminal escape injection or a stuck screen | Unicode-level allowlist in D9a before any PTY or BEL slice, with UTF-8, emoji, C1, OSC, and BEL fixtures | TUI maintainer |
 | Repo hooks execute untrusted code | Code execution on open or worktree create | Bind trust to repository, hook digest, and config version; re-prompt on change; default deny; sanitized environment; audit row | Worktree maintainer |
+| File discovery scans a large tree | A quick-open command feels slow or returns an irrelevant cap | Query filtering before the 20,001-match cap, root build-output pruning, and a measured follow-up before the TUI picker; the tree walk and ripgrep output capture are unchanged | CLI maintainer |
+| Ignored files hide sensitive paths in output | `.env` or keys appear in terminal output or logs | `--ignored` is opt-in, JSON is not logged by Baton, and the feature card names the exposure | Privacy owner |
+| Windows editor commands parse differently | An editor path with spaces fails to launch | Preserve backslashes unless they escape a quote or whitespace, use argv for the run path, and document `--print` host-shell quoting as best effort | CLI maintainer |
 | Remote or MCP mutation exceeds scope | Unauthorized spend or thread changes | A durable append-only audit event (actor, environment, thread, action, scope, confirmation, payload digest, result, timestamp, retention) defined before D19, plus scoped tokens, confirmation, and a spend cap | Host maintainer |
 | Secret leakage in logs or doctor output | Credential exposure | Redaction test with a fake key in every output path | CLI maintainer |
 | CI false green | A broken change merges | Full suite in merge candidate, selector self-test, independent selection check | CI maintainer |
@@ -285,7 +291,7 @@ Release 1 is the smallest set that makes the terminal core trustworthy: correct 
 |---|---|
 | D1, D2, D3a, D3b, D3c, D9a, D6, D7, D4a, D4d, D4b, D4e, D4c, D5 | D8a, D8, D10 to D17, D18a, D18b, D18, D19 to D24 |
 
-No implementation slice is currently in progress. The four-slice cap applies when a new implementation starts.
+The file-navigation slice is the only open implementation slice. The four-slice cap applies when a new implementation starts.
 
 Merged slices:
 
@@ -308,6 +314,9 @@ Merged slices:
 | D5 release | #103 | Release-build startup and input baselines |
 | D4c | #102 | Handoff preview, no-handoff, and confirmation |
 | CI 1C | #90 | Workflow on main; first green PR and push runs |
+| D16 pins | #145 | Durable pins, `/pin` full-ID picker, and pinned-first display order |
+| D16 pin order | #147 | Canonical microsecond order keys, immediate backfill and move, exact completions, PTY proof |
+| D16 pin keyboard | #148 | Ctrl+Up/Ctrl+Down picker reorder without closing, boundary notices, PTY proof |
 
 D3c closed on 2026-11-22. Run 44982816103 executed every PR job with `verify` green, and run 44983114852 is the first green `main` push. The earlier billing-blocked run 44969473815 is historical. D3c no longer blocks Release 1; branch protection and the D2 two-clean-round acceptance remain open.
 
@@ -382,10 +391,22 @@ Durable thread archive must not land before a thread-scoped operation claim or l
 
 | Field | Value |
 |---|---|
-| EGM round | Manual-pin review R1 through R5 reached the five-round cap. The reviewed keyboard-reorder plan is now implemented in this slice and covered by unit and PTY proof. |
+| EGM round | Manual-pin review R1 through R5 reached the five-round cap. The reviewed keyboard-reorder plan is now implemented in the pin slice and covered by unit and PTY proof. |
 | Reviewers | Round 1 through Round 3 reviewed parity and CI with `codebase_details`, `design_critic`, `comprehension`, and `implementation_readiness`. Round 7 reviewed the basic pin slice. Manual-pin R1 through R5 used fresh `design_critic` and `structural` pairs on the pin ledger, feature docs, PTY proof, archive deferral, and keyboard-reorder plan. |
 | Targets | `docs/parity.md`, `docs/ci.md`, `docs/ci-acceptance.md`, `ci/**`, `.github/workflows/ci.yml`; Manual-pin R1 through R5 also reviewed `README.md`, `.agents/skills/verify-baton/features/pin.md`, `.agents/skills/verify-baton/features/slash-commands.md`, `.agents/skills/verify-baton/features/README.md`, `.agents/skills/verify-baton/scripts/slash_probe.py`, `src/store.rs`, `src/tui/mod.rs`, `src/main.rs`, `src/status.rs`, `src/inbox.rs`, `src/mcp.rs`, and `tests/core.rs`, and the archive deferral and next-slice plan |
 | Findings report | `local_docs/goldfish_review_report.md`, which is gitignored. Durable conclusions live in this table and in the documents themselves. |
 | Accepted fixes | Baton evidence column and proof rubric; problem, goals, non-goals, alternatives, and risks; Release 1 boundary and the four-slice in-flight cap; corrected statuses for multiple accounts, task dependencies, attention inbox, worker mailbox, and the three performance rows; provider identity prerequisite (D8a) ahead of PTY, ACP, and Pi; sanitizer (D9a) ahead of BEL and PTY; egress and redaction ahead of cross-provider send; audit schema and hook-execution ADR as prerequisites; single scheduler owner; handoff defects recorded as the first slice; CI Phase 1A/1B/1C split; base-owned tools on every event; no PR-level CI override; gate-integrity suppression checks; test inventory floor; unbudgeted-command rule; provisional budgets with a shrink-only rule; basic pin display order separated from semantic resolution; scrolling full-ID pin picker; restart, CLI JSON, and default-target regressions; canonical microsecond pin keys with sub-microsecond truncation; indexed no-repair probe plus immediate backfill; immediate pin and move transactions with affected-row checks; deterministic malformed-timestamp repair; two-connection move serialization; batched latest-turn status reads; symlink and canonical path merging; single-cursor picker text; exact move completions and project scoping; a real PTY reorder plus boundary proof; `/help` and `/exit` completion coverage; the keyboard pin reorder slice; archive deferred until thread-operation claims, strict work queries, and canonical path storage exist; CI proof surface clarified as path-selected on PRs and full on merge-group and main; branch protection still pending; reviewed Ctrl+Up/Ctrl+Down picker reorder with exact modifier handling, single notifier path, unchanged selection on refusal, and real PTY Ctrl+Down proof |
 | Rejected fixes | A `ci-change` label that permits command changes (a label is a blanket bypass, so CI changes use the owner-only `ci-repair` path); a fake merge queue; a paid runner before measurement; a second project config file for hooks and actions; an archive implementation plan that predates thread-operation claims and a strict work query |
 | Open escalated items | Official merge queue needs an organization on GitHub Enterprise Cloud; branch protection is not yet configured; the D2 two-clean-round acceptance remains open; archive waits on the operation-claim prerequisite and a reviewed spec. |
+
+## Review record: file navigation
+
+| Field | Value |
+|---|---|
+| EGM rounds | File navigation R1: a fresh `structural` and `design_critic` pair on the first candidate. R2: a fresh pair on the fixed candidate. R3: a fresh `structural` check on the final candidate. |
+| Reviewers | Fresh `structural` and `design_critic` Goldfish agents, each with the feature-spec standard and the pinned T3 and Orca commits. |
+| Targets | `src/files.rs`, `src/cli.rs`, `src/main.rs`, `tests/files_cli.rs`, `docs/parity.md`, `README.md`, `.agents/skills/verify-baton/features/file-nav.md`, `.agents/skills/verify-baton/features/README.md`, `ci/test-inventory-floor.txt`, `ci/selftest.sh`, `docs/ci.md` |
+| Findings report | `local_docs/goldfish_review_report.md`, which is gitignored. Durable conclusions live here and in the documents. |
+| Accepted fixes | T3 quick-open evidence corrected to `ProjectFilePicker` and the command palette; one shared 20,001-match cap after merge and dedupe; query filtering before the cap; gitignored files ranked in one pool so `--ignored` reaches the default limit; ripgrep exit 1 treated as an empty listing; empty, pruned-only, and ignored-only directories covered; JSON and plain output survive a closed pipe; canonical absolute JSON `cwd` with lossy rendering for non-UTF-8; token-aware multi-token filename ranking; editor run, nonzero exit, missing editor, and `VISUAL` precedence proofs; `-C` scope in help, errors, ledger, and docs; empty quoted arguments preserved; Unix backslashes preserved and UNC paths tested; non-UTF-8 file names skipped; deleted tracked files dropped from the git fallback; cache pruning narrowed to caches and the root `target`; platform-aware `--print` quoting with the Windows best-effort caveat; `unit` proof surface with named tests; problem, alternatives, and risks sections; the TUI `/open` distinction; the test floor and the selftest fixture moved to the executed count; the file-navigation review record added. |
+| Rejected fixes | Applying `--limit` once per discovery pass (returns more rows than requested); an `--ignored-only` browse mode (a query already reaches an ignored path); implementing fuzzy matching in this slice (it is named, tested as absent, and belongs to its own slice); renaming the TUI `/open` command (it would break existing completions and docs for a temporary overlap). |
+| Open items | Fuzzy and subsequence matching, the TUI `/files` picker, line-number targets, project-content search, and recent-file ranking are the remaining `Partial` gaps. Windows `--print` quoting is best effort; the run path uses argv. |

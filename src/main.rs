@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use adapters::{AcpAdapter, BatonAdapter, ClaudeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
@@ -19,13 +20,14 @@ use adapters::TurnEvent;
 use usage::{cache_hit_rate, format_usage_line, sum_usage};
 
 fn main() {
-    if let Err(error) = main_result() {
+    let started = Instant::now();
+    if let Err(error) = main_result(started) {
         eprintln!("{error}");
         std::process::exit(1);
     }
 }
 
-fn main_result() -> Result<()> {
+fn main_result(started: Instant) -> Result<()> {
     let cli = cli::Cli::parse();
     let cwd = cli
         .cwd
@@ -546,6 +548,11 @@ fn main_result() -> Result<()> {
             }
             return Ok(());
         }
+        cli::Commands::Bench {
+            target,
+            json,
+            repeat,
+        } => return run_bench(&home, started, &target, json, repeat),
         cli::Commands::Chat => run_chat(
             cli,
             &home,
@@ -2084,6 +2091,84 @@ fn main_result() -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_bench(home: &Path, started: Instant, target: &str, json: bool, repeat: u32) -> Result<()> {
+    if target != "startup" {
+        anyhow::bail!("unknown bench target \"{target}\"; only startup is available");
+    }
+    let repeat = repeat.max(1);
+    let mut samples = Vec::new();
+    for _ in 0..repeat {
+        let iteration = Instant::now();
+        let phase = Instant::now();
+        config::validate_provider_overrides(home)?;
+        let config_ms = phase.elapsed().as_secs_f64() * 1000.0;
+
+        let phase = Instant::now();
+        let store = BatonStore::open(&paths::baton_db_path())?;
+        let store_ms = phase.elapsed().as_secs_f64() * 1000.0;
+
+        let phase = Instant::now();
+        let _ = process::reap_orphans(&store)?;
+        let reap_ms = phase.elapsed().as_secs_f64() * 1000.0;
+
+        let phase = Instant::now();
+        let threads = store.list_threads(None)?;
+        if let Some(thread) = threads.first() {
+            let _ = store.list_messages(&thread.id)?;
+        }
+        let hydrate_ms = phase.elapsed().as_secs_f64() * 1000.0;
+
+        samples.push(serde_json::json!({
+            "config_ms": config_ms,
+            "store_ms": store_ms,
+            "reap_ms": reap_ms,
+            "hydrate_ms": hydrate_ms,
+            "total_ms": iteration.elapsed().as_secs_f64() * 1000.0,
+            "threads": threads.len(),
+        }));
+    }
+    let median = |key: &str| -> f64 {
+        let mut values: Vec<f64> = samples
+            .iter()
+            .filter_map(|sample| sample.get(key).and_then(serde_json::Value::as_f64))
+            .collect();
+        values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        match values.len() {
+            0 => 0.0,
+            len if len % 2 == 1 => values[len / 2],
+            len => (values[len / 2 - 1] + values[len / 2]) / 2.0,
+        }
+    };
+    let process_ms = started.elapsed().as_secs_f64() * 1000.0;
+    if json {
+        let summary = serde_json::json!({
+            "target": "startup",
+            "repeat": repeat,
+            "process_ms": process_ms,
+            "samples": samples,
+            "median_ms": {
+                "config": median("config_ms"),
+                "store": median("store_ms"),
+                "reap": median("reap_ms"),
+                "hydrate": median("hydrate_ms"),
+                "total": median("total_ms"),
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!(
+            "startup over {repeat} run(s): config {:.1} ms, store {:.1} ms, reap {:.1} ms, hydrate {:.1} ms, per-run total {:.1} ms, process {:.1} ms",
+            median("config_ms"),
+            median("store_ms"),
+            median("reap_ms"),
+            median("hydrate_ms"),
+            median("total_ms"),
+            process_ms,
+        );
+    }
+    Ok(())
 }
 
 fn reconcile_startup_orchestrations() {

@@ -293,6 +293,18 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Measure startup phases so a performance change has a before and after
+    Bench {
+        /// What to measure; only `startup` exists
+        #[arg(default_value = "startup")]
+        target: String,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+        /// Run the measured phases this many times and report every sample
+        #[arg(long, default_value_t = 1)]
+        repeat: u32,
+    },
     /// List provider processes tracked by baton
     Ps {
         /// Emit a JSON object instead of lines

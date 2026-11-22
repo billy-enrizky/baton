@@ -569,7 +569,7 @@ fn main_result(started: Instant) -> Result<()> {
         cli::Commands::Threads { json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let resolved = resolve_config(&home, &cwd);
-            let threads = store.list_threads_for_path(&cwd)?;
+            let threads = store.list_threads_for_path_display(&cwd)?;
             if threads.is_empty() {
                 println!("no threads in this directory yet. Run baton to start one.");
                 return Ok(());
@@ -605,6 +605,7 @@ fn main_result(started: Instant) -> Result<()> {
                         "reasoning_effort": thread.reasoning_effort,
                         "session_mode": thread.session_mode.as_str(),
                         "permission_mode": thread.permission_mode.as_str(),
+                        "pinned": thread.pinned,
                         "goal": thread.goal,
                         "goal_paused": thread.goal_paused,
                         "phase": phase,
@@ -644,7 +645,8 @@ fn main_result(started: Instant) -> Result<()> {
                     .unwrap_or_else(|| "idle".to_string());
                 let queued = store.list_queued_messages(&thread.id)?.len();
                 println!(
-                    "{}  {}/{}{}  session:{}  {}  turns:{}  queue:{}  {}",
+                    "{}{}  {}/{}{}  session:{}  {}  turns:{}  queue:{}  {}",
+                    if thread.pinned { "* " } else { "" },
                     &thread.id[..8],
                     thread.current_provider,
                     model,

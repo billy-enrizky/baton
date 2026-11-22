@@ -27,22 +27,22 @@ Budget rule, applied at every phase: Phase 1 uses three times a conservative col
 
 ## Current baseline
 
-Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31fc5` and the inbox slices; current main is `7f18e59` before the completions slice.
+Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31fc5` and the inbox slices; later slices added tests, so the executed count row is refreshed with each slice while the timing samples stay historical.
 
-| Measurement | Current value | Evidence |
+| Measurement | Recorded value | Evidence |
 |---|---|---|
 | Warm Rust PR feedback | 58, 60, 61, 63, and 68 seconds; n=5, median 61.0 seconds, max 68 seconds | Runs 45004705055, 45009466461, 45021604178, 45011836996, and 45010710576 |
 | Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
 | Warm Test job | 33, 37, 49, 47, and 37 seconds | Runs 45004705055, 45009466461, 45010710576, 45011836996, and 45021604178 |
-| `cargo test --lib` | 1.67 to 3.70 seconds, 331 tests | Runs 45009466461 and 45011836996 |
-| Integration tests | 0.40 to 0.75 seconds, 75 tests across seven binaries | Runs 45009466461 and 45011836996 |
-| Executed test count (`ci/test-inventory.sh`) | 421 | Current local suite |
-| `ci/test-inventory-floor.txt` | 421 | Current floor and executed count |
+| `cargo test --lib` | 1.67 to 3.70 seconds, 331 tests at the cited runs | Runs 45009466461 and 45011836996; the suite now has 357 lib tests |
+| Integration tests | 0.40 to 0.75 seconds, 75 tests across seven binaries at the cited runs | Runs 45009466461 and 45011836996; the suite now has 90 integration tests across eight binaries, plus one Linux-only non-UTF-8 case |
+| Executed test count (`ci/test-inventory.sh`) | 447 | Current local suite |
+| `ci/test-inventory-floor.txt` | 447 | Current floor and executed count |
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
 
-The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 421 floor is a lower bound, not a per-test lock. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff.
+The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 447 floor is a lower bound, not a per-test lock. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff.
 
 Older local macOS measurements are historical and are not acceptance evidence. The acceptance record contains the Linux run-level data and the rejected experiments.
 
@@ -204,7 +204,7 @@ Fixtures required before Phase 3 lands: transitive importer, `lib.rs`, unmapped 
 
 ## Sharding (Phase 3)
 
-Shards are not active. The current lib binary runs 326 tests in 1.73 seconds and the seven integration binaries run 75 tests in 0.39 seconds. Sharding would duplicate the 16-second Test setup and the 13-second compile for no gain.
+Shards are not active. The current lib binary runs 357 tests and the eight integration binaries run 90 tests. At the cited runs the lib binary ran 326 tests in 1.73 seconds and the seven integration binaries ran 75 tests in 0.39 seconds. Sharding would duplicate the 16-second Test setup and the 13-second compile for no gain.
 
 If a gate ceiling is missed, shards are filled from recorded per-test times, never from a count:
 

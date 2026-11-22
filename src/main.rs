@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, files, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -1743,6 +1743,60 @@ fn main_result(started: Instant) -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Files {
+            query,
+            ignored,
+            json,
+        } => {
+            let query = query.join(" ");
+            let root = std::fs::canonicalize(&cwd).map_err(|error| {
+                anyhow::anyhow!("cannot resolve -C directory {}: {error}", cwd.display())
+            })?;
+            let listing = files::list_files(
+                &root,
+                files::FileOptions {
+                    query: (!query.trim().is_empty()).then_some(query.as_str()),
+                    limit: cli.limit,
+                    include_ignored: ignored,
+                },
+            )?;
+            if json {
+                print_json(&serde_json::json!({
+                    "schema_version": files::SCHEMA_VERSION,
+                    "cwd": root.to_string_lossy(),
+                    "query": query,
+                    "ignored": ignored,
+                    "limit": cli.limit,
+                    "truncated": listing.truncated,
+                    "capped": listing.capped,
+                    "count": listing.files.len(),
+                    "files": listing.files,
+                }))?;
+            } else {
+                print_file_paths(&listing.files)?;
+                if listing.capped {
+                    eprintln!("results truncated at the 20,001-match cap; refine the query");
+                } else if listing.truncated {
+                    eprintln!("showing {} files; raise --limit", listing.files.len());
+                }
+            }
+            Ok(())
+        }
+        cli::Commands::Open { path, print } => {
+            let target = files::resolve_project_file(&cwd, Path::new(&path))?;
+            let editor = files::editor_from_env().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no editor configured; set VISUAL or EDITOR, for example `EDITOR=vim baton open {path}`"
+                )
+            })?;
+            let command = files::build_open_command(&editor, &target)?;
+            if print {
+                print_file_paths(&[command.shell_line()])?;
+            } else {
+                command.run(&cwd)?;
+            }
+            Ok(())
+        }
         cli::Commands::Activity { json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match cli.thread.as_deref() {
@@ -2130,6 +2184,37 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    let text = serde_json::to_string_pretty(value)?;
+    let mut output = std::io::BufWriter::new(std::io::stdout().lock());
+    if let Err(error) = writeln!(output, "{text}").and_then(|()| output.flush()) {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn print_file_paths(paths: &[String]) -> Result<()> {
+    let mut output = std::io::BufWriter::new(std::io::stdout().lock());
+    for path in paths {
+        if let Err(error) = writeln!(output, "{path}") {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    }
+    if let Err(error) = output.flush() {
+        if error.kind() == std::io::ErrorKind::BrokenPipe {
+            return Ok(());
+        }
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn run_bench(home: &Path, started: Instant, target: &str, json: bool, repeat: u32) -> Result<()> {

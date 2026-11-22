@@ -336,6 +336,9 @@ enum Overlay {
         models: Vec<String>,
         selected: usize,
         filter: String,
+        /// True when the picker came from `/switch`, which also returns the
+        /// thread to a single harness. `/model` only changes the model.
+        switch_mode: bool,
     },
     SettingsPicker {
         provider: ProviderId,
@@ -2748,6 +2751,7 @@ fn handle_key(
                         models,
                         selected: 0,
                         filter: String::new(),
+                        switch_mode: true,
                     };
                 }
             }
@@ -2760,6 +2764,7 @@ fn handle_key(
             models,
             mut selected,
             mut filter,
+            switch_mode,
         } => {
             let filtered = model_filter_indices(&models, &filter);
             match key.code {
@@ -2807,7 +2812,11 @@ fn handle_key(
                 KeyCode::Enter => {
                     if let Some(index) = filtered.get(selected) {
                         if let Some(model) = models.get(*index).cloned() {
-                            perform_switch(state, store, provider, Some(model));
+                            if switch_mode {
+                                perform_switch(state, store, provider, Some(model));
+                            } else {
+                                set_current_model(state, store, model);
+                            }
                             return;
                         }
                     }
@@ -2819,6 +2828,7 @@ fn handle_key(
                 models,
                 selected,
                 filter,
+                switch_mode,
             };
         }
         Overlay::SettingsPicker {
@@ -5129,24 +5139,7 @@ fn handle_command(
             }
         }
         "/model" => match args.first() {
-            None => {
-                let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
-                let effective = state.thread.current_model.clone().unwrap_or_else(|| {
-                    resolved
-                        .for_provider(state.thread.current_provider)
-                        .model
-                        .clone()
-                });
-                let source = if state.thread.current_model.is_some() {
-                    "thread"
-                } else {
-                    "harness config"
-                };
-                state.notice = Some(format!(
-                    "current model: {}/{} ({source})",
-                    state.thread.current_provider, effective
-                ));
-            }
+            None => open_model_picker(state, engine_command_sender, state.thread.current_provider),
             Some(model) => {
                 let result = {
                     let guard = store.lock().unwrap();
@@ -6646,6 +6639,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 models,
                 selected,
                 filter,
+                ..
             } => draw_model_picker(
                 frame, chunks[1], state, *provider, models, *selected, filter,
             ),
@@ -6805,6 +6799,67 @@ fn handle_mcp_command(state: &mut TuiState, action: &str, args: &[String]) {
                 "unknown /mcp action {other}. Use list, add, remove, or sync"
             ))
         }
+    }
+}
+
+/// `/model` opens the same picker `/switch` uses, but choosing a model must
+/// not change the session mode.
+fn open_model_picker(
+    state: &mut TuiState,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    provider: ProviderId,
+) {
+    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let configured = resolved.for_provider(provider).model.clone();
+    let current = if provider == state.thread.current_provider {
+        state.thread.current_model.clone()
+    } else {
+        None
+    };
+    let mut models: Vec<String> = crate::models::catalog(provider)
+        .iter()
+        .map(|model| model.to_string())
+        .collect();
+    for extra in [Some(configured.clone()), current.clone()]
+        .into_iter()
+        .flatten()
+    {
+        if !models.contains(&extra) {
+            models.insert(0, extra);
+        }
+    }
+    let selected = current
+        .or(Some(configured))
+        .and_then(|active| models.iter().position(|model| *model == active))
+        .unwrap_or(0);
+    state.model_request_id = state.model_request_id.wrapping_add(1);
+    let _ = engine_command_sender.send(EngineCommand::ListModels {
+        thread_id: state.thread.id.clone(),
+        provider,
+        request_id: state.model_request_id,
+    });
+    state.overlay = Overlay::ModelPicker {
+        provider,
+        models,
+        selected,
+        filter: String::new(),
+        switch_mode: false,
+    };
+}
+
+fn set_current_model(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, model: String) {
+    let result = {
+        let guard = store.lock().unwrap();
+        ensure_persisted(&guard, &mut state.thread)
+            .and_then(|()| guard.set_thread_model(&state.thread.id, &model))
+    };
+    match result {
+        Ok(()) => {
+            state.thread.current_model = Some(model.clone());
+            state.overlay = Overlay::None;
+            state.notice = Some(format!("model set to {model}"));
+        }
+        Err(error) => state.notice = Some(format!("cannot set model: {error}")),
     }
 }
 
@@ -9147,6 +9202,48 @@ mod tests {
     }
 
     #[test]
+    fn model_without_an_argument_opens_the_picker_for_the_current_harness() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.set_session_mode(&store, SessionMode::Orchestrate);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/model");
+        let Overlay::ModelPicker {
+            provider,
+            models,
+            switch_mode,
+            ..
+        } = &state.overlay
+        else {
+            panic!("expected the model picker, got a different overlay");
+        };
+        assert_eq!(*provider, state.thread.current_provider);
+        assert!(!switch_mode, "/model must not change the session mode");
+        assert!(
+            models.len() > 1,
+            "the picker lists every catalog model, not just the current one: {models:?}"
+        );
+
+        let chosen = models[models.len() - 1].clone();
+        state.overlay = Overlay::ModelPicker {
+            provider: *provider,
+            models: models.clone(),
+            selected: models.len() - 1,
+            filter: String::new(),
+            switch_mode: false,
+        };
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert_eq!(state.thread.current_model.as_deref(), Some(chosen.as_str()));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(
+            state.thread.session_mode,
+            SessionMode::Orchestrate,
+            "choosing a model keeps orchestrate mode"
+        );
+    }
+
+    #[test]
     fn model_picker_window_follows_a_large_live_catalog() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -9156,6 +9253,7 @@ mod tests {
             models: (0..20).map(|index| format!("model-{index:02}")).collect(),
             selected: 15,
             filter: String::new(),
+            switch_mode: true,
         };
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(text.contains("16/20"), "position header: {text}");
@@ -9180,6 +9278,7 @@ mod tests {
             ],
             selected: 0,
             filter: String::new(),
+            switch_mode: true,
         };
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let key = |code| KeyEvent {
@@ -9219,6 +9318,7 @@ mod tests {
             models: vec!["selected-model".into()],
             selected: 0,
             filter: String::new(),
+            switch_mode: true,
         };
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let thread_id = state.thread.id.clone();
@@ -9264,6 +9364,7 @@ mod tests {
             models: vec!["current-model".into()],
             selected: 0,
             filter: String::new(),
+            switch_mode: true,
         };
         state.model_request_id = 2;
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();

@@ -234,7 +234,7 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 
 - The current workflow has fifteen warm samples. The Rust median is 62.0 seconds and the maximum is 74 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist; the under-60 target is not met.
 - The free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. A future proposal must be additive, not a replacement, keep an independent required x64 pre-merge Test job, and provide a matched rerun under the 100-run or four-week measurement policy. A merge queue alone is insufficient if it runs the same ARM job.
-- The historical docs-only sample was n=1, median 44 seconds, max 44 seconds. The current workflow has no docs-only sample yet.
+- The docs-only samples are 44 seconds (historical) and 38 seconds (run 45077008165); n=2, median 41 seconds, max 44 seconds.
 - Queue p50 is 0 seconds on cited non-retry runs. Queue p95, setup p95, and cache hit rate are not established; setup has one 16-second sample against a 15-second target.
 - The repository is public. Standard GitHub-hosted runners are free. No paid-runner cost is approved or required by the current measurements.
 - A paid 8-core runner remains an unmeasured option. It is not recommended until both Rust-target metrics miss across at least 100 runs or four weeks.

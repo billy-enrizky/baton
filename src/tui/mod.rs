@@ -96,7 +96,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/pin", "pin, unpin, or move a pinned thread"),
     ("/inbox", "all threads that need attention"),
     ("/open", "open a thread by id prefix"),
-    ("/files", "pick a project file and insert its path"),
+    (
+        "/files",
+        "pick a project file and insert its path, optionally with :line",
+    ),
     ("/usage", "token usage and cache hit rate"),
     ("/checkpoints", "list checkpoints for this thread"),
     ("/review", "review the latest turn diff with line notes"),
@@ -158,7 +161,7 @@ Type what you want to do. Baton picks a harness.
 Common
   /switch <provider> [model]  use one harness
   /model                      choose a model
-  /files [query]              insert a project path
+  /files [query][:line]       insert a project path or path:line
   /new                        start a new thread
   /threads                    list threads here
   /pin                        pin or unpin; /pin move <id> up or down
@@ -466,6 +469,10 @@ enum Overlay {
         filtered: Vec<usize>,
         /// Query used to load `entries`, shown in the heading.
         base_query: String,
+        /// Optional 1-based line appended to the inserted path.
+        line: Option<u32>,
+        /// Line supplied on the `/files` command, restored when the live filter clears.
+        command_line: Option<u32>,
         truncated: bool,
         loading: bool,
         request: u64,
@@ -2186,6 +2193,27 @@ fn model_filter_indices(models: &[String], filter: &str) -> Vec<usize> {
         .collect()
 }
 
+fn split_line_target(query: &str) -> (String, Option<u32>) {
+    let query = query.trim();
+    if let Some((path, digits)) = query.rsplit_once(':') {
+        if path.ends_with('\\') {
+            return (query.replace("\\:", ":"), None);
+        }
+        let digits = digits.trim();
+        if !path.trim().is_empty()
+            && !digits.is_empty()
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            if let Ok(line) = digits.parse::<u32>() {
+                if line > 0 {
+                    return (path.trim().replace("\\:", ":"), Some(line));
+                }
+            }
+        }
+    }
+    (query.replace("\\:", ":"), None)
+}
+
 fn files_filter_indices(entries: &[String], query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
         return (0..entries.len()).collect();
@@ -2306,7 +2334,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/fork", _) => Some("fork [--turn N] [title]"),
         ("/worktree", _) => Some("worktree [title]"),
         ("/open", _) => Some("open <thread id prefix>"),
-        ("/files", _) => Some("files [query]"),
+        ("/files", _) => Some("files [query] [:<line>]"),
         ("/pin", "move") => Some("pin move <id> up or down"),
         ("/review", _) => Some("review [turn]"),
         ("/diff", _) => Some("diff [turn]"),
@@ -3620,6 +3648,8 @@ fn handle_key(
             entries,
             mut filtered,
             base_query,
+            mut line,
+            command_line,
             truncated,
             loading,
             request,
@@ -3631,12 +3661,15 @@ fn handle_key(
                     }
                     query.clear();
                     selected = 0;
+                    line = command_line;
                     filtered = files_filter_indices(&entries, &query);
                 }
                 KeyCode::Backspace => {
                     query.pop();
                     selected = 0;
-                    filtered = files_filter_indices(&entries, &query);
+                    let (filter, typed_line) = split_line_target(&query);
+                    line = typed_line.or(command_line);
+                    filtered = files_filter_indices(&entries, &filter);
                 }
                 KeyCode::Char(character)
                     if !key
@@ -3645,7 +3678,9 @@ fn handle_key(
                 {
                     query.push(character);
                     selected = 0;
-                    filtered = files_filter_indices(&entries, &query);
+                    let (filter, typed_line) = split_line_target(&query);
+                    line = typed_line.or(command_line);
+                    filtered = files_filter_indices(&entries, &filter);
                 }
                 KeyCode::Up => {
                     if !filtered.is_empty() {
@@ -3666,8 +3701,12 @@ fn handle_key(
                 KeyCode::Enter => {
                     if let Some(index) = filtered.get(selected) {
                         if let Some(path) = entries.get(*index).cloned() {
-                            state.insert_input_str(&format!("{path} "));
-                            state.notice = Some(format!("inserted {path}"));
+                            let target = match line {
+                                Some(line) => format!("{path}:{line}"),
+                                None => path.clone(),
+                            };
+                            state.insert_input_str(&format!("{target} "));
+                            state.notice = Some(format!("inserted {target}"));
                             return;
                         }
                     } else if !loading {
@@ -3682,6 +3721,8 @@ fn handle_key(
                 entries,
                 filtered,
                 base_query,
+                line,
+                command_line,
                 truncated,
                 loading,
                 request,
@@ -3907,31 +3948,39 @@ fn apply_files_picker_event(state: &mut TuiState, event: FilesPickerEvent) {
         base_query,
         result,
     } = event;
-    let query = match &state.overlay {
+    let (query, command_line) = match &state.overlay {
         Overlay::FilesPicker {
             request: current,
             query,
+            command_line,
             ..
-        } if *current == request => query.clone(),
+        } if *current == request => (query.clone(), *command_line),
         _ => return,
     };
+    let (filter, typed_line) = split_line_target(&query);
+    let line = typed_line.or(command_line);
     match result {
         Ok(listing) if listing.files.is_empty() => {
             state.overlay = Overlay::None;
+            let line_note = line
+                .map(|line| format!(" (line {line})"))
+                .unwrap_or_default();
             state.notice = Some(if base_query.is_empty() {
                 "files: no files here · caches and build output are pruned".to_string()
             } else {
-                format!("files: no matches for \"{base_query}\"")
+                format!("files: no matches for \"{base_query}\"{line_note}")
             });
         }
         Ok(listing) => {
-            let filtered = files_filter_indices(&listing.files, &query);
+            let filtered = files_filter_indices(&listing.files, &filter);
             state.overlay = Overlay::FilesPicker {
                 selected: 0,
                 query,
                 entries: listing.files,
                 filtered,
                 base_query,
+                line,
+                command_line,
                 truncated: listing.truncated,
                 loading: false,
                 request,
@@ -6297,7 +6346,7 @@ fn handle_command(
                 );
                 return;
             }
-            let base_query = args.join(" ").trim().to_string();
+            let (base_query, line) = split_line_target(&args.join(" "));
             let request = state.files_picker_request + 1;
             state.files_picker_request = request;
             state.overlay = Overlay::FilesPicker {
@@ -6306,6 +6355,8 @@ fn handle_command(
                 entries: Vec::new(),
                 filtered: Vec::new(),
                 base_query: base_query.clone(),
+                line,
+                command_line: line,
                 truncated: false,
                 loading: true,
                 request,
@@ -7382,6 +7433,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 entries,
                 filtered,
                 base_query,
+                line,
                 truncated,
                 loading,
                 ..
@@ -7394,6 +7446,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                     selected: *selected,
                     query,
                     base_query,
+                    line: *line,
                     truncated: *truncated,
                     loading: *loading,
                     spinner: spinner_frame,
@@ -8158,6 +8211,7 @@ struct FilesPickerView<'a> {
     selected: usize,
     query: &'a str,
     base_query: &'a str,
+    line: Option<u32>,
     truncated: bool,
     loading: bool,
     spinner: usize,
@@ -8170,11 +8224,13 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
         selected,
         query,
         base_query,
+        line,
         truncated,
         loading,
         spinner,
     } = view;
-    let filter = query.trim();
+    let (filter, _) = split_line_target(query);
+    let filter = filter.as_str();
     let highlight = if filter.is_empty() {
         base_query.trim()
     } else {
@@ -8187,10 +8243,13 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
     };
     if loading {
         let spinner = SPINNER_FRAMES[spinner % SPINNER_FRAMES.len()];
+        let line_label = line
+            .map(|line| format!(" · line {line}"))
+            .unwrap_or_default();
         let heading = if base_query.is_empty() {
-            format!("files{filter_label} · loading {spinner}")
+            format!("files{filter_label}{line_label} · loading {spinner}")
         } else {
-            format!("files matching \"{base_query}\"{filter_label} · loading {spinner}")
+            format!("files matching \"{base_query}\"{filter_label}{line_label} · loading {spinner}")
         };
         let lines = vec![
             Line::styled(heading, Style::default().fg(COLORS.muted)),
@@ -8220,7 +8279,10 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
     } else {
         "enter insert · esc clears"
     };
-    let heading = format!("{scope}{filter_label} · {count} · {action}");
+    let line_label = line
+        .map(|line| format!(" · line {line}"))
+        .unwrap_or_default();
+    let heading = format!("{scope}{filter_label}{line_label} · {count} · {action}");
     let mut lines: Vec<Line> = vec![Line::styled(heading, Style::default().fg(COLORS.muted))];
     let visible = 8;
     if filtered.is_empty() {
@@ -13513,6 +13575,8 @@ mod tests {
             entries: vec!["src/other.rs".into(), "src/parser.rs".into()],
             filtered: vec![0, 1],
             base_query: String::new(),
+            line: Some(12),
+            command_line: Some(12),
             truncated: false,
             loading: false,
             request: 0,
@@ -13533,6 +13597,7 @@ mod tests {
         }
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(text.contains("filter \"parse\""), "{text}");
+        assert!(text.contains("line 12"), "{text}");
         assert!(text.contains("src/parser.rs"), "{text}");
         assert!(!text.contains("src/other.rs"), "{text}");
         assert!(text.contains("esc clears"), "{text}");
@@ -13543,7 +13608,10 @@ mod tests {
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         );
         match &state.overlay {
-            Overlay::FilesPicker { query, .. } => assert!(query.is_empty()),
+            Overlay::FilesPicker { query, line, .. } => {
+                assert!(query.is_empty());
+                assert_eq!(*line, Some(12));
+            }
             _ => panic!("first escape must clear the filter"),
         }
         handle_key(
@@ -13560,6 +13628,8 @@ mod tests {
             entries: vec!["src/other.rs".into(), "src/parser.rs".into()],
             filtered: vec![0, 1],
             base_query: String::new(),
+            line: None,
+            command_line: None,
             truncated: false,
             loading: false,
             request: 0,
@@ -13580,6 +13650,187 @@ mod tests {
         );
         assert_eq!(state.input, "src/parser.rs ");
         assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn line_targets_split_from_the_query() {
+        assert_eq!(
+            split_line_target("parser:42"),
+            ("parser".to_string(), Some(42))
+        );
+        assert_eq!(
+            split_line_target(" parser:42 "),
+            ("parser".to_string(), Some(42))
+        );
+        assert_eq!(
+            split_line_target("parser:0"),
+            ("parser:0".to_string(), None)
+        );
+        assert_eq!(split_line_target(":42"), (":42".to_string(), None));
+        assert_eq!(split_line_target("parser"), ("parser".to_string(), None));
+        assert_eq!(split_line_target("a:b.rs"), ("a:b.rs".to_string(), None));
+        assert_eq!(
+            split_line_target("parser: 12"),
+            ("parser".to_string(), Some(12))
+        );
+        assert_eq!(
+            split_line_target("parser : 12"),
+            ("parser".to_string(), Some(12))
+        );
+        assert_eq!(
+            split_line_target("parser:007"),
+            ("parser".to_string(), Some(7))
+        );
+        assert_eq!(
+            split_line_target("parser:000"),
+            ("parser:000".to_string(), None)
+        );
+        assert_eq!(split_line_target(":12"), (":12".to_string(), None));
+        assert_eq!(split_line_target("app\\:12"), ("app:12".to_string(), None));
+        assert_eq!(split_line_target("12:30"), ("12".to_string(), Some(30)));
+    }
+
+    #[test]
+    fn files_picker_inserts_a_line_target() {
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[("src/parser.rs", "fn parse() {}\n")]);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/files parser:42",
+        );
+        finish_files_picker_load(&mut state);
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("line 42"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "src/parser.rs:42 ");
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("src/parser.rs:42"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn files_picker_parses_a_line_target_typed_in_the_filter() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/other.rs".into(), "src/parser/mod.rs".into()],
+            filtered: vec![0, 1],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        for character in "pmod:12".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        match &state.overlay {
+            Overlay::FilesPicker {
+                query,
+                line,
+                filtered,
+                ..
+            } => {
+                assert_eq!(query, "pmod:12");
+                assert_eq!(*line, Some(12));
+                assert_eq!(filtered, &vec![1]);
+            }
+            _ => panic!("expected files picker"),
+        }
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("filter \"pmod\""), "{text}");
+        assert!(text.contains("line 12"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "src/parser/mod.rs:12 ");
+    }
+
+    #[test]
+    fn files_picker_clears_a_typed_line_target_when_the_suffix_is_deleted() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/parser/mod.rs".into()],
+            filtered: vec![0],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        for character in "pmod:12".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        match &state.overlay {
+            Overlay::FilesPicker { line, .. } => assert_eq!(*line, Some(12)),
+            _ => panic!("expected files picker"),
+        }
+        for _ in 0..3 {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+            );
+        }
+        match &state.overlay {
+            Overlay::FilesPicker { query, line, .. } => {
+                assert_eq!(query, "pmod");
+                assert_eq!(*line, None);
+            }
+            _ => panic!("expected files picker"),
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "src/parser/mod.rs ");
     }
 
     #[test]
@@ -13636,6 +13887,8 @@ mod tests {
             entries: vec!["src/other.rs".into(), "src/parser/mod.rs".into()],
             filtered: vec![0, 1],
             base_query: String::new(),
+            line: None,
+            command_line: None,
             truncated: false,
             loading: false,
             request: 0,
@@ -13674,6 +13927,8 @@ mod tests {
             entries: (0..10).map(|index| format!("src/file{index}.rs")).collect(),
             filtered: (0..10).collect(),
             base_query: String::new(),
+            line: None,
+            command_line: None,
             truncated: false,
             loading: false,
             request: 0,
@@ -13732,6 +13987,8 @@ mod tests {
             entries: Vec::new(),
             filtered: Vec::new(),
             base_query: "first".into(),
+            line: Some(12),
+            command_line: Some(12),
             truncated: false,
             loading: true,
             request: 2,
@@ -13776,11 +14033,13 @@ mod tests {
         match &state.overlay {
             Overlay::FilesPicker {
                 base_query,
+                line,
                 loading,
                 entries,
                 ..
             } => {
                 assert_eq!(base_query, "second");
+                assert_eq!(*line, Some(12));
                 assert!(!*loading);
                 assert_eq!(entries, &vec!["second.rs".to_string()]);
             }
@@ -13799,6 +14058,8 @@ mod tests {
             entries: vec!["src/parser.rs".into()],
             filtered: Vec::new(),
             base_query: String::new(),
+            line: None,
+            command_line: None,
             truncated: false,
             loading: false,
             request: 0,
@@ -13827,6 +14088,8 @@ mod tests {
             entries: vec!["src/other.rs".into(), "src/parser.rs".into()],
             filtered: vec![1],
             base_query: String::new(),
+            line: None,
+            command_line: None,
             truncated: true,
             loading: false,
             request: 0,
@@ -13880,6 +14143,15 @@ mod tests {
                 .as_deref()
                 .unwrap_or("")
                 .contains("no files here"),
+            "{:?}",
+            state.notice
+        );
+
+        handle_command(&mut state, &store, &engine_command_sender, "/files pmod:12");
+        finish_files_picker_load(&mut state);
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("(line 12)"),
             "{:?}",
             state.notice
         );

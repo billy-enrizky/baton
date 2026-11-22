@@ -116,11 +116,12 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
-        os.write(master, b"/files pmod\r")
+        os.write(master, b"/files pmod:12\r")
         pump(master, 1.5, transcript)
         files_picker = screen_text(transcript, args.width, args.height)
         files_required = [
             'files matching "pmod"',
+            "line 12",
             "src/parser/mod.rs",
             "enter insert",
             "esc close",
@@ -132,7 +133,7 @@ def main() -> int:
         os.write(master, b"\r")
         pump(master, 1.0, transcript)
         files_result = screen_text(transcript, args.width, args.height)
-        if "inserted src/parser/mod.rs" not in files_result:
+        if "inserted src/parser/mod.rs:12" not in files_result:
             missing.append("files insert notice")
         (evidence / "files-result-screen.txt").write_text(files_result + "\n")
         os.write(master, b"\x1b")

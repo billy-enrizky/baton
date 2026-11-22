@@ -31,9 +31,9 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 
 | Measurement | Current value | Evidence |
 |---|---|---|
-| Warm Rust PR feedback | 58, 60, 63, and 68 seconds; n=4, median 61.5 seconds, max 68 seconds | Runs 45004705055, 45009466461, 45010710576, and 45011836996 |
+| Warm Rust PR feedback | 58, 60, 61, 63, and 68 seconds; n=5, median 61.0 seconds, max 68 seconds | Runs 45004705055, 45009466461, 45021604178, 45011836996, and 45010710576 |
 | Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
-| Warm Test job | 33, 37, 47, and 49 seconds | Runs 45004705055, 45009466461, 45010710576, and 45011836996 |
+| Warm Test job | 33, 37, 49, 47, and 37 seconds | Runs 45004705055, 45009466461, 45010710576, 45011836996, and 45021604178 |
 | `cargo test --lib` | 1.67 to 3.70 seconds, 331 tests | Runs 45009466461 and 45011836996 |
 | Integration tests | 0.40 to 0.75 seconds, 75 tests across seven binaries | Runs 45009466461 and 45011836996 |
 | Executed test count (`ci/test-inventory.sh`) | 413 | Current local suite |
@@ -52,7 +52,7 @@ The free `ubuntu-24.04-arm` runner is not adopted for Test. A temporary ARM job 
 
 Replacing the x64 Test job would move Linux x64 runtime tests after merge, and official merge queue is unavailable for this repository. A runtime-only x64 regression could then land without a pre-merge test. That violates the rule that no phase removes a passing check. Test stays on `ubuntu-24.04`. The option is closed unless a future proposal is additive, not a replacement, keeps an independent required x64 pre-merge Test job, and provides a matched rerun with identical steps, event shape, cache policy, and command under the 100-run or four-week policy. A merge queue alone is insufficient if it runs the same ARM job.
 
-The experiment is recorded in [ci-acceptance.md](ci-acceptance.md#rejected-arm-runner-experiment) with its runs, timings, cache sizes, and CI013 failure. The p50 miss remains; the next levers are gate integrity and measured critical-path work, not architecture substitution.
+The experiment is recorded in [ci-acceptance.md](ci-acceptance.md#rejected-arm-runner-experiment) with its runs, timings, cache sizes, and CI013 failure. The p50 miss remains at 61.0 seconds; the next levers are measured critical-path work, not architecture substitution.
 
 ## What the gate enforces
 

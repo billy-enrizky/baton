@@ -22,9 +22,9 @@ SH
 chmod 755 "$build/baton"
 tar -C "$build" -czf "$release/baton-x86_64-unknown-linux-gnu.tar.gz" baton
 if command -v sha256sum >/dev/null 2>&1; then
-    (cd "$release" && sha256sum baton-x86_64-unknown-linux-gnu.tar.gz >SHA256SUMS)
+    (cd "$release" && sha256sum ./* >SHA256SUMS)
 else
-    (cd "$release" && shasum -a 256 baton-x86_64-unknown-linux-gnu.tar.gz >SHA256SUMS)
+    (cd "$release" && shasum -a 256 ./* >SHA256SUMS)
 fi
 
 cat >"$fake/uname" <<'SH'

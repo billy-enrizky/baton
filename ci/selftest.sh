@@ -54,4 +54,43 @@ if [[ $code -ne 124 ]]; then
 fi
 
 bash "$root/budget.sh" 5 true
+
+integrity_root=$(mktemp -d)
+for case in rustfmt wrapper lints allow; do
+  mkdir -p "$integrity_root/$case/src"
+  : > "$integrity_root/$case/src/lib.rs"
+done
+printf 'disable_all_formatting = true\n' > "$integrity_root/rustfmt/rustfmt.toml"
+mkdir -p "$integrity_root/wrapper/.cargo"
+printf '[build]\nrustc-wrapper = "./x.sh"\n' > "$integrity_root/wrapper/.cargo/config.toml"
+printf '[lints.clippy]\nall = "allow"\n' > "$integrity_root/lints/Cargo.toml"
+printf '#![allow(clippy::all)]\n' > "$integrity_root/allow/src/lib.rs"
+for pair in rustfmt:GI001 wrapper:GI002 lints:GI003 allow:GI004; do
+  case_name=${pair%%:*}
+  rule=${pair##*:}
+  set +e
+  output=$(bash "$root/gate-integrity.sh" "$integrity_root/$case_name" 2>&1)
+  code=$?
+  set -e
+  if [[ $code -eq 0 ]] || ! grep -q "$rule " <<< "$output"; then
+    echo "gate integrity did not reject $case_name with $rule" >&2
+    exit 1
+  fi
+done
+bash "$root/gate-integrity.sh" "$root/../.."
+
+empty_root=$(mktemp -d)
+mkdir -p "$empty_root/src"
+printf 'fn main() {}\n' > "$empty_root/src/main.rs"
+printf '[package]\nname = "empty"\nversion = "0.1.0"\nedition = "2021"\n' > "$empty_root/Cargo.toml"
+set +e
+output=$(bash "$root/test-inventory.sh" "$empty_root" 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q "TI001" <<< "$output"; then
+  echo "test inventory accepted a crate with no tests" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+
 echo "ci selftest passed"

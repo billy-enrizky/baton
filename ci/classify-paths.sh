@@ -2,14 +2,27 @@
 set -euo pipefail
 
 files_file=
-if [[ ${1:-} == --files ]]; then
-  files_file=${2:?--files requires a path}
-  shift 2
-fi
+event=
+while [[ ${1:-} == --* ]]; do
+  case "$1" in
+    --files)
+      files_file=${2:?--files requires a path}
+      shift 2
+      ;;
+    --event)
+      event=${2:?--event requires a name}
+      shift 2
+      ;;
+    *)
+      printf 'unknown option: %s\n' "$1" >&2
+      exit 2
+      ;;
+  esac
+done
 
 head_dir=${1:-.}
 base_dir=${2:-$head_dir}
-event=${GITHUB_EVENT_NAME:-pull_request}
+event=${event:-${GITHUB_EVENT_NAME:-pull_request}}
 
 full_reason=
 files=
@@ -21,8 +34,8 @@ elif [[ "$event" == merge_group || "$event" == push || "$event" == workflow_disp
 elif [[ "$event" == pull_request ]]; then
   if ! base_sha=$(git -C "$base_dir" rev-parse HEAD 2>/dev/null); then
     full_reason=unknown
-  else
-    files=$(git -C "$head_dir" diff --name-only --no-renames --diff-filter=ACDMR "$base_sha" HEAD)
+  elif ! files=$(git -C "$head_dir" diff --name-only --no-renames --diff-filter=ACDMR "$base_sha" HEAD 2>/dev/null); then
+    full_reason=unknown
   fi
 else
   full_reason=unknown

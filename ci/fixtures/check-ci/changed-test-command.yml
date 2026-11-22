@@ -24,38 +24,38 @@ jobs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
     steps:
       - run: |
-          base/ci/classify-paths.sh . base
-          base/ci/selftest.sh
-          base/ci/check-ci.sh .github/workflows/ci.yml
+          base/ci/budget.sh 30 base/ci/classify-paths.sh . base
+          base/ci/budget.sh 30 base/ci/selftest.sh
+          base/ci/budget.sh 30 base/ci/check-ci.sh .github/workflows/ci.yml
   selection:
     needs: changes
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - run: |
-          base/ci/classify-paths.sh . base
-          base/ci/check-ci.sh --base base/.github/workflows/ci.yml .github/workflows/ci.yml
+          base/ci/budget.sh 30 base/ci/classify-paths.sh . base
+          base/ci/budget.sh 30 base/ci/check-ci.sh --base base/.github/workflows/ci.yml .github/workflows/ci.yml
   check:
     needs: changes
     if: needs.changes.outputs.check_needed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - run: cargo check --locked --all-targets
+      - run: base/ci/budget.sh 90 cargo check --locked --all-targets
   build:
     needs: changes
     if: needs.changes.outputs.build_needed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - run: cargo build --locked --bin baton
+      - run: base/ci/budget.sh 90 cargo build --locked --bin baton
   test:
     needs: changes
     if: needs.changes.outputs.test_needed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - run: "true"
+      - run: base/ci/budget.sh 180 true
   debt:
     needs: changes
     if: needs.changes.outputs.debt_needed == 'true'
@@ -63,8 +63,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - run: |
-          base/ci/fmt-debt.sh . base/ci/fmt-baseline.txt
-          base/ci/clippy-debt.sh . base/ci/clippy-baseline.txt
+          base/ci/budget.sh 30 base/ci/fmt-debt.sh . base/ci/fmt-baseline.txt
+          base/ci/budget.sh 180 base/ci/clippy-debt.sh . base/ci/clippy-baseline.txt
   verify:
     if: always()
     needs: [changes, selection, check, build, test, debt]

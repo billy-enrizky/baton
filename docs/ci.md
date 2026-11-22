@@ -110,7 +110,7 @@ The base supplies every pass/fail script on every event. The head supplies only 
 - `push` uses `github.event.before`, falling back to `HEAD~1` for a first push or a zero SHA.
 - `workflow_dispatch` uses `github.event.before`, falling back to `HEAD~1`.
 
-The base copy is sparse-checked out to `base/` with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`. Each job then copies `base/ci` to `$RUNNER_TEMP/trusted-ci`, marks it read-only, records a SHA-256 manifest, and executes only from that copy. The `test` job re-verifies the manifest after `cargo test` and fails if any tool changed.
+The base copy is sparse-checked out to `base/` with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`. Each job then copies `base/ci` to `$RUNNER_TEMP/trusted-ci`, marks it read-only, records a SHA-256 manifest, and executes only from that copy. The `test` job reads the inventory floor and timing script from `$RUNNER_TEMP/trusted-ci`, treats the captured test log as untrusted input, and re-verifies the manifest after the test gates.
 
 That staging is a detection boundary, not a sandbox. `cargo test` runs arbitrary repository code with write access to the runner's filesystem, so a determined change can still tamper with the process. What staging buys is that tampering after the first gate step is visible as a manifest mismatch instead of silently changing the harness. A real sandbox needs a separate container or a read-only mount, which is a Phase 3 decision.
 
@@ -118,9 +118,9 @@ Head-controlled process configuration is rejected rather than compared. A workfl
 
 `rust-toolchain.toml` is compared byte for byte with the base copy in the `selection` job. There is no `RUSTUP_TOOLCHAIN` environment override anywhere in the workflow.
 
-On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run on `main`; the PR run is where command drift is rejected.
+On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run outside a pull request. Job-list equality is still enforced, and `workflow_dispatch` can target a feature branch, so it is owner-controlled rather than a substitute for the PR gate.
 
-Changing a gate command is not a PR-level decision. There is no `ci-change` label. The workflow passes `--allow-change` only on `push`, `merge_group`, and `workflow_dispatch`, where the commit is already on a protected branch; a `pull_request` run never does. A PR that changes a command, a `needs` edge, a gate `if`, a timeout, or a runner fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
+Changing a gate command is not a PR-level decision. There is no `ci-change` label. The workflow passes `--allow-change` on `push`, `merge_group`, and `workflow_dispatch`. Push and merge-group commits are protected; `workflow_dispatch` is owner-controlled and can target a feature branch. A job-list change is rejected on every event. A PR that changes a command, `needs`, `if`, timeout, runner, output, or strategy fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
 
 The single escape hatch is `ci-repair`, and it is a human action rather than a workflow branch:
 

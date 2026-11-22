@@ -168,6 +168,11 @@ Common
 /help all  every command · shift+enter newline · up/down history";
 
 #[derive(Debug, Clone)]
+struct RunChoice {
+    id: String,
+    label: String,
+}
+
 struct ReplyChoice {
     /// Position from the end, so 1 is the newest reply.
     position: usize,
@@ -362,6 +367,10 @@ enum Overlay {
     CopyPicker {
         selected: usize,
         replies: Vec<ReplyChoice>,
+    },
+    RunPicker {
+        selected: usize,
+        runs: Vec<RunChoice>,
     },
     ModePicker {
         selected: usize,
@@ -2958,6 +2967,47 @@ fn handle_key(
                 state.overlay = Overlay::McpPicker { selected };
             }
         },
+        Overlay::RunPicker { selected, runs } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                if !runs.is_empty() {
+                    state.overlay = Overlay::RunPicker {
+                        selected: (selected + runs.len() - 1) % runs.len(),
+                        runs,
+                    };
+                }
+            }
+            KeyCode::Down => {
+                if !runs.is_empty() {
+                    state.overlay = Overlay::RunPicker {
+                        selected: (selected + 1) % runs.len(),
+                        runs,
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(run) = runs.get(selected) {
+                    let result = orchestrate::report_from_rows(
+                        &store.lock().unwrap(),
+                        std::path::Path::new(&state.thread.cwd),
+                        &run.id,
+                    );
+                    match result {
+                        Ok(report) => {
+                            state.overlay = Overlay::None;
+                            open_run_report(state, report);
+                        }
+                        Err(error) => {
+                            state.notice = Some(format!("cannot open run: {error}"));
+                            state.overlay = Overlay::RunPicker { selected, runs };
+                        }
+                    }
+                }
+            }
+            _ => {
+                state.overlay = Overlay::RunPicker { selected, runs };
+            }
+        },
         Overlay::CopyPicker { selected, replies } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
@@ -4797,16 +4847,7 @@ fn handle_command(
                     )
                 };
                 match result {
-                    Ok(report) => {
-                        state.orchestration_report = Some(report);
-                        state.orchestration_scroll = 0;
-                        state.orchestration_selected = 0;
-                        state.orchestration_integrate_report = None;
-                        state.orchestration_confirm_ship = false;
-                        state.orchestration_ship_report = None;
-                        state.notice =
-                            Some(format!("opened run {}", &run_id[..8.min(run_id.len())]));
-                    }
+                    Ok(report) => open_run_report(state, report),
                     Err(error) => state.notice = Some(format!("cannot open run: {error}")),
                 }
             } else {
@@ -4826,10 +4867,11 @@ fn handle_command(
                             .to_string()
                     });
                 } else {
-                    let lines = runs
+                    let choices: Vec<RunChoice> = runs
                         .iter()
-                        .map(|run| {
-                            format!(
+                        .map(|run| RunChoice {
+                            id: run.id.clone(),
+                            label: format!(
                                 "{}  {:<9}  {}{}",
                                 &run.id[..8.min(run.id.len())],
                                 run.status,
@@ -4839,13 +4881,13 @@ fn handle_command(
                                 } else {
                                     ""
                                 }
-                            )
+                            ),
                         })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    state.notice = Some(format!(
-                        "recent orchestration runs:\n{lines}\n\n/runs <id> opens a report · /runs --all includes archived"
-                    ));
+                        .collect();
+                    state.overlay = Overlay::RunPicker {
+                        selected: 0,
+                        runs: choices,
+                    };
                 }
             }
         }
@@ -6668,6 +6710,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::McpPicker { .. } => 8,
             Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
+            Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
             Overlay::ModePicker { .. } => 7,
             Overlay::AuthPicker { .. } => 9,
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
@@ -6734,6 +6777,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[1], *selected),
             Overlay::CopyPicker { selected, replies } => {
                 draw_copy_picker(frame, chunks[1], replies, *selected)
+            }
+            Overlay::RunPicker { selected, runs } => {
+                draw_run_picker(frame, chunks[1], runs, *selected)
             }
             Overlay::SkillsPicker { selected, skills } => {
                 draw_skills_picker(frame, chunks[1], skills, *selected)
@@ -6939,6 +6985,17 @@ fn set_current_model(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, model
         }
         Err(error) => state.notice = Some(format!("cannot set model: {error}")),
     }
+}
+
+fn open_run_report(state: &mut TuiState, report: orchestrate::RunReport) {
+    let id = report.run_id.clone();
+    state.orchestration_report = Some(report);
+    state.orchestration_scroll = 0;
+    state.orchestration_selected = 0;
+    state.orchestration_integrate_report = None;
+    state.orchestration_confirm_ship = false;
+    state.orchestration_ship_report = None;
+    state.notice = Some(format!("opened run {}", &id[..8.min(id.len())]));
 }
 
 fn perform_switch(
@@ -7164,6 +7221,30 @@ fn draw_mcp_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ {action}"), style));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_run_picker(frame: &mut ratatui::Frame, area: Rect, runs: &[RunChoice], selected: usize) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!(
+            "orchestration runs ({}) · enter opens · esc close",
+            runs.len()
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, run) in runs.iter().take(8).enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(format!("❯ {}", run.label), style));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -9314,6 +9395,51 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::AcceptAlways);
         assert!(state.approvals.is_empty());
         assert!(state.review.is_some(), "review resumes after the approval");
+    }
+
+    #[test]
+    fn runs_without_an_argument_opens_a_picker_and_enter_opens_the_report() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .create_orchestration_run(
+                    "run-aaaaaaaa",
+                    "first goal",
+                    ProviderId::Codex,
+                    "m",
+                    Some("first summary"),
+                    "{}",
+                    false,
+                )
+                .unwrap();
+            guard
+                .create_orchestration_run(
+                    "run-bbbbbbbb",
+                    "second goal",
+                    ProviderId::Codex,
+                    "m",
+                    Some("second summary"),
+                    "{}",
+                    false,
+                )
+                .unwrap();
+        }
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/runs");
+        let Overlay::RunPicker { runs, .. } = &state.overlay else {
+            panic!("expected the run picker");
+        };
+        assert_eq!(runs.len(), 2, "both runs are offered");
+
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state.orchestration_report.is_some(),
+            "enter opens the report"
+        );
     }
 
     #[test]
@@ -13214,15 +13340,28 @@ mod tests {
         }
 
         handle_command(&mut state, &store, &engine_command_sender, "/runs");
-        let notice = state.notice.as_deref().unwrap_or("");
-        assert!(notice.contains("active goal"), "{notice}");
-        assert!(!notice.contains("archived goal"), "{notice}");
-        assert!(notice.contains("/runs --all"), "{notice}");
+        let Overlay::RunPicker { runs, .. } = &state.overlay else {
+            panic!("expected the run picker");
+        };
+        let labels = runs
+            .iter()
+            .map(|run| run.label.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(labels.contains("active goal"), "{labels}");
+        assert!(!labels.contains("archived goal"), "{labels}");
 
         handle_command(&mut state, &store, &engine_command_sender, "/runs --all");
-        let notice = state.notice.as_deref().unwrap_or("");
-        assert!(notice.contains("active goal"), "{notice}");
-        assert!(notice.contains("archived goal (archived)"), "{notice}");
+        let Overlay::RunPicker { runs, .. } = &state.overlay else {
+            panic!("expected the run picker");
+        };
+        let labels = runs
+            .iter()
+            .map(|run| run.label.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(labels.contains("active goal"), "{labels}");
+        assert!(labels.contains("archived goal (archived)"), "{labels}");
     }
 
     #[test]
@@ -13324,10 +13463,13 @@ mod tests {
         }
 
         handle_command(&mut state, &store, &engine_command_sender, "/runs");
+        let Overlay::RunPicker { runs, .. } = &state.overlay else {
+            panic!("expected the run picker");
+        };
         assert!(
-            state.notice.as_deref().unwrap_or("").contains("run-1234"),
-            "notice: {:?}",
-            state.notice
+            runs.iter().any(|run| run.label.contains("run-1234")),
+            "runs: {:?}",
+            runs.iter().map(|run| &run.label).collect::<Vec<_>>()
         );
 
         handle_command(&mut state, &store, &engine_command_sender, "/runs run-1234");

@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-Status on 2026-11-22: the current warm Rust PR samples are 58, 60, 63, and 68 seconds. A separate CI-docs PR finished at 59 seconds. The Rust median is 61.5 seconds, above the target. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
+Status on 2026-11-22: the current warm Rust PR samples are 58, 60, 63, and 68 seconds. A separate CI-docs PR finished at 59 seconds. The Rust median is 61.5 seconds, above the target. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The trusted-input proof main push was 54 seconds. Recent meta PRs were 51 and 64 seconds, so the p50 target is still not robustly met. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
 
 This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 
@@ -71,6 +71,12 @@ The runner was rejected because replacing the x64 Test job would move Linux x64 
 Both runs were `workflow_dispatch`, and `ci/check-ci.sh` rejects the temporary job-list change with CI013. `--allow-change` does not relax job-list equality.
 
 The warm ARM experiment restored 340,962,469 bytes for rustup in about 3 seconds and 248,109,421 bytes for Cargo in about 4 seconds. Those caches used a temporary key and were not adopted.
+
+## Trusted-input proof and current samples
+
+The trusted-input change was proven twice. Branch dispatch [45016871008](https://github.com/billy-enrizky/baton/actions/runs/45016871008) was green at 66 seconds with a 46-second Test job. The following `main` push [45017072401](https://github.com/billy-enrizky/baton/actions/runs/45017072401) was green at 54 seconds with a 35-second Test job. Both jobs reported `test_count=406`, used `$RUNNER_TEMP/trusted-ci/test-inventory-floor.txt`, and ran `$RUNNER_TEMP/trusted-ci/test-timings.sh`.
+
+The two PR samples around that work were 51 seconds for the ARM rejection docs (run 45016341050, Test 33 seconds) and 64 seconds for the parser (run 45016610933, Test 44 seconds). They are meta samples, not Rust samples. The spread shows that the Rust p50 target cannot be claimed from these runs.
 
 ## How the critical path changed
 
@@ -157,7 +163,11 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | [45011836996](https://github.com/billy-enrizky/baton/actions/runs/45011836996) | 1 | pull_request | `0add32c101cf` | success | 63 seconds | 47 seconds | Shell completions; 406 tests |
 | [45012384561](https://github.com/billy-enrizky/baton/actions/runs/45012384561) | 1 | workflow_dispatch | `91b0d4fc3221` | failure | 96 seconds | 85 seconds | Cold ARM experiment; 406 tests passed, CI013 rejected the temporary job list |
 | [45012538857](https://github.com/billy-enrizky/baton/actions/runs/45012538857) | 1 | workflow_dispatch | `91b0d4fc3221` | failure | 44 seconds | 33 seconds | Warm ARM experiment; 406 tests passed, 21.57-second `cargo test` in a 22-second step, CI013 rejected the temporary job list |
+| [45016341050](https://github.com/billy-enrizky/baton/actions/runs/45016341050) | 1 | pull_request | `d92a0b46f08a` | success | 51 seconds | 33 seconds | ARM rejection docs; meta sample |
+| [45016485687](https://github.com/billy-enrizky/baton/actions/runs/45016485687) | 1 | push | `709027e2ceb5` | success | 53 seconds | 38 seconds | Main push after ARM rejection docs; meta sample |
+| [45016610933](https://github.com/billy-enrizky/baton/actions/runs/45016610933) | 1 | pull_request | `0637fac16a3c` | success | 64 seconds | 44 seconds | Inventory parser; meta sample |
 | [45016871008](https://github.com/billy-enrizky/baton/actions/runs/45016871008) | 1 | workflow_dispatch | `12e85cdfafe9` | success | 66 seconds | 46 seconds | Trusted floor and timing script; 406 tests; `ci-repair` dispatch proof |
+| [45017072401](https://github.com/billy-enrizky/baton/actions/runs/45017072401) | 1 | push | `5ea2de872f53` | success | 54 seconds | 35 seconds | Trusted floor and timing script; 406 tests; final post-merge proof |
 
 ## Proof log
 
@@ -173,7 +183,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Warm PR samples | Rust PR 45004705055: 58 seconds; Rust PR 45009466461: 60 seconds; Rust PR 45010710576: 68 seconds; Rust PR 45011836996: 63 seconds; CI-docs PR 45005544007: 59 seconds | Rust median 61.5; above target |
 | ARM runner rejected | Runs 45012384561 and 45012538857: 406 tests, 85 and 33 second jobs | Rejected 2026-11-22; x64 Test retained |
 | Test inventory integrity | `ci/selftest.sh`: matching announced/executed count, short execution, missing totals | Passed locally; CI proof pending the next PR |
-| Trusted test inputs | Branch dispatch [45016871008](https://github.com/billy-enrizky/baton/actions/runs/45016871008): 406 tests, trusted floor and timing script, manifest clean | Passed; main push pending |
+| Trusted test inputs | Branch dispatch [45016871008](https://github.com/billy-enrizky/baton/actions/runs/45016871008) and main push [45017072401](https://github.com/billy-enrizky/baton/actions/runs/45017072401): 406 tests, trusted floor and timing script, manifest clean | Passed |
 | Installer checksum rejection | `ci/installer-selftest.sh`; full selftest in 45000399622 | Passed locally and in CI |
 | Release assets and checksums | Release run 44999297170, `v0.3.0` | Passed 2026-11-22 |
 | Homebrew formula | Tap `billy-enrizky/homebrew-baton` | `brew audit`, `brew test`, and install passed locally |
@@ -195,7 +205,6 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 - A paid 8-core runner remains an unmeasured option. It is not recommended until both Rust-target metrics miss across at least 100 runs or four weeks.
 - Official merge queue requires organization ownership or GitHub Enterprise Cloud. Until then, the PR `verify` run plus the following `main` push are the merge proof.
 - Branch protection must require `verify` and block direct pushes. This remains an owner action.
-- The trusted-input workflow change is a `ci-repair` change. The PR `verify` run is expected to fail CI013; branch dispatch 45016871008 and the following `main` push are the proof.
 
 ## Collection commands
 

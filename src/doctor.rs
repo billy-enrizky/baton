@@ -323,6 +323,7 @@ pub fn to_json(report: &DoctorReport) -> serde_json::Value {
         "next_action": next_action(report),
         "ready": report.providers.iter().filter(|provider| provider.installed()).map(|provider| provider.provider.as_str()).collect::<Vec<_>>(),
         "missing": report.providers.iter().filter(|provider| !provider.installed()).map(|provider| provider.provider.as_str()).collect::<Vec<_>>(),
+        "egress": crate::egress::json(),
         "processes": processes,
         "healthy": report.warnings.is_empty(),
         "warnings": report.warnings,
@@ -490,6 +491,13 @@ mod tests {
         assert_eq!(value["missing"], serde_json::json!(["antigravity"]));
         assert_eq!(value["processes"][0]["pid"], 42);
         assert_eq!(value["healthy"], false);
+        let egress = value["egress"].as_array().expect("egress inventory");
+        assert!(egress
+            .iter()
+            .any(|path| path["name"] == "handoff" && path["reach"] == "delegated"));
+        assert!(egress
+            .iter()
+            .any(|path| path["name"] == "MCP stdio server" && path["reach"] == "local"));
     }
 
     #[test]

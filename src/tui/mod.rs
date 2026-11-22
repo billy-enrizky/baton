@@ -8456,6 +8456,10 @@ mod tests {
             let mut dirs = vec![root];
             dirs.extend(std::env::split_paths(&path));
             std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+            // A runner has no clipboard, and the product's fallback is a
+            // platform command. Pin it for the whole binary so copy assertions
+            // test this code rather than the host.
+            std::env::set_var("BATON_CLIPBOARD_COMMAND", "cat");
         });
     }
 

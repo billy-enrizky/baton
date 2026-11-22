@@ -1795,7 +1795,9 @@ fn start_orchestration(
 fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
     match event {
         TurnEvent::TextDelta { text } => {
-            state.streaming_text.push_str(&text);
+            state
+                .streaming_text
+                .push_str(&crate::sanitize::sanitize_terminal_text(&text));
         }
         TurnEvent::AssistantText { .. } => {}
         TurnEvent::ToolStarted { id, tool, detail } => {
@@ -6692,6 +6694,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
     // Pre-wrap all text at the actual terminal width so line counts are exact
     let width = area.width as usize;
     let wrap = |text: &str| -> Vec<String> {
+        let text = crate::sanitize::sanitize_terminal_text(text);
         text.split('\n')
             .flat_map(|line| {
                 if line.is_empty() {
@@ -6768,10 +6771,11 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
                 ),
                 Style::default().fg(COLORS.muted),
             ));
+            let sanitized = crate::sanitize::sanitize_terminal_text(&message.text);
             let rendered = state
                 .markdown_cache
                 .borrow_mut()
-                .render(&message.text, width.saturating_sub(2));
+                .render(&sanitized, width.saturating_sub(2));
             all_lines.extend(rendered.iter().cloned());
         }
         all_lines.push(Line::from(vec![Span::raw(" ")]));
@@ -7901,6 +7905,38 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["/copy 1".to_string()]
         );
+    }
+
+    #[test]
+    fn transcript_render_never_emits_child_control_sequences() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![MessageRow {
+            id: 1,
+            thread_id: state.thread.id.clone(),
+            turn: 1,
+            role: "assistant".into(),
+            provider: Some("claude".into()),
+            model: None,
+            text: "before\u{1b}]0;spoofed title\u{7}\u{1b}[2Jafter".into(),
+            created_at: String::new(),
+        }];
+        let rendered: String = buffer_lines(&render_state(&state, 80, 24)).join("\n");
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "escape introducer reached the terminal buffer"
+        );
+        assert!(
+            !rendered.contains('\u{7}'),
+            "bell reached the terminal buffer"
+        );
+        assert!(
+            rendered.contains('\u{fffd}'),
+            "the sanitizer must replace the escape introducer, not rely on the renderer to drop it"
+        );
+        assert!(rendered.contains("spoofed title"));
+        assert!(rendered.contains("after"));
     }
 
     #[test]

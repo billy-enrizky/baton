@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, scanner, status, store, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::Parser;
@@ -236,7 +236,7 @@ fn main_result() -> Result<()> {
                     match &event {
                         TurnEvent::TextDelta { text } if !machine => {
                             if !text.is_empty() {
-                                print!("{text}");
+                                print!("{}", sanitize::sanitize_terminal_text(text));
                                 let _ = std::io::stdout().flush();
                             }
                         }
@@ -333,7 +333,7 @@ fn main_result() -> Result<()> {
             // If deltas were streamed, do not print the same answer twice.
             if stream.streamed_text.is_empty() && !stream.final_text.is_empty() {
                 if !machine {
-                    println!("{}", stream.final_text);
+                    println!("{}", sanitize::sanitize_terminal_text(&stream.final_text));
                 }
                 stream.saw_output = true;
             } else if !stream.streamed_text.is_empty() && !machine {

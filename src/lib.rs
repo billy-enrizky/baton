@@ -17,6 +17,7 @@ pub mod process;
 pub mod provider_runtime;
 pub mod resume;
 pub mod runtime;
+pub mod sanitize;
 pub mod status;
 pub mod scanner;
 pub mod store;

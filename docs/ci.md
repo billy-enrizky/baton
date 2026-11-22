@@ -25,21 +25,23 @@ Budget rule, applied at every phase: a budget starts at three times the measured
 
 ## Current baseline
 
-Measured on 2026-11-21. The Baton baseline is `origin/main` `3e2d57891eec34151e4e1a52a4956d009c2e7b31`. PR #86 is open and adds six tests, so its numbers are recorded separately.
+Measured on 2026-11-21 after PR #86 and PR #89 merged. The Baton baseline is `origin/main` `3b86d3c`.
 
-| Measurement | Baton `origin/main` | PR #86 head |
-|---|---|---|
-| GitHub Actions workflows | None | None |
-| GitHub Actions run history | None | None |
-| Discovered test count (`ci/test-inventory.sh`) | 350 | 356 |
-| `cargo fmt --check` `Diff in` lines | 884 | 890 |
-| Clippy `error:` lines with `-D warnings` | 60 | 61 |
-| Cold `cargo build --locked` on the developer macOS host | 29.25 seconds | Not remeasured |
-| Warm `cargo build` | 0.14 seconds | 0.14 seconds |
-| Warm `cargo check --tests` | 0.93 seconds | 0.93 seconds |
-| `cargo test --lib` | 48 to 62 seconds across runs | Not remeasured |
-| `cargo nextest run`, full suite | 76.13 seconds, 350 tests | Not remeasured |
-| Slowest recorded nextest test | `orchestrate::tests::ships_completed_worker_branches_idempotently`, 62.61 seconds under contention | Not remeasured |
+| Measurement | `origin/main` `3b86d3c` |
+|---|---|
+| GitHub Actions workflows | None (Phase 1C adds the first one) |
+| GitHub Actions run history | None |
+| Discovered test count (`ci/test-inventory.sh`) | 358 |
+| `cargo fmt --check` `Diff in` lines | 890 |
+| Clippy `error:` lines with `-D warnings` | 61 |
+| Cold `cargo build --locked` on the developer macOS host | 29.25 seconds at `3e2d578`; not remeasured since |
+| Warm `cargo build` | 0.14 seconds |
+| Warm `cargo check --tests` | 0.93 seconds |
+| `cargo test --lib` | 48 to 62 seconds across runs |
+| `cargo nextest run`, full suite | 76.13 seconds, 350 tests at `3e2d578` |
+| Slowest recorded nextest test | `orchestrate::tests::ships_completed_worker_branches_idempotently`, 62.61 seconds under contention |
+
+`ci/fmt-baseline.txt`, `ci/clippy-baseline.txt`, and `ci/test-inventory-floor.txt` carry the same three numbers, and the workflow fails if a PR raises a baseline or lowers the floor.
 
 These are local macOS measurements, not GitHub Actions measurements. Phase 2 records Linux x64 queue, setup, compile, test, and verify times from real runs. No shard budget is accepted before that data exists.
 

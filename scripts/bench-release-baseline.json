@@ -1,0 +1,15 @@
+{
+  "machine": "Darwin-arm64",
+  "binary": "target/release/baton",
+  "runs": 15,
+  "process_start_ms": 18.614790998981334,
+  "process_start_p95_ms": 23.269375000381842,
+  "startup_ms": {
+    "config": 0.002,
+    "store": 0.305333,
+    "reap": 0.00825,
+    "hydrate": 0.014041,
+    "total": 0.332042,
+    "process": 1.551375
+  }
+}

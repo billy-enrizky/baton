@@ -157,8 +157,8 @@ Rules the evidence column obeys:
 
 | Capability | Upstream evidence | Baton status | Baton evidence and proof surface | Terminal decision | First slice | Plan |
 |---|---|---|---|---|---|---|
-| Startup performance | T3: `docs/operations/development.md`, `scripts/profile-startup.mjs` | Partial | `baton bench startup --json` times config validation, store open, orphan reap, and hydrate per run, plus process time from `main` entry; `scripts/bench.py` records p50 and p95 and fails above 10 percent of a recorded baseline; `tests/cli_bench.rs`; unit | Enforce warm p50 under 250 ms and p95 under 500 ms | Recorded baseline is 16.1 ms process start p50 and 0.63 ms of in-process phases on Darwin arm64 debug. Remaining: a release-build baseline, and wiring the gate into CI once billing clears. | D5 |
-| Input and render latency | Orca: `src/renderer/src/diagnostics/typing-latency/diagnostic.ts`, `src/renderer/src/diagnostics/typing-latency/renderer-long-tasks.ts` | Partial | `scripts/typing_probe.py` types into the real TUI through a PTY and measures keystroke-to-quiet, and its `--slash` mode measures `/` to the suggestion list; both have recorded baselines and a 10 percent gate; typing 10.7 ms p50, slash 3.1 ms p50 on Darwin arm64 debug; local bench | Enforce keystroke-to-render p95 under 50 ms | Keystroke-to-quiet and `/` completion are recorded. Remaining: a release-build baseline, RSS, and CI wiring. | D5 |
+| Startup performance | T3: `docs/operations/development.md`, `scripts/profile-startup.mjs` | Partial | `baton bench startup --json` times config validation, store open, orphan reap, and hydrate per run, plus process time from `main` entry; `scripts/bench.py` records p50 and p95 and fails above 10 percent of a recorded baseline; `tests/cli_bench.rs`; unit | Enforce warm p50 under 250 ms and p95 under 500 ms | Debug baseline 16.1 ms process start p50 and 0.63 ms in-process; release 18.6 ms process start and 0.33 ms in-process, so startup is exec-bound rather than compute-bound. Remaining: RSS, and wiring the gate into CI once billing clears. | D5 |
+| Input and render latency | Orca: `src/renderer/src/diagnostics/typing-latency/diagnostic.ts`, `src/renderer/src/diagnostics/typing-latency/renderer-long-tasks.ts` | Partial | `scripts/typing_probe.py` types into the real TUI through a PTY and measures keystroke-to-quiet, and its `--slash` mode measures `/` to the suggestion list; both have recorded baselines and a 10 percent gate; typing 10.7 ms p50, slash 3.1 ms p50 on Darwin arm64 debug; local bench | Enforce keystroke-to-render p95 under 50 ms | Keystroke-to-quiet, `/` completion, and release-build baselines are recorded. Remaining: RSS and CI wiring. | D5 |
 | Memory and process bounds | T3: `docs/internals/resource-telemetry.md`, `apps/server/src/diagnostics/ProcessResourceMonitor.ts` | Unmeasured | Provider process tracking in `src/process.rs`; no RSS measurement or budget exists; none | Bound idle RSS under 200 MB and bound the adapter process count in the benchmark fixture | Add RSS sampling to `scripts/bench.py` at idle, during a turn, and after quit, then fail a regression above 10 percent. | D5 |
 | Shell completion | T3: `apps/server/src/cli/install.ts`, `apps/server/src/cli/install.test.ts` | Missing | `clap` is present but no completion command or install path; none | Generate from the clap command graph. | Add `baton completions <shell>`. | D17 |
 | Stdin, stdout, and exit codes | T3: `apps/server/src/binCli.test.ts`, `apps/server/src/cli/consoleStdin.ts` | Partial | `src/cli.rs` JSON and stream JSON; `src/mcp.rs` stdin server; `std::process::exit(130)` is reached only for a cancelled orchestration report, while an interrupted `exec` turn exits 1 and a TUI Ctrl+C does not exit; none | Keep machine output on stdout and progress on stderr | Define the cancellation contract explicitly, then add an integration test for `baton status --json` with a closed stdin and one for an interrupted `exec`. | D17 |
@@ -182,6 +182,17 @@ Measured 2026-11-22 on Darwin arm64 with the debug binary, median of 11 runs, is
 | Process time from `main` entry (warm) | 3.08 ms |
 | Keystroke to quiet, TUI through a PTY | 11.4 ms p50, 12.1 ms p95, 13.8 ms max over 40 keys |
 | `/` to suggestion list | 3.1 ms p50, 6.5 ms p95, 9.0 ms max over 20 presses |
+
+Release build, same host, `--release --locked`:
+
+| Metric | Release | Debug |
+|---|---|---|
+| Process start | 18.6 ms p50, 23.3 ms p95 | 16.1 ms p50 |
+| In-process startup phases | 0.33 ms | 0.63 ms |
+| Keystroke to quiet | 8.1 ms p50, 8.7 ms p95 | 10.7 ms p50 |
+| `/` to suggestion list | 0.7 ms p50, 1.1 ms p95 | 3.1 ms p50 |
+
+The release binary is about 25 percent faster per keystroke and four times faster on the suggestion list, and its in-process startup work halves. Its process start is slightly slower, because that number is dominated by loading the larger executable, not by Baton's own work. Startup optimization therefore has to shrink the binary or defer work that runs before the first frame; compiler optimization alone will not move it.
 
 `scripts/bench-baseline.json` stores these numbers with the host class. `scripts/bench.py --check` fails above 110 percent of any of them and refuses to compare across machines without `--force`, because a cross-host comparison measures the host, not the change.
 

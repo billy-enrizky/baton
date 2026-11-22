@@ -100,6 +100,25 @@ def main() -> int:
         (evidence / "model-picker-screen.txt").write_text(model_picker + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
+
+        os.write(master, b"/pin\r")
+        pump(master, 1.5, transcript)
+        pin_picker = screen_text(transcript, args.width, args.height)
+        pin_required = ["pin · enter toggle · esc close", "New thread"]
+        missing.extend(value for value in pin_required if value not in pin_picker)
+        (evidence / "pin-picker-screen.txt").write_text(pin_picker + "\n")
+
+        os.write(master, b"\r")
+        pump(master, 1.0, transcript)
+        pin_result = screen_text(transcript, args.width, args.height)
+        if "pinned New thread" not in pin_result:
+            missing.append("pinned notice")
+        if "New thread  [new]  pinned" not in pin_result:
+            missing.append("pinned picker row")
+        (evidence / "pin-result-screen.txt").write_text(pin_result + "\n")
+
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
         os.write(master, b"/quit\r")
         pump(master, 0.5, transcript)
         exit_code = reap(pid, 5)

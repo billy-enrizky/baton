@@ -92,6 +92,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "fork this conversation into an isolated git worktree",
     ),
     ("/threads", "list threads in this directory"),
+    (
+        "/pin",
+        "pin or unpin a thread; Enter toggles the selected thread",
+    ),
     ("/inbox", "all threads that need attention"),
     ("/open", "open a thread by id prefix"),
     ("/usage", "token usage and cache hit rate"),
@@ -156,6 +160,7 @@ Common
   /model                      choose a model
   /new                        start a new thread
   /threads                    list threads here
+  /pin                        pin or unpin a thread
   /inbox                      failed, unverified, needs-input, or queued work
   /status                     what is happening now
   /activity                   every turn, tool call, diff, and usage
@@ -182,10 +187,53 @@ struct ReplyChoice {
     text: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadPickerAction {
+    Open,
+    Pin,
+}
+
+#[derive(Clone, Debug)]
 struct ThreadChoice {
-    id: String,
+    full_id: String,
     title: String,
     status: String,
+    pinned: bool,
+}
+
+fn thread_choice(store: &BatonStore, thread: ThreadRow) -> ThreadChoice {
+    let status = store
+        .list_turn_records(&thread.id)
+        .ok()
+        .map(|turns| short_thread_status(turns.last().map(|turn| turn.phase)))
+        .unwrap_or("new")
+        .to_string();
+    ThreadChoice {
+        full_id: thread.id,
+        title: thread.title,
+        status,
+        pinned: thread.pinned,
+    }
+}
+
+fn project_thread_choices(state: &TuiState, store: &Arc<Mutex<BatonStore>>) -> Vec<ThreadChoice> {
+    let guard = store.lock().unwrap();
+    guard
+        .list_threads_for_path_display(std::path::Path::new(&state.thread.cwd))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|thread| thread_choice(&guard, thread))
+        .collect()
+}
+
+fn all_thread_choices(store: &Arc<Mutex<BatonStore>>) -> Vec<ThreadChoice> {
+    let guard = store.lock().unwrap();
+    guard
+        .list_threads_display(None)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|thread| thread_choice(&guard, thread))
+        .collect()
 }
 
 fn short_thread_status(phase: Option<TurnPhase>) -> &'static str {
@@ -384,6 +432,7 @@ enum Overlay {
     ThreadPicker {
         selected: usize,
         threads: Vec<ThreadChoice>,
+        action: ThreadPickerAction,
     },
     InboxPicker {
         selected: usize,
@@ -2505,16 +2554,78 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 .store
                 .lock()
                 .unwrap()
-                .list_threads(None)
+                .list_threads_display(None)
                 .unwrap_or_default();
-            for thread in threads.into_iter().take(8) {
+            for thread in threads {
                 let id = thread.id[..8.min(thread.id.len())].to_string();
                 push_suggestion(&mut suggestions, command, &id, thread.title);
+            }
+        }
+        "/pin" => {
+            let threads = state
+                .store
+                .lock()
+                .unwrap()
+                .list_threads_for_path_display(std::path::Path::new(&state.thread.cwd))
+                .unwrap_or_default();
+            for thread in threads {
+                let id = thread.id[..8.min(thread.id.len())].to_string();
+                let action = if thread.pinned { "unpin" } else { "pin" };
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &id,
+                    format!("{action} {}", thread.title),
+                );
             }
         }
         _ => {}
     }
     suggestions
+}
+
+fn toggle_thread_pin_by_id(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    thread_id: &str,
+) -> Option<bool> {
+    let updated = {
+        let guard = store.lock().unwrap();
+        let matches = guard
+            .list_threads_for_path(std::path::Path::new(&state.thread.cwd))
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|thread| thread.id == thread_id || thread.id.starts_with(thread_id))
+            .collect::<Vec<_>>();
+        let thread = match matches.len() {
+            0 => {
+                state.notice = Some(format!("no thread in this project matches \"{thread_id}\""));
+                return None;
+            }
+            1 => matches.into_iter().next().unwrap(),
+            count => {
+                state.notice = Some(format!(
+                    "\"{thread_id}\" matches {count} threads; use more characters"
+                ));
+                return None;
+            }
+        };
+        let pinned = !thread.pinned;
+        if let Err(error) = guard.set_thread_pinned(&thread.id, pinned) {
+            state.notice = Some(format!("cannot update pin: {error}"));
+            return None;
+        }
+        (thread.id, thread.title, pinned)
+    };
+    let (full_id, title, pinned) = updated;
+    if state.thread.id == full_id {
+        state.thread.pinned = pinned;
+    }
+    state.notice = Some(format!(
+        "{} {title}",
+        if pinned { "pinned" } else { "unpinned" }
+    ));
+    Some(pinned)
 }
 
 fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread_id: &str) {
@@ -3183,7 +3294,11 @@ fn handle_key(
                 state.overlay = Overlay::AuthPicker { selected };
             }
         },
-        Overlay::ThreadPicker { selected, threads } => match key.code {
+        Overlay::ThreadPicker {
+            selected,
+            threads,
+            action,
+        } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
                 if !threads.is_empty() {
@@ -3191,6 +3306,7 @@ fn handle_key(
                     state.overlay = Overlay::ThreadPicker {
                         selected: new_selected,
                         threads,
+                        action,
                     };
                 }
             }
@@ -3200,16 +3316,37 @@ fn handle_key(
                     state.overlay = Overlay::ThreadPicker {
                         selected: new_selected,
                         threads,
+                        action,
                     };
                 }
             }
             KeyCode::Enter => {
-                if let Some(choice) = threads.get(selected) {
-                    open_thread_by_id(state, store, &choice.id);
+                let choice_id = threads.get(selected).map(|choice| choice.full_id.clone());
+                if let Some(id) = choice_id {
+                    if action == ThreadPickerAction::Pin {
+                        if toggle_thread_pin_by_id(state, store, &id).is_some() {
+                            let threads = project_thread_choices(state, store);
+                            let selected = threads
+                                .iter()
+                                .position(|choice| choice.full_id == id)
+                                .unwrap_or(0);
+                            state.overlay = Overlay::ThreadPicker {
+                                selected,
+                                threads,
+                                action,
+                            };
+                        }
+                    } else {
+                        open_thread_by_id(state, store, &id);
+                    }
                 }
             }
             _ => {
-                state.overlay = Overlay::ThreadPicker { selected, threads };
+                state.overlay = Overlay::ThreadPicker {
+                    selected,
+                    threads,
+                    action,
+                };
             }
         },
         Overlay::InboxPicker { selected, items } => match key.code {
@@ -5718,35 +5855,31 @@ fn handle_command(
             ));
         }
         "/threads" => {
-            let threads: Vec<ThreadChoice> = {
-                let guard = store.lock().unwrap();
-                guard
-                    .list_threads_for_path(std::path::Path::new(&state.thread.cwd))
-                    .unwrap_or_default()
-                    .into_iter()
-                    .take(20)
-                    .map(|thread| {
-                        let status = guard
-                            .list_turn_records(&thread.id)
-                            .ok()
-                            .map(|turns| short_thread_status(turns.last().map(|turn| turn.phase)))
-                            .unwrap_or("new")
-                            .to_string();
-                        ThreadChoice {
-                            id: thread.id[..8].to_string(),
-                            title: thread.title,
-                            status,
-                        }
-                    })
-                    .collect()
-            };
+            let threads = project_thread_choices(state, store);
             if threads.is_empty() {
                 state.notice = Some("no threads in this directory".into());
             } else {
                 state.overlay = Overlay::ThreadPicker {
                     selected: 0,
                     threads,
+                    action: ThreadPickerAction::Open,
                 };
+            }
+        }
+        "/pin" => {
+            if let Some(prefix) = args.first() {
+                toggle_thread_pin_by_id(state, store, prefix);
+            } else {
+                let threads = project_thread_choices(state, store);
+                if threads.is_empty() {
+                    state.notice = Some("no threads in this directory".into());
+                } else {
+                    state.overlay = Overlay::ThreadPicker {
+                        selected: 0,
+                        threads,
+                        action: ThreadPickerAction::Pin,
+                    };
+                }
             }
         }
         "/inbox" => {
@@ -5786,36 +5919,14 @@ fn handle_command(
                     None => state.notice = Some(format!("no thread matches \"{prefix}\"")),
                 }
             } else {
-                let threads: Vec<ThreadChoice> = {
-                    let guard = store.lock().unwrap();
-                    guard
-                        .list_threads(None)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .take(20)
-                        .map(|thread| {
-                            let status = guard
-                                .list_turn_records(&thread.id)
-                                .ok()
-                                .map(|turns| {
-                                    short_thread_status(turns.last().map(|turn| turn.phase))
-                                })
-                                .unwrap_or("new")
-                                .to_string();
-                            ThreadChoice {
-                                id: thread.id[..8].to_string(),
-                                title: thread.title,
-                                status,
-                            }
-                        })
-                        .collect()
-                };
+                let threads = all_thread_choices(store);
                 if threads.is_empty() {
                     state.notice = Some("no threads".into());
                 } else {
                     state.overlay = Overlay::ThreadPicker {
                         selected: 0,
                         threads,
+                        action: ThreadPickerAction::Open,
                     };
                 }
             }
@@ -6852,9 +6963,11 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::AuthPicker { selected } => {
                 draw_auth_picker(frame, chunks[1], state, *selected)
             }
-            Overlay::ThreadPicker { selected, threads } => {
-                draw_thread_picker(frame, chunks[1], threads, *selected)
-            }
+            Overlay::ThreadPicker {
+                selected,
+                threads,
+                action,
+            } => draw_thread_picker(frame, chunks[1], threads, *selected, *action),
             Overlay::InboxPicker { selected, items } => {
                 draw_inbox_picker(frame, chunks[1], items, *selected)
             }
@@ -7571,12 +7684,23 @@ fn draw_thread_picker(
     area: Rect,
     threads: &[ThreadChoice],
     selected: usize,
+    action: ThreadPickerAction,
 ) {
-    let mut lines: Vec<Line> = vec![Line::styled(
-        "threads · enter open · esc close",
-        Style::default().fg(COLORS.muted),
-    )];
-    for (index, choice) in threads.iter().take(8).enumerate() {
+    let heading = match action {
+        ThreadPickerAction::Open => "threads · enter open · esc close",
+        ThreadPickerAction::Pin => "pin · enter toggle · esc close",
+    };
+    let mut lines: Vec<Line> = vec![Line::styled(heading, Style::default().fg(COLORS.muted))];
+    let visible = 8;
+    let start = if threads.len() <= visible {
+        0
+    } else {
+        selected
+            .saturating_sub(visible - 1)
+            .min(threads.len() - visible)
+    };
+    for (offset, choice) in threads.iter().skip(start).take(visible).enumerate() {
+        let index = start + offset;
         let style = if index == selected {
             Style::default()
                 .fg(COLORS.accent)
@@ -7584,8 +7708,12 @@ fn draw_thread_picker(
         } else {
             Style::default().fg(COLORS.muted)
         };
+        let pinned = if choice.pinned { "  pinned" } else { "" };
         lines.push(Line::styled(
-            format!("❯ {}  {}  [{}]", choice.id, choice.title, choice.status),
+            format!(
+                "❯ {}  {}  [{}]{}",
+                choice.full_id, choice.title, choice.status, pinned
+            ),
             style,
         ));
     }
@@ -8976,6 +9104,7 @@ mod tests {
             "/fork",
             "/worktree",
             "/open",
+            "/pin",
             "/review",
             "/diff",
             "/rewind",
@@ -12380,10 +12509,12 @@ mod tests {
         state.overlay = Overlay::ThreadPicker {
             selected: 0,
             threads: vec![ThreadChoice {
-                id: other.id.clone(),
+                full_id: other.id.clone(),
                 title: other.title.clone(),
                 status: "new".to_string(),
+                pinned: false,
             }],
+            action: ThreadPickerAction::Open,
         };
         handle_key(
             &mut state,
@@ -12587,13 +12718,227 @@ mod tests {
         state.overlay = Overlay::ThreadPicker {
             selected: 0,
             threads: vec![ThreadChoice {
-                id: "12345678".to_string(),
+                full_id: "12345678-full".to_string(),
                 title: "fix login".to_string(),
                 status: "failed".to_string(),
+                pinned: true,
             }],
+            action: ThreadPickerAction::Open,
         };
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
-        assert!(text.contains("12345678  fix login  [failed]"), "{text}");
+        assert!(
+            text.contains("12345678-full  fix login  [failed]  pinned"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn pin_picker_toggles_without_opening_the_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let current_id = state.thread.id.clone();
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "pin me".to_string(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/pin");
+        let (threads, _selected, action) = match &state.overlay {
+            Overlay::ThreadPicker {
+                threads,
+                selected,
+                action,
+            } => (threads.clone(), *selected, *action),
+            _ => panic!("expected a pin picker"),
+        };
+        assert_eq!(action, ThreadPickerAction::Pin);
+        let index = threads
+            .iter()
+            .position(|choice| choice.full_id == other.id)
+            .expect("the new thread is in the pin picker");
+        state.overlay = Overlay::ThreadPicker {
+            selected: index,
+            threads,
+            action,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(state.thread.id, current_id, "pin does not open a thread");
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get_thread(&other.id)
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
+        let Overlay::ThreadPicker {
+            selected,
+            threads,
+            action,
+        } = &state.overlay
+        else {
+            panic!("expected the pin picker to stay open");
+        };
+        assert_eq!(*action, ThreadPickerAction::Pin);
+        assert_eq!(*selected, 0);
+        assert_eq!(threads[0].full_id, other.id);
+        assert!(threads[0].pinned);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .get_thread(&other.id)
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            &format!("/pin {}", &other.id[..8]),
+        );
+        assert!(
+            store
+                .lock()
+                .unwrap()
+                .get_thread(&other.id)
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
+    }
+
+    #[test]
+    fn thread_picker_window_follows_selection_past_eight() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::ThreadPicker {
+            selected: 8,
+            threads: (1..=9)
+                .map(|index| ThreadChoice {
+                    full_id: format!("thread-{index}"),
+                    title: format!("thread {index}"),
+                    status: "ready".to_string(),
+                    pinned: false,
+                })
+                .collect(),
+            action: ThreadPickerAction::Pin,
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("thread 9"), "{text}");
+        assert!(!text.contains("thread 1  "), "{text}");
+    }
+
+    #[test]
+    fn pin_prefix_rejects_foreign_and_ambiguous_matches() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let foreign = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "foreign".to_string(),
+                cwd: "/tmp/foreign-pin".to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let first = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "first".to_string(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let second = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "second".to_string(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            &format!("/pin {}", foreign.id),
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("no thread in this project")),
+            "{:?}",
+            state.notice
+        );
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .get_thread(&foreign.id)
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
+
+        assert!(toggle_thread_pin_by_id(&mut state, &store, "").is_none());
+        assert!(
+            state.notice.as_deref().is_some_and(
+                |notice| notice.contains("matches") && notice.contains("more characters")
+            ),
+            "{:?}",
+            state.notice
+        );
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .get_thread(&first.id)
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
+        assert!(
+            !store
+                .lock()
+                .unwrap()
+                .get_thread(&second.id)
+                .unwrap()
+                .unwrap()
+                .pinned
+        );
     }
 
     #[test]

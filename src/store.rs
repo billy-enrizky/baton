@@ -17,6 +17,7 @@ pub struct ThreadRow {
     pub goal: Option<String>,
     pub goal_paused: bool,
     pub session_mode: SessionMode,
+    pub pinned: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -208,6 +209,7 @@ CREATE TABLE IF NOT EXISTS threads (
   goal TEXT,
   goal_paused INTEGER NOT NULL DEFAULT 0,
   session_mode TEXT NOT NULL DEFAULT 'single',
+  pinned INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -410,7 +412,13 @@ fn ensure_thread_columns(db: &Connection) -> Result<()> {
     ensure_column(db, "threads", "reasoning_effort", "TEXT")?;
     ensure_column(db, "threads", "goal", "TEXT")?;
     ensure_column(db, "threads", "goal_paused", "INTEGER NOT NULL DEFAULT 0")?;
-    ensure_column(db, "threads", "session_mode", "TEXT NOT NULL DEFAULT 'single'")?;
+    ensure_column(
+        db,
+        "threads",
+        "session_mode",
+        "TEXT NOT NULL DEFAULT 'single'",
+    )?;
+    ensure_column(db, "threads", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
     Ok(())
 }
 
@@ -435,13 +443,14 @@ fn migrate_thread_model_nullable(db: &Connection) -> Result<()> {
                   permission_mode TEXT NOT NULL DEFAULT 'default',
                   goal TEXT,
                   goal_paused INTEGER NOT NULL DEFAULT 0,
+                  pinned INTEGER NOT NULL DEFAULT 0,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
-                INSERT INTO threads_migrated (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, created_at, updated_at)
+                INSERT INTO threads_migrated (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, pinned, created_at, updated_at)
                   SELECT id, title, cwd, current_provider,
                     CASE WHEN current_model IN ('gpt-6.1-sol', 'claude-sonnet-4-5') THEN NULL ELSE current_model END,
-                    'default', NULL, 0, created_at, updated_at
+                    'default', NULL, 0, 0, created_at, updated_at
                   FROM threads;
                 DROP TABLE threads;
                 ALTER TABLE threads_migrated RENAME TO threads;
@@ -483,6 +492,7 @@ fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
         goal: row.get(8)?,
         goal_paused: row.get::<_, i64>(9)? != 0,
         session_mode: SessionMode::parse(&session_mode).unwrap_or(SessionMode::Single),
+        pinned: row.get::<_, i64>(12)? != 0,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
     })
@@ -534,7 +544,7 @@ fn map_orchestration_task(row: &rusqlite::Row) -> rusqlite::Result<Orchestration
     })
 }
 
-const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode, reasoning_effort";
+const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode, reasoning_effort, pinned";
 
 /// Per-project prompt history cap, Claude Code style.
 pub const PROMPT_HISTORY_LIMIT: i64 = 100;
@@ -597,6 +607,7 @@ impl BatonStore {
             goal: None,
             goal_paused: false,
             session_mode,
+            pinned: false,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -739,6 +750,7 @@ impl BatonStore {
             goal: None,
             goal_paused: false,
             session_mode: SessionMode::Single,
+            pinned: false,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -748,6 +760,20 @@ impl BatonStore {
     /// canonical form. A symlinked invocation path must not hide threads that
     /// were created through the real project path, or vice versa.
     pub fn list_threads_for_path(&self, cwd: &Path) -> Result<Vec<ThreadRow>> {
+        self.list_threads_for_path_ordered(cwd, false)
+    }
+
+    /// Display order puts pinned threads first. Semantic resolution uses
+    /// `list_threads_for_path`, which stays recency-first.
+    pub fn list_threads_for_path_display(&self, cwd: &Path) -> Result<Vec<ThreadRow>> {
+        self.list_threads_for_path_ordered(cwd, true)
+    }
+
+    fn list_threads_for_path_ordered(
+        &self,
+        cwd: &Path,
+        pinned_first: bool,
+    ) -> Result<Vec<ThreadRow>> {
         let mut candidates = vec![cwd.to_path_buf()];
         if let Ok(canonical) = cwd.canonicalize() {
             if canonical != cwd {
@@ -765,7 +791,10 @@ impl BatonStore {
             }
         }
         for candidate in candidates {
-            let rows = self.list_threads(Some(candidate.to_string_lossy().as_ref()))?;
+            let rows = self.list_threads_ordered(
+                Some(candidate.to_string_lossy().as_ref()),
+                pinned_first,
+            )?;
             if !rows.is_empty() {
                 return Ok(rows);
             }
@@ -773,7 +802,7 @@ impl BatonStore {
         // The stored cwd may be the symlinked form while the caller uses the
         // real path. Compare canonical stored paths as the final fallback.
         let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let rows = self.list_threads(None)?;
+        let rows = self.list_threads_ordered(None, pinned_first)?;
         Ok(rows
             .into_iter()
             .filter(|thread| {
@@ -786,12 +815,29 @@ impl BatonStore {
     }
 
     pub fn list_threads(&self, cwd: Option<&str>) -> Result<Vec<ThreadRow>> {
+        self.list_threads_ordered(cwd, false)
+    }
+
+    pub fn list_threads_display(&self, cwd: Option<&str>) -> Result<Vec<ThreadRow>> {
+        self.list_threads_ordered(cwd, true)
+    }
+
+    fn list_threads_ordered(
+        &self,
+        cwd: Option<&str>,
+        pinned_first: bool,
+    ) -> Result<Vec<ThreadRow>> {
+        let order = if pinned_first {
+            "pinned DESC, updated_at DESC, rowid DESC"
+        } else {
+            "updated_at DESC, rowid DESC"
+        };
         let mut statement = match cwd {
             Some(_cwd) => self.db.prepare(&format!(
-                "SELECT {THREAD_COLUMNS} FROM threads WHERE cwd = ? ORDER BY updated_at DESC, rowid DESC"
+                "SELECT {THREAD_COLUMNS} FROM threads WHERE cwd = ? ORDER BY {order}"
             ))?,
             None => self.db.prepare(&format!(
-                "SELECT {THREAD_COLUMNS} FROM threads ORDER BY updated_at DESC, rowid DESC"
+                "SELECT {THREAD_COLUMNS} FROM threads ORDER BY {order}"
             ))?,
         };
         let rows = match cwd {
@@ -816,6 +862,14 @@ impl BatonStore {
         self.db.execute(
             "UPDATE threads SET title = ?, updated_at = ? WHERE id = ?",
             params![title, now_iso(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_thread_pinned(&self, id: &str, pinned: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE threads SET pinned = ? WHERE id = ?",
+            params![pinned as i64, id],
         )?;
         Ok(())
     }
@@ -1193,7 +1247,7 @@ impl BatonStore {
     pub fn find_thread_by_native_session(&self, provider: ProviderId, native_session_id: &str) -> Result<Option<ThreadRow>> {
         self.db
             .query_row(
-                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode, t.reasoning_effort FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
+                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode, t.reasoning_effort, t.pinned FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
                 params![provider.as_str(), native_session_id],
                 |row| {
                     let provider: String = row.get(3)?;
@@ -1212,6 +1266,7 @@ impl BatonStore {
                         goal_paused: row.get::<_, i64>(9)? != 0,
                         session_mode: SessionMode::parse(&session_mode)
                             .unwrap_or(SessionMode::Single),
+                        pinned: row.get::<_, i64>(12)? != 0,
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
                     })

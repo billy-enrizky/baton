@@ -17,7 +17,7 @@ Open the TUI and type `/mode `, `/model`, `/switch `, `/effort `, `/auth `, `/me
   --evidence-dir local_docs/verification/evidence
 ```
 
-The probe types `/find ` and requires its argument syntax, then types `/mode `, requires all four permission choices and the completion hint, presses Tab to accept `default`, presses Enter, and requires the resulting `permission mode: default` notice. It then types `/model`, requires the model picker header, filter hint, and Enter/Escape affordances, closes it with Escape, and requires a clean `/quit`.
+The probe types `/find ` and requires its argument syntax, then types `/mode `, requires all four permission choices and the completion hint, presses Tab to accept `default`, presses Enter, and requires the resulting `permission mode: default` notice. It then types `/model`, requires the model picker header, filter hint, and Enter/Escape affordances, closes it with Escape, opens `/pin`, requires the pin picker and a toggled pinned row, closes it with Escape, and requires a clean `/quit`.
 
 ## Gotchas
 - The displayed permission banner uses the provider default when the explicit value is `default`. The command notice reports the selected value; the banner reports the effective provider mode.

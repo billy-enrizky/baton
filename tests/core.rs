@@ -353,6 +353,124 @@ fn store_crud_and_thread_lifecycle() {
 }
 
 #[test]
+fn thread_pins_persist_and_sort_before_recent_threads() {
+    let store = BatonStore::memory().unwrap();
+    let older = store
+        .create_thread(NewThread {
+            title: "older".to_string(),
+            cwd: "/tmp/pins".to_string(),
+            current_provider: ProviderId::Claude,
+            current_model: None,
+        })
+        .unwrap();
+    let newer = store
+        .create_thread(NewThread {
+            title: "newer".to_string(),
+            cwd: "/tmp/pins".to_string(),
+            current_provider: ProviderId::Claude,
+            current_model: None,
+        })
+        .unwrap();
+
+    store.set_thread_pinned(&older.id, true).unwrap();
+    let display = store
+        .list_threads_for_path_display(std::path::Path::new("/tmp/pins"))
+        .unwrap();
+    assert_eq!(display[0].id, older.id);
+    assert!(display[0].pinned);
+    assert!(!display[1].pinned);
+    let semantic = store.list_threads(Some("/tmp/pins")).unwrap();
+    assert_eq!(semantic[0].id, newer.id, "default resolution stays newest");
+
+    store.set_thread_pinned(&older.id, false).unwrap();
+    let display = store
+        .list_threads_for_path_display(std::path::Path::new("/tmp/pins"))
+        .unwrap();
+    assert_eq!(display[0].id, newer.id);
+    assert!(!store.get_thread(&older.id).unwrap().unwrap().pinned);
+}
+
+#[test]
+fn threads_json_reports_pinned() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "pinned".to_string(),
+            cwd: work.path().to_string_lossy().to_string(),
+            current_provider: ProviderId::Claude,
+            current_model: None,
+        })
+        .unwrap();
+    let newer = store
+        .create_thread(NewThread {
+            title: "newer".to_string(),
+            cwd: work.path().to_string_lossy().to_string(),
+            current_provider: ProviderId::Claude,
+            current_model: None,
+        })
+        .unwrap();
+    store.set_thread_pinned(&thread.id, true).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["-C", work.path().to_str().unwrap(), "threads", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows[0]["thread_id"], thread.id);
+    assert_eq!(rows[0]["pinned"], true);
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["-C", work.path().to_str().unwrap(), "status", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["thread_id"], newer.id);
+}
+
+#[test]
+fn thread_pin_survives_store_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("baton.sqlite");
+    let thread_id;
+    {
+        let store = BatonStore::open(&path).unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "durable pin".to_string(),
+                cwd: "/tmp/durable-pins".to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        store.set_thread_pinned(&thread.id, true).unwrap();
+        thread_id = thread.id;
+    }
+    let store = BatonStore::open(&path).unwrap();
+    assert!(store.get_thread(&thread_id).unwrap().unwrap().pinned);
+    assert_eq!(
+        store
+            .list_threads_for_path_display(std::path::Path::new("/tmp/durable-pins"))
+            .unwrap()[0]
+            .id,
+        thread_id
+    );
+}
+
+#[test]
 fn thread_reasoning_effort_persists_and_forks() {
     let store = BatonStore::memory().unwrap();
     let thread = store
@@ -936,6 +1054,7 @@ fn store_migration_resets_stale_defaults() {
     assert_eq!(stale.permission_mode, PermissionMode::Default);
     assert_eq!(stale.goal, None);
     assert!(!stale.goal_paused);
+    assert!(!stale.pinned);
     assert_eq!(
         store.get_thread("fresh-id").unwrap().unwrap().current_model.as_deref(),
         Some("claude-opus-5-5")

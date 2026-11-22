@@ -851,6 +851,34 @@ mod tests {
     }
 
     #[test]
+    fn default_status_keeps_newest_thread_when_older_is_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+        let store = BatonStore::memory().unwrap();
+        let older = store
+            .create_thread(NewThread {
+                title: "older".into(),
+                cwd: cwd.to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let newer = store
+            .create_thread(NewThread {
+                title: "newer".into(),
+                cwd: cwd.to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store.set_thread_pinned(&older.id, true).unwrap();
+        let server = McpServer::new(store, dir.path().to_path_buf(), cwd);
+        let status = tool_json(&server, "baton_status", json!({}));
+        assert_eq!(status["thread_id"], newer.id);
+    }
+
+    #[test]
     fn messages_queue_and_diff_are_readable() {
         let server = server();
         let messages = tool_json(&server, "baton_messages", json!({ "limit": 2 }));

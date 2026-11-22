@@ -22,7 +22,16 @@ pub struct ProviderAuthFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NotificationsConfig {
+    /// Ring the terminal on turn end. Off unless the user turns it on.
+    #[serde(default)]
+    pub bell: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BatonConfigFile {
+    #[serde(default)]
+    pub notifications: NotificationsConfig,
     #[serde(default, flatten)]
     pub providers: BTreeMap<String, ProviderAuthFile>,
     #[serde(default, rename = "defaultModels")]
@@ -59,6 +68,10 @@ pub fn default_models() -> BTreeMap<String, String> {
 }
 
 
+
+pub fn notifications(home: &Path) -> NotificationsConfig {
+    load_config_file(home).map(|file| file.notifications).unwrap_or_default()
+}
 
 pub fn config_path(home: &Path) -> PathBuf {
     home.join("config.json")

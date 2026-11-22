@@ -11,6 +11,7 @@ pub mod harness_config;
 pub mod mcp;
 pub mod memory;
 pub mod models;
+pub mod notify;
 pub mod orchestrate;
 pub mod paths;
 pub mod process;

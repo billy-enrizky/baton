@@ -39,8 +39,8 @@ def main() -> int:
 
     home = tempfile.mkdtemp(prefix="baton-slash-home-")
     workdir = tempfile.mkdtemp(prefix="baton-slash-cwd-")
-    (Path(workdir) / "src").mkdir()
-    (Path(workdir) / "src" / "parser.rs").write_text("fn parse() {}\n")
+    (Path(workdir) / "src" / "parser").mkdir(parents=True)
+    (Path(workdir) / "src" / "parser" / "mod.rs").write_text("pub fn parse() {}\n")
     (Path(workdir) / "README.md").write_text("# readme\n")
     subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
     evidence = Path(args.evidence_dir) / f"slash-probe-{int(time.time())}"
@@ -116,21 +116,23 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
-        os.write(master, b"/files parser\r")
+        os.write(master, b"/files pmod\r")
         pump(master, 1.5, transcript)
         files_picker = screen_text(transcript, args.width, args.height)
         files_required = [
-            'files matching "parser"',
-            "src/parser.rs",
+            'files matching "pmod"',
+            "src/parser/mod.rs",
             "enter insert",
             "esc close",
         ]
         missing.extend(value for value in files_required if value not in files_picker)
+        if "README.md" in files_picker:
+            missing.append("files picker leaked an unmatched row")
         (evidence / "files-picker-screen.txt").write_text(files_picker + "\n")
         os.write(master, b"\r")
         pump(master, 1.0, transcript)
         files_result = screen_text(transcript, args.width, args.height)
-        if "inserted src/parser.rs" not in files_result:
+        if "inserted src/parser/mod.rs" not in files_result:
             missing.append("files insert notice")
         (evidence / "files-result-screen.txt").write_text(files_result + "\n")
         os.write(master, b"\x1b")

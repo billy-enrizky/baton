@@ -2,6 +2,10 @@
 set -euo pipefail
 
 root=$(cd -- "$(dirname -- "$0")" && pwd)
+quick=false
+if [[ "${1:-}" == "--quick" ]]; then
+    quick=true
+fi
 repo_root=${BATON_REPO_ROOT:-}
 if [ -z "$repo_root" ]; then
     if [ -f "$PWD/Cargo.toml" ]; then
@@ -23,6 +27,11 @@ done
 
 valid="$root/fixtures/check-ci/valid.yml"
 bash "$root/check-ci.sh" --bootstrap "$valid" >/dev/null
+
+if [[ "$quick" == true ]]; then
+    echo "ci quick selftest passed"
+    exit 0
+fi
 
 for invalid in "$root"/fixtures/check-ci/invalid-*.yml; do
   expected_file="${invalid%.yml}.expected"

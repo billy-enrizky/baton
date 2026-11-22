@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::Parser;
@@ -662,6 +662,29 @@ fn main_result(started: Instant) -> Result<()> {
             }
             if has_open {
                 println!("note: one or more turns are open; use `baton status <id>` to inspect them");
+            }
+            Ok(())
+        }
+        cli::Commands::Inbox { json } => {
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let items = inbox::items(&store)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&items)?);
+                return Ok(());
+            }
+            if items.is_empty() {
+                println!("inbox is empty");
+                return Ok(());
+            }
+            for item in items {
+                let id: String = item.thread_id.chars().take(8).collect();
+                println!(
+                    "{id}  {}  [{}]  {}  {}",
+                    item.title,
+                    item.status,
+                    item.reasons.join(" · "),
+                    item.updated_at
+                );
             }
             Ok(())
         }

@@ -313,8 +313,26 @@ pub fn terminate_group(pgid: u32) -> bool {
     if pgid == 0 {
         return false;
     }
-    let _ = send_group_signal(pgid, "-TERM");
+    let dump = || {
+        if let Ok(output) = std::process::Command::new("ps")
+            .args(["-eo", "pid,ppid,pgid,stat,cmd"])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            for line in text.lines() {
+                let fields: Vec<_> = line.split_whitespace().collect();
+                if fields.len() > 2 && fields[2] == pgid.to_string() {
+                    eprintln!("group member: {line}");
+                }
+            }
+        }
+    };
+    eprintln!("terminate_group({pgid}) before signal");
+    dump();
+    let term = send_group_signal(pgid, "-TERM");
+    eprintln!("send_group_signal TERM -> {term}");
     if !group_alive(pgid) {
+        eprintln!("group gone before wait");
         return true;
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -324,7 +342,9 @@ pub fn terminate_group(pgid: u32) -> bool {
         }
         std::thread::sleep(Duration::from_millis(25));
     }
-    let _ = send_group_signal(pgid, "-KILL");
+    let kill = send_group_signal(pgid, "-KILL");
+    eprintln!("send_group_signal KILL -> {kill}");
+    dump();
     let deadline = Instant::now() + Duration::from_millis(500);
     while Instant::now() < deadline {
         if !group_alive(pgid) {

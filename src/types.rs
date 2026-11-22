@@ -10,6 +10,52 @@ pub enum ProviderId {
     Antigravity,
 }
 
+/// A provider name as stored or configured. Built-in harnesses map to
+/// `ProviderId`; a configured agent that Baton does not know yet keeps its own
+/// name instead of being silently rewritten to a built-in one.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ProviderKey(String);
+
+impl ProviderKey {
+    /// Validates a name that came from outside Baton: config, CLI, ACP.
+    pub fn parse(value: &str) -> Option<ProviderKey> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() || trimmed.len() > 64 {
+            return None;
+        }
+        let valid = trimmed
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'));
+        valid.then(|| ProviderKey(trimmed.to_string()))
+    }
+
+    /// A value read back from the store. Storage only ever holds what Baton or
+    /// a validated config wrote, so this never rewrites an unknown name.
+    pub fn from_stored(value: &str) -> ProviderKey {
+        ProviderKey(value.trim().to_string())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn builtin(&self) -> Option<ProviderId> {
+        ProviderId::parse(&self.0)
+    }
+}
+
+impl From<ProviderId> for ProviderKey {
+    fn from(provider: ProviderId) -> Self {
+        ProviderKey(provider.as_str().to_string())
+    }
+}
+
+impl fmt::Display for ProviderKey {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
 impl ProviderId {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -250,6 +296,40 @@ pub struct NativeSessionRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_key_keeps_an_unknown_name_verbatim() {
+        let key = ProviderKey::from_stored("custom-agent");
+        assert_eq!(key.as_str(), "custom-agent");
+        assert_eq!(
+            key.builtin(),
+            None,
+            "an unknown key must not become a built-in"
+        );
+        assert_eq!(key.to_string(), "custom-agent");
+    }
+
+    #[test]
+    fn provider_key_maps_builtins_both_ways() {
+        for provider in ProviderId::all() {
+            let key = ProviderKey::from(*provider);
+            assert_eq!(key.as_str(), provider.as_str());
+            assert_eq!(key.builtin(), Some(*provider));
+        }
+    }
+
+    #[test]
+    fn provider_key_rejects_empty_and_odd_input() {
+        assert!(ProviderKey::parse("").is_none());
+        assert!(ProviderKey::parse("   ").is_none());
+        assert!(ProviderKey::parse("has space").is_none());
+        assert!(ProviderKey::parse("bad$name").is_none());
+        assert!(ProviderKey::parse(&"x".repeat(65)).is_none());
+        assert_eq!(
+            ProviderKey::parse("claude").unwrap().builtin(),
+            Some(ProviderId::Claude)
+        );
+    }
 
     #[test]
     fn only_terminal_phases_report_terminal() {

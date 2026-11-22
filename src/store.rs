@@ -37,7 +37,8 @@ pub struct TurnRow {
 #[derive(Debug, Clone)]
 pub struct ProviderSessionRow {
     pub thread_id: String,
-    pub provider: ProviderId,
+    /// The stored name, including a configured agent Baton does not know yet.
+    pub provider: crate::types::ProviderKey,
     pub native_session_id: String,
     pub model: Option<String>,
     pub rollout_path: Option<String>,
@@ -1107,11 +1108,12 @@ impl BatonStore {
     pub fn upsert_provider_session(
         &self,
         thread_id: &str,
-        provider: ProviderId,
+        provider: impl Into<crate::types::ProviderKey>,
         native_session_id: &str,
         model: Option<String>,
         rollout_path: Option<String>,
     ) -> Result<()> {
+        let provider = provider.into();
         self.db.execute(
             r#"INSERT INTO provider_sessions (thread_id, provider, native_session_id, model, rollout_path, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)
@@ -1129,9 +1131,10 @@ impl BatonStore {
     pub fn mark_provider_session_covered(
         &self,
         thread_id: &str,
-        provider: ProviderId,
+        provider: impl Into<crate::types::ProviderKey>,
         turn: i64,
     ) -> Result<()> {
+        let provider = provider.into();
         self.db.execute(
             "UPDATE provider_sessions SET covered_turn = MAX(covered_turn, ?) WHERE thread_id = ? AND provider = ?",
             params![turn, thread_id, provider.as_str()],
@@ -1139,7 +1142,12 @@ impl BatonStore {
         Ok(())
     }
 
-    pub fn get_provider_session(&self, thread_id: &str, provider: ProviderId) -> Result<Option<ProviderSessionRow>> {
+    pub fn get_provider_session(
+        &self,
+        thread_id: &str,
+        provider: impl Into<crate::types::ProviderKey>,
+    ) -> Result<Option<ProviderSessionRow>> {
+        let provider = provider.into();
         self.db
             .query_row(
                 "SELECT thread_id, provider, native_session_id, model, rollout_path, updated_at, covered_turn FROM provider_sessions WHERE thread_id = ? AND provider = ?",
@@ -1148,7 +1156,7 @@ impl BatonStore {
                     let provider: String = row.get(1)?;
                     Ok(ProviderSessionRow {
                         thread_id: row.get(0)?,
-                        provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
+                        provider: crate::types::ProviderKey::from_stored(&provider),
                         native_session_id: row.get(2)?,
                         model: row.get(3)?,
                         rollout_path: row.get(4)?,
@@ -1170,7 +1178,7 @@ impl BatonStore {
                 let provider: String = row.get(1)?;
                 Ok(ProviderSessionRow {
                     thread_id: row.get(0)?,
-                    provider: ProviderId::parse(&provider).unwrap_or(ProviderId::Claude),
+                    provider: crate::types::ProviderKey::from_stored(&provider),
                     native_session_id: row.get(2)?,
                     model: row.get(3)?,
                     rollout_path: row.get(4)?,

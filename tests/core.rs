@@ -1006,6 +1006,39 @@ fn handoff_builds_sections_and_respects_budget() {
 }
 
 #[test]
+fn an_unknown_provider_session_key_round_trips_without_becoming_claude() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "custom".into(),
+            cwd: "/tmp/custom".into(),
+            current_provider: ProviderId::Claude,
+            current_model: None,
+        })
+        .unwrap();
+    let key = baton::types::ProviderKey::from_stored("custom-agent");
+    store
+        .upsert_provider_session(&thread.id, key.clone(), "native-1", None, None)
+        .unwrap();
+    let sessions = store.list_provider_sessions(&thread.id).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].provider.as_str(), "custom-agent");
+    assert_eq!(
+        sessions[0].provider.builtin(),
+        None,
+        "an unknown stored provider must not be coerced to a built-in"
+    );
+    assert!(store.get_provider_session(&thread.id, key).unwrap().is_some());
+    assert!(
+        store
+            .get_provider_session(&thread.id, ProviderId::Claude)
+            .unwrap()
+            .is_none(),
+        "the built-in name must not match a different stored key"
+    );
+}
+
+#[test]
 fn provider_session_covered_turn_defaults_to_zero_and_only_moves_forward() {
     let store = BatonStore::memory().unwrap();
     let thread = store

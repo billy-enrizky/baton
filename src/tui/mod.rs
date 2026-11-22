@@ -2187,6 +2187,9 @@ fn model_filter_indices(models: &[String], filter: &str) -> Vec<usize> {
 }
 
 fn files_filter_indices(entries: &[String], query: &str) -> Vec<usize> {
+    if query.trim().is_empty() {
+        return (0..entries.len()).collect();
+    }
     crate::files::ranked_indices(entries, query)
 }
 
@@ -8172,6 +8175,11 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
         spinner,
     } = view;
     let filter = query.trim();
+    let highlight = if filter.is_empty() {
+        base_query.trim()
+    } else {
+        filter
+    };
     let filter_label = if filter.is_empty() {
         String::new()
     } else {
@@ -8240,7 +8248,7 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
                 Style::default().fg(COLORS.muted)
             };
             let cursor = if position == selected { "❯" } else { " " };
-            lines.push(Line::styled(format!("{cursor} {}", entries[*index]), style));
+            lines.push(file_row(cursor, &entries[*index], highlight, style));
         }
     }
     let hint = if truncated {
@@ -8255,6 +8263,32 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn file_row(cursor: &str, path: &str, filter: &str, style: Style) -> Line<'static> {
+    let marks = crate::files::match_positions(path, filter);
+    let highlight = Style::default()
+        .fg(COLORS.accent)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let mut spans = vec![Span::styled(format!("{cursor} "), style)];
+    let mut run = String::new();
+    let mut run_marked = false;
+    for (position, character) in path.chars().enumerate() {
+        let marked = marks.binary_search(&position).is_ok();
+        if marked != run_marked && !run.is_empty() {
+            let style = if run_marked { highlight } else { style };
+            spans.push(Span::styled(std::mem::take(&mut run), style));
+            run_marked = marked;
+        } else if run.is_empty() {
+            run_marked = marked;
+        }
+        run.push(character);
+    }
+    if !run.is_empty() {
+        let style = if run_marked { highlight } else { style };
+        spans.push(Span::styled(run, style));
+    }
+    Line::from(spans)
 }
 
 fn draw_inbox_picker(frame: &mut ratatui::Frame, area: Rect, items: &[InboxItem], selected: usize) {
@@ -13549,6 +13583,87 @@ mod tests {
     }
 
     #[test]
+    fn file_row_marks_matches_and_keeps_the_gutter() {
+        let base = Style::default().fg(COLORS.muted);
+        let line = file_row("❯", "src/parser/mod.rs", "pmod", base);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "❯ src/parser/mod.rs");
+        assert!(
+            line.spans.iter().any(
+                |span| span.style.add_modifier.contains(Modifier::UNDERLINED)
+                    && span.content.contains('p')
+            ),
+            "{:?}",
+            line.spans
+        );
+        let unmarked = file_row(" ", "src/parser/mod.rs", "", base);
+        assert!(unmarked
+            .spans
+            .iter()
+            .all(|span| !span.style.add_modifier.contains(Modifier::UNDERLINED)));
+
+        let selected = Style::default()
+            .fg(COLORS.accent)
+            .add_modifier(Modifier::BOLD);
+        let selected_line = file_row("❯", "src/parser/mod.rs", "pmod", selected);
+        assert!(
+            selected_line.spans.iter().any(|span| span
+                .style
+                .add_modifier
+                .contains(Modifier::BOLD | Modifier::UNDERLINED)
+                && span.content.contains('p')),
+            "{:?}",
+            selected_line.spans
+        );
+
+        let entries = vec!["long/path.rs".to_string(), "a.rs".to_string()];
+        assert_eq!(files_filter_indices(&entries, ""), vec![0, 1]);
+        assert_eq!(files_filter_indices(&entries, "a"), vec![1, 0]);
+    }
+
+    #[test]
+    fn files_picker_matches_a_subsequence_and_inserts() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/other.rs".into(), "src/parser/mod.rs".into()],
+            filtered: vec![0, 1],
+            base_query: String::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        for character in "pmod".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        match &state.overlay {
+            Overlay::FilesPicker { filtered, .. } => assert_eq!(filtered, &vec![1]),
+            _ => panic!("expected files picker"),
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "src/parser/mod.rs ");
+    }
+
+    #[test]
     fn files_picker_scrolls_past_eight_entries() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -13567,6 +13682,7 @@ mod tests {
         assert!(text.contains("src/file9.rs"), "{text}");
         assert!(!text.contains("src/file0.rs"), "{text}");
         assert_eq!(text.matches('❯').count(), 1, "{text}");
+        assert!(text.contains("❯ src/file9.rs"), "{text}");
         assert!(
             text.contains("files · 10 · enter insert · esc close"),
             "{text}"

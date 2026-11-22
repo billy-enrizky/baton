@@ -317,6 +317,7 @@ fn list_with_git(root: &Path, include_ignored: bool, tokens: &[&str]) -> Result<
 fn parse_null_paths(bytes: &[u8], tokens: &[&str]) -> CandidateSet {
     let mut seen = HashSet::new();
     let mut items = Vec::new();
+    let mut fuzzy = Vec::new();
     let mut truncated = false;
     for part in bytes
         .split(|byte| *byte == 0)
@@ -335,17 +336,33 @@ fn parse_null_paths(bytes: &[u8], tokens: &[&str]) -> CandidateSet {
         if path.is_empty() || path.starts_with('/') || path.starts_with("../") {
             continue;
         }
-        if !should_include_path(path) || !matches_tokens(path, tokens) {
+        if !should_include_path(path) {
+            continue;
+        }
+        let lower = path.to_lowercase();
+        let substring = tokens.iter().all(|token| lower.contains(token));
+        if !substring && !(tokens.len() == 1 && is_subsequence(tokens[0], &lower)) {
             continue;
         }
         if !seen.insert(path.to_string()) {
             continue;
         }
-        if items.len() == MAX_FILES {
+        if substring {
+            if items.len() < MAX_FILES {
+                items.push(path.to_string());
+            } else {
+                truncated = true;
+            }
+        } else if fuzzy.len() < MAX_FILES {
+            fuzzy.push(path.to_string());
+        } else {
             truncated = true;
-            break;
         }
-        items.push(path.to_string());
+    }
+    items.extend(fuzzy);
+    if items.len() > MAX_FILES {
+        items.truncate(MAX_FILES);
+        truncated = true;
     }
     CandidateSet { items, truncated }
 }
@@ -370,19 +387,87 @@ fn should_include_path(path: &str) -> bool {
         .any(|segment| segment == "node_modules" || HIDDEN_DIRS.contains(&segment))
 }
 
-fn matches_tokens(path: &str, tokens: &[&str]) -> bool {
+fn matches_any(path: &str, tokens: &[&str]) -> bool {
     if tokens.is_empty() {
         return true;
     }
     let path = path.to_lowercase();
     tokens.iter().all(|token| path.contains(token))
+        || (tokens.len() == 1 && is_subsequence(tokens[0], &path))
+}
+
+fn is_subsequence(needle: &str, haystack: &str) -> bool {
+    let mut chars = needle.chars();
+    let Some(mut current) = chars.next() else {
+        return true;
+    };
+    for character in haystack.chars() {
+        if character == current {
+            current = match chars.next() {
+                Some(next) => next,
+                None => return true,
+            };
+        }
+    }
+    false
+}
+
+fn subsequence_positions(needle: &str, haystack: &str) -> Option<Vec<usize>> {
+    if needle.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut positions = Vec::new();
+    let mut chars = needle.chars();
+    let mut current = chars.next();
+    for (index, character) in haystack.chars().enumerate() {
+        if Some(character) == current {
+            positions.push(index);
+            current = chars.next();
+            if current.is_none() {
+                return Some(positions);
+            }
+        }
+    }
+    None
+}
+
+/// Character positions in `path` that match `query`, for picker highlighting.
+pub fn match_positions(path: &str, query: &str) -> Vec<usize> {
+    let query = query.trim().to_lowercase();
+    let tokens = query.split_whitespace().collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let lower = path.to_lowercase();
+    if path.chars().count() != lower.chars().count() {
+        return Vec::new();
+    }
+    let mut positions = Vec::new();
+    for token in &tokens {
+        match lower.rfind(token) {
+            Some(byte) => {
+                let start = lower[..byte].chars().count();
+                positions.extend(start..start + token.chars().count());
+            }
+            None => {
+                positions.clear();
+                if tokens.len() == 1 {
+                    positions = subsequence_positions(tokens[0], &lower).unwrap_or_default();
+                }
+                break;
+            }
+        }
+    }
+    positions.sort_unstable();
+    positions.dedup();
+    positions
 }
 
 fn sorted_indices(entries: &[String], query: &str, tokens: &[&str]) -> Vec<usize> {
     let mut indices = entries
         .iter()
         .enumerate()
-        .filter(|(_, path)| matches_tokens(path, tokens))
+        .filter(|(_, path)| matches_any(path, tokens))
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     indices.sort_by_cached_key(|index| {
@@ -412,7 +497,7 @@ fn rank_candidates(candidates: Vec<String>, query: Option<&str>) -> Vec<String> 
         .collect()
 }
 
-fn rank_key(path: &str, query: &str, tokens: &[&str]) -> (u8, String) {
+fn rank_key(path: &str, query: &str, tokens: &[&str]) -> (u8, usize, String) {
     let name = path.rsplit('/').next().unwrap_or(path).to_lowercase();
     let path = path.to_lowercase();
     let score = if query.is_empty() {
@@ -423,10 +508,15 @@ fn rank_key(path: &str, query: &str, tokens: &[&str]) -> (u8, String) {
         1
     } else if tokens.iter().all(|token| name.contains(token)) {
         2
-    } else {
+    } else if tokens.iter().all(|token| path.contains(token)) {
         3
+    } else if tokens.len() == 1 && is_subsequence(tokens[0], &name) {
+        4
+    } else {
+        5
     };
-    (score, path)
+    let length = if score >= 4 { path.chars().count() } else { 0 };
+    (score, length, path)
 }
 
 fn escapes_next(input: &str, index: usize) -> bool {
@@ -483,7 +573,7 @@ mod tests {
         assert_eq!(ranked, vec!["zzz_parser.md", "aaa/parser/notes.md"]);
         let single = vec!["src/parser/mod.rs".to_string()];
         assert_eq!(ranked_indices(&single, "PARSER rs"), vec![0]);
-        assert!(ranked_indices(&single, "prsr").is_empty());
+        assert_eq!(ranked_indices(&single, "prsr"), vec![0]);
 
         let entries = vec![
             "aaa/parser/notes.md".to_string(),
@@ -494,9 +584,59 @@ mod tests {
     }
 
     #[test]
-    fn subsequence_queries_do_not_match_in_this_slice() {
-        let ranked = rank_candidates(vec!["src/parser.rs".to_string()], Some("prsr"));
-        assert!(ranked.is_empty());
+    fn subsequence_queries_match_in_order() {
+        let ranked = rank_candidates(
+            vec!["src/parser/mod.rs".to_string(), "src/other.rs".to_string()],
+            Some("pmod"),
+        );
+        assert_eq!(ranked, vec!["src/parser/mod.rs"]);
+        let out_of_order = rank_candidates(vec!["src/parser/mod.rs".to_string()], Some("dopm"));
+        assert!(out_of_order.is_empty());
+
+        let ranked = rank_candidates(
+            vec!["zzz/parser/mod.rs".to_string(), "pm_o_d.rs".to_string()],
+            Some("pmod"),
+        );
+        assert_eq!(ranked, vec!["pm_o_d.rs", "zzz/parser/mod.rs"]);
+
+        assert_eq!(
+            match_positions("src/parser/mod.rs", "pmod"),
+            vec![4, 11, 12, 13]
+        );
+        assert_eq!(
+            match_positions("src/parser/mod.rs", "parser"),
+            vec![4, 5, 6, 7, 8, 9]
+        );
+        assert!(match_positions("src/parser/mod.rs", "zzz").is_empty());
+        assert_eq!(match_positions("mod/x/mod.rs", "mod"), vec![6, 7, 8]);
+        assert!(match_positions("İ.rs", "rs").is_empty());
+
+        assert!(ranked_indices(&["src/parser/mod.rs".to_string()], "pmod rs").is_empty());
+        assert_eq!(
+            ranked_indices(&["src/parser/mod.rs".to_string()], "PMOD"),
+            vec![0]
+        );
+        let ranked = rank_candidates(
+            vec!["pm_o_d.rs".to_string(), "pmod.rs".to_string()],
+            Some("pmod"),
+        );
+        assert_eq!(ranked, vec!["pmod.rs", "pm_o_d.rs"]);
+    }
+
+    #[test]
+    fn substring_matches_survive_a_fuzzy_cap() {
+        let mut bytes = Vec::new();
+        for index in 0..(MAX_FILES + 1) {
+            bytes.extend_from_slice(format!("vendor/p_m_o_d_{index}.lock\0").as_bytes());
+        }
+        bytes.extend_from_slice(b"src/pmod.rs\0");
+        let candidates = parse_null_paths(&bytes, &["pmod"]);
+        assert!(candidates.truncated);
+        assert_eq!(
+            candidates.items.first().map(String::as_str),
+            Some("src/pmod.rs")
+        );
+        assert!(candidates.items.len() <= MAX_FILES);
     }
 
     #[test]

@@ -49,6 +49,30 @@ First real measurements, cold cache, `ubuntu-24.04`:
 
 Both runs were cold: the first had no cache, and the push run saved the first one. The next code PR measures the warm number.
 
+## Recorded test timings
+
+Run 44988029960, `main` at `a18251c`, `ci/test-timings.sh` on the captured log:
+
+| Test binary | Seconds | Tests |
+|---|---|---|
+| `unittests src/lib.rs` | 30.11 | 321 |
+| `tests/cli_bench.rs` | 1.66 | 2 |
+| `tests/opencode_adapter.rs` | 0.13 | 4 |
+| `tests/core.rs` | 0.10 | 35 |
+| `tests/codex_adapter.rs` | 0.05 | 9 |
+| `tests/harness.rs` | 0.05 | 16 |
+| `tests/claude_adapter.rs` | 0.02 | 3 |
+| `tests/acp_adapter.rs` | 0.01 | 4 |
+| `unittests src/main.rs` | 0.00 | 0 |
+
+Total test execution is 32 seconds of a 161-second test job. The other ~130 seconds is compilation.
+
+That changes the optimization order. Sharding tests would move 32 seconds across runners and duplicate a 130-second compile in each, which is worse. The critical path is compile:
+1. Stop compiling four times in one run. Check, Build, Test, and Debt each build the same crate from the same cache seed.
+2. Only then consider shards, and only if the compile work per job still exceeds the budget.
+
+A per-test harness is also visible: `tests/cli_bench.rs` spawns the binary twice and costs more than 35 core tests together, so it is a candidate to fold into an existing binary rather than a shard.
+
 The target is 60s median and 120s p95. The gap is the test job, which compiles the suite and then runs it, and the compile is repeated in Check, Build, and Debt. Optimization order: record per-test-binary times, shard from that data, then look at sharing compilation between jobs.
 
 That is the first recorded Actions observation. It proves the workflow file parses and schedules every job. No step ran, so it is not evidence about any gate.

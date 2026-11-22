@@ -14710,6 +14710,16 @@ mod tests {
             selected_line.spans
         );
 
+        let multi = file_row("❯", "src/parser/mod.rs", "pmod rs", selected);
+        let underlined = multi
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(underlined.contains('p'), "{underlined:?}");
+        assert!(underlined.contains('r'), "{underlined:?}");
+
         let entries = vec!["long/path.rs".to_string(), "a.rs".to_string()];
         assert_eq!(files_filter_indices(&entries, "", &[]), vec![0, 1]);
         assert_eq!(files_filter_indices(&entries, "a", &[]), vec![1, 0]);
@@ -14736,6 +14746,47 @@ mod tests {
         let (engine_command_sender, _engine_command_receiver) =
             tokio::sync::mpsc::unbounded_channel();
         for character in "pmod".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        match &state.overlay {
+            Overlay::FilesPicker { filtered, .. } => assert_eq!(filtered, &vec![1]),
+            _ => panic!("expected files picker"),
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "src/parser/mod.rs ");
+    }
+
+    #[test]
+    fn files_picker_matches_multiple_fuzzy_tokens() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/other.rs".into(), "src/parser/mod.rs".into()],
+            filtered: vec![0, 1],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        for character in "pmod rs".chars() {
             handle_key(
                 &mut state,
                 &store,

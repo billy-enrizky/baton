@@ -125,11 +125,11 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
-        os.write(master, b"/files pmod:12\r")
+        os.write(master, b"/files pmod rs:12\r")
         pump(master, 1.5, transcript)
         files_picker = screen_text(transcript, args.width, args.height)
         files_required = [
-            'files matching "pmod"',
+            'files matching "pmod rs"',
             "line 12",
             "src/parser/mod.rs",
             "enter insert",
@@ -154,7 +154,7 @@ def main() -> int:
         for value in ["files · 2 · enter insert", "README.md", "❯ src/parser/mod.rs"]:
             if value not in recent_picker:
                 missing.append(f"recent file ranking: {value}")
-        if 'files matching "pmod"' in recent_picker:
+        if 'files matching "pmod rs"' in recent_picker:
             missing.append("recent file ranking kept a stale filter")
         (evidence / "files-recent-screen.txt").write_text(recent_picker + "\n")
         os.write(master, b"\x1b")

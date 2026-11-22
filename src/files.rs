@@ -229,21 +229,32 @@ fn list_with_rg(
         return Ok(primary);
     }
     let ignored = run_rg(root, rg, true, tokens)?;
-    Ok(merge_ignored(primary, ignored))
+    Ok(merge_ignored(primary, ignored, tokens))
 }
 
-fn merge_ignored(primary: CandidateSet, ignored: CandidateSet) -> CandidateSet {
-    let seen = primary.items.iter().cloned().collect::<HashSet<_>>();
-    let mut items = primary.items;
-    items.extend(
-        ignored
-            .items
-            .into_iter()
-            .filter(|path| !seen.contains(path)),
-    );
-    let truncated = primary.truncated || ignored.truncated || items.len() > MAX_FILES;
-    items.truncate(MAX_FILES);
-    CandidateSet { items, truncated }
+fn merge_ignored(primary: CandidateSet, ignored: CandidateSet, tokens: &[&str]) -> CandidateSet {
+    let mut seen = HashSet::new();
+    let mut substrings = Vec::new();
+    let mut fuzzy = Vec::new();
+    for path in primary.items.into_iter().chain(ignored.items) {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let lower = path.to_lowercase();
+        if tokens.is_empty() || tokens.iter().all(|token| lower.contains(token)) {
+            substrings.push(path);
+        } else {
+            fuzzy.push(path);
+        }
+    }
+    let truncated =
+        primary.truncated || ignored.truncated || substrings.len() + fuzzy.len() > MAX_FILES;
+    substrings.extend(fuzzy);
+    substrings.truncate(MAX_FILES);
+    CandidateSet {
+        items: substrings,
+        truncated,
+    }
 }
 
 fn run_rg(root: &Path, rg: &Path, ignored_pass: bool, tokens: &[&str]) -> Result<CandidateSet> {
@@ -325,7 +336,7 @@ fn list_with_git(root: &Path, include_ignored: bool, tokens: &[&str]) -> Result<
         }
         let mut ignored = parse_null_paths(&output.stdout, tokens);
         ignored.items.retain(|path| root.join(path).is_file());
-        candidates = merge_ignored(candidates, ignored);
+        candidates = merge_ignored(candidates, ignored, tokens);
     }
     Ok(candidates)
 }
@@ -357,7 +368,10 @@ fn parse_null_paths(bytes: &[u8], tokens: &[&str]) -> CandidateSet {
         }
         let lower = path.to_lowercase();
         let substring = tokens.iter().all(|token| lower.contains(token));
-        if !substring && !(tokens.len() == 1 && is_subsequence(tokens[0], &lower)) {
+        let fuzzy_match = !substring
+            && !tokens.is_empty()
+            && tokens.iter().all(|token| is_subsequence(token, &lower));
+        if !substring && !fuzzy_match {
             continue;
         }
         if !seen.insert(path.to_string()) {
@@ -403,13 +417,16 @@ pub(crate) fn should_include_path(path: &str) -> bool {
         .any(|segment| segment == "node_modules" || HIDDEN_DIRS.contains(&segment))
 }
 
-fn matches_any(path: &str, tokens: &[&str]) -> bool {
+fn matches_lower_path(path: &str, tokens: &[&str]) -> bool {
     if tokens.is_empty() {
         return true;
     }
-    let path = path.to_lowercase();
     tokens.iter().all(|token| path.contains(token))
-        || (tokens.len() == 1 && is_subsequence(tokens[0], &path))
+        || tokens.iter().all(|token| is_subsequence(token, path))
+}
+
+fn matches_any(path: &str, tokens: &[&str]) -> bool {
+    matches_lower_path(&path.to_lowercase(), tokens)
 }
 
 fn is_subsequence(needle: &str, haystack: &str) -> bool {
@@ -460,18 +477,13 @@ pub fn match_positions(path: &str, query: &str) -> Vec<usize> {
     }
     let mut positions = Vec::new();
     for token in &tokens {
-        match lower.rfind(token) {
-            Some(byte) => {
-                let start = lower[..byte].chars().count();
-                positions.extend(start..start + token.chars().count());
-            }
-            None => {
-                positions.clear();
-                if tokens.len() == 1 {
-                    positions = subsequence_positions(tokens[0], &lower).unwrap_or_default();
-                }
-                break;
-            }
+        if let Some(byte) = lower.rfind(token) {
+            let start = lower[..byte].chars().count();
+            positions.extend(start..start + token.chars().count());
+        } else if let Some(found) = subsequence_positions(token, &lower) {
+            positions.extend(found);
+        } else {
+            return Vec::new();
         }
     }
     positions.sort_unstable();
@@ -559,10 +571,12 @@ fn rank_key(
         2
     } else if tokens.iter().all(|token| path.contains(token)) {
         3
-    } else if tokens.len() == 1 && is_subsequence(tokens[0], &name) {
+    } else if tokens.iter().all(|token| is_subsequence(token, &name)) {
         4
-    } else {
+    } else if tokens.iter().all(|token| is_subsequence(token, &path)) {
         5
+    } else {
+        6
     };
     let recency = recent.get(&path).copied().unwrap_or(usize::MAX);
     let length = if score >= 4 { path.chars().count() } else { 0 };
@@ -661,7 +675,38 @@ mod tests {
         assert_eq!(match_positions("mod/x/mod.rs", "mod"), vec![6, 7, 8]);
         assert!(match_positions("İ.rs", "rs").is_empty());
 
-        assert!(ranked_indices(&["src/parser/mod.rs".to_string()], "pmod rs").is_empty());
+        assert_eq!(
+            ranked_indices(&["src/parser/mod.rs".to_string()], "pmod rs"),
+            vec![0]
+        );
+        assert_eq!(
+            ranked_indices(&["src/parser/mod.rs".to_string()], "rs pmod"),
+            vec![0]
+        );
+        assert!(ranked_indices(&["src/parser/mod.rs".to_string()], "pmod rz").is_empty());
+        assert_eq!(
+            match_positions("src/parser/mod.rs", "pmod rs"),
+            vec![4, 11, 12, 13, 15, 16]
+        );
+        assert_eq!(
+            match_positions("src/parser/mod.rs", "rs pmod"),
+            vec![4, 11, 12, 13, 15, 16]
+        );
+        let ranked = rank_candidates(
+            vec!["src/parser/mod.rs".to_string(), "pm_o_d.rs".to_string()],
+            Some("pmod rs"),
+        );
+        assert_eq!(ranked, vec!["pm_o_d.rs", "src/parser/mod.rs"]);
+        let ranked = rank_candidates(
+            vec!["pm_o_d.rs".to_string(), "src/pmod_rs/notes.txt".to_string()],
+            Some("pmod rs"),
+        );
+        assert_eq!(ranked, vec!["src/pmod_rs/notes.txt", "pm_o_d.rs"]);
+        let ranked = rank_candidates(
+            vec!["notes/daily.rs".to_string(), "daily notes.md".to_string()],
+            Some("daily notes"),
+        );
+        assert_eq!(ranked, vec!["daily notes.md", "notes/daily.rs"]);
         assert_eq!(
             ranked_indices(&["src/parser/mod.rs".to_string()], "PMOD"),
             vec![0]
@@ -687,6 +732,39 @@ mod tests {
             Some("src/pmod.rs")
         );
         assert!(candidates.items.len() <= MAX_FILES);
+
+        let mut bytes = Vec::new();
+        for index in 0..(MAX_FILES + 1) {
+            bytes.extend_from_slice(format!("vendor/p_m_o_d_r_s_{index}.lock\0").as_bytes());
+        }
+        bytes.extend_from_slice(b"src/pmod.rs\0");
+        let candidates = parse_null_paths(&bytes, &["pmod", "rs"]);
+        assert!(candidates.truncated);
+        assert_eq!(
+            candidates.items.first().map(String::as_str),
+            Some("src/pmod.rs")
+        );
+        assert!(candidates.items.len() <= MAX_FILES);
+
+        let mut primary_items = (0..(MAX_FILES - 1))
+            .map(|index| format!("src/pmod_rs_{index}.rs"))
+            .collect::<Vec<_>>();
+        primary_items.push("vendor/p_m_o_d_r_s.lock".to_string());
+        let primary = CandidateSet {
+            items: primary_items,
+            truncated: false,
+        };
+        let ignored = CandidateSet {
+            items: vec!["src/ignored_pmod_rs.rs".into()],
+            truncated: false,
+        };
+        let merged = merge_ignored(primary, ignored, &["pmod", "rs"]);
+        assert!(merged.truncated);
+        assert!(merged.items.contains(&"src/ignored_pmod_rs.rs".to_string()));
+        assert!(!merged
+            .items
+            .contains(&"vendor/p_m_o_d_r_s.lock".to_string()));
+        assert_eq!(merged.items.len(), MAX_FILES);
     }
 
     #[test]
@@ -766,7 +844,7 @@ mod tests {
             items: vec![".env".into(), "src/main.rs".into()],
             truncated: false,
         };
-        let merged = merge_ignored(primary, ignored);
+        let merged = merge_ignored(primary, ignored, &[]);
         assert_eq!(merged.items, vec!["src/main.rs", ".env"]);
         let ranked = rank_candidates(merged.items, None);
         assert_eq!(ranked, vec![".env", "src/main.rs"]);
@@ -858,7 +936,7 @@ mod tests {
             ],
             truncated: false,
         };
-        let merged = merge_ignored(primary, ignored);
+        let merged = merge_ignored(primary, ignored, &[]);
         assert_eq!(merged.items.len(), MAX_FILES);
         assert!(merged.truncated);
         assert!(merged.items.iter().all(|path| !path.ends_with(".log")));
@@ -874,7 +952,7 @@ mod tests {
             items: vec!["a.rs".into(), "b.log".into()],
             truncated: false,
         };
-        let merged = merge_ignored(primary, ignored);
+        let merged = merge_ignored(primary, ignored, &[]);
         assert_eq!(merged.items, vec!["a.rs", "b.log"]);
         assert!(!merged.truncated);
     }

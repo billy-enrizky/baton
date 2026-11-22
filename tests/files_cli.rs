@@ -534,7 +534,7 @@ fn json_cwd_renders_a_non_utf8_directory_lossily() {
 }
 
 #[test]
-fn files_match_a_single_token_subsequence() {
+fn files_match_subsequence_tokens() {
     let project = init_project();
     std::fs::create_dir_all(project.path().join("src/parser")).unwrap();
     std::fs::write(
@@ -562,6 +562,44 @@ fn files_match_a_single_token_subsequence() {
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["files"], serde_json::json!(["src/parser/mod.rs"]));
+
+    for query in [["pmod", "rs"], ["rs", "pmod"]] {
+        let output = Command::new(binary)
+            .args([
+                "-C",
+                project.path().to_str().unwrap(),
+                "files",
+                query[0],
+                query[1],
+                "--json",
+            ])
+            .env("BATON_HOME", home.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["files"], serde_json::json!(["src/parser/mod.rs"]));
+    }
+
+    let output = Command::new(binary)
+        .args([
+            "-C",
+            project.path().to_str().unwrap(),
+            "files",
+            "pmod",
+            "rz",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["files"], serde_json::json!([]));
 
     let output = Command::new(binary)
         .args([

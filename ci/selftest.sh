@@ -150,4 +150,15 @@ for case in rustc linker; do
   fi
 done
 
+timings_log=$(mktemp)
+printf '     Running unittests src/lib.rs (target/debug/deps/baton-1)\nrunning 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 12.50s\n     Running tests/core.rs (target/debug/deps/core-2)\nrunning 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s\n' > "$timings_log"
+timings_out=$(mktemp)
+bash "$root/test-timings.sh" "$timings_log" "$timings_out" >/dev/null
+expected_timings=$(printf 'unittests src/lib.rs\t12.50\t2\ntests/core.rs\t0.40\t1')
+if [[ "$(cat "$timings_out")" != "$expected_timings" ]]; then
+  echo "test timings did not parse the sample log" >&2
+  cat "$timings_out" >&2
+  exit 1
+fi
+
 echo "ci selftest passed"

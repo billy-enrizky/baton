@@ -48,6 +48,29 @@ pub fn wrap_prompt_with_handoff(handoff: &str, prompt: &str) -> String {
     format!("{handoff}\n\n---\n\n{prompt}")
 }
 
+pub fn handoff_prompt(
+    cwd: &str,
+    thread_title: &str,
+    prior_messages: &[HandoffMessage],
+    git_status: Option<&str>,
+    prompt: &str,
+    char_budget: Option<usize>,
+) -> String {
+    let handoff = build_handoff(cwd, thread_title, prior_messages, git_status, char_budget);
+    wrap_prompt_with_handoff(&handoff, prompt)
+}
+
+fn truncate_at_boundary(text: &str, limit: usize) -> &str {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 fn render_messages(messages: &[HandoffMessage], budget: usize) -> String {
     if budget == 0 {
         return String::new();
@@ -57,7 +80,10 @@ fn render_messages(messages: &[HandoffMessage], budget: usize) -> String {
     for message in messages.iter().rev() {
         let mut text = message.text.clone();
         if text.len() > PER_MESSAGE_CHAR_LIMIT {
-            text = format!("{}\n[...truncated]", &text[..PER_MESSAGE_CHAR_LIMIT]);
+            text = format!(
+                "{}\n[...truncated]",
+                truncate_at_boundary(&text, PER_MESSAGE_CHAR_LIMIT)
+            );
         }
         let speaker = if message.role == "user" {
             "user".to_string()

@@ -21,9 +21,9 @@ The design is staged. Phase 1 creates one honest full-suite gate with hard budge
 
 Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command, and `--version` runs only after a build that is already budgeted.
 
-Phase 2 is in progress from recorded runs. The current warm Rust PR sample is 58 seconds. That is one sample, not a p50. The acceptance record names the run, the job breakdown, and every rejected experiment. Budgets remain provisional until repeated p50 and p95 evidence exists.
+Phase 2 is in progress from recorded runs. The current warm Rust PR is 58 seconds. A separate CI-docs PR is 59 seconds. Both are under 60 seconds, but all p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
 
-Budget rule, applied at every phase: a budget starts at three times the measured cold p95 on the target runner, and may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
+Budget rule, applied at every phase: Phase 1 uses three times a conservative cold estimate. Phase 2 sets each budget to the measured Linux p95 plus 20 percent. That reset is the only allowed increase. After it, a budget may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
 
 ## Current baseline
 
@@ -31,7 +31,8 @@ Measured on 2026-11-22 at `origin/main` `be31fc5`, after the cancellation and ga
 
 | Measurement | Current value | Evidence |
 |---|---|---|
-| Warm Rust PR feedback | 58 seconds, one sample | Run 45004705055 |
+| Warm Rust PR feedback | 58 seconds, n=1 | Run 45004705055 |
+| Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
 | Warm Test job | 33 seconds | Run 45004705055 |
 | `cargo test --lib` | 1.73 seconds, 326 tests | Run 45004705055 |
 | Integration tests | 0.39 seconds, 75 tests across seven binaries | Run 45004705055 |
@@ -39,7 +40,7 @@ Measured on 2026-11-22 at `origin/main` `be31fc5`, after the cancellation and ga
 | `ci/test-inventory-floor.txt` | 358 | Current floor, not the discovered count |
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
-| Cold Rust PR | 190 seconds | Run 44982816103 |
+| Cold Rust PR | 189 seconds | Run 44982816103 |
 
 The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 358 test floor is a lower bound, not a per-test lock. It blocks a drop below 358, while the inventory check requires every discovered test to execute. Deleting tests above that floor still needs review in the diff.
 
@@ -86,9 +87,11 @@ Gate-integrity rules:
 | Rule | Rejects |
 |---|---|
 | GI001 | `rustfmt.toml` or `clippy.toml` in any spelling |
-| GI002 | `.cargo/config.toml` that replaces the compiler, runner, or registry |
+| GI002 | Any `.cargo/config.toml`, `.cargo/config`, or `.cargo/config.toml.example` |
 | GI003 | `[lints]` in `Cargo.toml` |
-| GI004 | A blanket `allow(clippy::all)` style attribute in `src/` or `tests/` |
+| GI004 | A blanket all, pedantic, nursery, or correctness Clippy allow in `src/` or `tests/` |
+| GI005 | A warning suppression or conditional Clippy suppression in tracked Rust sources |
+| GI006 | A `#[rustfmt::skip]` attribute in tracked Rust sources |
 
 ## Trust model
 
@@ -128,7 +131,7 @@ This is visible in the PR, the merge API, and the next main run. It is not silen
 | 1A | Design and acceptance record | Create `docs/parity.md`, `docs/ci.md`, `docs/ci-acceptance.md`, `scripts/check_parity_paths.py`, `scripts/check_doc_links.py`; modify `README.md` | Both checkers print `0 missing`; the EGM review record has two consecutive clean rounds |
 | 1B | Trusted helpers, skills, and formal model | Create `ci/*.sh`, `ci/fixtures/**`, `ci/fmt-baseline.txt`, `ci/clippy-baseline.txt`, `ci/test-inventory-floor.txt`, `ci/formal/ci-admission/**`, `rust-toolchain.toml`, `.agents/skills/verify-baton-ci/**`, `.agents/skills/verify-baton-ci-formal/**` | `ci/selftest.sh` passes; a budget overrun exits 124; the formal gate passes locally; `cargo check`, `cargo build`, `cargo test`, and `ci/test-inventory.sh` pass |
 | 1C | Full-suite workflow | Create `.github/workflows/ci.yml`; modify `docs/ci.md` | Done: run 44982816103 executed every job with `verify` green, and run 44983114852 is the first green `main` push |
-| 2 | Record real timings and choose the test runner | `ci/test-timings.sh` records per-binary times; `docs/ci-acceptance.md` records the warm path | In progress: `cargo test` retained, nextest count shards rejected, one warm PR at 58 seconds |
+| 2 | Record real timings and choose the test runner | `ci/test-timings.sh` records per-binary times; `docs/ci-acceptance.md` records the warm path | In progress: `cargo test` retained, nextest count shards rejected, warm PR samples at 58 and 59 seconds |
 | 3 | Diff-aware selection and recorded-time shards | Create `ci/select-tests.sh`, `ci/plan-shards.sh`, `ci/test-groups.json`; modify `.github/workflows/ci.yml`, `ci/check-ci.sh`, `docs/ci.md` | Not started: selector fixtures and shard union proof still required |
 | 4 | Full format and lint plus local hooks | Create `.githooks/pre-commit`, `.githooks/pre-push`, `ci/install-hooks.sh`; modify `.github/workflows/ci.yml`, `docs/ci.md` | Format and Clippy baselines are zero and both are required; hooks run under budget |
 | 5 | Last-100-run audit and runner decision | Modify `docs/ci-acceptance.md` | PR p50/p95, queue p50/p95, cache hit rate, and a paid-runner decision, all from recorded runs |
@@ -243,7 +246,7 @@ What it does not prove: test inventory completeness, shard union coverage, or th
 | Format ratchet | 60 seconds | 30 seconds |
 | Clippy ratchet | 300 seconds | 180 seconds |
 
-Phase 1 values are three times a conservative local cold estimate. They are caps, not targets: a command that exceeds one fails the job. Phase 2 replaces each value with the measured Linux p95 plus 20 percent, and no value may increase after that.
+Phase 1 values are three times a conservative local cold estimate. They are caps, not targets: a command that exceeds one fails the job. Phase 2 replaces each value with the measured Linux p95 plus 20 percent. That replacement is the only allowed increase; after it, no value may increase.
 
 ## Debt ratchets
 
@@ -251,7 +254,7 @@ A count is a floor, not a quality gate: fixing one violation while adding anothe
 
 Compensating controls, shipped in Phase 1:
 
-- `ci/gate-integrity.sh` rejects the configuration changes that would fake a smaller count: `rustfmt.toml`, `clippy.toml`, `.cargo/config.toml` compiler or runner replacement, `[lints]` in `Cargo.toml`, and blanket `allow(clippy::all)`.
+- `ci/gate-integrity.sh` rejects the exact configuration set in the gate-integrity table, including any Cargo config file and any blanket Clippy group suppression.
 - The ratchet scripts fail when the command produces no recognizable diagnostics at all, so a broken tool cannot report zero.
 - The baseline files may only be lowered. Lowering one is part of the PR that fixes the debt.
 
@@ -263,10 +266,10 @@ The acceptance record is [ci-acceptance.md](ci-acceptance.md). It records the ru
 
 - PR feedback starts at run `createdAt` and ends when `verify` completes.
 - Queue time is `startedAt - createdAt`.
-- Report p50, maximum, and sample count until at least 100 runs or four weeks exist. A p95 from fewer than 100 runs is provisional and cannot justify a paid-runner decision.
-- Report docs-only and Rust PRs separately. A docs-only median that skips every gate must not stand in for Rust feedback.
-- Record cancelled, failed, and superseded runs. Removing a slow run is a weakening.
-- Record the exact commit, workflow revision, event, selected gates, cache key, slowest job, failure step, and budget miss.
+- Until at least 100 runs or four weeks exist, p50 rows report n, median, and maximum; p95 rows report n and maximum. A percentile from fewer than 100 runs before four weeks exist is provisional and cannot justify a paid-runner decision.
+- Report docs-only, meta, and Rust PRs separately. A docs-only or meta sample must not stand in for Rust feedback.
+- The acceptance log is selective. It records the decision-changing fields in the table and points to the run for the rest. The Actions run and API supply the workflow revision, selected gates, cache key, slowest job, failure step, and budget miss. The collection commands reproduce those fields.
+- Record cancelled, failed, retried, and superseded runs when they change a decision. The remainder stay in Actions history rather than being copied into the acceptance file.
 
 ## Caching
 
@@ -284,7 +287,7 @@ The pinned Rust toolchain is cached separately per job under `rustup-1.100.0-<os
 | Monthly minute cap | Not applicable to free standard runners | Revisit only if a paid runner is approved |
 | Branch protection | Not configured | Require `verify`, block direct pushes to `main`, and record the ruleset proof |
 | Official merge queue | Blocked | Requires an organization on GitHub Enterprise Cloud; until then, a merge candidate is proved by the PR `verify` run on an up-to-date branch plus the `push` run on `main` |
-| Paid runner | Not approved | The warm PR sample is under 60 seconds; measure more PR runs before considering a larger runner |
+| Paid runner | Not approved | Revisit only after Rust p50 and p95 both miss across at least 100 runs or four weeks |
 | `ci-repair` merge override | Owner only | Documented in the trust model; every use is quoted in its PR |
 
 Merge-candidate proof without a merge queue: when branch protection requires branches to be up to date, the PR's tree is the tree that lands, so the full-suite `verify` run on that head is a proof of the merge candidate. The `push` run on `main` re-runs every gate on the merged commit and is the final record. A PR that bypasses "up to date" invalidates the proof, which is why that setting is part of the branch-protection owner action.

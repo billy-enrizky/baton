@@ -168,6 +168,12 @@ Common
 /help all  every command · shift+enter newline · up/down history";
 
 #[derive(Debug, Clone)]
+struct ReplyChoice {
+    /// Position from the end, so 1 is the newest reply.
+    position: usize,
+    text: String,
+}
+
 struct ThreadChoice {
     id: String,
     title: String,
@@ -352,6 +358,10 @@ enum Overlay {
     SkillsPicker {
         selected: usize,
         skills: Vec<(String, String)>,
+    },
+    CopyPicker {
+        selected: usize,
+        replies: Vec<ReplyChoice>,
     },
     ModePicker {
         selected: usize,
@@ -2948,6 +2958,48 @@ fn handle_key(
                 state.overlay = Overlay::McpPicker { selected };
             }
         },
+        Overlay::CopyPicker { selected, replies } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                if !replies.is_empty() {
+                    let new_selected = (selected + replies.len() - 1) % replies.len();
+                    state.overlay = Overlay::CopyPicker {
+                        selected: new_selected,
+                        replies,
+                    };
+                }
+            }
+            KeyCode::Down => {
+                if !replies.is_empty() {
+                    let new_selected = (selected + 1) % replies.len();
+                    state.overlay = Overlay::CopyPicker {
+                        selected: new_selected,
+                        replies,
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(reply) = replies.get(selected) {
+                    match crate::clipboard::copy(&reply.text) {
+                        Ok(()) => {
+                            state.notice = Some(format!(
+                                "copied assistant reply {} ({} chars)",
+                                reply.position,
+                                reply.text.chars().count()
+                            ));
+                            state.overlay = Overlay::None;
+                        }
+                        Err(error) => {
+                            state.notice = Some(format!("cannot copy reply: {error}"));
+                            state.overlay = Overlay::CopyPicker { selected, replies };
+                        }
+                    }
+                }
+            }
+            _ => {
+                state.overlay = Overlay::CopyPicker { selected, replies };
+            }
+        },
         Overlay::SkillsPicker { selected, skills } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
@@ -4544,6 +4596,28 @@ fn handle_command(
             });
         }
         "/copy" => {
+            if args.is_empty() {
+                let replies: Vec<ReplyChoice> = state
+                    .history
+                    .iter()
+                    .rev()
+                    .filter(|message| message.role == "assistant")
+                    .enumerate()
+                    .map(|(index, message)| ReplyChoice {
+                        position: index + 1,
+                        text: message.text.clone(),
+                    })
+                    .collect();
+                if replies.is_empty() {
+                    state.notice = Some("no assistant replies to copy yet".into());
+                } else {
+                    state.overlay = Overlay::CopyPicker {
+                        selected: 0,
+                        replies,
+                    };
+                }
+                return;
+            }
             let index = args
                 .first()
                 .and_then(|value| value.parse::<usize>().ok())
@@ -6593,6 +6667,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::McpPicker { .. } => 8,
             Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
+            Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::ModePicker { .. } => 7,
             Overlay::AuthPicker { .. } => 9,
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
@@ -6657,6 +6732,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 *value_index,
             ),
             Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[1], *selected),
+            Overlay::CopyPicker { selected, replies } => {
+                draw_copy_picker(frame, chunks[1], replies, *selected)
+            }
             Overlay::SkillsPicker { selected, skills } => {
                 draw_skills_picker(frame, chunks[1], skills, *selected)
             }
@@ -7086,6 +7164,43 @@ fn draw_mcp_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ {action}"), style));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_copy_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    replies: &[ReplyChoice],
+    selected: usize,
+) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!("copy reply ({}) · enter copies · esc close", replies.len()),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, reply) in replies.iter().take(8).enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let preview: String = reply
+            .text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(70)
+            .collect();
+        lines.push(Line::styled(
+            format!("❯ {} · {preview}", reply.position),
+            style,
+        ));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -9199,6 +9314,52 @@ mod tests {
         assert_eq!(receiver.try_recv().unwrap(), ApprovalDecision::AcceptAlways);
         assert!(state.approvals.is_empty());
         assert!(state.review.is_some(), "review resumes after the approval");
+    }
+
+    #[test]
+    fn copy_without_an_argument_opens_a_picker_of_replies() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        state.history = vec![
+            MessageRow {
+                id: 1,
+                thread_id: thread_id.clone(),
+                turn: 1,
+                role: "assistant".into(),
+                provider: None,
+                model: None,
+                text: "older reply".into(),
+                created_at: String::new(),
+            },
+            MessageRow {
+                id: 2,
+                thread_id,
+                turn: 2,
+                role: "assistant".into(),
+                provider: None,
+                model: None,
+                text: "newer reply".into(),
+                created_at: String::new(),
+            },
+        ];
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/copy");
+        let Overlay::CopyPicker { replies, .. } = &state.overlay else {
+            panic!("expected the copy picker");
+        };
+        assert_eq!(replies.len(), 2, "both replies are offered");
+        assert_eq!(replies[0].position, 1);
+        assert_eq!(replies[0].text, "newer reply", "newest first");
+
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("copied assistant reply 1"));
     }
 
     #[test]

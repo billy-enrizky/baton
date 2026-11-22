@@ -415,15 +415,11 @@ jobs:
         id: inventory
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 120 "$RUNNER_TEMP/trusted-ci/test-inventory.sh" . "$GITHUB_WORKSPACE/base/ci/test-inventory-floor.txt" "$RUNNER_TEMP/test-output.log" | tee -a "$GITHUB_OUTPUT"
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 120 "$RUNNER_TEMP/trusted-ci/test-inventory.sh" . "$RUNNER_TEMP/trusted-ci/test-inventory-floor.txt" "$RUNNER_TEMP/test-output.log" | tee -a "$GITHUB_OUTPUT"
       - name: Record test timings
         run: |
           set -euo pipefail
-          if [ ! -f ci/test-timings.sh ]; then
-            echo "no timings script in the head tree; skipping" >&2
-            exit 0
-          fi
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 30 ci/test-timings.sh "$RUNNER_TEMP/test-output.log" "$RUNNER_TEMP/test-timings.tsv"
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 30 "$RUNNER_TEMP/trusted-ci/test-timings.sh" "$RUNNER_TEMP/test-output.log" "$RUNNER_TEMP/test-timings.tsv"
       - name: Upload test timings
         if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

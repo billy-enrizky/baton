@@ -15,7 +15,7 @@ mkdir -p "$release" "$install" "$fake" "$build"
 cat >"$build/baton" <<'SH'
 #!/bin/sh
 if [ "${1:-}" = "--version" ]; then
-    echo "baton 0.3.0"
+    echo "baton 0.4.0"
     exit 0
 fi
 echo fake baton
@@ -70,7 +70,7 @@ BATON_TEST_RELEASE="$release" \
 BATON_INSTALL_DIR="$install" \
 PATH="$fake:$PATH" \
     "$repo_root/install.sh" >/dev/null
-[ "$("$install/baton" --version)" = "baton 0.3.0" ]
+[ "$("$install/baton" --version)" = "baton 0.4.0" ]
 
 printf 'corrupt\n' >>"$release/baton-x86_64-unknown-linux-gnu.tar.gz"
 if BATON_TEST_RELEASE="$release" \

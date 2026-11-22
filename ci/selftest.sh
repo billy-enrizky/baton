@@ -129,7 +129,7 @@ if [[ $code -eq 0 ]] || ! grep -q "TI002" <<< "$output"; then
 fi
 
 ignored_log=$(mktemp)
-printf 'test result: ok. 400 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$ignored_log"
+printf 'test result: ok. 404 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.01s\n' > "$ignored_log"
 set +e
 output=$(bash "$root/test-inventory.sh" "$root/../.." "$root/test-inventory-floor.txt" "$ignored_log" 2>&1)
 code=$?

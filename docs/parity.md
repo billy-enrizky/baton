@@ -48,11 +48,11 @@ The product problem is: a terminal user should be able to start, supervise, reco
 
 | Repository | URL | Checkout | Ref | Commit |
 |---|---|---|---|---|
-| T3 Code | `https://github.com/pingdotgg/t3code` | `/Users/billy/Documents/t3code` | `origin/main` | `7b21adbe7cd633813eeb8a9e3ec4961ec31f98a3` |
-| Orca | `https://github.com/stablyai/orca` | `/Users/billy/Documents/orca` | `origin/main` | `52673d4e065ef6e27d0bda3be288ecb6282a2a42` |
-| Baton baseline | `https://github.com/billy-enrizky/baton` | current working copy | `origin/main` | `107ffa4` at the Round 7 review; refresh on every sync |
+| T3 Code | `https://github.com/pingdotgg/t3code` | `/Users/billy/Documents/t3code` | `origin/main` | `90c028c6fc4a9ecd3af048cb52432e819af6487c` |
+| Orca | `https://github.com/stablyai/orca` | `/Users/billy/Documents/orca` | `origin/main` | `1355cc4ef30ccb370542154181b0b2864e584373` |
+| Baton baseline | `https://github.com/billy-enrizky/baton` | current working copy | `origin/main` | `130250d` before the inbox slice |
 
-The upstream working trees can be dirty and behind their refs. Read upstream evidence with `git -C <checkout> show <commit>:<path>`, or verify the path exists with `git -C <checkout> cat-file -e <commit>:<path>`. Evidence paths are prefixed with `T3:` or `Orca:`.
+The upstream working trees can be dirty and behind their refs. Read upstream evidence with `git -C <checkout> show <commit>:<path>`, or verify the path exists with `git -C <checkout> cat-file -e <commit>:<path>`. Evidence paths are prefixed with `T3:` or `Orca:`. The upstream heads were refreshed on 2026-11-22; the inbox slice re-resolved every path against the current checkouts.
 
 The slash-completion contract landed in PR #86. Rows that depend on it cite the tests, not the PR.
 
@@ -123,7 +123,7 @@ Rules the evidence column obeys:
 | Capability | Upstream evidence | Baton status | Baton evidence and proof surface | Terminal decision | First slice | Plan |
 |---|---|---|---|---|---|---|
 | Single-repository worktrees | T3: `apps/server/src/orchestration-v2/ThreadLaunchService.ts`; Orca: `src/main/git/worktrees/creation/worktree-add.ts` | Equivalent | `src/worktree.rs`; `/worktree`; `baton worktrees`; worktree tests in `src/tui/mod.rs` and `src/worktree.rs`; unit | Keep the existing worktree and shared-directory model. | None. | - |
-| Multi-repository worktrees | T3: `apps/server/src/workspace/TaskFolders.ts` | Missing | `src/worktree.rs` resolves one `repo_root`; `baton.json` supports only `worktree.sharedDirectories`; none | One thread may need several repositories | Resolve and operate on a list of repositories per thread, with one worktree per repository. Setup hooks are the separate trust row. | D22 |
+| Multi-repository worktrees | T3: `apps/server/src/orchestration-v2/ThreadLaunchService.ts` resolves one repository per thread; the former `apps/server/src/workspace/TaskFolders.ts` is absent at `90c028c` | Design decision | `src/worktree.rs` resolves one `repo_root`; `baton.json` supports only `worktree.sharedDirectories`; none | Defer until a current upstream capability or user request exists | Decision owner: Baton maintainer. Do not add a multi-repository model speculatively. | Deferred |
 | Commit, push, and open a PR from a normal thread | T3: `apps/server/src/git/GitWorkflowService.ts`; Orca: `src/renderer/src/components/right-sidebar/source-control/commit/use-commit-flows.ts`, `src/main/github/client/create/create-github-pull-request.ts` | Partial | `src/orchestrate.rs` `open_prs_with_gh` commits worker branches, runs `git push -u`, and calls `gh pr create`; no normal-thread git command; `CI+local`; none | Normal threads need the same finish path as workers. | Add `/git commit` for the current thread worktree with a generated message. `/git push` and `/git pr` are separate follow-ups. | D14 |
 | PR checks, review, merge, and multiple forges | T3: `apps/server/src/sourceControl/SourceControlProviderRegistry.ts`; Orca: `src/main/github/client/check/get-pr-checks.ts` | Missing | `src/orchestrate.rs` only creates GitHub PRs; no checks, review, or merge path; none | Start with GitHub and `gh`. | Add `/git checks` backed by `gh pr checks`. | D14 |
 | Diff review and navigation | T3: `apps/web/src/components/DiffPanel.tsx`; Orca: `src/renderer/src/components/diff-comments/DiffCommentCard.tsx` | Partial | `src/tui/mod.rs` `/review`, `/diff`; `src/store.rs` review notes; review tests; unit | Add sources and search without replacing the existing review overlay. | Add `/` search inside the current review rows. | D10 |

@@ -21,28 +21,28 @@ The design is staged. Phase 1 creates one honest full-suite gate with hard budge
 
 Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command, and `--version` runs only after a build that is already budgeted.
 
-Phase 2 is in progress from recorded runs. The current warm Rust PR is 58 seconds. A separate CI-docs PR is 59 seconds. Both are under 60 seconds, but all p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
+Phase 2 is in progress from recorded runs. The current warm Rust PR samples are 58 and 60 seconds; the CI-docs PR is 59 seconds. The Rust median is 59 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
 
 Budget rule, applied at every phase: Phase 1 uses three times a conservative cold estimate. Phase 2 sets each budget to the measured Linux p95 plus 20 percent. That reset is the only allowed increase. After it, a budget may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
 
 ## Current baseline
 
-Measured on 2026-11-22 from the cited runs. The Rust sample was based on `be31fc5`; current main is `9112c06` after the verification probe change.
+Measured on 2026-11-22 from the cited runs. The Rust sample was based on `be31fc5`; current main is `130250d` before the inbox slice.
 
 | Measurement | Current value | Evidence |
 |---|---|---|
-| Warm Rust PR feedback | 58 seconds, n=1 | Run 45004705055 |
+| Warm Rust PR feedback | 58 and 60 seconds; n=2, median 59 seconds, max 60 seconds | Runs 45004705055 and 45009466461 |
 | Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
-| Warm Test job | 33 seconds | Run 45004705055 |
-| `cargo test --lib` | 1.73 seconds, 326 tests | Run 45004705055 |
-| Integration tests | 0.39 seconds, 75 tests across seven binaries | Run 45004705055 |
-| Discovered test count (`ci/test-inventory.sh`) | 401 | Run 45004705055 |
-| `ci/test-inventory-floor.txt` | 358 | Current floor, not the discovered count |
+| Warm Test job | 33 and 37 seconds | Runs 45004705055 and 45009466461 |
+| `cargo test --lib` | 3.70 seconds, 329 tests | Run 45009466461 |
+| Integration tests | 0.75 seconds, 75 tests across seven binaries | Run 45009466461 |
+| Discovered test count (`ci/test-inventory.sh`) | 404 | Run 45009466461 |
+| `ci/test-inventory-floor.txt` | 404 | Current floor and discovered count |
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
 
-The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 358 test floor is a lower bound, not a per-test lock. It blocks a drop below 358, while the inventory check requires every discovered test to execute. Deleting tests above that floor still needs review in the diff.
+The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 404 test floor is a lower bound, not a per-test lock. It blocks a drop below 404, while the inventory check requires every discovered test to execute. Deleting tests above that floor still needs review in the diff.
 
 Older local macOS measurements are historical and are not acceptance evidence. The acceptance record contains the Linux run-level data and the rejected experiments.
 

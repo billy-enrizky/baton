@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, SteerOutcome, SteerRequest, TurnEvent, TurnStartInput};
 use crate::checkpoints::capture_checkpoint;
 use crate::config::{provider_auth_env, resolve_config};
-use crate::handoff::{derive_title, git_status_summary, handoff_prompt, HandoffMessage};
+use crate::handoff::{derive_title, git_status_summary, HandoffMessage};
 use crate::store::{BatonStore, NewThread, ThreadRow};
 use crate::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
 
@@ -753,8 +753,15 @@ async fn execute_turn(
     }
 
     let mut prompt = prompt_text.clone();
-    if session.is_none() && !prior_messages.is_empty() {
-        let handoff_messages: Vec<HandoffMessage> = prior_messages
+    // A native session has already read the turns up to its marker. Sending it
+    // again would spend cache and repeat context, so only unseen turns travel.
+    let covered_turn = session.as_ref().map(|row| row.covered_turn).unwrap_or(0);
+    let unseen: Vec<&crate::store::MessageRow> = prior_messages
+        .iter()
+        .filter(|message| message.turn > covered_turn)
+        .collect();
+    if !unseen.is_empty() {
+        let handoff_messages: Vec<HandoffMessage> = unseen
             .iter()
             .map(|message| HandoffMessage {
                 role: message.role.clone(),
@@ -764,7 +771,20 @@ async fn execute_turn(
             })
             .collect();
         let git_status = git_status_summary(std::path::Path::new(&cwd), 50);
-        prompt = handoff_prompt(&cwd, &thread_title, &handoff_messages, git_status.as_deref(), &prompt_text, None);
+        let intro = if session.is_some() {
+            crate::handoff::RESUME_INTRO
+        } else {
+            crate::handoff::NEW_HARNESS_INTRO
+        };
+        prompt = crate::handoff::handoff_prompt_with_intro(
+            &cwd,
+            &thread_title,
+            &handoff_messages,
+            git_status.as_deref(),
+            &prompt_text,
+            None,
+            intro,
+        );
     }
 
     let cwd_for_checkpoint = cwd.clone();
@@ -950,20 +970,35 @@ async fn execute_turn(
                 store.add_usage(thread_id, turn, provider, Some(&model), &usage)?;
             }
             if let Some(native_session_id) = outcome.native_session_id.as_ref() {
-                store.upsert_provider_session(thread_id, provider, native_session_id, Some(model.clone()), outcome.rollout_path.clone())?;
+                store.upsert_provider_session(
+                    thread_id,
+                    provider,
+                    native_session_id,
+                    Some(model.clone()),
+                    outcome.rollout_path.clone(),
+                )?;
+                store.mark_provider_session_covered(thread_id, provider, turn)?;
             }
         }
         let cwd_path = std::path::PathBuf::from(&cwd_for_checkpoint);
         if cwd_path.exists() {
             if let Ok(reference) = capture_checkpoint(&cwd_path, thread_id, turn) {
-                store.lock().unwrap().add_checkpoint(thread_id, turn, &reference)?;
+                store
+                    .lock()
+                    .unwrap()
+                    .add_checkpoint(thread_id, turn, &reference)?;
                 // The turn's own changes, kept in the conversation as a diff.
                 if start_captured {
                     let start = crate::checkpoints::checkpoint_start_ref(thread_id, turn);
-                    if let Ok(diff) = crate::checkpoints::diff_checkpoints(&cwd_path, &start, &reference) {
+                    if let Ok(diff) =
+                        crate::checkpoints::diff_checkpoints(&cwd_path, &start, &reference)
+                    {
                         if !diff.trim().is_empty() {
                             let capped = cap_diff(&diff);
-                            let _ = store.lock().unwrap().add_message(thread_id, turn, "diff", None, None, &capped);
+                            let _ = store
+                                .lock()
+                                .unwrap()
+                                .add_message(thread_id, turn, "diff", None, None, &capped);
                         }
                     }
                 }
@@ -1161,6 +1196,7 @@ mod tests {
 
     struct CapturingAdapter {
         prompt: Arc<Mutex<Option<String>>>,
+        session_id: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -1187,7 +1223,7 @@ mod tests {
             let _ = emit.send(TurnEvent::TurnCompleted {
                 final_text: "done".into(),
                 usage: None,
-                native_session_id: None,
+                native_session_id: self.session_id.clone(),
                 rollout_path: None,
             });
             Ok(())
@@ -1228,6 +1264,7 @@ mod tests {
         let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
             Box::new(CapturingAdapter {
                 prompt: captured.clone(),
+                session_id: None,
             }) as Box<dyn BatonAdapter>,
         ))];
         let adapter_indices = HashMap::from([(ProviderId::Codex, 0)]);
@@ -1260,6 +1297,152 @@ mod tests {
             messages.iter().any(|message| message.role == "user" && message.text == "hello $memories"),
             "the transcript keeps the raw prompt"
         );
+    }
+
+    #[tokio::test]
+    async fn a_returning_provider_receives_only_turns_it_has_not_seen() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let cwd = home.path().to_string_lossy().to_string();
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "handoff".into(),
+                cwd: cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        {
+            let store = store.lock().unwrap();
+            store.add_message(&thread.id, 1, "user", Some("codex"), Some("m"), "first question").unwrap();
+            store.add_message(&thread.id, 1, "assistant", Some("codex"), Some("m"), "first answer").unwrap();
+            store.add_message(&thread.id, 2, "user", Some("claude"), Some("m"), "claude question").unwrap();
+            store.add_message(&thread.id, 2, "assistant", Some("claude"), Some("m"), "claude answer").unwrap();
+            store
+                .upsert_provider_session(
+                    &thread.id,
+                    ProviderId::Codex,
+                    "s1",
+                    Some("m".into()),
+                    None,
+                )
+                .unwrap();
+            store
+                .mark_provider_session_covered(&thread.id, ProviderId::Codex, 1)
+                .unwrap();
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
+            CapturingAdapter {
+                prompt: captured.clone(),
+                session_id: Some("s1".into()),
+            },
+        ) as Box<dyn BatonAdapter>))];
+        let adapter_indices = HashMap::from([(ProviderId::Codex, 0)]);
+        let provider_claims: ProviderClaims = Arc::new(Mutex::new(HashMap::new()));
+        let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        execute_turn(
+            &store,
+            &home.path().to_path_buf(),
+            &adapters,
+            &adapter_indices,
+            &provider_claims,
+            cancel_receiver,
+            &thread.id,
+            "next",
+            PermissionMode::Default,
+            &engine_sender,
+            &turn_sender,
+        )
+        .await
+        .expect("turn completes");
+
+        let prompt = captured.lock().unwrap().clone().expect("prompt captured");
+        assert!(prompt.contains(crate::handoff::RESUME_INTRO), "{prompt}");
+        assert!(prompt.contains("claude question"), "{prompt}");
+        assert!(prompt.contains("claude answer"), "{prompt}");
+        assert!(
+            !prompt.contains("first question"),
+            "turns the provider already saw must not be resent: {prompt}"
+        );
+        let covered = store
+            .lock()
+            .unwrap()
+            .get_provider_session(&thread.id, ProviderId::Codex)
+            .unwrap()
+            .unwrap()
+            .covered_turn;
+        assert_eq!(covered, 3, "a completed turn advances the marker");
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_has_seen_every_turn_gets_the_raw_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let cwd = home.path().to_string_lossy().to_string();
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "handoff".into(),
+                cwd: cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        {
+            let store = store.lock().unwrap();
+            store.add_message(&thread.id, 1, "user", Some("codex"), Some("m"), "first question").unwrap();
+            store.add_message(&thread.id, 1, "assistant", Some("codex"), Some("m"), "first answer").unwrap();
+            store
+                .upsert_provider_session(
+                    &thread.id,
+                    ProviderId::Codex,
+                    "s1",
+                    Some("m".into()),
+                    None,
+                )
+                .unwrap();
+            store
+                .mark_provider_session_covered(&thread.id, ProviderId::Codex, 1)
+                .unwrap();
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
+            CapturingAdapter {
+                prompt: captured.clone(),
+                session_id: Some("s1".into()),
+            },
+        ) as Box<dyn BatonAdapter>))];
+        let adapter_indices = HashMap::from([(ProviderId::Codex, 0)]);
+        let provider_claims: ProviderClaims = Arc::new(Mutex::new(HashMap::new()));
+        let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        execute_turn(
+            &store,
+            &home.path().to_path_buf(),
+            &adapters,
+            &adapter_indices,
+            &provider_claims,
+            cancel_receiver,
+            &thread.id,
+            "next",
+            PermissionMode::Default,
+            &engine_sender,
+            &turn_sender,
+        )
+        .await
+        .expect("turn completes");
+
+        let prompt = captured.lock().unwrap().clone().expect("prompt captured");
+        assert_eq!(prompt, "next", "a fully caught-up session gets no handoff");
     }
 
     struct IdleAdapter;

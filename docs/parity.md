@@ -107,7 +107,7 @@ Rules the evidence column obeys:
 | Capability | Upstream evidence | Baton status | Baton evidence and proof surface | Terminal decision | First slice | Plan |
 |---|---|---|---|---|---|---|
 | Steering and queueing | T3: `apps/server/src/orchestration-v2/ThreadMessageIntake.ts`, `apps/server/src/orchestration-v2/QueuedRunOrder.ts`; Orca: `docs/site/content/docs/agents/native-chat.mdx` | Equivalent | `src/tui/mod.rs` steering plus `/queue send <n>`, `edit <n> <text>`, `move <from> <to>`, `clear`, and listing with choices; `src/store.rs` `take_queued_message` and `replace_queued_messages`; `queue_send_edit_and_move_control_the_durable_queue` and `queue_rejects_out_of_range_positions_and_keeps_the_queue`; unit | Steering is already correct, and the queue is now fully controllable from the TUI | None. The three list actions keep the durable order, and a sent item leaves the queue before it dispatches. | D7 |
-| Cross-provider handoff | T3: `apps/server/src/orchestration-v2/ContextHandoffService.ts`, `packages/provider-core/src/server/handoffBudget.ts`, `apps/server/src/orchestration-v2/ProviderSwitchService.ts` | Partial | `src/handoff.rs` `build_handoff` uses a 24,000-byte budget and a 4,000-byte per-message cap; `src/runtime.rs` builds a handoff only when `session.is_none()`; `tests/core.rs` covers composition and UTF-8 truncation, not the returning-provider delta; unit | Core to Baton's promise and a provider-to-provider egress path | D4a fixes the remaining correctness defect: switching back to a provider that already has a session gets no delta, because `provider_sessions` has no covered-turn marker. PR #89 already fixed the duplicate prompt and the byte-offset panic. D4b adds transcript redaction and the handoff egress inventory. D4c adds the preview, no-handoff, and confirmation. | D4a, D4b, D4c |
+| Cross-provider handoff | T3: `apps/server/src/orchestration-v2/ContextHandoffService.ts`, `packages/provider-core/src/server/handoffBudget.ts`, `apps/server/src/orchestration-v2/ProviderSwitchService.ts` | Partial | `src/handoff.rs` builds a 24,000-byte handoff and a resume intro; `src/runtime.rs` filters prior messages by `provider_sessions.covered_turn` and advances the marker on success; `a_returning_provider_receives_only_turns_it_has_not_seen`, `a_provider_that_has_seen_every_turn_gets_the_raw_prompt`, and `provider_session_covered_turn_defaults_to_zero_and_only_moves_forward`; unit | Core to Baton's promise and a provider-to-provider egress path | PR #89 fixed the duplicate prompt and the byte-offset panic. D4d added the covered-turn marker, so a returning provider receives only the turns it has not seen. D4b adds transcript redaction and the handoff egress inventory. D4c adds the preview, no-handoff, and confirmation. | D4a, D4d, D4b, D4c |
 | Compaction and context telemetry | T3: `apps/server/src/orchestration-v2/IdleCompactionService.ts`, `packages/contracts/src/providerRuntime.ts` (symbol ThreadTokenUsageSnapshot) | Partial | `src/tui/mod.rs` `/compact` and `/context`; `src/usage.rs` records input, output, cache tokens, and cost; it does not record model capacity; none | Show model-relative context use before a safe compaction point. | Add a context-window field to `ProviderCapabilities` with an explicit unknown state, then add percent used to `/context`; without the capability field there is no capacity source. | D5 |
 | Rich context references and attachments | T3: `packages/contracts/src/composerContext.ts`; Orca: `docs/site/content/docs/editing/file-explorer.mdx` | Partial | `src/tui/mod.rs` composer text; `src/memory.rs` `expand_memories`; `src/handoff.rs`; none | Text paths and quoted excerpts cover most terminal needs. | Add `@file` completion that serializes absolute paths. | D10 |
 | Side chats and merge-back | T3: `apps/server/src/orchestration-v2/ThreadForkService.ts`, `apps/server/src/orchestration-v2/testkit/ThreadMergeBack.integration.test.ts` | Partial | `src/tui/mod.rs` `/fork`; `src/cli.rs` `baton fork`; `src/store.rs` `fork_thread_through_turn`; fork tests; unit | Wrap the existing fork path rather than build a second thread model. | Add `/btw` as a fork with a side-chat marker and no source mutation. Add `/merge-back` as a separate follow-up. | D16 |
@@ -267,18 +267,33 @@ Release 1 is the smallest set that makes the terminal core trustworthy: correct 
 
 | In Release 1 | Out of Release 1 (backlog) |
 |---|---|
-| D1, D2, D3a, D3b, D3c, D9a, D6, D7, D4a, D4b, D4c, D5 | D8a, D8, D10 to D17, D18a, D18b, D18, D19 to D24 |
+| D1, D2, D3a, D3b, D3c, D9a, D6, D7, D4a, D4d, D4b, D4c, D5 | D8a, D8, D10 to D17, D18a, D18b, D18, D19 to D24 |
 
 Work in progress, capped at four slices. A fifth slice waits even if it is ready.
 
-| Slice | PR | Done when |
+| Slice | State | Done when |
 |---|---|---|
-| D1 | #86, open | Every finite-argument command exposes choices and the PTY probe passes |
-| D2 | #88, open | Both checkers report zero missing and two Goldfish rounds are clean |
-| D3b | #87, open | `ci/selftest.sh`, the budget negative test, and the formal gate pass |
-| D4a | #89, open | The duplicate prompt and the UTF-8 truncation are fixed; the covered-turn marker is a second PR |
+| D3c | #90, open | Billing cleared, then one PR run with every job executed and `verify` green, and one green `main` push run |
 
-The cap is four: one product feature, two records and tools, and one defect fix, all review-ready and independent. Starting a fifth slice before one of these merges is a regression against this document.
+Merged, with the acceptance each one met:
+
+| Slice | PR | Acceptance |
+|---|---|---|
+| D1 | #86 | Every finite-argument command exposes choices; unit tests and the PTY slash probe passed |
+| D2 | #88 | Both checkers report zero missing; the two-clean-round acceptance is still open in the review record |
+| D3a | #88 | Documentation landed; Phase 1B and 1C acceptance is tracked under D3b and D3c |
+| D3b | #87 | `ci/selftest.sh`, the budget negative test, and the formal gate passed |
+| D4a | #89 | Duplicate prompt and UTF-8 truncation fixed and tested |
+| D9a | #91 | Sanitizer and its eight tests |
+| D5 start | #93 | Startup phases with a recorded baseline |
+| D6 start | #94 | Turn-end bell with a limiter and a config flag |
+| D7 | #95 | Queue send, edit, move, clear, with durable order |
+| D5 typing | #96 | Keystroke-to-quiet with a recorded baseline |
+| D4d | this PR | Covered-turn marker, delta filter, resume intro, three tests |
+
+D3c is billing-blocked: run 44969473815 scheduled every job and failed in 2 seconds on an account-billing message, so no step ran. Release 1 has one dependency outside the repository until that clears.
+
+Starting a new slice is fine while D3c waits; the cap applies to review-ready work, and there is none.
 
 ## Delivery order
 
@@ -296,7 +311,8 @@ Each row is one small PR. A row with a letter suffix is the smallest unit that c
 | D9a | Unicode output sanitizer | Nothing that renders child bytes can be safe before this exists, so it precedes every such slice including BEL | Escape-sequence, UTF-8, C1, and ZWJ fixture suite |
 | D6 | Attention notifications | Small and user-visible once the sanitizer owns the BEL decision | PTY byte test and mute test |
 | D7 | Queue edit, send-now, and reorder | Uses the existing durable queue | Store and TUI tests |
-| D4a | Handoff correctness | Two defects are already fixed in PR #89; the returning-provider delta remains | Defect tests for the duplicate prompt, UTF-8 truncation, and a covered-turn marker |
+| D4a | Handoff duplicate prompt and UTF-8 truncation | Fixed in PR #89 | `handoff_prompt_includes_the_user_prompt_once` and `handoff_truncation_keeps_utf8_intact` |
+| D4d | Returning-provider delta | A provider that already had a session got no delta because `provider_sessions` had no covered-turn marker | `covered_turn`, the resume intro, the delta filter, and three tests |
 | D4b | Transcript redaction and the handoff egress inventory | A handoff is provider-to-provider egress; it cannot send before this exists | Fake-key transcript test and an inventory test over the Baton-owned paths |
 | D4c | Handoff preview, no-handoff, and confirmation | Makes the egress explicit to the user, on top of a redacted payload | Handoff state-machine gate plus a transcript fixture |
 | D5 | Startup benchmark, then input-to-render and memory benchmarks, plus context and usage telemetry and the NO_COLOR, non-TTY, and 60x20 checks | Sets numeric baselines and surfaces the resource state those baselines measure | `scripts/bench.py` with a recorded baseline and a 10 percent fail threshold |

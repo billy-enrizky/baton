@@ -1006,6 +1006,46 @@ fn handoff_builds_sections_and_respects_budget() {
 }
 
 #[test]
+fn provider_session_covered_turn_defaults_to_zero_and_only_moves_forward() {
+    let store = BatonStore::memory().unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "covered".into(),
+            cwd: "/tmp/covered".into(),
+            current_provider: ProviderId::Codex,
+            current_model: Some("m".into()),
+        })
+        .unwrap();
+    store
+        .upsert_provider_session(&thread.id, ProviderId::Codex, "s1", Some("m".into()), None)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_provider_session(&thread.id, ProviderId::Codex)
+            .unwrap()
+            .unwrap()
+            .covered_turn,
+        0,
+        "a brand new session has seen nothing"
+    );
+    store
+        .mark_provider_session_covered(&thread.id, ProviderId::Codex, 3)
+        .unwrap();
+    store
+        .mark_provider_session_covered(&thread.id, ProviderId::Codex, 2)
+        .unwrap();
+    assert_eq!(
+        store
+            .get_provider_session(&thread.id, ProviderId::Codex)
+            .unwrap()
+            .unwrap()
+            .covered_turn,
+        3,
+        "the marker never regresses"
+    );
+}
+
+#[test]
 fn handoff_prompt_includes_the_user_prompt_once() {
     let prompt = handoff_prompt(
         "/work/repo",

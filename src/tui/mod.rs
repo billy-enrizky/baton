@@ -2059,7 +2059,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/orchestrate", _) => Some("orchestrate on|off|--plan-only|<goal>"),
         ("/runs", _) => Some("runs --all|<run id>"),
         ("/commands", _) => Some("commands [turn]"),
-        ("/queue", _) => Some("queue [clear]"),
+        ("/queue", _) => Some("queue [send <n> | edit <n> <text> | move <from> <to> | clear]"),
         ("/mcp", "add") => Some("mcp add <name> <command> [args...]"),
         ("/mcp", "remove") => Some("mcp remove <name>"),
         ("/mcp", _) => Some("mcp list|add|remove|sync"),
@@ -2217,7 +2217,32 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
             }
         }
         "/queue" => {
-            push_suggestion(&mut suggestions, command, "clear", "remove all queued follow-ups");
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "clear",
+                "remove all queued follow-ups",
+            );
+            for index in 1..=state.queued_messages.len().min(10) {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &format!("send {index}"),
+                    format!("send queued item {index} now"),
+                );
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &format!("edit {index}"),
+                    format!("edit queued item {index}"),
+                );
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &format!("move {index}"),
+                    format!("move queued item {index}"),
+                );
+            }
         }
         "/copy" => {
             for index in 1..=assistant_reply_count(state).min(10) {
@@ -2540,7 +2565,8 @@ fn handle_key(
             }
             KeyCode::Enter => {
                 if let Some(provider) = PROVIDERS.get(selected).copied() {
-                    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+                    let resolved =
+                        resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
                     let default_model = resolved.for_provider(provider).model.clone();
                     let mut models: Vec<String> = crate::models::catalog(provider)
                         .iter()
@@ -3185,6 +3211,14 @@ fn dispatch_message(
     } else {
         submit(state, store, engine_command_sender, text);
     }
+}
+
+fn parse_queue_index(raw: Option<&String>, len: usize) -> Option<usize> {
+    let index: usize = raw?.parse().ok()?;
+    if index == 0 || index > len {
+        return None;
+    }
+    Some(index - 1)
 }
 
 fn escape_review_text(text: &str) -> String {
@@ -4151,7 +4185,9 @@ fn handle_command(
                 }
             };
             if parsed.worktrees {
-                if let Err(error) = crate::worktree::repo_root(std::path::Path::new(&state.thread.cwd)) {
+                if let Err(error) =
+                    crate::worktree::repo_root(std::path::Path::new(&state.thread.cwd))
+                {
                     state.notice = Some(format!(
                         "/multi --worktrees needs a git repository: {error}"
                     ));
@@ -4177,7 +4213,11 @@ fn handle_command(
             state.notice = Some(format!(
                 "sending to {} providers in parallel: {}",
                 valid_providers.len(),
-                valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
+                valid_providers
+                    .iter()
+                    .map(|provider| provider.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
             let mut threads = Vec::new();
             for provider in valid_providers.clone() {
@@ -4195,11 +4235,8 @@ fn handle_command(
                     // engine looks the thread up immediately, so create it now.
                     let _ = ensure_persisted(&guard, &mut thread);
                     let _ = guard.set_thread_permission_mode(&thread.id, state.permission_mode);
-                    let _ = guard.set_thread_goal(
-                        &thread.id,
-                        state.goal.as_deref(),
-                        state.goal_paused,
-                    );
+                    let _ =
+                        guard.set_thread_goal(&thread.id, state.goal.as_deref(), state.goal_paused);
                     thread
                 };
                 threads.push(thread);
@@ -4236,8 +4273,7 @@ fn handle_command(
             match args.first().map(String::as_str) {
                 Some("on") => {
                     state.set_session_mode(store, SessionMode::Orchestrate);
-                    state.notice =
-                        Some("orchestrate mode: prompts spawn worker harnesses".into());
+                    state.notice = Some("orchestrate mode: prompts spawn worker harnesses".into());
                     return;
                 }
                 Some("off") => {
@@ -4481,26 +4517,89 @@ fn handle_command(
             }
         }
         "/queue" => {
-            if args.first().map(String::as_str) == Some("clear") {
-                state.queued_messages.clear();
-                match store.lock().unwrap().clear_queued_messages(&state.thread.id) {
-                    Ok(()) => state.notice = Some("queue cleared".into()),
-                    Err(error) => state.notice = Some(format!("cannot clear queue: {error}")),
-                }
-            } else if args.is_empty() {
-                if state.queued_messages.is_empty() {
-                    state.notice = Some("queue: empty".into());
-                } else {
-                    let mut text = format!("queue: {} waiting", state.queued_messages.len());
-                    for (index, message) in state.queued_messages.iter().enumerate() {
-                        let preview: String = message.lines().next().unwrap_or("").chars().take(70).collect();
-                        text.push_str(&format!("\n  {}. {preview}", index + 1));
+            let action = args.first().map(String::as_str).unwrap_or("");
+            match action {
+                "clear" => {
+                    state.queued_messages.clear();
+                    match store.lock().unwrap().clear_queued_messages(&state.thread.id) {
+                        Ok(()) => state.notice = Some("queue cleared".into()),
+                        Err(error) => state.notice = Some(format!("cannot clear queue: {error}")),
                     }
-                    text.push_str("\n\n/queue clear to remove them");
-                    state.notice = Some(text);
                 }
-            } else {
-                state.notice = Some("usage: /queue · /queue clear".into());
+                "send" => {
+                    let Some(index) = parse_queue_index(args.get(1), state.queued_messages.len()) else {
+                        state.notice = Some(format!(
+                            "usage: /queue send <1-{}>",
+                            state.queued_messages.len().max(1)
+                        ));
+                        return;
+                    };
+                    let taken = store
+                        .lock()
+                        .unwrap()
+                        .take_queued_message(&state.thread.id, index);
+                    match taken {
+                        Ok(Some(text)) => {
+                            state.queued_messages.remove(index);
+                            state.notice = Some(format!("sent queued item {}", index + 1));
+                            dispatch_message(state, store, engine_command_sender, text, false);
+                        }
+                        Ok(None) => state.notice = Some("queue: no item at that position".into()),
+                        Err(error) => state.notice = Some(format!("cannot send from queue: {error}")),
+                    }
+                }
+                "edit" => {
+                    let Some(index) = parse_queue_index(args.get(1), state.queued_messages.len()) else {
+                        state.notice = Some("usage: /queue edit <n> <text>".into());
+                        return;
+                    };
+                    let text = args.get(2..).unwrap_or(&[]).join(" ");
+                    if text.trim().is_empty() {
+                        state.notice = Some("usage: /queue edit <n> <text>".into());
+                        return;
+                    }
+                    let mut messages = state.queued_messages.clone();
+                    messages[index] = text;
+                    match store.lock().unwrap().replace_queued_messages(&state.thread.id, &messages) {
+                        Ok(()) => {
+                            state.queued_messages = messages;
+                            state.notice = Some(format!("edited queued item {}", index + 1));
+                        }
+                        Err(error) => state.notice = Some(format!("cannot edit the queue: {error}")),
+                    }
+                }
+                "move" => {
+                    let from = parse_queue_index(args.get(1), state.queued_messages.len());
+                    let to = parse_queue_index(args.get(2), state.queued_messages.len());
+                    let (Some(from), Some(to)) = (from, to) else {
+                        state.notice = Some("usage: /queue move <from> <to>".into());
+                        return;
+                    };
+                    let mut messages = state.queued_messages.clone();
+                    let item = messages.remove(from);
+                    messages.insert(to, item);
+                    match store.lock().unwrap().replace_queued_messages(&state.thread.id, &messages) {
+                        Ok(()) => {
+                            state.queued_messages = messages;
+                            state.notice = Some(format!("moved queued item {} to {}", from + 1, to + 1));
+                        }
+                        Err(error) => state.notice = Some(format!("cannot reorder the queue: {error}")),
+                    }
+                }
+                "" => {
+                    if state.queued_messages.is_empty() {
+                        state.notice = Some("queue: empty".into());
+                    } else {
+                        let mut text = format!("queue: {} waiting", state.queued_messages.len());
+                        for (index, message) in state.queued_messages.iter().enumerate() {
+                            let preview: String = message.lines().next().unwrap_or("").chars().take(70).collect();
+                            text.push_str(&format!("\n  {}. {preview}", index + 1));
+                        }
+                        text.push_str("\n\n/queue send <n> · /queue edit <n> <text> · /queue move <n> <n> · /queue clear");
+                        state.notice = Some(text);
+                    }
+                }
+                _ => state.notice = Some("usage: /queue · /queue send <n> · /queue edit <n> <text> · /queue move <from> <to> · /queue clear".into()),
             }
         }
         "/compact" => {
@@ -12245,5 +12344,75 @@ mod tests {
         assert!(text.contains("commit: 01234567"), "{text}");
         assert!(text.contains("esc closes"), "{text}");
         assert!(text.contains("boom"), "{text}");
+    }
+    #[test]
+    fn queue_send_edit_and_move_control_the_durable_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        for text in ["first", "second", "third"] {
+            store.lock().unwrap().enqueue_message(&state.thread.id, text).unwrap();
+        }
+        state.queued_messages = store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/queue move 1 3");
+        assert_eq!(state.queued_messages, vec!["second", "third", "first"]);
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            vec!["second", "third", "first"],
+            "the move is durable, not only in the state"
+        );
+
+        handle_command(&mut state, &store, &engine_command_sender, "/queue edit 2 rewritten prompt");
+        assert_eq!(state.queued_messages, vec!["second", "rewritten prompt", "first"]);
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            vec!["second", "rewritten prompt", "first"]
+        );
+
+        handle_command(&mut state, &store, &engine_command_sender, "/queue send 2");
+        assert_eq!(state.queued_messages, vec!["second", "first"]);
+        let command = engine_command_receiver.try_recv().expect("send dispatches the item");
+        match command {
+            EngineCommand::Submit { text, .. } => assert_eq!(text, "rewritten prompt"),
+            _ => panic!("expected a submit for the sent item"),
+        }
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            vec!["second", "first"],
+            "a sent item leaves the durable queue"
+        );
+    }
+
+    #[test]
+    fn queue_rejects_out_of_range_positions_and_keeps_the_queue() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        store.lock().unwrap().enqueue_message(&state.thread.id, "only").unwrap();
+        state.queued_messages = store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/queue send 9");
+        assert_eq!(state.queued_messages, vec!["only"]);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("usage: /queue send"));
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/queue move 1 4",
+        );
+        assert_eq!(state.queued_messages, vec!["only"]);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("usage: /queue move"));
     }
 }

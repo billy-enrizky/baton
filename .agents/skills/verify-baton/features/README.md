@@ -12,7 +12,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Default provider | CLI and TUI | new work starts on an installed harness, with an explicit override |
 | Recent thread hint | TUI | a new session points at existing threads in the folder |
 | Attention inbox | TUI | `/inbox` lists failed, unverified, interrupted, needs-input, and queued work and opens the selected thread |
-| Thread pins | TUI; CLI read | `/pin` toggles a durable pin, `/pin move` orders pinned threads, pinned rows sort first, and `baton threads --json` exposes `pinned` and `pin_order_key` |
+| Thread pins | TUI; CLI read | `/pin` toggles a durable pin, Ctrl+Up/Ctrl+Down or `/pin move` orders pinned threads, pinned rows sort first, and `baton threads --json` exposes `pinned` and `pin_order_key` |
 | Shell completions | CLI | `baton completions <shell>` generates from the clap command graph and handles a broken pipe |
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |

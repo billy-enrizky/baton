@@ -289,7 +289,7 @@ fn send_signal(pid: u32, signal: &str) -> bool {
 #[cfg(unix)]
 fn send_group_signal(pgid: u32, signal: &str) -> bool {
     std::process::Command::new("kill")
-        .args([signal, &format!("-{pgid}")])
+        .args([signal, "--", &format!("-{pgid}")])
         .stderr(std::process::Stdio::null())
         .status()
         .map(|status| status.success())
@@ -298,12 +298,25 @@ fn send_group_signal(pgid: u32, signal: &str) -> bool {
 
 #[cfg(unix)]
 fn group_alive(pgid: u32) -> bool {
-    std::process::Command::new("kill")
-        .args(["-0", &format!("-{pgid}")])
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-eo", "pgid=,stat="])
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let Some(group) = fields.next() else {
+            return false;
+        };
+        let Some(state) = fields.next() else {
+            return false;
+        };
+        group.parse::<u32>() == Ok(pgid) && !state.starts_with('Z')
+    })
 }
 
 /// Stops every process in a worker's process group. The worker runs `baton
@@ -649,6 +662,37 @@ mod tests {
             assert!(Instant::now() < deadline, "watchdog did not kill the server");
             std::thread::sleep(Duration::from_millis(100));
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminates_a_shell_group_quickly_and_ignores_its_zombie_leader() {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        use std::time::Instant;
+
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pgid = child.id();
+        std::thread::sleep(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let terminated = terminate_group(pgid);
+        let elapsed = started.elapsed();
+        let status = child.wait().unwrap();
+
+        assert!(terminated, "the process group is gone");
+        assert!(!status.success(), "the leader was terminated");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "group termination waited on a zombie for {elapsed:?}"
+        );
     }
 
     #[test]

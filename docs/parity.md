@@ -48,11 +48,11 @@ The product problem is: a terminal user should be able to start, supervise, reco
 
 | Repository | URL | Checkout | Ref | Commit |
 |---|---|---|---|---|
-| T3 Code | `https://github.com/pingdotgg/t3code` | `/Users/billy/Documents/t3code` | `origin/main` | `90c028c6fc4a9ecd3af048cb52432e819af6487c` |
-| Orca | `https://github.com/stablyai/orca` | `/Users/billy/Documents/orca` | `origin/main` | `1355cc4ef30ccb370542154181b0b2864e584373` |
-| Baton baseline | `https://github.com/billy-enrizky/baton` | current working copy | `origin/main` | `7f18e59` before the completions slice |
+| T3 Code | `https://github.com/pingdotgg/t3code` | `/Users/billy/Documents/t3code` | `origin/main` | `7b21adbe7cd633813eeb8a9e3ec4961ec31f98a3` |
+| Orca | `https://github.com/stablyai/orca` | `/Users/billy/Documents/orca` | `origin/main` | `52673d4e065ef6e27d0bda3be288ecb6282a2a42` |
+| Baton baseline | `https://github.com/billy-enrizky/baton` | `/Users/billy/Documents/baton/.worktrees/pin-order` | `origin/main` | `08e1003` before the manual-pin slice |
 
-The upstream working trees can be dirty and behind their refs. Read upstream evidence with `git -C <checkout> show <commit>:<path>`, or verify the path exists with `git -C <checkout> cat-file -e <commit>:<path>`. Evidence paths are prefixed with `T3:` or `Orca:`. The upstream heads were refreshed on 2026-11-22; the inbox slice re-resolved every path against the current checkouts.
+The T3 and Orca rows were refreshed to the local `origin/main` commits shown on 2026-11-22. Read upstream evidence with `git -C <checkout> show <commit>:<path>`, or verify the path exists with `git -C <checkout> cat-file -e <commit>:<path>`. Evidence paths are prefixed with `T3:` or `Orca:`. Refresh the rows through the sync procedure when a slice changes upstream behavior.
 
 The slash-completion contract landed in PR #86. Rows that depend on it cite the tests, not the PR.
 
@@ -60,7 +60,7 @@ The slash-completion contract landed in PR #86. Rows that depend on it cite the 
 
 | Status | Required evidence |
 |---|---|
-| `Equivalent` | A Baton source path and a test, PTY probe, or runtime transcript proves the same user-visible outcome |
+| `Equivalent` | A Baton source path and a named unit test prove the same user-visible outcome; a PTY probe or runtime transcript may add supporting evidence |
 | `Partial` | At least one working path exists and the gap is named in `First slice`; the proof surface records whether a test covers it |
 | `Missing` | No working code path exists; the evidence cell names the source location that proves the absence, checked against source, Cargo dependencies, and the CLI/TUI command inventory |
 | `Unmeasured` | The capability exists, but no recorded benchmark or transcript exists, so no performance or parity claim is made |
@@ -70,11 +70,12 @@ The slash-completion contract landed in PR #86. Rows that depend on it cite the 
 Proof surfaces:
 
 - `unit`: a deterministic Rust test that runs with `cargo test --locked`. Available today.
-- `CI`: the same deterministic gate, required by the workflow. Not available until Phase 1C lands, so every row that says `CI` today actually means `unit` and becomes `CI` when the workflow is merged.
+- `CI`: the same deterministic gate, path-selected on pull requests and run in full on merge-group entries and main pushes. Branch-protection enforcement is a separate repository setting and is still pending.
 - `local`: a real provider, `gh`, SSH, or another paid or credential-bearing probe. It is not a CI gate.
 - `local bench`: a recorded benchmark run on the developer host. Not deterministic, so it cannot support `Equivalent` on its own.
 - `CI+local`: both a deterministic gate and a real-path check.
 - `PTY`: a deterministic real TUI journey through a PTY with an isolated `BATON_HOME`; zero-cost and repeatable, but not a CI gate today.
+- `unit+PTY`: a named deterministic Rust test plus a PTY journey for the same user-visible behavior.
 
 `unit` and `CI` are the same underlying test. The distinction records whether the workflow currently enforces it, not two kinds of evidence.
 
@@ -112,7 +113,7 @@ Rules the evidence column obeys:
 | Compaction and context telemetry | T3: `apps/server/src/orchestration-v2/IdleCompactionService.ts`, `packages/contracts/src/providerRuntime.ts` (symbol ThreadTokenUsageSnapshot) | Partial | `src/tui/mod.rs` `/compact` and `/context`; `src/usage.rs` records input, output, cache tokens, and cost; it does not record model capacity; none | Show model-relative context use before a safe compaction point. | Add a context-window field to `ProviderCapabilities` with an explicit unknown state, then add percent used to `/context`; without the capability field there is no capacity source. | D5 |
 | Rich context references and attachments | T3: `packages/contracts/src/composerContext.ts`; Orca: `docs/site/content/docs/editing/file-explorer.mdx` | Partial | `src/tui/mod.rs` composer text; `src/memory.rs` `expand_memories`; `src/handoff.rs`; none | Text paths and quoted excerpts cover most terminal needs. | Add `@file` completion that serializes absolute paths. | D10 |
 | Side chats and merge-back | T3: `apps/server/src/orchestration-v2/ThreadForkService.ts`, `apps/server/src/orchestration-v2/testkit/ThreadMergeBack.integration.test.ts` | Partial | `src/tui/mod.rs` `/fork`; `src/cli.rs` `baton fork`; `src/store.rs` `fork_thread_through_turn`; fork tests; unit | Wrap the existing fork path rather than build a second thread model. | Add `/btw` as a fork with a side-chat marker and no source mutation. Add `/merge-back` as a separate follow-up. | D16 |
-| Thread organization | T3: `packages/contracts/src/orchestrationV2.ts` (symbols thread.pin, thread.unpin, thread.pin.reorder, pinOrderKey), `apps/server/src/orchestration-v2/Orchestrator.ts` pin cases, `apps/web/src/components/Sidebar.logic.ts` | Partial | `src/store.rs` `ThreadRow.pinned`, `set_thread_pinned`, semantic `list_threads` and `list_threads_for_path`, display-only `list_threads_display` and `list_threads_for_path_display`; `src/tui/mod.rs` `/pin` full-ID scrolling picker with live reorder; `src/main.rs` `baton threads --json`; `thread_pins_persist_and_sort_before_recent_threads`, `thread_pin_survives_store_reopen`, `threads_json_reports_pinned`, `mcp::tests::default_status_keeps_newest_thread_when_older_is_pinned`, `pin_picker_toggles_without_opening_the_thread`, `thread_picker_window_follows_selection_past_eight`, `pin_prefix_rejects_foreign_and_ambiguous_matches`; PTY `slash_probe.py`; unit, PTY | Pins, snooze, and archive are useful without a sidebar. | Basic pins landed: `/pin` exposes current-project choices, Enter toggles durably, display is pinned-first, and implicit CLI/MCP resolution stays newest-first. Remaining: manual pin order, snooze, archive. Next slice: add nullable `pin_order_key TEXT` to `threads`, assign UTC microseconds on pin, backfill existing pinned rows from `updated_at`, set it NULL on unpin, order display by `pinned DESC, pin_order_key DESC, updated_at DESC, rowid DESC`, add `set_thread_pin_order(id, key: Option<&str>)`, and implement `/pin move <id> up or down` for pinned threads only with boundary notices and completion. Tests: `pin_order_moves_a_pinned_thread_and_rejects_unpinned`, `pin_move_reorders_and_refreshes_the_picker`, `pin_move_choices_are_exposed`. Files: `src/store.rs`, `src/tui/mod.rs`, `tests/core.rs`, `README.md`, `docs/parity.md`, `.agents/skills/verify-baton/features/pin.md`. | D16 |
+| Thread organization | T3: `packages/contracts/src/orchestrationV2.ts` (symbols thread.pin, thread.unpin, thread.pin.reorder, pinOrderKey), `apps/server/src/orchestration-v2/Orchestrator.ts` pin cases, `apps/web/src/components/Sidebar.logic.ts` | Partial | `src/store.rs` `ThreadRow.pinned`, `ThreadRow.pin_order_key`, `set_thread_pinned`, `move_thread_pin`, `backfill_pin_order_keys`, `format_pin_order_key`, semantic `list_threads` and `list_threads_for_path`, display-only `list_threads_display` and `list_threads_for_path_display`; `src/tui/mod.rs` `/pin` full-ID scrolling picker and `/pin move <id> up or down`; `src/main.rs` `baton threads --json`; `thread_pins_persist_and_sort_before_recent_threads`, `thread_pin_survives_store_reopen`, `threads_json_reports_pinned`, `pin_order_keys_sort_and_can_be_swapped`, `pin_order_key_backfills_on_open`, `concurrent_pin_moves_serialize_without_duplicate_keys`, `store::tests::pin_order_keys_advance_within_one_microsecond`, `mcp::tests::default_status_keeps_newest_thread_when_older_is_pinned`, `pin_picker_toggles_without_opening_the_thread`, `thread_picker_window_follows_selection_past_eight`, `pin_prefix_rejects_foreign_and_ambiguous_matches`, `pin_move_reorders_and_refreshes_the_picker`, `pin_move_choices_are_exposed`; PTY `slash_probe.py`; unit+PTY | Pins, snooze, and archive are useful without a sidebar. | Pins and manual order are implemented in this review candidate: `/pin` exposes current-project choices, Enter toggles durably, completion lists `move <id> up` and `move <id> down` for pinned threads, moves swap adjacent keys in one immediate transaction, boundary notices are explicit, and implicit CLI/MCP resolution stays newest-first. Remaining: keyboard reorder in the picker, snooze, archive. Next slice: the keyboard pin reorder plan below. Durable archive waits for the thread-operation claim described there. | D16 |
 | Unified search and command palette | T3: `apps/server/src/orchestration-v2/ThreadSearch.ts`, `apps/web/src/components/CommandPalette.tsx`; Orca: `src/renderer/src/components/file-actions/quick-open/QuickOpen.tsx` | Partial | `src/store.rs` `search_messages`; `src/tui/mod.rs` `/find`; `src/cli.rs` `search`; none | Start with actions, threads, and files. | Add a `Ctrl-K` palette that lists built-in actions and `/open` thread choices. | D17 |
 | Cross-thread attention inbox | T3: `packages/client-runtime/src/state/threadInbox.ts` (symbol createInboxReturnTracker); Orca: `docs/site/content/docs/activity.mdx` | Equivalent | `src/inbox.rs`; `/inbox` picker and `baton inbox [--json]`; `src/tui/mod.rs` `inbox_lists_attention_threads_and_opens_the_selected_one`; `src/inbox.rs` unit tests; `src/cli.rs` `inbox_accepts_json`; unit | One inbox merges failed, unverified, interrupted, needs-input, queued, and completed-unshipped work across projects. | None for the row; later work can add archive or acknowledge actions. | D16 |
 | Usage and cost history | T3: `apps/server/src/usage/UsageService.ts`; Orca: `src/main/rate-limits/service/rate-limit-service.ts` | Partial | `src/usage.rs`; `/usage`; `baton usage`; usage tests; unit | Token, cache, and cost history belongs in JSON and the TUI. | Add `--by day`, `--by model`, and `--by provider` to `baton usage`. | D5 |
@@ -124,8 +125,8 @@ Rules the evidence column obeys:
 | Capability | Upstream evidence | Baton status | Baton evidence and proof surface | Terminal decision | First slice | Plan |
 |---|---|---|---|---|---|---|
 | Single-repository worktrees | T3: `apps/server/src/orchestration-v2/ThreadLaunchService.ts`; Orca: `src/main/git/worktrees/creation/worktree-add.ts` | Equivalent | `src/worktree.rs`; `/worktree`; `baton worktrees`; worktree tests in `src/tui/mod.rs` and `src/worktree.rs`; unit | Keep the existing worktree and shared-directory model. | None. | - |
-| Multi-repository worktrees | T3: `apps/server/src/orchestration-v2/ThreadLaunchService.ts` resolves one repository per thread; the former `apps/server/src/workspace/TaskFolders.ts` is absent at `90c028c` | Design decision | `src/worktree.rs` resolves one `repo_root`; `baton.json` supports only `worktree.sharedDirectories`; none | Defer until a current upstream capability or user request exists | Decision owner: Baton maintainer. Do not add a multi-repository model speculatively. | Deferred |
-| Commit, push, and open a PR from a normal thread | T3: `apps/server/src/git/GitWorkflowService.ts`; Orca: `src/renderer/src/components/right-sidebar/source-control/commit/use-commit-flows.ts`, `src/main/github/client/create/create-github-pull-request.ts` | Partial | `src/orchestrate.rs` `open_prs_with_gh` commits worker branches, runs `git push -u`, and calls `gh pr create`; no normal-thread git command; `CI+local`; none | Normal threads need the same finish path as workers. | Add `/git commit` for the current thread worktree with a generated message. `/git push` and `/git pr` are separate follow-ups. | D14 |
+| Multi-repository worktrees | T3: `apps/server/src/orchestration-v2/ThreadLaunchService.ts` resolves one repository per thread; the former `apps/server/src/workspace/TaskFolders.ts` is absent at the pinned snapshot | Design decision | `src/worktree.rs` resolves one `repo_root`; `baton.json` supports only `worktree.sharedDirectories`; none | Defer until a current upstream capability or user request exists | Decision owner: Baton maintainer. Do not add a multi-repository model speculatively. | Deferred |
+| Commit, push, and open a PR from a normal thread | T3: `apps/server/src/git/GitWorkflowService.ts`; Orca: `src/renderer/src/components/right-sidebar/source-control/commit/use-commit-flows.ts`, `src/main/github/client/create/create-github-pull-request.ts` | Partial | `src/orchestrate.rs` `open_prs_with_gh` commits worker branches, runs `git push -u`, and calls `gh pr create`; no normal-thread git command; none | Normal threads need the same finish path as workers. | Add `/git commit` for the current thread worktree with a generated message. `/git push` and `/git pr` are separate follow-ups. | D14 |
 | PR checks, review, merge, and multiple forges | T3: `apps/server/src/sourceControl/SourceControlProviderRegistry.ts`; Orca: `src/main/github/client/check/get-pr-checks.ts` | Missing | `src/orchestrate.rs` only creates GitHub PRs; no checks, review, or merge path; none | Start with GitHub and `gh`. | Add `/git checks` backed by `gh pr checks`. | D14 |
 | Diff review and navigation | T3: `apps/web/src/components/DiffPanel.tsx`; Orca: `src/renderer/src/components/diff-comments/DiffCommentCard.tsx` | Partial | `src/tui/mod.rs` `/review`, `/diff`; `src/store.rs` review notes; review tests; unit | Add sources and search without replacing the existing review overlay. | Add `/` search inside the current review rows. | D10 |
 | Checkpoint restore safety | T3: `apps/server/src/orchestration-v2/CheckpointRestoreSafety.ts`, `apps/server/src/orchestration-v2/CheckpointRollbackService.ts` | Partial | `src/checkpoints.rs`; `tests/harness.rs` checkpoint and diff tests; unit | Restore must refuse shared concurrent work rather than guess. | Add a pre-restore cleanliness and worktree-ownership check. | D15 |
@@ -158,7 +159,7 @@ Rules the evidence column obeys:
 
 | Capability | Upstream evidence | Baton status | Baton evidence and proof surface | Terminal decision | First slice | Plan |
 |---|---|---|---|---|---|---|
-| Startup performance | T3: `docs/operations/development.md`, `scripts/profile-startup.mjs` | Partial | `baton bench startup --json` times config validation, store open, orphan reap, and hydrate per run, plus process time from `main` entry; `scripts/bench.py` records p50 and p95 and fails above 10 percent of a recorded baseline; `tests/cli_bench.rs`; unit | Enforce warm p50 under 250 ms and p95 under 500 ms | Debug baseline 16.1 ms process start p50 and 0.63 ms in-process; release 18.6 ms process start and 0.33 ms in-process, so startup is exec-bound rather than compute-bound. Remaining: RSS, and wiring the gate into CI once billing clears. | D5 |
+| Startup performance | T3: `docs/operations/development.md`, `scripts/profile-startup.mjs` | Partial | `baton bench startup --json` times config validation, store open, orphan reap, and hydrate per run, plus process time from `main` entry; `scripts/bench.py` records p50 and p95 and fails above 10 percent of a recorded baseline; `tests/cli_bench.rs`; unit | Enforce warm p50 under 250 ms and p95 under 500 ms | Debug baseline 16.1 ms process start p50 and 0.63 ms in-process; release 18.6 ms process start and 0.33 ms in-process, so startup is exec-bound rather than compute-bound. Remaining: RSS, and adding the benchmark gate to the CI job that owns it. | D5 |
 | Input and render latency | Orca: `src/renderer/src/diagnostics/typing-latency/diagnostic.ts`, `src/renderer/src/diagnostics/typing-latency/renderer-long-tasks.ts` | Partial | `scripts/typing_probe.py` types into the real TUI through a PTY and measures keystroke-to-quiet, and its `--slash` mode measures `/` to the suggestion list; both have recorded baselines and a 10 percent gate; typing 10.7 ms p50, slash 3.1 ms p50 on Darwin arm64 debug; local bench | Enforce keystroke-to-render p95 under 50 ms | Keystroke-to-quiet, `/` completion, and release-build baselines are recorded, and CI is live, so the wiring is next. Remaining: RSS, and enforcing the baselines in CI rather than by hand. | D5 |
 | Memory and process bounds | T3: `docs/internals/resource-telemetry.md`, `apps/server/src/diagnostics/ProcessResourceMonitor.ts` | Partial | `scripts/rss_probe.py` samples the real TUI's resident set at idle and while driving the slash list, typing, and interrupts, then requires a clean exit; measured idle 18.3 MB and load peak 18.4 MB on Darwin arm64 debug, against the 200 MB budget; local bench | Bound idle RSS under 200 MB and bound the adapter process count in the benchmark fixture | Idle and load RSS are recorded. Remaining: sample during a provider turn, which needs a live provider, and assert the process count after quit. | D5 |
 | Shell completion | T3: `apps/server/src/cli/install.ts`, `apps/server/src/cli/install.test.ts` | Equivalent | `src/cli.rs` `Completions`; `src/main.rs` generates from `Cli::command`; `completions_accept_every_supported_shell`; unit | Generate from the clap command graph. | None. | D17 |
@@ -284,13 +285,9 @@ Release 1 is the smallest set that makes the terminal core trustworthy: correct 
 |---|---|
 | D1, D2, D3a, D3b, D3c, D9a, D6, D7, D4a, D4d, D4b, D4e, D4c, D5 | D8a, D8, D10 to D17, D18a, D18b, D18, D19 to D24 |
 
-Work in progress, capped at four slices. A fifth slice waits even if it is ready.
+No implementation slice is currently in progress. The four-slice cap applies when a new implementation starts.
 
-| Slice | State | Done when |
-|---|---|---|
-| D3c | #90, open | Billing cleared, then one PR run with every job executed and `verify` green, and one green `main` push run |
-
-Merged, with the acceptance each one met:
+Merged slices:
 
 | Slice | PR | Acceptance |
 |---|---|---|
@@ -303,7 +300,6 @@ Merged, with the acceptance each one met:
 | D5 start | #93 | Startup phases with a recorded baseline |
 | D6 start | #94 | Turn-end bell with a limiter and a config flag |
 | D7 | #95 | Queue send, edit, move, clear, with durable order |
-| D5 typing | #96 | Keystroke-to-quiet with a recorded baseline |
 | D4d | #97 | Covered-turn marker, delta filter, resume intro, three tests |
 | D5 typing | #96 | Keystroke-to-quiet with a recorded baseline |
 | D4b | #98 | Handoff redaction of configured keys |
@@ -313,9 +309,9 @@ Merged, with the acceptance each one met:
 | D4c | #102 | Handoff preview, no-handoff, and confirmation |
 | CI 1C | #90 | Workflow on main; first green PR and push runs |
 
-D3c is billing-blocked: run 44969473815 scheduled every job and failed in 2 seconds on an account-billing message, so no step ran. Release 1 has one dependency outside the repository until that clears.
+D3c closed on 2026-11-22. Run 44982816103 executed every PR job with `verify` green, and run 44983114852 is the first green `main` push. The earlier billing-blocked run 44969473815 is historical. D3c no longer blocks Release 1; branch protection and the D2 two-clean-round acceptance remain open.
 
-Starting a new slice is fine while D3c waits; the cap applies to review-ready work, and there is none.
+Starting a new slice is fine because no release gate is waiting on an external dependency.
 
 ## Delivery order
 
@@ -364,6 +360,31 @@ Deferred rows: agent hibernation, guest access, themes and plugin host, voice, a
 
 Every new slash command introduced by D6 to D24 must ship its argument choices or a usage hint in the same slice. The completion contract is defined in PR #86 and enforced by the `every_argument_command_has_choices_or_a_usage_hint` test.
 
+## Next slice: keyboard pin reorder
+
+Problem: `/pin move` makes manual order durable, but reordering still requires remembering and typing a thread ID plus a direction. The picker already has the target selected, so the next order change should happen where the user is looking.
+
+Goals: in the `/pin` picker, `Ctrl+Up` and `Ctrl+Down` move the selected pinned thread by one adjacent pinned thread, refresh the picker without closing it, keep the moved row selected, and show the existing moved or boundary notice. Unpinned rows use the existing `pin <title> before moving it` notice. The final pin-picker heading is `pin · ctrl+↑/↓ move · enter toggle · esc close` so the shortcut is discoverable. Plain Up and Down continue to move the selection. Non-goals: drag and drop, changing slash syntax, cross-project moves, or a new persistent order model.
+
+Architecture: add `KeyModifiers::CONTROL` arms for `KeyCode::Up` and `KeyCode::Down` inside `Overlay::ThreadPicker` when `ThreadPickerAction::Pin`. The arms call the existing transactional `move_thread_pin` for the selected full ID and explicitly rebuild the same `ThreadPicker` overlay for every result: `Moved` reloads choices and selects the moved row; `AlreadyFirst`, `AlreadyLast`, unpinned, `NotFound`, and store-error results restore the unchanged choices, preserve the selected row, and update the notice. The picker never closes for any result. The slash-command path keeps its existing notice-only behavior when no picker is open. The store remains the only owner of order.
+
+Acceptance tests:
+- `pin_picker_ctrl_arrows_reorder_without_closing`: both directions, selected row follows, picker remains open, and durable order changes.
+- `pin_picker_ctrl_arrows_report_boundaries_and_unpinned`: first, last, unpinned, and injected-error notices with no key changes, the picker remains open, and the selected row stays unchanged.
+- Add a render assertion for the exact new heading, update all three existing probe heading checks, then extend `slash_probe.py` after the boundary proof: reopen `/pin`, send the exact `Ctrl+Down` bytes `b"\x1b[1;5B"`, require the moved notice, `pin · ctrl+↑/↓ move · enter toggle · esc close`, the selected full ID from the cursor row, and the full two-row ID order, then send Esc and `/quit`.
+
+Files: `src/tui/mod.rs`, `tests/core.rs` only if a store assertion is needed, `README.md`, `docs/parity.md`, `.agents/skills/verify-baton/features/pin.md`, `.agents/skills/verify-baton/features/slash-commands.md`, and `.agents/skills/verify-baton/scripts/slash_probe.py`.
+
+Alternatives considered: a separate `/pin up` command adds another memorized form; picker letter shortcuts are harder to discover than chorded arrows; drag and drop has no honest terminal model. Bound `Ctrl+Up` and `Ctrl+Down` to the selected row instead.
+
+Risks and mitigations: a stale picker could move the wrong row, so the handler carries the full ID and the store re-resolves the current order in its immediate transaction; a boundary or unpinned result must not repaint stale keys, so the handler restores the unchanged picker and reloads only after `Moved`; terminal key mapping varies, so the PTY probe exercises the exact escape sequence and unit tests cover the crossterm key shape.
+
+## Deferred: durable thread archive
+
+Status: Design decision. Decision owner: Baton maintainer. Archive implementation is not authorized yet.
+
+Durable thread archive must not land before a thread-scoped operation claim or lease covers native and transcript fork, native and transcript rewind, checkpoint restore, resume, worktree creation, `exec -t`, queue changes, and turn start. It also needs a strict target-thread work query rather than the best-effort inbox aggregate, a canonical project-path column for list queries, and a feature spec covering visibility, unarchive, idempotence, archived pins, queues, turns, and claim scope. The acceptance condition for starting the slice is a reviewed spec and a passing operation-claim formal gate.
+
 ## Sync procedure
 
 1. Fetch `origin/main` in `/Users/billy/Documents/t3code` and `/Users/billy/Documents/orca` without changing their working trees.
@@ -380,10 +401,10 @@ Every new slash command introduced by D6 to D24 must ship its argument choices o
 
 | Field | Value |
 |---|---|
-| EGM round | Round 6 findings addressed; Round 7 reviewed the basic pin slice and its proof |
-| Reviewers | Round 1 (parity and CI): `codebase_details`, `design_critic`, `comprehension`, `implementation_readiness`. Round 2: `design_critic` on parity, `implementation_readiness` and `design_critic` on CI, plus a parity `codebase_details` retry that returned no report and was rerun in Round 3. Round 3: `codebase_details` and `design_critic` on parity; `implementation_readiness` and `design_critic` on CI. Round 7: `design_critic` and `structural` on the pin row, README, feature file, and tests. |
-| Targets | `docs/parity.md`, `docs/ci.md`, `docs/ci-acceptance.md`, `ci/**`, `.github/workflows/ci.yml`; Round 7 also reviewed `README.md`, `.agents/skills/verify-baton/features/pin.md`, and `.agents/skills/verify-baton/scripts/slash_probe.py` |
+| EGM round | Manual-pin review R1 through R5 reached the five-round cap. All Blocker and Major findings in the delivered slice were fixed. Open next-slice concerns are recorded here and in the report. |
+| Reviewers | Round 1 through Round 3 reviewed parity and CI with `codebase_details`, `design_critic`, `comprehension`, and `implementation_readiness`. Round 7 reviewed the basic pin slice. Manual-pin R1 through R5 used fresh `design_critic` and `structural` pairs on the pin ledger, feature docs, PTY proof, archive deferral, and keyboard-reorder plan. |
+| Targets | `docs/parity.md`, `docs/ci.md`, `docs/ci-acceptance.md`, `ci/**`, `.github/workflows/ci.yml`; Manual-pin R1 through R5 also reviewed `README.md`, `.agents/skills/verify-baton/features/pin.md`, `.agents/skills/verify-baton/features/slash-commands.md`, `.agents/skills/verify-baton/features/README.md`, `.agents/skills/verify-baton/scripts/slash_probe.py`, `src/store.rs`, `src/tui/mod.rs`, `src/main.rs`, `src/status.rs`, `src/inbox.rs`, `src/mcp.rs`, and `tests/core.rs`, and the archive deferral and next-slice plan |
 | Findings report | `local_docs/goldfish_review_report.md`, which is gitignored. Durable conclusions live in this table and in the documents themselves. |
-| Accepted fixes | Baton evidence column and proof rubric; problem, goals, non-goals, alternatives, and risks; Release 1 boundary and the four-slice in-flight cap; corrected statuses for multiple accounts, task dependencies, attention inbox, worker mailbox, and the three performance rows; provider identity prerequisite (D8a) ahead of PTY, ACP, and Pi; sanitizer (D9a) ahead of BEL and PTY; egress and redaction ahead of cross-provider send; audit schema and hook-execution ADR as prerequisites; single scheduler owner; handoff defects recorded as the first slice; CI Phase 1A/1B/1C split; base-owned tools on every event; no PR-level CI override; gate-integrity suppression checks; test inventory floor; unbudgeted-command rule; provisional budgets with a shrink-only rule; basic pin display order separated from semantic resolution; scrolling full-ID pin picker; restart, CLI JSON, and default-target regressions |
-| Rejected fixes | A `ci-change` label that permits command changes (a label is a blanket bypass, so CI changes use the owner-only `ci-repair` path); a fake merge queue; a paid runner before measurement; a second project config file for hooks and actions |
-| Open escalated items | Official merge queue needs an organization on GitHub Enterprise Cloud; private-repository Actions minutes and rate are unconfirmed; branch protection is not yet configured |
+| Accepted fixes | Baton evidence column and proof rubric; problem, goals, non-goals, alternatives, and risks; Release 1 boundary and the four-slice in-flight cap; corrected statuses for multiple accounts, task dependencies, attention inbox, worker mailbox, and the three performance rows; provider identity prerequisite (D8a) ahead of PTY, ACP, and Pi; sanitizer (D9a) ahead of BEL and PTY; egress and redaction ahead of cross-provider send; audit schema and hook-execution ADR as prerequisites; single scheduler owner; handoff defects recorded as the first slice; CI Phase 1A/1B/1C split; base-owned tools on every event; no PR-level CI override; gate-integrity suppression checks; test inventory floor; unbudgeted-command rule; provisional budgets with a shrink-only rule; basic pin display order separated from semantic resolution; scrolling full-ID pin picker; restart, CLI JSON, and default-target regressions; canonical microsecond pin keys with sub-microsecond truncation; indexed no-repair probe plus immediate backfill; immediate pin and move transactions with affected-row checks; deterministic malformed-timestamp repair; two-connection move serialization; batched latest-turn status reads; symlink and canonical path merging; single-cursor picker text; exact move completions and project scoping; a real PTY reorder plus boundary proof; `/help` and `/exit` completion coverage; the keyboard pin reorder next slice; archive deferred until thread-operation claims, strict work queries, and canonical path storage exist; CI proof surface clarified as path-selected on PRs and full on merge-group and main; branch protection still pending |
+| Rejected fixes | A `ci-change` label that permits command changes (a label is a blanket bypass, so CI changes use the owner-only `ci-repair` path); a fake merge queue; a paid runner before measurement; a second project config file for hooks and actions; an archive implementation plan that predates thread-operation claims and a strict work query |
+| Open escalated items | Official merge queue needs an organization on GitHub Enterprise Cloud; branch protection is not yet configured; the D2 two-clean-round acceptance remains open; archive waits on the operation-claim prerequisite and a reviewed spec. |

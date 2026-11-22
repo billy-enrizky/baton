@@ -17,7 +17,7 @@ use crate::handoff::git_branch_label;
 use crate::inbox::{self, InboxItem};
 use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
-use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
+use crate::store::{BatonStore, MessageRow, NewThread, PinMoveOutcome, ThreadRow};
 use crate::sync;
 use crate::types::{
     normalize_reasoning_effort, ApprovalDecision, PermissionMode, ProviderId, SessionMode,
@@ -71,6 +71,7 @@ const LOGO_ROWS: [&str; 6] = [
 ];
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
+    ("/help", "show common paths or every command"),
     (
         "/switch",
         "switch to a single harness: /switch <provider> [model]",
@@ -92,10 +93,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "fork this conversation into an isolated git worktree",
     ),
     ("/threads", "list threads in this directory"),
-    (
-        "/pin",
-        "pin or unpin a thread; Enter toggles the selected thread",
-    ),
+    ("/pin", "pin, unpin, or move a pinned thread"),
     ("/inbox", "all threads that need attention"),
     ("/open", "open a thread by id prefix"),
     ("/usage", "token usage and cache hit rate"),
@@ -139,6 +137,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/copy", "copy the latest assistant reply to the clipboard"),
     ("/clear", "clear panels and notices"),
     ("/quit", "exit baton"),
+    ("/exit", "exit baton; alias for /quit"),
 ];
 
 const EFFORT_VALUES: [&str; 6] = ["default", "low", "medium", "high", "xhigh", "max"];
@@ -160,7 +159,7 @@ Common
   /model                      choose a model
   /new                        start a new thread
   /threads                    list threads here
-  /pin                        pin or unpin a thread
+  /pin                        pin or unpin; /pin move <id> up or down
   /inbox                      failed, unverified, needs-input, or queued work
   /status                     what is happening now
   /activity                   every turn, tool call, diff, and usage
@@ -201,13 +200,8 @@ struct ThreadChoice {
     pinned: bool,
 }
 
-fn thread_choice(store: &BatonStore, thread: ThreadRow) -> ThreadChoice {
-    let status = store
-        .list_turn_records(&thread.id)
-        .ok()
-        .map(|turns| short_thread_status(turns.last().map(|turn| turn.phase)))
-        .unwrap_or("new")
-        .to_string();
+fn thread_choice(thread: ThreadRow, latest_phase: Option<TurnPhase>) -> ThreadChoice {
+    let status = short_thread_status(latest_phase).to_string();
     ThreadChoice {
         full_id: thread.id,
         title: thread.title,
@@ -218,21 +212,37 @@ fn thread_choice(store: &BatonStore, thread: ThreadRow) -> ThreadChoice {
 
 fn project_thread_choices(state: &TuiState, store: &Arc<Mutex<BatonStore>>) -> Vec<ThreadChoice> {
     let guard = store.lock().unwrap();
-    guard
+    let threads = guard
         .list_threads_for_path_display(std::path::Path::new(&state.thread.cwd))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let ids = threads
+        .iter()
+        .map(|thread| thread.id.clone())
+        .collect::<Vec<_>>();
+    let phases = guard.latest_turn_phases(&ids).unwrap_or_default();
+    threads
         .into_iter()
-        .map(|thread| thread_choice(&guard, thread))
+        .map(|thread| {
+            let phase = phases.get(&thread.id).copied();
+            thread_choice(thread, phase)
+        })
         .collect()
 }
 
 fn all_thread_choices(store: &Arc<Mutex<BatonStore>>) -> Vec<ThreadChoice> {
     let guard = store.lock().unwrap();
-    guard
-        .list_threads_display(None)
-        .unwrap_or_default()
+    let threads = guard.list_threads_display(None).unwrap_or_default();
+    let ids = threads
+        .iter()
+        .map(|thread| thread.id.clone())
+        .collect::<Vec<_>>();
+    let phases = guard.latest_turn_phases(&ids).unwrap_or_default();
+    threads
         .into_iter()
-        .map(|thread| thread_choice(&guard, thread))
+        .map(|thread| {
+            let phase = phases.get(&thread.id).copied();
+            thread_choice(thread, phase)
+        })
         .collect()
 }
 
@@ -2183,6 +2193,9 @@ fn compute_suggestions(state: &TuiState) -> Vec<CommandSuggestion> {
         let prefix = prefix.trim_end();
         let mut suggestions = argument_suggestions(state, command);
         suggestions.retain(|suggestion| suggestion.insert.starts_with(prefix));
+        if prefix != command {
+            suggestions.retain(|suggestion| suggestion.insert != prefix);
+        }
         return suggestions;
     }
     SLASH_COMMANDS
@@ -2248,6 +2261,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/fork", _) => Some("fork [--turn N] [title]"),
         ("/worktree", _) => Some("worktree [title]"),
         ("/open", _) => Some("open <thread id prefix>"),
+        ("/pin", "move") => Some("pin move <id> up or down"),
         ("/review", _) => Some("review [turn]"),
         ("/diff", _) => Some("diff [turn]"),
         ("/rewind", _) => Some("rewind [--native]"),
@@ -2568,7 +2582,13 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 .unwrap()
                 .list_threads_for_path_display(std::path::Path::new(&state.thread.cwd))
                 .unwrap_or_default();
-            for thread in threads {
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "move",
+                "move a pinned thread up or down",
+            );
+            for thread in &threads {
                 let id = thread.id[..8.min(thread.id.len())].to_string();
                 let action = if thread.pinned { "unpin" } else { "pin" };
                 push_suggestion(
@@ -2578,10 +2598,45 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                     format!("{action} {}", thread.title),
                 );
             }
+            for thread in threads.iter().filter(|thread| thread.pinned) {
+                let id = thread.id[..8.min(thread.id.len())].to_string();
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &format!("move {id} up"),
+                    format!("move {} up", thread.title),
+                );
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &format!("move {id} down"),
+                    format!("move {} down", thread.title),
+                );
+            }
         }
         _ => {}
     }
     suggestions
+}
+
+fn resolve_project_thread(
+    store: &BatonStore,
+    cwd: &str,
+    thread_id: &str,
+) -> std::result::Result<ThreadRow, String> {
+    let matches = store
+        .list_threads_for_path(std::path::Path::new(cwd))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|thread| thread.id == thread_id || thread.id.starts_with(thread_id))
+        .collect::<Vec<_>>();
+    match matches.len() {
+        0 => Err(format!("no thread in this project matches \"{thread_id}\"")),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        count => Err(format!(
+            "\"{thread_id}\" matches {count} threads; use more characters"
+        )),
+    }
 }
 
 fn toggle_thread_pin_by_id(
@@ -2589,43 +2644,103 @@ fn toggle_thread_pin_by_id(
     store: &Arc<Mutex<BatonStore>>,
     thread_id: &str,
 ) -> Option<bool> {
-    let updated = {
+    let thread = {
         let guard = store.lock().unwrap();
-        let matches = guard
-            .list_threads_for_path(std::path::Path::new(&state.thread.cwd))
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|thread| thread.id == thread_id || thread.id.starts_with(thread_id))
-            .collect::<Vec<_>>();
-        let thread = match matches.len() {
-            0 => {
-                state.notice = Some(format!("no thread in this project matches \"{thread_id}\""));
+        match resolve_project_thread(&guard, &state.thread.cwd, thread_id) {
+            Ok(thread) => thread,
+            Err(notice) => {
+                state.notice = Some(notice);
                 return None;
             }
-            1 => matches.into_iter().next().unwrap(),
-            count => {
-                state.notice = Some(format!(
-                    "\"{thread_id}\" matches {count} threads; use more characters"
-                ));
-                return None;
-            }
-        };
-        let pinned = !thread.pinned;
-        if let Err(error) = guard.set_thread_pinned(&thread.id, pinned) {
-            state.notice = Some(format!("cannot update pin: {error}"));
-            return None;
         }
-        (thread.id, thread.title, pinned)
     };
-    let (full_id, title, pinned) = updated;
-    if state.thread.id == full_id {
+    let pinned = !thread.pinned;
+    if let Err(error) = store.lock().unwrap().set_thread_pinned(&thread.id, pinned) {
+        state.notice = Some(format!("cannot update pin: {error}"));
+        return None;
+    }
+    if state.thread.id == thread.id {
         state.thread.pinned = pinned;
     }
     state.notice = Some(format!(
-        "{} {title}",
-        if pinned { "pinned" } else { "unpinned" }
+        "{} {}",
+        if pinned { "pinned" } else { "unpinned" },
+        thread.title
     ));
     Some(pinned)
+}
+
+fn move_pinned_thread(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    thread_id: &str,
+    direction: &str,
+) -> Option<()> {
+    let up = match direction.to_ascii_lowercase().as_str() {
+        "up" => true,
+        "down" => false,
+        _ => {
+            state.notice = Some("use /pin move <id> up or down".into());
+            return None;
+        }
+    };
+    let thread = {
+        let guard = store.lock().unwrap();
+        match resolve_project_thread(&guard, &state.thread.cwd, thread_id) {
+            Ok(thread) => thread,
+            Err(notice) => {
+                state.notice = Some(notice);
+                return None;
+            }
+        }
+    };
+    let outcome = store.lock().unwrap().move_thread_pin(
+        &thread.id,
+        std::path::Path::new(&state.thread.cwd),
+        up,
+    );
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.notice = Some(format!("cannot move pin: {error}"));
+            return None;
+        }
+    };
+    match outcome {
+        PinMoveOutcome::Moved => {}
+        PinMoveOutcome::NotPinned => {
+            state.notice = Some(format!("pin {} before moving it", thread.title));
+            return None;
+        }
+        PinMoveOutcome::AlreadyFirst | PinMoveOutcome::AlreadyLast => {
+            state.notice = Some(format!(
+                "{} is already {} among pinned threads",
+                thread.title,
+                if up { "first" } else { "last" }
+            ));
+            return None;
+        }
+        PinMoveOutcome::NotFound => {
+            state.notice = Some(format!("cannot find thread {}", thread.title));
+            return None;
+        }
+    }
+    let threads = project_thread_choices(state, store);
+    let selected = threads
+        .iter()
+        .position(|choice| choice.full_id == thread.id)
+        .unwrap_or(0);
+    state.overlay = Overlay::ThreadPicker {
+        selected,
+        threads,
+        action: ThreadPickerAction::Pin,
+    };
+    state.notice = Some(format!(
+        "moved {} {}",
+        thread.title,
+        if up { "up" } else { "down" }
+    ));
+    Some(())
 }
 
 fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread_id: &str) {
@@ -5867,7 +5982,13 @@ fn handle_command(
             }
         }
         "/pin" => {
-            if let Some(prefix) = args.first() {
+            if args.first().is_some_and(|arg| arg == "move") {
+                if args.len() < 3 {
+                    state.notice = Some("use /pin move <id> up or down".into());
+                } else {
+                    move_pinned_thread(state, store, &args[1], &args[2]);
+                }
+            } else if let Some(prefix) = args.first() {
                 toggle_thread_pin_by_id(state, store, prefix);
             } else {
                 let threads = project_thread_choices(state, store);
@@ -7709,10 +7830,11 @@ fn draw_thread_picker(
             Style::default().fg(COLORS.muted)
         };
         let pinned = if choice.pinned { "  pinned" } else { "" };
+        let cursor = if index == selected { "❯" } else { " " };
         lines.push(Line::styled(
             format!(
-                "❯ {}  {}  [{}]{}",
-                choice.full_id, choice.title, choice.status, pinned
+                "{cursor} {}  {}  [{}]{}",
+                choice.full_id, choice.title, choice.status, pinned,
             ),
             style,
         ));
@@ -12849,6 +12971,249 @@ mod tests {
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(text.contains("thread 9"), "{text}");
         assert!(!text.contains("thread 1  "), "{text}");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+    }
+
+    #[test]
+    fn pin_move_reorders_and_refreshes_the_picker() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let mut threads = Vec::new();
+        for title in ["first", "second", "third"] {
+            let thread = store
+                .lock()
+                .unwrap()
+                .create_thread(NewThread {
+                    title: title.to_string(),
+                    cwd: state.thread.cwd.clone(),
+                    current_provider: ProviderId::Codex,
+                    current_model: None,
+                })
+                .unwrap();
+            store
+                .lock()
+                .unwrap()
+                .set_thread_pinned(&thread.id, true)
+                .unwrap();
+            threads.push(thread);
+        }
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            &format!("/pin move {} up", &threads[1].id[..8]),
+        );
+        let display = store
+            .lock()
+            .unwrap()
+            .list_threads_for_path_display(std::path::Path::new(&state.thread.cwd))
+            .unwrap()
+            .into_iter()
+            .filter(|thread| thread.pinned)
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            display,
+            vec![
+                threads[1].id.clone(),
+                threads[2].id.clone(),
+                threads[0].id.clone()
+            ]
+        );
+        let Overlay::ThreadPicker {
+            selected,
+            threads: picker,
+            action,
+        } = &state.overlay
+        else {
+            panic!("expected the refreshed pin picker");
+        };
+        assert_eq!(*action, ThreadPickerAction::Pin);
+        assert_eq!(*selected, 0);
+        assert_eq!(picker[0].full_id, threads[1].id);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("moved second up")),
+            "{:?}",
+            state.notice
+        );
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            &format!("/pin move {} down", &threads[1].id[..8]),
+        );
+        let display = store
+            .lock()
+            .unwrap()
+            .list_threads_for_path_display(std::path::Path::new(&state.thread.cwd))
+            .unwrap()
+            .into_iter()
+            .filter(|thread| thread.pinned)
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            display,
+            vec![
+                threads[2].id.clone(),
+                threads[1].id.clone(),
+                threads[0].id.clone()
+            ]
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("moved second down")),
+            "{:?}",
+            state.notice
+        );
+
+        let foreign = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "foreign".to_string(),
+                cwd: format!("{}-other", state.thread.cwd),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_thread_pinned(&foreign.id, true)
+            .unwrap();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            &format!("/pin move {} up", &threads[2].id[..8]),
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("already first")),
+            "{:?}",
+            state.notice
+        );
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            &format!("/pin move {} down", &threads[0].id[..8]),
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("already last")),
+            "{:?}",
+            state.notice
+        );
+
+        let unpinned = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "unpinned".to_string(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            &format!("/pin move {} down", &unpinned.id[..8]),
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("pin unpinned before moving")),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn pin_move_choices_are_exposed() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "pinned".to_string(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_thread_pinned(&thread.id, true)
+            .unwrap();
+        let unpinned = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "unpinned".to_string(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let foreign = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "foreign".to_string(),
+                cwd: "/tmp/foreign-pin-choices".to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_thread_pinned(&foreign.id, true)
+            .unwrap();
+        state.input = "/pin move ".to_string();
+        let mut moves = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .filter(|suggestion| suggestion.starts_with("/pin move "))
+            .collect::<Vec<_>>();
+        moves.sort();
+        let prefix = &thread.id[..8];
+        assert_eq!(
+            moves,
+            vec![
+                format!("/pin move {prefix} down"),
+                format!("/pin move {prefix} up")
+            ]
+        );
+        let all = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .collect::<Vec<_>>();
+        assert!(!all.iter().any(|choice| choice == "/pin move"));
+        assert!(!all.iter().any(|choice| choice.contains(&unpinned.id[..8])));
+        assert!(!all.iter().any(|choice| choice.contains(&foreign.id[..8])));
     }
 
     #[test]
@@ -13337,6 +13702,14 @@ mod tests {
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        state.input = "/".to_string();
+        let commands = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .collect::<Vec<_>>();
+        assert!(commands.contains(&"/help".to_string()), "{commands:?}");
+        assert!(commands.contains(&"/exit".to_string()), "{commands:?}");
 
         handle_command(&mut state, &store, &engine_command_sender, "/help");
         let text = state.notice.as_deref().unwrap_or("");

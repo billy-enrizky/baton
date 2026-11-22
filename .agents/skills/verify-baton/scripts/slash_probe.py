@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import pty
+import re
 import signal
 import sys
 import tempfile
@@ -116,6 +117,70 @@ def main() -> int:
         if "New thread  [new]  pinned" not in pin_result:
             missing.append("pinned picker row")
         (evidence / "pin-result-screen.txt").write_text(pin_result + "\n")
+
+        first_thread = re.search(
+            r"❯ ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})  New thread",
+            pin_result,
+        )
+        if first_thread is None:
+            missing.append("pinned thread id")
+        else:
+            first_id = first_thread.group(1)
+            os.write(master, b"\x1b")
+            pump(master, 0.2, transcript)
+            os.write(master, b"/new\r")
+            pump(master, 1.0, transcript)
+            os.write(master, b"/model\r")
+            pump(master, 1.5, transcript)
+            os.write(master, b"\x1b")
+            pump(master, 0.2, transcript)
+
+            os.write(master, b"/pin\r")
+            pump(master, 1.5, transcript)
+            os.write(master, b"\x1b[B")
+            pump(master, 0.2, transcript)
+            os.write(master, b"\r")
+            pump(master, 1.0, transcript)
+            second_result = screen_text(transcript, args.width, args.height)
+            if "pin · enter toggle · esc close" not in second_result:
+                missing.append("second pin picker")
+            if second_result.count("  pinned") < 2:
+                missing.append("second pinned row")
+            second_thread = re.search(
+                r"❯ ([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})  New thread",
+                second_result,
+            )
+            if second_thread is None:
+                missing.append("second pinned thread id")
+            else:
+                second_id = second_thread.group(1)
+                os.write(master, b"\x1b")
+                pump(master, 0.2, transcript)
+                os.write(master, f"/pin move {second_id} down\r".encode())
+                pump(master, 1.0, transcript)
+                pin_move = screen_text(transcript, args.width, args.height)
+                if "moved New thread down" not in pin_move:
+                    missing.append("pin move notice")
+                if "pin · enter toggle · esc close" not in pin_move:
+                    missing.append("refreshed pin picker")
+                order = re.findall(
+                    r"(?:❯| )([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})  New thread",
+                    pin_move,
+                )
+                if order[:2] != [first_id, second_id]:
+                    missing.append("pin move order")
+                (evidence / "pin-move-screen.txt").write_text(pin_move + "\n")
+
+                os.write(master, b"\x1b")
+                pump(master, 0.2, transcript)
+                os.write(master, f"/pin move {second_id} down\r".encode())
+                pump(master, 1.0, transcript)
+                pin_boundary = screen_text(transcript, args.width, args.height)
+                if "already last among pinned threads" not in pin_boundary:
+                    missing.append("pin move boundary notice")
+                (evidence / "pin-boundary-screen.txt").write_text(
+                    pin_boundary + "\n"
+                )
 
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)

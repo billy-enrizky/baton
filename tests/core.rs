@@ -1,5 +1,5 @@
 use baton::handoff::{build_handoff, handoff_prompt, wrap_prompt_with_handoff, HandoffMessage};
-use baton::store::{BatonStore, ImportedMessage, NewThread};
+use baton::store::{BatonStore, ImportedMessage, NewThread, PinMoveOutcome};
 use baton::types::{PermissionMode, ProviderId, SessionMode, TurnPhase, TurnUsage};
 use baton::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 use baton::scanner::{parse_claude_transcript, parse_codex_transcript};
@@ -391,6 +391,190 @@ fn thread_pins_persist_and_sort_before_recent_threads() {
 }
 
 #[test]
+fn pin_order_keys_sort_and_can_be_swapped() {
+    let store = BatonStore::memory().unwrap();
+    let mut ids = Vec::new();
+    for title in ["first", "second", "third"] {
+        ids.push(
+            store
+                .create_thread(NewThread {
+                    title: title.to_string(),
+                    cwd: "/tmp/pin-order".to_string(),
+                    current_provider: ProviderId::Claude,
+                    current_model: None,
+                })
+                .unwrap()
+                .id,
+        );
+    }
+    for id in &ids {
+        store.set_thread_pinned(id, true).unwrap();
+    }
+    let display = store
+        .list_threads_for_path_display(std::path::Path::new("/tmp/pin-order"))
+        .unwrap();
+    assert_eq!(
+        display
+            .iter()
+            .map(|thread| thread.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![ids[2].as_str(), ids[1].as_str(), ids[0].as_str()]
+    );
+    assert!(display.iter().all(|thread| thread.pin_order_key.is_some()));
+
+    assert_eq!(
+        store
+            .move_thread_pin(&ids[1], std::path::Path::new("/tmp/pin-order"), true)
+            .unwrap(),
+        PinMoveOutcome::Moved
+    );
+    let display = store
+        .list_threads_for_path_display(std::path::Path::new("/tmp/pin-order"))
+        .unwrap();
+    assert_eq!(
+        display
+            .iter()
+            .map(|thread| thread.id.as_str())
+            .collect::<Vec<_>>(),
+        vec![ids[1].as_str(), ids[2].as_str(), ids[0].as_str()]
+    );
+
+    store.set_thread_pinned(&ids[1], false).unwrap();
+    assert!(store
+        .get_thread(&ids[1])
+        .unwrap()
+        .unwrap()
+        .pin_order_key
+        .is_none());
+}
+
+#[test]
+fn pin_order_key_backfills_on_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("baton.sqlite");
+    let (first_id, second_id, third_id);
+    {
+        let store = BatonStore::open(&path).unwrap();
+        let first = store
+            .create_thread(NewThread {
+                title: "first".to_string(),
+                cwd: "/tmp/pin-backfill".to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        let second = store
+            .create_thread(NewThread {
+                title: "second".to_string(),
+                cwd: "/tmp/pin-backfill".to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        let third = store
+            .create_thread(NewThread {
+                title: "third".to_string(),
+                cwd: "/tmp/pin-backfill".to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        store.set_thread_pinned(&first.id, true).unwrap();
+        store.set_thread_pinned(&second.id, true).unwrap();
+        store.set_thread_pinned(&third.id, true).unwrap();
+        first_id = first.id;
+        second_id = second.id;
+        third_id = third.id;
+    }
+    {
+        let raw = rusqlite::Connection::open(&path).unwrap();
+        raw.execute(
+            "UPDATE threads SET pin_order_key = NULL, updated_at = '2026-01-02T03:04:05.006000999Z' WHERE id = ?",
+            rusqlite::params![first_id],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE threads SET pin_order_key = NULL, updated_at = 'not-a-date' WHERE id = ?",
+            rusqlite::params![second_id],
+        )
+        .unwrap();
+        raw.execute(
+            "UPDATE threads SET pin_order_key = '2026-01-02T03:04:05.006000Z', updated_at = '2000-01-02T03:04:05.006Z' WHERE id = ?",
+            rusqlite::params![third_id],
+        )
+        .unwrap();
+    }
+    let store = BatonStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .get_thread(&first_id)
+            .unwrap()
+            .unwrap()
+            .pin_order_key
+            .as_deref(),
+        Some("2026-01-02T03:04:05.006001Z")
+    );
+    assert_eq!(
+        store
+            .get_thread(&second_id)
+            .unwrap()
+            .unwrap()
+            .pin_order_key
+            .as_deref(),
+        Some("2026-01-02T03:04:05.006002Z")
+    );
+    assert_eq!(
+        store
+            .get_thread(&third_id)
+            .unwrap()
+            .unwrap()
+            .pin_order_key
+            .as_deref(),
+        Some("2026-01-02T03:04:05.006000Z")
+    );
+    assert_eq!(
+        store
+            .list_threads_for_path_display(std::path::Path::new("/tmp/pin-backfill"))
+            .unwrap()
+            .into_iter()
+            .map(|thread| thread.id)
+            .collect::<Vec<_>>(),
+        vec![second_id, first_id.clone(), third_id]
+    );
+    let created_at = store.get_thread(&first_id).unwrap().unwrap().created_at;
+    drop(store);
+    let raw = rusqlite::Connection::open(&path).unwrap();
+    raw.execute(
+        "UPDATE threads SET pin_order_key = NULL, updated_at = 'not-a-date'",
+        [],
+    )
+    .unwrap();
+    drop(raw);
+    let store = BatonStore::open(&path).unwrap();
+    let expected = chrono::DateTime::parse_from_rfc3339(&created_at)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    assert_eq!(
+        store
+            .get_thread(&first_id)
+            .unwrap()
+            .unwrap()
+            .pin_order_key
+            .as_deref(),
+        Some(expected.as_str())
+    );
+    let mut keys = store
+        .list_threads_for_path_display(std::path::Path::new("/tmp/pin-backfill"))
+        .unwrap()
+        .into_iter()
+        .filter_map(|thread| thread.pin_order_key)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), 3);
+}
+
+#[test]
 fn threads_json_reports_pinned() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();
@@ -426,6 +610,15 @@ fn threads_json_reports_pinned() {
     let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(rows[0]["thread_id"], thread.id);
     assert_eq!(rows[0]["pinned"], true);
+    assert_eq!(
+        rows[0]["pin_order_key"].as_str(),
+        store
+            .get_thread(&thread.id)
+            .unwrap()
+            .unwrap()
+            .pin_order_key
+            .as_deref()
+    );
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
         .args(["-C", work.path().to_str().unwrap(), "status", "--json"])
@@ -445,29 +638,128 @@ fn threads_json_reports_pinned() {
 fn thread_pin_survives_store_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("baton.sqlite");
-    let thread_id;
+    let expected;
     {
         let store = BatonStore::open(&path).unwrap();
-        let thread = store
-            .create_thread(NewThread {
-                title: "durable pin".to_string(),
-                cwd: "/tmp/durable-pins".to_string(),
-                current_provider: ProviderId::Claude,
-                current_model: None,
-            })
+        let mut ids = Vec::new();
+        for title in ["first", "second", "third"] {
+            let thread = store
+                .create_thread(NewThread {
+                    title: title.to_string(),
+                    cwd: "/tmp/durable-pins".to_string(),
+                    current_provider: ProviderId::Claude,
+                    current_model: None,
+                })
+                .unwrap();
+            store.set_thread_pinned(&thread.id, true).unwrap();
+            ids.push(thread.id);
+        }
+        store
+            .move_thread_pin(&ids[1], std::path::Path::new("/tmp/durable-pins"), true)
             .unwrap();
-        store.set_thread_pinned(&thread.id, true).unwrap();
-        thread_id = thread.id;
+        expected = store
+            .list_threads_for_path_display(std::path::Path::new("/tmp/durable-pins"))
+            .unwrap()
+            .into_iter()
+            .map(|thread| (thread.id, thread.pin_order_key))
+            .collect::<Vec<_>>();
     }
     let store = BatonStore::open(&path).unwrap();
-    assert!(store.get_thread(&thread_id).unwrap().unwrap().pinned);
     assert_eq!(
         store
             .list_threads_for_path_display(std::path::Path::new("/tmp/durable-pins"))
             .unwrap()[0]
             .id,
-        thread_id
+        expected[0].0
     );
+    assert_eq!(
+        store
+            .list_threads_for_path_display(std::path::Path::new("/tmp/durable-pins"))
+            .unwrap()
+            .into_iter()
+            .map(|thread| (thread.id, thread.pin_order_key))
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
+#[test]
+fn concurrent_pin_moves_serialize_without_duplicate_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("baton.sqlite");
+    let store = BatonStore::open(&path).unwrap();
+    let mut ids = Vec::new();
+    for title in ["first", "second", "third", "fourth"] {
+        let thread = store
+            .create_thread(NewThread {
+                title: title.to_string(),
+                cwd: "/tmp/concurrent-pins".to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        store.set_thread_pinned(&thread.id, true).unwrap();
+        ids.push(thread.id);
+    }
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let first_store = BatonStore::open(&path).unwrap();
+    let second_store = BatonStore::open(&path).unwrap();
+    let first_id = ids[0].clone();
+    let second_id = ids[1].clone();
+    let first_barrier = barrier.clone();
+    let second_barrier = barrier;
+    let first = std::thread::spawn(move || {
+        first_barrier.wait();
+        first_store.move_thread_pin(
+            &first_id,
+            std::path::Path::new("/tmp/concurrent-pins"),
+            true,
+        )
+    });
+    let second = std::thread::spawn(move || {
+        second_barrier.wait();
+        second_store.move_thread_pin(
+            &second_id,
+            std::path::Path::new("/tmp/concurrent-pins"),
+            true,
+        )
+    });
+    assert_eq!(first.join().unwrap().unwrap(), PinMoveOutcome::Moved);
+    assert_eq!(second.join().unwrap().unwrap(), PinMoveOutcome::Moved);
+
+    let display = BatonStore::open(&path)
+        .unwrap()
+        .list_threads_for_path_display(std::path::Path::new("/tmp/concurrent-pins"))
+        .unwrap();
+    let order = display
+        .iter()
+        .map(|thread| thread.id.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        order
+            == vec![
+                ids[3].as_str(),
+                ids[2].as_str(),
+                ids[1].as_str(),
+                ids[0].as_str()
+            ]
+            || order
+                == vec![
+                    ids[3].as_str(),
+                    ids[1].as_str(),
+                    ids[0].as_str(),
+                    ids[2].as_str()
+                ],
+        "{order:?}"
+    );
+    let mut keys = display
+        .into_iter()
+        .filter_map(|thread| thread.pin_order_key)
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(keys.len(), ids.len());
 }
 
 #[test]
@@ -790,6 +1082,10 @@ fn store_turn_records_and_reconcile() {
     assert_eq!(turns[0].phase, TurnPhase::Completed);
     assert_eq!(turns[1].phase, TurnPhase::Unverified);
     assert!(turns[1].ended_at.is_some());
+    let phases = store
+        .latest_turn_phases(&[thread.id.clone()])
+        .unwrap();
+    assert_eq!(phases.get(&thread.id), Some(&TurnPhase::Unverified));
     assert_eq!(
         store.reconcile_running_turns(Some("/tmp/project")).unwrap().len(),
         0,
@@ -814,9 +1110,20 @@ fn store_thread_lookup_accepts_symlinked_project_paths() {
             current_model: None,
         })
         .unwrap();
-    let found = store.list_threads_for_path(&link).unwrap();
-    assert_eq!(found.len(), 1);
-    assert_eq!(found[0].id, thread.id);
+    let linked = store
+        .create_thread(NewThread {
+            title: "stored through link".into(),
+            cwd: link.to_string_lossy().to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    for path in [&real, &link] {
+        let found = store.list_threads_for_path(path).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().any(|row| row.id == thread.id));
+        assert!(found.iter().any(|row| row.id == linked.id));
+    }
 }
 
 #[cfg(unix)]

@@ -139,6 +139,18 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
+        os.write(master, b"/files \r")
+        pump(master, 1.5, transcript)
+        recent_picker = screen_text(transcript, args.width, args.height)
+        for value in ["files · 2 · enter insert", "README.md", "❯ src/parser/mod.rs"]:
+            if value not in recent_picker:
+                missing.append(f"recent file ranking: {value}")
+        if 'files matching "pmod"' in recent_picker:
+            missing.append("recent file ranking kept a stale filter")
+        (evidence / "files-recent-screen.txt").write_text(recent_picker + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
         os.write(master, b"/grep ")
         pump(master, 0.5, transcript)
         grep_hint = screen_text(transcript, args.width, args.height)

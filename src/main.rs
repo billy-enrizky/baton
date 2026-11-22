@@ -1752,12 +1752,20 @@ fn main_result(started: Instant) -> Result<()> {
             let root = std::fs::canonicalize(&cwd).map_err(|error| {
                 anyhow::anyhow!("cannot resolve -C directory {}: {error}", cwd.display())
             })?;
+            let project = files::recent_project_key(&root.to_string_lossy());
+            let recent = BatonStore::open(&paths::baton_db_path())
+                .and_then(|store| {
+                    let _ = store.prune_missing_recent_projects();
+                    store.list_recent_files(&project, crate::store::RECENT_FILE_LIMIT)
+                })
+                .unwrap_or_default();
             let listing = files::list_files(
                 &root,
                 files::FileOptions {
                     query: (!query.trim().is_empty()).then_some(query.as_str()),
                     limit: cli.limit,
                     include_ignored: ignored,
+                    recent: &recent,
                 },
             )?;
             if json {
@@ -1848,6 +1856,14 @@ fn main_result(started: Instant) -> Result<()> {
         }
         cli::Commands::Open { path, print } => {
             let target = files::resolve_project_file(&cwd, Path::new(&path))?;
+            let root = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
+            if let Ok(relative) = target.strip_prefix(&root) {
+                let project = files::recent_project_key(&root.to_string_lossy());
+                if let Ok(store) = BatonStore::open(&paths::baton_db_path()) {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    let _ = store.record_recent_file(&project, &relative);
+                }
+            }
             let editor = files::editor_from_env().ok_or_else(|| {
                 anyhow::anyhow!(
                     "no editor configured; set VISUAL or EDITOR, for example `EDITOR=vim baton open {path}`"

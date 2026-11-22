@@ -499,6 +499,8 @@ enum Overlay {
         line: Option<u32>,
         /// Line supplied on the `/files` command, restored when the live filter clears.
         command_line: Option<u32>,
+        /// Recently picked paths, newest first.
+        recent: Vec<String>,
         truncated: bool,
         loading: bool,
         request: u64,
@@ -2277,11 +2279,11 @@ fn grep_filter_indices(matches: &[crate::grep::ContentMatch], query: &str) -> Ve
         .collect()
 }
 
-fn files_filter_indices(entries: &[String], query: &str) -> Vec<usize> {
+fn files_filter_indices(entries: &[String], query: &str, recent: &[String]) -> Vec<usize> {
     if query.trim().is_empty() {
         return (0..entries.len()).collect();
     }
-    crate::files::ranked_indices(entries, query)
+    crate::files::ranked_indices_with_recent(entries, query, recent)
 }
 
 fn suggestions_for(state: &TuiState) -> Vec<CommandSuggestion> {
@@ -3761,6 +3763,11 @@ fn handle_key(
                 KeyCode::Enter => {
                     if let Some(index) = filtered.get(selected) {
                         if let Some(found) = matches.get(*index) {
+                            let project = crate::files::recent_project_key(&state.thread.cwd);
+                            let _ = store
+                                .lock()
+                                .unwrap()
+                                .record_recent_file(&project, &found.path);
                             let target = crate::sanitize::sanitize_terminal_text(&format!(
                                 "{}:{}",
                                 found.path, found.line
@@ -3798,6 +3805,7 @@ fn handle_key(
             base_query,
             mut line,
             command_line,
+            recent,
             truncated,
             loading,
             request,
@@ -3810,14 +3818,14 @@ fn handle_key(
                     query.clear();
                     selected = 0;
                     line = command_line;
-                    filtered = files_filter_indices(&entries, &query);
+                    filtered = files_filter_indices(&entries, &query, &recent);
                 }
                 KeyCode::Backspace => {
                     query.pop();
                     selected = 0;
                     let (filter, typed_line) = split_line_target(&query);
                     line = typed_line.or(command_line);
-                    filtered = files_filter_indices(&entries, &filter);
+                    filtered = files_filter_indices(&entries, &filter, &recent);
                 }
                 KeyCode::Char(character)
                     if !key
@@ -3828,7 +3836,7 @@ fn handle_key(
                     selected = 0;
                     let (filter, typed_line) = split_line_target(&query);
                     line = typed_line.or(command_line);
-                    filtered = files_filter_indices(&entries, &filter);
+                    filtered = files_filter_indices(&entries, &filter, &recent);
                 }
                 KeyCode::Up => {
                     if !filtered.is_empty() {
@@ -3849,6 +3857,8 @@ fn handle_key(
                 KeyCode::Enter => {
                     if let Some(index) = filtered.get(selected) {
                         if let Some(path) = entries.get(*index).cloned() {
+                            let project = crate::files::recent_project_key(&state.thread.cwd);
+                            let _ = store.lock().unwrap().record_recent_file(&project, &path);
                             let target = match line {
                                 Some(line) => format!("{path}:{line}"),
                                 None => path.clone(),
@@ -3871,6 +3881,7 @@ fn handle_key(
                 base_query,
                 line,
                 command_line,
+                recent,
                 truncated,
                 loading,
                 request,
@@ -4141,13 +4152,14 @@ fn apply_files_picker_event(state: &mut TuiState, event: FilesPickerEvent) {
         base_query,
         result,
     } = event;
-    let (query, command_line) = match &state.overlay {
+    let (query, command_line, recent) = match &state.overlay {
         Overlay::FilesPicker {
             request: current,
             query,
             command_line,
+            recent,
             ..
-        } if *current == request => (query.clone(), *command_line),
+        } if *current == request => (query.clone(), *command_line, recent.clone()),
         _ => return,
     };
     let (filter, typed_line) = split_line_target(&query);
@@ -4165,7 +4177,7 @@ fn apply_files_picker_event(state: &mut TuiState, event: FilesPickerEvent) {
             });
         }
         Ok(listing) => {
-            let filtered = files_filter_indices(&listing.files, &filter);
+            let filtered = files_filter_indices(&listing.files, &filter, &recent);
             state.overlay = Overlay::FilesPicker {
                 selected: 0,
                 query,
@@ -4174,6 +4186,7 @@ fn apply_files_picker_event(state: &mut TuiState, event: FilesPickerEvent) {
                 base_query,
                 line,
                 command_line,
+                recent,
                 truncated: listing.truncated,
                 loading: false,
                 request,
@@ -6542,6 +6555,12 @@ fn handle_command(
             let (base_query, line) = split_line_target(&args.join(" "));
             let request = state.files_picker_request + 1;
             state.files_picker_request = request;
+            let project = crate::files::recent_project_key(&state.thread.cwd);
+            let recent = store
+                .lock()
+                .unwrap()
+                .list_recent_files(&project, crate::store::RECENT_FILE_LIMIT)
+                .unwrap_or_default();
             state.overlay = Overlay::FilesPicker {
                 selected: 0,
                 query: String::new(),
@@ -6550,6 +6569,7 @@ fn handle_command(
                 base_query: base_query.clone(),
                 line,
                 command_line: line,
+                recent: recent.clone(),
                 truncated: false,
                 loading: true,
                 request,
@@ -6561,6 +6581,7 @@ fn handle_command(
                     query: (!base_query.is_empty()).then_some(base_query.as_str()),
                     limit: FILES_PICKER_LIMIT,
                     include_ignored: false,
+                    recent: &recent,
                 };
                 let result = crate::files::list_files(std::path::Path::new(&cwd), options)
                     .map_err(|error| error.to_string());
@@ -13973,6 +13994,7 @@ mod tests {
             ("src/main.rs", "fn main() {\n    println!(\"hello\");\n}\n"),
             ("README.md", "# hello\n"),
         ]);
+        let project_key = crate::files::recent_project_key(project.path().to_str().unwrap());
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
         state.thread.cwd = project.path().to_string_lossy().to_string();
@@ -14001,6 +14023,14 @@ mod tests {
         );
         assert_eq!(state.input, "src/main.rs:2 ");
         assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_recent_files(&project_key, 10)
+                .unwrap(),
+            vec!["src/main.rs".to_string()]
+        );
     }
 
     #[test]
@@ -14286,6 +14316,49 @@ mod tests {
     }
 
     #[test]
+    fn files_picker_prefers_a_recent_file_and_records_the_pick() {
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[
+            ("README.md", "# readme\n"),
+            ("src/Main.rs", "fn main() {}\n"),
+        ]);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let project_key = crate::files::recent_project_key(project.path().to_str().unwrap());
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/files Main");
+        finish_files_picker_load(&mut state);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "src/Main.rs ");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_recent_files(&project_key, 10)
+                .unwrap(),
+            vec!["src/Main.rs".to_string()]
+        );
+
+        state.set_input(String::new());
+        handle_command(&mut state, &store, &engine_command_sender, "/files");
+        finish_files_picker_load(&mut state);
+        match &state.overlay {
+            Overlay::FilesPicker { entries, .. } => {
+                assert_eq!(entries.first().map(String::as_str), Some("src/Main.rs"));
+            }
+            _ => panic!("expected files picker"),
+        }
+    }
+
+    #[test]
     fn files_picker_inserts_the_selected_path() {
         let home = tempfile::tempdir().unwrap();
         let project = files_project(&[
@@ -14339,6 +14412,7 @@ mod tests {
             base_query: String::new(),
             line: Some(12),
             command_line: Some(12),
+            recent: Vec::new(),
             truncated: false,
             loading: false,
             request: 0,
@@ -14392,6 +14466,7 @@ mod tests {
             base_query: String::new(),
             line: None,
             command_line: None,
+            recent: Vec::new(),
             truncated: false,
             loading: false,
             request: 0,
@@ -14501,6 +14576,7 @@ mod tests {
             base_query: String::new(),
             line: None,
             command_line: None,
+            recent: Vec::new(),
             truncated: false,
             loading: false,
             request: 0,
@@ -14553,6 +14629,7 @@ mod tests {
             base_query: String::new(),
             line: None,
             command_line: None,
+            recent: Vec::new(),
             truncated: false,
             loading: false,
             request: 0,
@@ -14634,8 +14711,8 @@ mod tests {
         );
 
         let entries = vec!["long/path.rs".to_string(), "a.rs".to_string()];
-        assert_eq!(files_filter_indices(&entries, ""), vec![0, 1]);
-        assert_eq!(files_filter_indices(&entries, "a"), vec![1, 0]);
+        assert_eq!(files_filter_indices(&entries, "", &[]), vec![0, 1]);
+        assert_eq!(files_filter_indices(&entries, "a", &[]), vec![1, 0]);
     }
 
     #[test]
@@ -14651,6 +14728,7 @@ mod tests {
             base_query: String::new(),
             line: None,
             command_line: None,
+            recent: Vec::new(),
             truncated: false,
             loading: false,
             request: 0,
@@ -14691,6 +14769,7 @@ mod tests {
             base_query: String::new(),
             line: None,
             command_line: None,
+            recent: Vec::new(),
             truncated: false,
             loading: false,
             request: 0,
@@ -14751,6 +14830,7 @@ mod tests {
             base_query: "first".into(),
             line: Some(12),
             command_line: Some(12),
+            recent: Vec::new(),
             truncated: false,
             loading: true,
             request: 2,
@@ -14822,6 +14902,7 @@ mod tests {
             base_query: String::new(),
             line: None,
             command_line: None,
+            recent: Vec::new(),
             truncated: false,
             loading: false,
             request: 0,
@@ -14852,6 +14933,7 @@ mod tests {
             base_query: String::new(),
             line: None,
             command_line: None,
+            recent: Vec::new(),
             truncated: true,
             loading: false,
             request: 0,

@@ -12212,7 +12212,8 @@ mod tests {
             &sender,
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
         );
-        assert!(state.notice.as_deref().unwrap_or("").contains("copied"));
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("copied"), "expected a copy notice, got {notice:?}");
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! Read-only aggregation of threads that need a person.
 
 use anyhow::Result;
+use serde::Serialize;
 
 use crate::store::BatonStore;
 use crate::types::TurnPhase;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct InboxItem {
     pub thread_id: String,
     pub title: String,
@@ -27,10 +28,15 @@ pub fn items(store: &BatonStore) -> Result<Vec<InboxItem>> {
             .flatten();
         let mut reasons = Vec::new();
 
-        match task.as_ref().map(|task| task.status.as_str()) {
-            Some("needs_input") => reasons.push("worker needs input".to_string()),
-            Some("failed") => reasons.push("worker failed".to_string()),
-            _ => {}
+        if let Some(task) = task.as_ref() {
+            match task.status.as_str() {
+                "needs_input" => reasons.push("worker needs input".to_string()),
+                "failed" => reasons.push("worker failed".to_string()),
+                "completed" if task.pr_url.is_none() && task.merged_at.is_none() => {
+                    reasons.push("worker complete".to_string());
+                }
+                _ => {}
+            }
         }
         match last_phase {
             Some(TurnPhase::Failed) => reasons.push("turn failed".to_string()),
@@ -115,6 +121,7 @@ mod tests {
     fn includes_a_worker_waiting_for_an_answer() {
         let store = BatonStore::memory().unwrap();
         let waiting = thread(&store, "waiting worker");
+        let completed = thread(&store, "completed worker");
         store
             .create_orchestration_run(
                 "run-inbox",
@@ -149,10 +156,43 @@ mod tests {
                 None,
             )
             .unwrap();
+        store
+            .add_orchestration_task(
+                "task-done",
+                "run-inbox",
+                2,
+                "completed task",
+                ProviderId::Codex,
+                "model",
+                "prompt",
+                None,
+                None,
+                Some("0123456789abcdef"),
+                Some(&completed.id),
+                "completed",
+                Some("done"),
+                None,
+                "2026-11-22T00:00:01Z",
+                Some("2026-11-22T00:00:02Z"),
+                None,
+                None,
+                None,
+            )
+            .unwrap();
 
         let listed = items(&store).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status, "needs_input");
-        assert_eq!(listed[0].reasons, vec!["worker needs input".to_string()]);
+        assert_eq!(listed.len(), 2);
+        let waiting_item = listed
+            .iter()
+            .find(|item| item.thread_id == waiting.id)
+            .expect("waiting worker");
+        assert_eq!(waiting_item.status, "needs_input");
+        assert_eq!(waiting_item.reasons, vec!["worker needs input".to_string()]);
+        let completed_item = listed
+            .iter()
+            .find(|item| item.thread_id == completed.id)
+            .expect("completed worker");
+        assert_eq!(completed_item.status, "completed");
+        assert_eq!(completed_item.reasons, vec!["worker complete".to_string()]);
     }
 }

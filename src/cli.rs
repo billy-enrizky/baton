@@ -111,6 +111,12 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List threads that need attention across all projects
+    Inbox {
+        /// Emit a JSON array
+        #[arg(long)]
+        json: bool,
+    },
     /// Start a new thread with a title
     New {
         title: Vec<String>,
@@ -415,6 +421,15 @@ mod tests {
         match cli.command {
             Some(Commands::Activity { json: true }) => {}
             _ => panic!("expected activity"),
+        }
+    }
+
+    #[test]
+    fn inbox_accepts_json() {
+        let cli = Cli::try_parse_from(["baton", "inbox", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Inbox { json: true }) => {}
+            _ => panic!("expected inbox"),
         }
     }
 

@@ -58,7 +58,8 @@ try {
         $Expected = $null
         foreach ($Line in Get-Content $Sums) {
             $Fields = $Line.Trim() -split "\s+"
-            if ($Fields.Count -ge 2 -and $Fields[1] -eq $Asset) {
+            $Name = if ($Fields.Count -ge 2) { $Fields[1] -replace "^\./", "" } else { "" }
+            if ($Name -eq $Asset) {
                 $Expected = $Fields[0].ToLowerInvariant()
                 break
             }

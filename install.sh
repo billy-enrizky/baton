@@ -111,7 +111,7 @@ if download "${base_url}/${asset}" "${tmp}/${asset}"; then
     if ! download "${base_url}/SHA256SUMS" "${tmp}/SHA256SUMS"; then
         fail "downloaded ${asset}, but its SHA256SUMS file is missing"
     fi
-    expected=$(awk -v name="$asset" '$2 == name { print $1; exit }' "${tmp}/SHA256SUMS")
+    expected=$(awk -v name="$asset" '{ file=$2; sub(/^\.\//, "", file); if (file == name) { print $1; exit } }' "${tmp}/SHA256SUMS")
     [ -n "$expected" ] || fail "${asset} is missing from SHA256SUMS"
     actual=$(sha256_file "${tmp}/${asset}")
     [ "$actual" = "$expected" ] || fail "checksum mismatch for ${asset}"

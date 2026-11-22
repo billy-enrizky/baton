@@ -3777,6 +3777,14 @@ printf 'worker\n' > worker.txt",
         let body = "if [ \"$(basename \"$PWD\")\" = \"first-task\" ]; then printf 'one\\n' > one.txt; else printf 'two\\n' > two.txt; fi";
         let (repo, home, store, report) = run_fixture(plan, body);
         assert_eq!(report.tasks.len(), 2);
+        assert!(
+            report
+                .tasks
+                .iter()
+                .all(|task| task.status == "completed" && task.commit.is_some()),
+            "both workers must complete with commits: {:#?}",
+            report.tasks
+        );
 
         let remote = home.path().join("remote.git");
         let init = Command::new("git")
@@ -3794,7 +3802,14 @@ printf 'worker\n' > worker.txt",
 
         let shipped = open_prs_with_gh(&store, repo.path(), short_run, &[], Some(&gh)).unwrap();
         assert_eq!(ship_status(&shipped), "done");
-        assert_eq!(shipped.opened.len(), 2, "both worker branches open a PR");
+        assert_eq!(
+            shipped.opened.len(),
+            2,
+            "both worker branches open a PR: opened={:?} skipped={:?} failed={:?}",
+            shipped.opened,
+            shipped.skipped,
+            shipped.failed
+        );
         assert_eq!(shipped.remote, "origin");
         let tasks = store.list_orchestration_tasks(&report.run_id).unwrap();
         assert!(tasks.iter().all(|task| task.pr_url.is_some()));

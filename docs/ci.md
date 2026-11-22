@@ -21,7 +21,7 @@ The design is staged. Phase 1 creates one honest full-suite gate with hard budge
 
 Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command, and `--version` runs only after a build that is already budgeted.
 
-Phase 2 is in progress from recorded runs. The current warm Rust PR samples are 52, 56, 58, 60, 61, 63, 64, 65, 68, and 70 seconds; the CI-docs PR is 59 seconds. The Rust median is 62.0 seconds, above the target. A free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
+Phase 2 is in progress from recorded runs. The current warm Rust PR samples are 52, 56, 58, 60, 61, 63, 64, 65, 65, 68, and 70 seconds; the CI-docs PR is 59 seconds. The Rust median is 64.0 seconds, above the target. A free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
 
 Budget rule, applied at every phase: Phase 1 uses three times a conservative cold estimate. Phase 2 sets each budget to the measured Linux p95 plus 20 percent. That reset is the only allowed increase. After it, a budget may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
 
@@ -31,9 +31,9 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 
 | Measurement | Recorded value | Evidence |
 |---|---|---|
-| Warm Rust PR feedback | 52, 56, 58, 60, 61, 63, 64, 65, 68, and 70 seconds; n=10, median 62.0 seconds, max 70 seconds | Runs 45035044248, 45055995298, 45004705055, 45009466461, 45021604178, 45011836996, 45010710576, 45037001045, 45046974039, and 45051808580 |
+| Warm Rust PR feedback | 52, 56, 58, 60, 61, 63, 64, 65, 65, 68, and 70 seconds; n=11, median 64.0 seconds, max 70 seconds | Runs 45035044248, 45055995298, 45004705055, 45009466461, 45021604178, 45060299027, 45011836996, 45010710576, 45037001045, 45046974039, and 45051808580 |
 | Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
-| Warm Test job | 33 to 49 seconds; n=10 | Runs 45035044248, 45055995298, 45004705055, 45009466461, 45021604178, 45011836996, 45010710576, 45037001045, 45046974039, and 45051808580 |
+| Warm Test job | 33 to 50 seconds; n=11 | Runs 45035044248, 45055995298, 45004705055, 45009466461, 45021604178, 45060299027, 45011836996, 45010710576, 45037001045, 45046974039, and 45051808580 |
 | `cargo test --lib` | 1.67 to 3.70 seconds, 331 tests at the cited runs | Runs 45009466461 and 45011836996; the suite now has 373 lib tests |
 | Integration tests | 0.40 to 0.75 seconds, 75 tests across seven binaries at the cited runs | Runs 45009466461 and 45011836996; the suite now has 91 integration tests across eight binaries, plus one Linux-only non-UTF-8 case |
 | Executed test count (`ci/test-inventory.sh`) | 464 | Current local suite |

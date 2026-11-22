@@ -19,6 +19,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Greeting | TUI | `hi` in default orchestrate mode answers directly, with no planner run |
 | MCP stdio | CLI | `baton mcp` handshakes, lists 12 tools, and answers status, turns, threads, and doctor |
 | Antigravity | CLI | `agy acp` completes one turn with the ICA key and custom base URL |
+| Output sanitization | CLI and TUI | Control sequences are replaced before `exec` stdout and the transcript; unit proof only |
 | Activity | TUI and CLI | `/activity` and `baton activity --json` index every turn's tools, diff, and usage |
 | Memories | TUI and CLI | `/memories`, `$memories`, and `baton memories` share canonical project/global rows |
 | Grok | CLI | `grok agent stdio` completes a turn on the ICA endpoint |

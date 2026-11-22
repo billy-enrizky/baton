@@ -531,7 +531,7 @@ jobs:
       - name: Run cancellation diagnostic
         run: |
           set -euo pipefail
-          cargo test --locked --lib cancellation_stops_the_worker_group_and_marks_the_run_cancelled -- --exact --nocapture
+          cargo test --locked --lib orchestrate::tests::cancellation_stops_the_worker_group_and_marks_the_run_cancelled -- --exact --nocapture
 
   verify:
     name: Verify

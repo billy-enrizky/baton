@@ -531,18 +531,7 @@ jobs:
       - name: Run cancellation diagnostic
         run: |
           set -euo pipefail
-          command -v kill
-          kill --version | head -1 || true
-          setsid sh -c 'sleep 30' &
-          pid=$!
-          sleep 0.5
-          ps -o pid,ppid,pgid,stat,cmd -g "$pid" || true
-          kill -TERM -- "-$pid" || true
-          sleep 0.5
-          ps -o pid,ppid,pgid,stat,cmd -g "$pid" || true
-          kill -KILL -- "-$pid" || true
-          sleep 0.5
-          ps -o pid,ppid,pgid,stat,cmd -g "$pid" || true
+          cargo test --locked --lib orchestrate::tests::cancellation_stops_the_worker_group_and_marks_the_run_cancelled -- --exact --nocapture
 
   verify:
     name: Verify

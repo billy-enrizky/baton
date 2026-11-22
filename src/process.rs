@@ -289,7 +289,7 @@ fn send_signal(pid: u32, signal: &str) -> bool {
 #[cfg(unix)]
 fn send_group_signal(pgid: u32, signal: &str) -> bool {
     std::process::Command::new("kill")
-        .args([signal, &format!("-{pgid}")])
+        .args([signal, "--", &format!("-{pgid}")])
         .stderr(std::process::Stdio::null())
         .status()
         .map(|status| status.success())
@@ -299,7 +299,7 @@ fn send_group_signal(pgid: u32, signal: &str) -> bool {
 #[cfg(unix)]
 fn group_alive(pgid: u32) -> bool {
     std::process::Command::new("kill")
-        .args(["-0", &format!("-{pgid}")])
+        .args(["-0", "--", &format!("-{pgid}")])
         .stderr(std::process::Stdio::null())
         .status()
         .map(|status| status.success())

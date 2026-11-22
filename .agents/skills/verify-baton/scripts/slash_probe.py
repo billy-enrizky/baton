@@ -103,6 +103,15 @@ def main() -> int:
         model_picker = screen_text(transcript, args.width, args.height)
         model_required = ["models ·", "type to filter", "enter", "esc"]
         missing.extend(value for value in model_required if value not in model_picker)
+        model_header = re.search(
+            r"[a-z-]+ models · (\d+)/(\d+) · type to filter · enter · esc",
+            model_picker,
+        )
+        if model_header is None or int(model_header.group(1)) < 2:
+            missing.append("model picker count is at least 2")
+        model_rows = re.findall(r"❯\s+(?:●\s+)?\S+", model_picker)
+        if len(model_rows) < 2:
+            missing.append("model picker has at least 2 option rows")
         (evidence / "model-picker-screen.txt").write_text(model_picker + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)

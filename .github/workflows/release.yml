@@ -12,15 +12,39 @@ on:
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
+  guard:
+    name: Guard tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      sha: ${{ steps.tag.outputs.sha }}
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
+      - name: Verify tag and package version
+        id: tag
+        run: |
+          set -euo pipefail
+          git rev-parse --verify "refs/tags/$TAG"
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+          bash ci/release-guard.sh "$TAG" Cargo.toml
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   build:
     name: ${{ matrix.target }}
+    needs: guard
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -43,9 +67,10 @@ jobs:
             target: x86_64-pc-windows-msvc
             archive: zip
     steps:
-      - name: Checkout
+      - name: Checkout guarded commit
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
         with:
+          ref: ${{ needs.guard.outputs.sha }}
           persist-credentials: false
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
@@ -76,30 +101,85 @@ jobs:
 
   publish:
     name: Publish release
-    needs: build
+    needs:
+      - guard
+      - build
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write
     env:
       GH_REPO: ${{ github.repository }}
       GH_TOKEN: ${{ github.token }}
       TAG: ${{ inputs.tag || github.ref_name }}
+      GUARD_SHA: ${{ needs.guard.outputs.sha }}
     steps:
       - name: Download release assets
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           path: dist
           merge-multiple: true
-      - name: Write checksums
+      - name: Prepare and publish release
         run: |
           set -euo pipefail
-          cd dist
-          sha256sum ./* > SHA256SUMS
-          cat SHA256SUMS
-      - name: Publish
-        run: |
-          set -euo pipefail
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
+          archives=(
+            baton-aarch64-apple-darwin.tar.gz
+            baton-aarch64-unknown-linux-gnu.tar.gz
+            baton-x86_64-apple-darwin.tar.gz
+            baton-x86_64-pc-windows-msvc.zip
+            baton-x86_64-unknown-linux-gnu.tar.gz
+          )
+          assets=("${archives[@]}" SHA256SUMS)
+          expected=$(printf '%s\n' "${assets[@]}" | sort)
+          for asset in "${archives[@]}"; do
+            test -f "dist/$asset" || {
+              echo "missing release asset: $asset" >&2
+              exit 1
+            }
+          done
+          count=$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')
+          test "$count" -eq 5 || {
+            echo "expected 5 release assets, found $count" >&2
+            exit 1
+          }
+          (
+            cd dist
+            sha256sum "${archives[@]}" > SHA256SUMS
+            sha256sum -c SHA256SUMS
+            cat SHA256SUMS
+          )
+          test "$(git ls-remote "https://github.com/$GH_REPO.git" "refs/tags/$TAG^{}" | cut -f1)" = "$GUARD_SHA"
+          if state=$(gh release view "$TAG" --json isDraft,isPrerelease --template '{{.isDraft}} {{.isPrerelease}}' 2>/dev/null); then
+            test "$state" = "true false" || {
+              echo "release $TAG must be an unpublished, non-prerelease draft; found $state" >&2
+              exit 1
+            }
           else
-            gh release create "$TAG" dist/* --title "Baton $TAG" --generate-notes
+            gh release create "$TAG" --draft --verify-tag --title "Baton $TAG" --generate-notes
           fi
+          while IFS= read -r name; do
+            [ -n "$name" ] || continue
+            keep=false
+            for expected_asset in "${assets[@]}"; do
+              if [ "$name" = "$expected_asset" ]; then
+                keep=true
+              fi
+            done
+            if [ "$keep" = "false" ]; then
+              gh release delete-asset "$TAG" "$name" --yes
+            fi
+          done < <(gh release view "$TAG" --json assets --jq '.assets[].name')
+          test "$(gh release view "$TAG" --json isDraft,isPrerelease --template '{{.isDraft}} {{.isPrerelease}}')" = "true false"
+          test "$(git ls-remote "https://github.com/$GH_REPO.git" "refs/tags/$TAG^{}" | cut -f1)" = "$GUARD_SHA"
+          gh release upload "$TAG" dist/* --clobber
+          actual=$(gh release view "$TAG" --json assets --jq '.assets[].name' | sort)
+          test "$actual" = "$expected" || {
+            echo "release asset set does not match the expected six files" >&2
+            printf 'expected:\n%s\nactual:\n%s\n' "$expected" "$actual" >&2
+            exit 1
+          }
+          test "$(gh release view "$TAG" --json isDraft,isPrerelease --template '{{.isDraft}} {{.isPrerelease}}')" = "true false"
+          test "$(git ls-remote "https://github.com/$GH_REPO.git" "refs/tags/$TAG^{}" | cut -f1)" = "$GUARD_SHA"
+          gh release edit "$TAG" --draft=false --latest
+          test "$(gh release view "$TAG" --json isImmutable --jq .isImmutable)" = "true"
+          test "$(gh api "repos/$GH_REPO/releases/latest" --jq .tag_name)" = "$TAG"

@@ -11,6 +11,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Provider readiness | CLI and TUI | doctor summarizes ready/missing; pickers mark missing harnesses |
 | Default provider | CLI and TUI | new work starts on an installed harness, with an explicit override |
 | Recent thread hint | TUI | a new session points at existing threads in the folder |
+| Attention inbox | TUI | `/inbox` lists failed, unverified, interrupted, needs-input, and queued work and opens the selected thread |
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |
 | Native rewind | CLI | `baton rewind --native` truncates Codex or OpenCode history and keeps the session |

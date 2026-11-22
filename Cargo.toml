@@ -33,3 +33,10 @@ tempfile = "3"
 
 [profile.release]
 lto = true
+
+# Tests keep file and line in backtraces without full debug info. Measured
+# cold on a fresh target: 65.3 user seconds and a 1.0 GB target, against 72.9
+# and 1.2 GB at the default. The runner is CPU-bound, so that CPU time is the
+# number that moves the CI job.
+[profile.test]
+debug = "line-tables-only"

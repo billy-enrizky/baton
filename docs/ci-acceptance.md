@@ -152,7 +152,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 
 ## Review record
 
-The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as structural reviewer. Round 1 found the unsupported complete-archive claim and mixed measurement definitions. Rounds 2 through 4 found and fixed wrong Verify endpoints, retry handling, Rust and meta sample mixing, and percentile reporting inconsistencies. Rounds 5 and 6 reported no Blocker or Major findings.
+The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as structural reviewer. Round 1 found the unsupported complete-archive claim and mixed measurement definitions. Rounds 2 through 4 found and fixed wrong Verify endpoints, retry handling, Rust and meta sample mixing, and percentile reporting inconsistencies. Round 7 caught an out-of-date-base run that the classifier labeled `unknown`; it was removed rather than counted as meta. Rounds 8 and 9 reported no Blocker or Major findings.
 
 ## Open gaps
 

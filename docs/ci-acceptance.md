@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-No recorded runs yet.
+Three recorded runs: one billing failure and two green.
 
 This file records actual GitHub Actions evidence for [ci.md](ci.md). Do not add estimated runs, synthetic runs, or runs from an older workflow unless the run URL, commit, and workflow revision are recorded.
 
@@ -30,7 +30,26 @@ For a PR run, also record the selected gate outputs from the `changes` job and t
 
 | Run | Event | Commit | Workflow revision | Created | Queue | Feedback | Slowest job | Cache key | Selected gates | Result | Failure or budget miss |
 |---|---|---|---|---|---|---|---|---|---|---|---|
-| [44969473815](https://github.com/billy-enrizky/baton/actions/runs/44969473815) | pull_request | `cb1119bc` | Phase 1C `ci.yml` in PR #90 | 2026-11-22 01:01:42Z | not observed | 2s | none started | none | none | failure | Account billing: "The job was not started because recent account payments have failed or your spending limit needs to be increased" |
+| [44969473815](https://github.com/billy-enrizky/baton/actions/runs/44969473815) | pull_request | `cb1119bc` | Phase 1C `ci.yml` in PR #90 | 2026-11-22 01:01:42Z | not observed | 2s | none started | none | none | failure | Account billing, before any step ran. The repository is now public, which removed the billing dependency |
+| [44982816103](https://github.com/billy-enrizky/baton/actions/runs/44982816103) | pull_request | `223e5f30` | Phase 1C `ci.yml` | 2026-11-22 03:56:06Z | 0s | 190s | Test 165s | cold | all | success | none |
+| [44983114852](https://github.com/billy-enrizky/baton/actions/runs/44983114852) | push | `107ffa4` | Phase 1C `ci.yml` on main | 2026-11-22 04:00:30Z | 0s | 195s | Test 171s | cold | all | success | none |
+
+First real measurements, cold cache, `ubuntu-24.04`:
+
+| Job | PR run 44982816103 | Push run 44983114852 |
+|---|---|---|
+| Changes | 13s | 10s |
+| Selection guard | 11s | 5s |
+| Check | 55s | 69s |
+| Build | 69s | 70s |
+| Test | 165s | 171s |
+| Debt ratchet | 54s | 53s |
+| Verify | 5s | 5s |
+| **PR feedback** | **190s** | 195s |
+
+Both runs were cold: the first had no cache, and the push run saved the first one. The next code PR measures the warm number.
+
+The target is 60s median and 120s p95. The gap is the test job, which compiles the suite and then runs it, and the compile is repeated in Check, Build, and Debt. Optimization order: record per-test-binary times, shard from that data, then look at sharing compilation between jobs.
 
 That is the first recorded Actions observation. It proves the workflow file parses and schedules every job. No step ran, so it is not evidence about any gate.
 
@@ -69,8 +88,8 @@ Billable minutes are summed per job as `ceil(job_seconds / 60)`. The estimate mu
 
 | Proof | Evidence | Result |
 |---|---|---|
-| First green `main` full-suite run | Phase 1C workflow | Blocked on account billing |
-| First PR run with `verify` | Phase 1C workflow | Blocked on account billing |
+| First green `main` full-suite run | Run 44983114852 | Passed 2026-11-22 |
+| First PR run with `verify` | Run 44982816103 | Passed 2026-11-22 |
 | Budget overrun fails | Phase 1B `ci/selftest.sh`, exit 124 | Passed locally on 2026-11-21; CI pending |
 | Hidden TUI change cannot skip tests | Phase 1 classifier fixture plus Phase 3 selector proof | Classifier fixture passes locally; selector proof pending |
 | No-op test command fails the workflow guard | Phase 1C `ci/check-ci.sh --base` | Passed locally against the Phase 1C workflow; CI pending |

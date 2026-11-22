@@ -12206,13 +12206,18 @@ mod tests {
             "ctrl+y copies without typing"
         );
         state.review.as_mut().unwrap().note_input = None;
+        let command = std::env::var("BATON_CLIPBOARD_COMMAND").unwrap_or_default();
         handle_key(
             &mut state,
             &store,
             &sender,
             KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
         );
-        assert!(state.notice.as_deref().unwrap_or("").contains("copied"));
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("copied"),
+            "expected a copy notice, got {notice:?} with clipboard command {command:?}"
+        );
     }
 
     #[test]

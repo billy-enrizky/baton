@@ -232,7 +232,7 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
-          shared-key: baton-${{ runner.os }}-${{ runner.arch }}
+          shared-key: baton-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
           key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check
@@ -291,7 +291,7 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
-          shared-key: baton-${{ runner.os }}-${{ runner.arch }}
+          shared-key: baton-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
           key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
@@ -353,7 +353,7 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
-          shared-key: baton-${{ runner.os }}-${{ runner.arch }}
+          shared-key: baton-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
           key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
@@ -432,7 +432,7 @@ jobs:
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4
         with:
-          shared-key: baton-${{ runner.os }}-${{ runner.arch }}
+          shared-key: baton-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
           key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format debt

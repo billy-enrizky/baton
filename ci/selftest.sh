@@ -72,6 +72,62 @@ fi
 
 bash "$root/budget.sh" 5 true
 
+release_manifest=$(mktemp)
+printf '[package]\nname = "fixture"\nversion = "1.2.3"\n\n[dependencies]\nversion = "9.9.9"\n' > "$release_manifest"
+bash "$root/release-guard.sh" v1.2.3 "$release_manifest" >/dev/null
+
+check_release_guard() {
+  local name=$1
+  local tag=$2
+  local manifest=$3
+  local expected=$4
+  set +e
+  local output
+  output=$(bash "$root/release-guard.sh" "$tag" "$manifest" 2>&1)
+  local code=$?
+  set -e
+  if [[ $code -ne "$expected" ]]; then
+    echo "release guard $name returned $code instead of $expected" >&2
+    printf '%s\n' "$output" >&2
+    exit 1
+  fi
+}
+
+check_release_guard mismatch v1.2.4 "$release_manifest" 1
+check_release_guard no-prefix 1.2.3 "$release_manifest" 1
+check_release_guard incomplete v1.2 "$release_manifest" 1
+check_release_guard leading-zero v01.2.3 "$release_manifest" 1
+check_release_guard missing-manifest v1.2.3 "$(mktemp -d)/missing.toml" 1
+
+malformed_version=$(mktemp)
+printf '[package]\nname = "fixture"\nversion = "1.2"\n' > "$malformed_version"
+check_release_guard malformed-package-version v1.2.3 "$malformed_version" 1
+
+leading_zero_manifest=$(mktemp)
+printf '[package]\nname = "fixture"\nversion = "01.2.3"\n' > "$leading_zero_manifest"
+check_release_guard leading-zero-package-version v1.2.3 "$leading_zero_manifest" 1
+
+trailing_token=$(mktemp)
+printf '[package]\nname = "fixture"\nversion = "1.2.3" extra\n' > "$trailing_token"
+check_release_guard trailing-version-token v1.2.3 "$trailing_token" 1
+set +e
+output=$(bash "$root/release-guard.sh" 2>&1)
+code=$?
+set -e
+if [[ $code -ne 2 ]]; then
+  echo "release guard without arguments returned $code instead of 2" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+
+missing_version=$(mktemp)
+printf '[package]\nname = "fixture"\n\n[metadata]\nversion = "1.2.3"\n' > "$missing_version"
+check_release_guard missing-package-version v1.2.3 "$missing_version" 1
+
+duplicate_version=$(mktemp)
+printf '[package]\nname = "fixture"\nversion = "1.2.3"\nversion = "1.2.4"\n' > "$duplicate_version"
+check_release_guard duplicate-package-version v1.2.3 "$duplicate_version" 1
+
 integrity_root=$(mktemp -d)
 for case in rustfmt wrapper lints allow; do
   mkdir -p "$integrity_root/$case/src"

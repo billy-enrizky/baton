@@ -96,6 +96,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/pin", "pin, unpin, or move a pinned thread"),
     ("/inbox", "all threads that need attention"),
     ("/open", "open a thread by id prefix"),
+    ("/files", "pick a project file and insert its path"),
     ("/usage", "token usage and cache hit rate"),
     ("/checkpoints", "list checkpoints for this thread"),
     ("/review", "review the latest turn diff with line notes"),
@@ -157,6 +158,7 @@ Type what you want to do. Baton picks a harness.
 Common
   /switch <provider> [model]  use one harness
   /model                      choose a model
+  /files [query]              insert a project path
   /new                        start a new thread
   /threads                    list threads here
   /pin                        pin or unpin; /pin move <id> up or down
@@ -345,6 +347,14 @@ enum OrchestrationEvent {
     ShipFailed(String),
 }
 
+enum FilesPickerEvent {
+    Loaded {
+        request: u64,
+        base_query: String,
+        result: Result<crate::files::FileListing, String>,
+    },
+}
+
 enum NativeRewindEvent {
     Done {
         turn: i64,
@@ -448,6 +458,18 @@ enum Overlay {
         selected: usize,
         items: Vec<InboxItem>,
     },
+    FilesPicker {
+        selected: usize,
+        query: String,
+        entries: Vec<String>,
+        /// Indices into `entries` that match `query`, recomputed on edits.
+        filtered: Vec<usize>,
+        /// Query used to load `entries`, shown in the heading.
+        base_query: String,
+        truncated: bool,
+        loading: bool,
+        request: u64,
+    },
     CheckpointPicker {
         selected: usize,
         checkpoints: Vec<(i64, String)>,
@@ -479,6 +501,8 @@ struct HandoffPrompt {
     unseen: usize,
     provider: ProviderId,
 }
+
+const FILES_PICKER_LIMIT: usize = crate::files::MAX_FILES;
 
 const PROVIDERS: [ProviderId; 6] = [
     ProviderId::Claude,
@@ -553,6 +577,9 @@ pub struct TuiState {
     orchestration_sender: std::sync::mpsc::Sender<OrchestrationEvent>,
     native_rewind_sender: std::sync::mpsc::Sender<NativeRewindEvent>,
     native_rewind_running: bool,
+    files_picker_sender: std::sync::mpsc::Sender<FilesPickerEvent>,
+    files_picker_receiver: std::sync::mpsc::Receiver<FilesPickerEvent>,
+    files_picker_request: u64,
 }
 
 pub fn run_tui(
@@ -592,6 +619,7 @@ pub fn run_tui(
     let custom_commands = discover_custom_commands(&thread.cwd);
     let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
     let (native_rewind_sender, native_rewind_receiver) = std::sync::mpsc::channel();
+    let (files_picker_sender, files_picker_receiver) = std::sync::mpsc::channel();
     let bell_enabled = crate::config::notifications(&home).bell;
     let mut state = TuiState {
         bell_enabled,
@@ -656,6 +684,9 @@ pub fn run_tui(
         orchestration_sender,
         native_rewind_sender,
         native_rewind_running: false,
+        files_picker_sender,
+        files_picker_receiver,
+        files_picker_request: 0,
     };
 
     let mut startup_notes = Vec::new();
@@ -743,6 +774,13 @@ pub fn run_tui(
         }
         while let Ok(event) = native_rewind_receiver.try_recv() {
             apply_native_rewind_event(&mut state, &store, event);
+        }
+        let mut files_events = Vec::new();
+        while let Ok(event) = state.files_picker_receiver.try_recv() {
+            files_events.push(event);
+        }
+        for event in files_events {
+            apply_files_picker_event(&mut state, event);
         }
         if crossterm::event::poll(Duration::from_millis(32))? {
             match crossterm::event::read()? {
@@ -2148,6 +2186,10 @@ fn model_filter_indices(models: &[String], filter: &str) -> Vec<usize> {
         .collect()
 }
 
+fn files_filter_indices(entries: &[String], query: &str) -> Vec<usize> {
+    crate::files::ranked_indices(entries, query)
+}
+
 fn suggestions_for(state: &TuiState) -> Vec<CommandSuggestion> {
     let key = (
         state.input.clone(),
@@ -2261,6 +2303,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/fork", _) => Some("fork [--turn N] [title]"),
         ("/worktree", _) => Some("worktree [title]"),
         ("/open", _) => Some("open <thread id prefix>"),
+        ("/files", _) => Some("files [query]"),
         ("/pin", "move") => Some("pin move <id> up or down"),
         ("/review", _) => Some("review [turn]"),
         ("/diff", _) => Some("diff [turn]"),
@@ -3568,6 +3611,79 @@ fn handle_key(
                 state.overlay = Overlay::InboxPicker { selected, items };
             }
         },
+        Overlay::FilesPicker {
+            mut selected,
+            mut query,
+            entries,
+            mut filtered,
+            base_query,
+            truncated,
+            loading,
+            request,
+        } => {
+            match key.code {
+                KeyCode::Esc => {
+                    if loading || query.is_empty() {
+                        return;
+                    }
+                    query.clear();
+                    selected = 0;
+                    filtered = files_filter_indices(&entries, &query);
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    selected = 0;
+                    filtered = files_filter_indices(&entries, &query);
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    query.push(character);
+                    selected = 0;
+                    filtered = files_filter_indices(&entries, &query);
+                }
+                KeyCode::Up => {
+                    if !filtered.is_empty() {
+                        selected = (selected + filtered.len() - 1) % filtered.len();
+                    }
+                }
+                KeyCode::Down => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 1) % filtered.len();
+                    }
+                }
+                KeyCode::PageUp => selected = selected.saturating_sub(10),
+                KeyCode::PageDown => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 10).min(filtered.len() - 1);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(index) = filtered.get(selected) {
+                        if let Some(path) = entries.get(*index).cloned() {
+                            state.insert_input_str(&format!("{path} "));
+                            state.notice = Some(format!("inserted {path}"));
+                            return;
+                        }
+                    } else if !loading {
+                        state.notice = Some("files: no matches".into());
+                    }
+                }
+                _ => {}
+            }
+            state.overlay = Overlay::FilesPicker {
+                selected,
+                query,
+                entries,
+                filtered,
+                base_query,
+                truncated,
+                loading,
+                request,
+            };
+        }
         Overlay::CheckpointPicker {
             selected,
             checkpoints,
@@ -3780,6 +3896,49 @@ fn start_native_rewind(
         };
         let _ = sender.send(event);
     });
+}
+
+fn apply_files_picker_event(state: &mut TuiState, event: FilesPickerEvent) {
+    let FilesPickerEvent::Loaded {
+        request,
+        base_query,
+        result,
+    } = event;
+    let query = match &state.overlay {
+        Overlay::FilesPicker {
+            request: current,
+            query,
+            ..
+        } if *current == request => query.clone(),
+        _ => return,
+    };
+    match result {
+        Ok(listing) if listing.files.is_empty() => {
+            state.overlay = Overlay::None;
+            state.notice = Some(if base_query.is_empty() {
+                "files: no files here · caches and build output are pruned".to_string()
+            } else {
+                format!("files: no matches for \"{base_query}\"")
+            });
+        }
+        Ok(listing) => {
+            let filtered = files_filter_indices(&listing.files, &query);
+            state.overlay = Overlay::FilesPicker {
+                selected: 0,
+                query,
+                entries: listing.files,
+                filtered,
+                base_query,
+                truncated: listing.truncated,
+                loading: false,
+                request,
+            };
+        }
+        Err(error) => {
+            state.overlay = Overlay::None;
+            state.notice = Some(format!("files: {error}"));
+        }
+    }
 }
 
 fn apply_native_rewind_event(
@@ -6127,6 +6286,44 @@ fn handle_command(
                 }
             }
         }
+        "/files" => {
+            if args.iter().any(|arg| arg == "--ignored") {
+                state.notice = Some(
+                    "/files lists nonignored files; use `baton files --ignored` for ignored paths"
+                        .to_string(),
+                );
+                return;
+            }
+            let base_query = args.join(" ").trim().to_string();
+            let request = state.files_picker_request + 1;
+            state.files_picker_request = request;
+            state.overlay = Overlay::FilesPicker {
+                selected: 0,
+                query: String::new(),
+                entries: Vec::new(),
+                filtered: Vec::new(),
+                base_query: base_query.clone(),
+                truncated: false,
+                loading: true,
+                request,
+            };
+            let cwd = state.thread.cwd.clone();
+            let sender = state.files_picker_sender.clone();
+            std::thread::spawn(move || {
+                let options = crate::files::FileOptions {
+                    query: (!base_query.is_empty()).then_some(base_query.as_str()),
+                    limit: FILES_PICKER_LIMIT,
+                    include_ignored: false,
+                };
+                let result = crate::files::list_files(std::path::Path::new(&cwd), options)
+                    .map_err(|error| error.to_string());
+                let _ = sender.send(FilesPickerEvent::Loaded {
+                    request,
+                    base_query,
+                    result,
+                });
+            });
+        }
         "/usage" => {
             let lines = {
                 let guard = store.lock().unwrap();
@@ -7083,6 +7280,15 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::AuthPicker { .. } => 9,
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
             Overlay::InboxPicker { items, .. } => items.len().min(8) + 4,
+            Overlay::FilesPicker {
+                filtered, loading, ..
+            } => {
+                if *loading {
+                    6
+                } else {
+                    filtered.len().min(8) + 5
+                }
+            }
             Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
             Overlay::DirtyConfirm { .. } => 5,
             Overlay::CommandList { expanded, .. } => {
@@ -7167,6 +7373,29 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::InboxPicker { selected, items } => {
                 draw_inbox_picker(frame, chunks[1], items, *selected)
             }
+            Overlay::FilesPicker {
+                selected,
+                query,
+                entries,
+                filtered,
+                base_query,
+                truncated,
+                loading,
+                ..
+            } => draw_files_picker(
+                frame,
+                chunks[1],
+                FilesPickerView {
+                    entries,
+                    filtered,
+                    selected: *selected,
+                    query,
+                    base_query,
+                    truncated: *truncated,
+                    loading: *loading,
+                    spinner: spinner_frame,
+                },
+            ),
             Overlay::CheckpointPicker {
                 selected,
                 checkpoints,
@@ -7914,6 +8143,114 @@ fn draw_thread_picker(
             style,
         ));
     }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+struct FilesPickerView<'a> {
+    entries: &'a [String],
+    filtered: &'a [usize],
+    selected: usize,
+    query: &'a str,
+    base_query: &'a str,
+    truncated: bool,
+    loading: bool,
+    spinner: usize,
+}
+
+fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerView<'_>) {
+    let FilesPickerView {
+        entries,
+        filtered,
+        selected,
+        query,
+        base_query,
+        truncated,
+        loading,
+        spinner,
+    } = view;
+    let filter = query.trim();
+    let filter_label = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" · filter \"{filter}\"")
+    };
+    if loading {
+        let spinner = SPINNER_FRAMES[spinner % SPINNER_FRAMES.len()];
+        let heading = if base_query.is_empty() {
+            format!("files{filter_label} · loading {spinner}")
+        } else {
+            format!("files matching \"{base_query}\"{filter_label} · loading {spinner}")
+        };
+        let lines = vec![
+            Line::styled(heading, Style::default().fg(COLORS.muted)),
+            Line::styled(
+                "scanning the project directory · esc closes",
+                Style::default().fg(COLORS.muted),
+            ),
+        ];
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(COLORS.border));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+    let scope = if base_query.is_empty() {
+        "files".to_string()
+    } else {
+        format!("files matching \"{base_query}\"")
+    };
+    let count = if filtered.is_empty() && !filter.is_empty() {
+        "no matches".to_string()
+    } else {
+        filtered.len().to_string()
+    };
+    let action = if filter.is_empty() {
+        "enter insert · esc close"
+    } else {
+        "enter insert · esc clears"
+    };
+    let heading = format!("{scope}{filter_label} · {count} · {action}");
+    let mut lines: Vec<Line> = vec![Line::styled(heading, Style::default().fg(COLORS.muted))];
+    let visible = 8;
+    if filtered.is_empty() {
+        let empty = if truncated {
+            "no matches in the loaded inventory"
+        } else {
+            "no files match"
+        };
+        lines.push(Line::styled(empty, Style::default().fg(COLORS.muted)));
+    } else {
+        let start = if filtered.len() <= visible {
+            0
+        } else {
+            selected
+                .saturating_sub(visible - 1)
+                .min(filtered.len() - visible)
+        };
+        for (offset, index) in filtered.iter().skip(start).take(visible).enumerate() {
+            let position = start + offset;
+            let style = if position == selected {
+                Style::default()
+                    .fg(COLORS.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLORS.muted)
+            };
+            let cursor = if position == selected { "❯" } else { " " };
+            lines.push(Line::styled(format!("{cursor} {}", entries[*index]), style));
+        }
+    }
+    let hint = if truncated {
+        "inventory capped at 20,001 · rerun /files <query> to search the full tree"
+    } else if filter.is_empty() {
+        "type to filter · esc close"
+    } else {
+        "type to narrow · backspace edits · esc clears"
+    };
+    lines.push(Line::styled(hint, Style::default().fg(COLORS.muted)));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.border));
@@ -9159,6 +9496,7 @@ mod tests {
             .unwrap()
             .list_queued_messages(&thread.id)
             .unwrap_or_default();
+        let (files_picker_sender, files_picker_receiver) = std::sync::mpsc::channel();
         TuiState {
             bell_enabled: crate::config::notifications(home).bell,
             bell: crate::notify::BellLimiter::new(),
@@ -9222,7 +9560,18 @@ mod tests {
             orchestration_sender: std::sync::mpsc::channel().0,
             native_rewind_sender: std::sync::mpsc::channel().0,
             native_rewind_running: false,
+            files_picker_sender,
+            files_picker_receiver,
+            files_picker_request: 0,
         }
+    }
+
+    fn finish_files_picker_load(state: &mut TuiState) {
+        let event = state
+            .files_picker_receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("files picker load");
+        apply_files_picker_event(state, event);
     }
 
     fn history_message(thread_id: &str, index: usize) -> MessageRow {
@@ -9301,6 +9650,7 @@ mod tests {
             "/fork",
             "/worktree",
             "/open",
+            "/files",
             "/pin",
             "/review",
             "/diff",
@@ -13057,6 +13407,380 @@ mod tests {
         assert!(text.contains("thread 9"), "{text}");
         assert!(!text.contains("thread 1  "), "{text}");
         assert_eq!(text.matches('❯').count(), 1, "{text}");
+    }
+
+    fn files_project(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let project = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(project.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        for (path, contents) in files {
+            let path = project.path().join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, contents).unwrap();
+        }
+        project
+    }
+
+    #[test]
+    fn files_picker_inserts_the_selected_path() {
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[
+            ("src/parser.rs", "fn parse() {}\n"),
+            ("src/other.rs", "fn other() {}\n"),
+            ("README.md", "# readme\n"),
+        ]);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/files parser");
+        match &state.overlay {
+            Overlay::FilesPicker { loading, .. } => assert!(*loading),
+            _ => panic!("expected loading files picker"),
+        }
+        finish_files_picker_load(&mut state);
+        match &state.overlay {
+            Overlay::FilesPicker { entries, .. } => {
+                assert_eq!(entries, &vec!["src/parser.rs".to_string()]);
+            }
+            _ => panic!("expected files picker"),
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "src/parser.rs ");
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("inserted"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn files_picker_filters_typed_text_and_escape_resets() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/other.rs".into(), "src/parser.rs".into()],
+            filtered: vec![0, 1],
+            base_query: String::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        for character in "parse".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        match &state.overlay {
+            Overlay::FilesPicker { query, .. } => assert_eq!(query, "parse"),
+            _ => panic!("expected files picker"),
+        }
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("filter \"parse\""), "{text}");
+        assert!(text.contains("src/parser.rs"), "{text}");
+        assert!(!text.contains("src/other.rs"), "{text}");
+        assert!(text.contains("esc clears"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        match &state.overlay {
+            Overlay::FilesPicker { query, .. } => assert!(query.is_empty()),
+            _ => panic!("first escape must clear the filter"),
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/other.rs".into(), "src/parser.rs".into()],
+            filtered: vec![0, 1],
+            base_query: String::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        for character in "parse".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "src/parser.rs ");
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn files_picker_scrolls_past_eight_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 9,
+            query: String::new(),
+            entries: (0..10).map(|index| format!("src/file{index}.rs")).collect(),
+            filtered: (0..10).collect(),
+            base_query: String::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("src/file9.rs"), "{text}");
+        assert!(!text.contains("src/file0.rs"), "{text}");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+        assert!(
+            text.contains("files · 10 · enter insert · esc close"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn files_picker_shows_loading_and_ignores_a_cancelled_load() {
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[("src/parser.rs", "fn parse() {}\n")]);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/files");
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("files · loading"), "{text}");
+        assert!(text.contains("esc closes"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("filter \"p\" · loading"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        finish_files_picker_load(&mut state);
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn files_picker_ignores_a_superseded_load() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: Vec::new(),
+            filtered: Vec::new(),
+            base_query: "first".into(),
+            truncated: false,
+            loading: true,
+            request: 2,
+        };
+        apply_files_picker_event(
+            &mut state,
+            FilesPickerEvent::Loaded {
+                request: 1,
+                base_query: "stale".into(),
+                result: Ok(crate::files::FileListing {
+                    files: vec!["stale.rs".into()],
+                    truncated: false,
+                    capped: false,
+                }),
+            },
+        );
+        match &state.overlay {
+            Overlay::FilesPicker {
+                base_query,
+                loading,
+                entries,
+                ..
+            } => {
+                assert_eq!(base_query, "first");
+                assert!(*loading);
+                assert!(entries.is_empty());
+            }
+            _ => panic!("expected files picker"),
+        }
+        apply_files_picker_event(
+            &mut state,
+            FilesPickerEvent::Loaded {
+                request: 2,
+                base_query: "second".into(),
+                result: Ok(crate::files::FileListing {
+                    files: vec!["second.rs".into()],
+                    truncated: false,
+                    capped: false,
+                }),
+            },
+        );
+        match &state.overlay {
+            Overlay::FilesPicker {
+                base_query,
+                loading,
+                entries,
+                ..
+            } => {
+                assert_eq!(base_query, "second");
+                assert!(!*loading);
+                assert_eq!(entries, &vec!["second.rs".to_string()]);
+            }
+            _ => panic!("expected files picker"),
+        }
+    }
+
+    #[test]
+    fn files_picker_enter_without_rows_warns() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: "zzz".into(),
+            entries: vec!["src/parser.rs".into()],
+            filtered: Vec::new(),
+            base_query: String::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::FilesPicker { .. }));
+        assert_eq!(state.notice.as_deref(), Some("files: no matches"));
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn files_picker_keeps_the_cap_warning_while_filtering() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: "parse".into(),
+            entries: vec!["src/other.rs".into(), "src/parser.rs".into()],
+            filtered: vec![1],
+            base_query: String::new(),
+            truncated: true,
+            loading: false,
+            request: 0,
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("filter \"parse\""), "{text}");
+        assert!(text.contains("inventory capped at 20,001"), "{text}");
+        assert!(text.contains("rerun /files <query>"), "{text}");
+    }
+
+    #[test]
+    fn files_picker_rejects_the_ignored_flag_with_a_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/files --ignored",
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("baton files --ignored"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn files_picker_reports_empty_and_missing_directories() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        let project = files_project(&[]);
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        handle_command(&mut state, &store, &engine_command_sender, "/files");
+        finish_files_picker_load(&mut state);
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("no files here"),
+            "{:?}",
+            state.notice
+        );
+
+        state.thread.cwd = project.path().join("missing").to_string_lossy().to_string();
+        handle_command(&mut state, &store, &engine_command_sender, "/files");
+        finish_files_picker_load(&mut state);
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("not a directory"),
+            "{:?}",
+            state.notice
+        );
     }
 
     #[test]

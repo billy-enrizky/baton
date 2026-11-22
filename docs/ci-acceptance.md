@@ -22,7 +22,7 @@ gh run view <run-id> --json jobs
 gh run view <run-id> --log
 ```
 
-`--log` is required for the cache key and the per-step budget line, which `--json jobs` does not return.
+`--log` is required for the cache key and each step's timestamps. `ci/budget.sh` prints no budget line of its own, so a command's duration is its step's `completedAt` minus `startedAt`.
 
 For a PR run, also record the selected gate outputs from the `changes` job and the cache key from the `rust-cache` step log.
 
@@ -53,6 +53,10 @@ For a PR run, also record the selected gate outputs from the `changes` job and t
 | Cache hit rate | Not measured |
 | Billable minute estimate | Not measured |
 | Monthly cap decision | Not approved |
+| Included Actions minutes (private repo) | Not recorded |
+| Per-minute rate above the included allowance | Not recorded |
+| Monthly minute cap | Not set |
+| Pause threshold | Not set |
 | Paid runner decision | Not evaluated |
 
 Billable minutes are summed per job as `ceil(job_seconds / 60)`. The estimate must include cancelled and superseded runs, workflow_dispatch, and the calibration runs. It must separate docs-only from Rust PR volume.

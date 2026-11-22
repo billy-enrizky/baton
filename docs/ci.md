@@ -19,7 +19,7 @@ The design is staged. Phase 1 creates one honest full-suite gate with hard budge
 | Skipped required checks | Zero | Now |
 | Failed required check reported as success | Zero | Now |
 
-Phase 1 does not claim the 60/120 target. It claims a hard ceiling: every job has `timeout-minutes`, every gate command runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. Phase 1 budgets are provisional because no GitHub Actions run exists yet, and they must shrink in Phase 2.
+Phase 1 does not claim the 60/120 target. It claims a hard ceiling: every job has `timeout-minutes`, every command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command, and `--version` runs only after a build that is already budgeted. Phase 1 budgets are provisional because no GitHub Actions run exists yet, and they must shrink in Phase 2.
 
 Budget rule, applied at every phase: a budget starts at three times the measured cold p95 on the target runner, and may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
 
@@ -47,7 +47,7 @@ The formatting and Clippy counts are baseline debt. Phase 1 adds ratchets that r
 
 ## What the gate enforces
 
-Every check below is a real command in `ci/`, and `ci/selftest.sh` proves one failing fixture per rule.
+Every check below is a real command in `ci/`, and `ci/selftest.sh` proves at least one failing fixture per rule.
 
 | Area | File | Enforcement |
 |---|---|---|
@@ -55,7 +55,7 @@ Every check below is a real command in `ci/`, and `ci/selftest.sh` proves one fa
 | Path selection | `ci/classify-paths.sh` | `--event`, `--files`, first-match precedence `unknown` > `code` > `meta` > docs |
 | Workflow invariants | `ci/check-ci.sh` | Rules CI001 to CI017 |
 | Gate integrity | `ci/gate-integrity.sh` | Rules GI001 to GI004 |
-| Test inventory | `ci/test-inventory.sh` | Rules TI001 and TI002 against `ci/test-inventory-floor.txt` |
+| Test inventory | `ci/test-inventory.sh` | Rules TI001 to TI004 against `ci/test-inventory-floor.txt` and the captured test log |
 | Format debt | `ci/fmt-debt.sh` | Count of `Diff in ` lines must not exceed the baseline |
 | Clippy debt | `ci/clippy-debt.sh` | Count of `error:` lines must not exceed the baseline |
 | Self-test | `ci/selftest.sh` | Runs every fixture and the budget negative test |
@@ -105,13 +105,13 @@ Head-controlled process configuration is rejected rather than compared. A workfl
 
 `rust-toolchain.toml` is compared byte for byte with the base copy in the `selection` job. There is no `RUSTUP_TOOLCHAIN` environment override anywhere in the workflow.
 
-Changing a gate command is not a PR-level decision. There is no `ci-change` label and no `--allow-change` path in the workflow. A PR that changes a command, a `needs` edge, a gate `if`, a timeout, or a runner fails `verify` against the base workflow, by design.
+Changing a gate command is not a PR-level decision. There is no `ci-change` label and the workflow never passes `--allow-change`; that flag exists only for a local `ci-repair` run. A PR that changes a command, a `needs` edge, a gate `if`, a timeout, or a runner fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
 
 The single escape hatch is `ci-repair`, and it is a human action rather than a workflow branch:
 
 1. The repository owner opens a PR that touches only `ci/**`, `.github/**`, or `docs/ci*.md`.
 2. The PR is expected to fail `verify` at the base comparison. That failure is the record of the change.
-3. Before merging, the owner runs `ci/selftest.sh`, `ci/check-ci.sh --base`, `actionlint`, and a full local `cargo test --locked` on the same commit.
+3. Before merging, the owner runs `ci/selftest.sh`, `ci/check-ci.sh --base <base workflow> <head workflow> --allow-change`, `actionlint`, and a full local `cargo test --locked` on the same commit.
 4. The owner merges with an admin override, quoting the local results in the PR.
 5. The `push` run on `main` is the proof: it runs the new tools against the full suite with all gates selected.
 
@@ -213,7 +213,7 @@ The real configuration, `BatonCiAdmission.cfg`, runs 2,332,700 states and 371,42
 | `BatonCiAdmissionCommandDrift.cfg` | `CommandsMatch` |
 | `BatonCiAdmissionReportWithoutStart.cfg` | `NoFalseGreen` |
 
-What the model proves: a selected gate cannot be skipped and reported green, an unselected gate cannot report success, merge events cannot use a subset, a retry cannot convert a failure, an unknown selection cannot select nothing, and a command edit cannot pass the guard.
+What the model proves, with `CommandDriftAllowed = FALSE`: a selected gate cannot be skipped and reported green, an unselected gate cannot report success, merge events cannot use a subset, a retry cannot convert a failure, an unknown selection cannot select nothing, and a command edit cannot pass `CommandsMatch`. The one config that sets `CommandDriftAllowed = TRUE` exists only to show that `CommandsMatch` depends on that constant. The model models the rule, not the shell implementation, so `ci/selftest.sh` remains the executable proof.
 
 What it does not prove: test inventory completeness, shard union coverage, or that the selector's dependency map is correct. Those are covered by the selection union check and its fixtures.
 

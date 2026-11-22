@@ -8,7 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::config::resolve_config;
 use crate::store::{BatonStore, OrchestrationRunRow, OrchestrationTaskRow};
@@ -38,6 +38,7 @@ fn run_command_cancellable(
     mut command: Command,
     cancel: Option<&AtomicBool>,
 ) -> std::io::Result<CommandResult> {
+    let started = Instant::now();
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -68,10 +69,13 @@ fn run_command_cancellable(
             break;
         }
         if is_cancelled(cancel) {
+            eprintln!("cancel seen after {:?}; pgid={pgid}", started.elapsed());
             cancelled = true;
             #[cfg(unix)]
             {
-                if !crate::process::terminate_group(pgid) {
+                let terminated = crate::process::terminate_group(pgid);
+                eprintln!("terminate_group({pgid}) -> {terminated} after {:?}", started.elapsed());
+                if !terminated {
                     let _ = child.kill();
                 }
             }
@@ -83,12 +87,22 @@ fn run_command_cancellable(
         }
         std::thread::sleep(Duration::from_millis(50));
     }
+    eprintln!("wait start after {:?}", started.elapsed());
     let status = child.wait()?;
+    eprintln!("wait done after {:?}", started.elapsed());
     let stdout = stdout
-        .map(|handle| handle.join().unwrap_or_default())
+        .map(|handle| {
+            let result = handle.join().unwrap_or_default();
+            eprintln!("stdout joined after {:?}", started.elapsed());
+            result
+        })
         .unwrap_or_default();
     let stderr = stderr
-        .map(|handle| handle.join().unwrap_or_default())
+        .map(|handle| {
+            let result = handle.join().unwrap_or_default();
+            eprintln!("stderr joined after {:?}", started.elapsed());
+            result
+        })
         .unwrap_or_default();
     Ok(CommandResult {
         status,

@@ -19,7 +19,10 @@ This file records actual GitHub Actions evidence for [ci.md](ci.md). Do not add 
 gh run list --workflow ci.yml --limit 20 \
   --json databaseId,event,headSha,createdAt,startedAt,updatedAt,conclusion,url
 gh run view <run-id> --json jobs
+gh run view <run-id> --log
 ```
+
+`--log` is required for the cache key and the per-step budget line, which `--json jobs` does not return.
 
 For a PR run, also record the selected gate outputs from the `changes` job and the cache key from the `rust-cache` step log.
 
@@ -58,12 +61,12 @@ Billable minutes are summed per job as `ceil(job_seconds / 60)`. The estimate mu
 
 | Proof | Evidence | Result |
 |---|---|---|
-| First green `main` full-suite run | Phase 1B workflow | Pending |
-| First PR run with `verify` | Phase 1B workflow | Pending |
-| Budget overrun fails | Phase 1A `ci/selftest.sh`, exit 124 | Pending in CI, passed locally |
-| Hidden TUI change cannot skip tests | Phase 1 classifier fixture plus Phase 3 selector proof | Pending |
-| No-op test command fails the workflow guard | Phase 1B `ci/check-ci.sh --base` | Pending |
-| Formal CI gate | `ci/formal/ci-admission/run.sh` | Pending |
+| First green `main` full-suite run | Phase 1C workflow | Pending |
+| First PR run with `verify` | Phase 1C workflow | Pending |
+| Budget overrun fails | Phase 1B `ci/selftest.sh`, exit 124 | Passed locally on 2026-11-21; CI pending |
+| Hidden TUI change cannot skip tests | Phase 1 classifier fixture plus Phase 3 selector proof | Classifier fixture passes locally; selector proof pending |
+| No-op test command fails the workflow guard | Phase 1C `ci/check-ci.sh --base` | Passed locally against the Phase 1C workflow; CI pending |
+| Formal CI gate | `ci/formal/ci-admission/run.sh` | Passed locally on 2026-11-21; requires a JDK, not yet in CI |
 | End-to-end CI probe | `.agents/skills/verify-baton-ci/scripts/ci_probe.sh` | Pending |
 | Branch protection requires `verify` | Repository owner action | Pending |
 | Merge-queue full suite | Blocked by repository ownership and plan | Pending |

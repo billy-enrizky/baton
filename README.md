@@ -11,8 +11,8 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 - **A clear start.** The banner shows version, cwd, session mode, model, reasoning effort when set, permissions, and billing before the first prompt. New threads inherit the harness config's permission mode, so the banner shows the mode the provider will actually use. Greetings go to one harness; real work goes to the planner.
 - **Orchestrated by default.** A first prompt starts a coordinator, which plans independent tasks and picks a harness for each. Workers run in isolated worktrees with live progress, commit their changes to their own branches, and can be merged back with a confirmation. If the coordinator cannot return a usable plan, baton runs one direct worker instead of failing the run. If a Baton process dies mid-run, the next start settles the abandoned run to a terminal verdict while preserving completed workers.
 - **One CLI, many harnesses.** Codex, Claude Code, Grok Build, OpenCode, Cursor, and Antigravity, driven through their supported programmatic surfaces (app-server JSON-RPC, headless stream-json, ACP, HTTP).
-- **The thread is the product.** Switching harness or model mid-thread is a dropdown: `/switch` opens the provider picker, then the model picker. First turn on a new harness carries a token-budgeted context handoff; after that each harness keeps its own native session.
-- **High prompt cache hit rates.** baton never replays history into a harness. The cache hit rate is always visible in the status bar.
+- **The thread is the product.** Switching harness or model mid-thread is a dropdown: `/switch` opens the provider picker, then the model picker. The first turn on a new harness carries a context handoff capped at 24,000 bytes; after that each harness keeps its own native session.
+- **High prompt cache hit rates.** Once a harness has a native session, baton sends only the new message and the harness replays its own history. The first turn on a harness that has no session carries a bounded handoff instead. The cache hit rate is always visible in the status bar.
 - **Reads the same context jsonl.** `baton import` discovers existing native sessions (claude transcripts, codex rollouts) and imports them as resumable baton threads.
 - **Checkpoints.** Every turn ends with a hidden git ref capturing the working tree. `/rewind` restores the conversation and optionally the code.
 - **Review from the terminal.** `/review` shows the turn diff with context, keeps notes on exact changed lines, and sends them back as a steer or the next prompt.
@@ -188,13 +188,15 @@ Tools:
 - `baton_orchestration_runs`: durable orchestration runs with status, coordinator, task counts, and timestamps; `all=true` includes archived runs
 - `baton_orchestration_report`: one run's plan, worker tasks, commits, worktree paths, PR links, text, and errors
 - `baton_fork`: create a new thread from a conversation, optionally through a completed turn, without changing the source; set `native=true` for a Codex or OpenCode native fork
+- `baton_activity`: recent activity across projects with turn and worker status
+- `baton_memories`: durable memories for the project, or every project with `all=true`
 - `baton_latest_diff`: newest stored turn diff
 
 The server is read-only except for the explicit `baton_queue` clear option and `baton_fork`, which creates a new thread and leaves the source unchanged. It opens the same `~/.baton/baton.sqlite` database and honors `BATON_HOME`.
 
 ## How context and caching work
 
-Each provider keeps its own native session per baton thread. On every turn only the new user message is sent; the harness resumes its own session, which keeps provider prompt caches warm. Provider caches are separate systems: switching harnesses means a cold cache for the new one, and switching back re-warms within that provider's cache TTL.
+Each provider keeps its own native session per baton thread. On every turn after the first, only the new user message is sent; the harness resumes its own session, which keeps provider prompt caches warm. The first turn on a harness with no session sends a handoff built from prior messages plus the working-tree summary, capped at 24,000 bytes. Provider caches are separate systems: switching harnesses means a cold cache for the new one, and switching back re-warms within that provider's cache TTL.
 
 ## Storage
 
@@ -206,6 +208,12 @@ Each provider keeps its own native session per baton thread. On every turn only 
 cargo test     # unit + protocol tests
 cargo build --release
 ```
+
+Planning and verification records:
+
+- [Terminal parity ledger](docs/parity.md)
+- [CI design](docs/ci.md)
+- [CI acceptance record](docs/ci-acceptance.md)
 
 ## License
 

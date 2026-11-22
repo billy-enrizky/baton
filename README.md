@@ -107,6 +107,7 @@ baton --mode single      # fresh session on one harness
 baton -t <id>            # open an existing thread and its saved session mode
 baton threads [--json]   # list threads with phase, turns, goal, queue
 baton inbox [--json]     # failed, unverified, needs-input, queued, and unshipped worker work
+baton completions <shell>  # bash, zsh, fish, powershell, or elvish
 baton status [-t id] [--json]  # plain-language next step, phase, goal, queue, usage
 baton activity [-t id] [--json]  # per-turn provider, tool calls, diff, usage
 baton memories [-C path] [--json]  # governed project and global memories

@@ -1,4 +1,4 @@
-use baton::handoff::{build_handoff, wrap_prompt_with_handoff, HandoffMessage};
+use baton::handoff::{build_handoff, handoff_prompt, wrap_prompt_with_handoff, HandoffMessage};
 use baton::store::{BatonStore, ImportedMessage, NewThread};
 use baton::types::{PermissionMode, ProviderId, SessionMode, TurnPhase, TurnUsage};
 use baton::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
@@ -975,7 +975,10 @@ fn handoff_builds_sections_and_respects_budget() {
     let handoff = build_handoff(
         "/work/repo",
         "fix login",
-        &[message("user", "fix the login bug"), message("assistant", "done, tests pass")],
+        &[
+            message("user", "fix the login bug"),
+            message("assistant", "done, tests pass"),
+        ],
         Some("M src/auth.ts"),
         None,
     );
@@ -1000,6 +1003,45 @@ fn handoff_builds_sections_and_respects_budget() {
     let wrapped = wrap_prompt_with_handoff("HANDOFF", "do the thing");
     assert!(wrapped.starts_with("HANDOFF"));
     assert!(wrapped.ends_with("do the thing"));
+}
+
+#[test]
+fn handoff_prompt_includes_the_user_prompt_once() {
+    let prompt = handoff_prompt(
+        "/work/repo",
+        "fix login",
+        &[message("user", "fix the login bug"), message("assistant", "done, tests pass")],
+        Some("M src/auth.rs"),
+        "now add a test",
+        None,
+    );
+    assert_eq!(prompt.matches("now add a test").count(), 1);
+    assert!(prompt.contains("[user]\nfix the login bug"));
+}
+
+#[test]
+fn handoff_truncation_keeps_utf8_intact() {
+    let inside = format!("{}é{}", "a".repeat(3998), "z".repeat(10));
+    let inside_handoff = build_handoff("/r", "t", &[message("user", &inside)], None, Some(20000));
+    assert!(
+        inside_handoff.contains("é"),
+        "a character ending exactly at the limit must survive"
+    );
+    assert!(inside_handoff.contains("[...truncated]"));
+
+    let straddling = format!("{}é{}", "a".repeat(3999), "z".repeat(10));
+    let straddling_handoff = build_handoff(
+        "/r",
+        "t",
+        &[message("user", &straddling)],
+        None,
+        Some(20000),
+    );
+    assert!(straddling_handoff.contains("[...truncated]"));
+    assert!(
+        straddling_handoff.contains(&"a".repeat(3999)),
+        "truncation must back off to a character boundary"
+    );
 }
 
 #[test]

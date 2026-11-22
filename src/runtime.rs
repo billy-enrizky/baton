@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, SteerOutcome, SteerRequest, TurnEvent, TurnStartInput};
 use crate::checkpoints::capture_checkpoint;
 use crate::config::{provider_auth_env, resolve_config};
-use crate::handoff::{build_handoff, derive_title, git_status_summary, wrap_prompt_with_handoff, HandoffMessage};
+use crate::handoff::{derive_title, git_status_summary, handoff_prompt, HandoffMessage};
 use crate::store::{BatonStore, NewThread, ThreadRow};
 use crate::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
 
@@ -754,7 +754,7 @@ async fn execute_turn(
 
     let mut prompt = prompt_text.clone();
     if session.is_none() && !prior_messages.is_empty() {
-        let mut handoff_messages: Vec<HandoffMessage> = prior_messages
+        let handoff_messages: Vec<HandoffMessage> = prior_messages
             .iter()
             .map(|message| HandoffMessage {
                 role: message.role.clone(),
@@ -763,15 +763,8 @@ async fn execute_turn(
                 text: message.text.clone(),
             })
             .collect();
-        handoff_messages.push(HandoffMessage {
-            role: "user".to_string(),
-            provider: Some(provider.as_str().to_string()),
-            model: Some(model.clone()),
-            text: prompt_text.clone(),
-        });
         let git_status = git_status_summary(std::path::Path::new(&cwd), 50);
-        let handoff = build_handoff(&cwd, &thread_title, &handoff_messages, git_status.as_deref(), None);
-        prompt = wrap_prompt_with_handoff(&handoff, &prompt_text);
+        prompt = handoff_prompt(&cwd, &thread_title, &handoff_messages, git_status.as_deref(), &prompt_text, None);
     }
 
     let cwd_for_checkpoint = cwd.clone();

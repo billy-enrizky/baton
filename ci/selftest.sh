@@ -170,4 +170,6 @@ if [[ "$(cat "$timings_out")" != "$expected_timings" ]]; then
   exit 1
 fi
 
+bash "$root/installer-selftest.sh"
+
 echo "ci selftest passed"

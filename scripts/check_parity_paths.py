@@ -64,6 +64,30 @@ def iter_baton_evidence(document: Path):
                 yield line_number, path
 
 
+DELIVERY_ROW = re.compile(r"^\| (D[0-9]+[a-z]?) \|")
+PLAN_CODE = re.compile(r"\bD[0-9]+[a-z]?\b")
+
+
+def iter_plan_codes(document: Path):
+    for line_number, line in enumerate(document.read_text().splitlines(), 1):
+        if not line.startswith("| ") or line.startswith("|---") or line.count("|") != 8:
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) != 7:
+            continue
+        for code in PLAN_CODE.findall(cells[6]):
+            yield line_number, code
+
+
+def delivery_codes(document: Path) -> set[str]:
+    codes = set()
+    for line in document.read_text().splitlines():
+        match = DELIVERY_ROW.match(line)
+        if match:
+            codes.add(match.group(1))
+    return codes
+
+
 def iter_statuses(document: Path):
     for line_number, line in enumerate(document.read_text().splitlines(), 1):
         if not line.startswith("|") or line.startswith("|---"):
@@ -122,6 +146,15 @@ def main() -> int:
     for line_number, path in baton_missing:
         LOGGER.error("docs/parity.md:%s missing Baton path %s", line_number, path)
 
+    defined = delivery_codes(args.document)
+    bad_code: list[tuple[int, str]] = []
+    for line_number, code in iter_plan_codes(args.document):
+        if code not in defined:
+            bad_code.append((line_number, code))
+
+    for line_number, code in bad_code:
+        LOGGER.error("docs/parity.md:%s Plan references undefined slice %s", line_number, code)
+
     bad_status: list[tuple[int, str]] = []
     for line_number, status in iter_statuses(args.document):
         if status not in STATUSES:
@@ -131,14 +164,16 @@ def main() -> int:
         LOGGER.error("docs/parity.md:%s unknown status %s", line_number, status)
 
     LOGGER.warning(
-        "checked %s upstream paths, %s Baton paths, and %s statuses; %s missing, %s unknown statuses",
+        "checked %s upstream paths, %s Baton paths, %s statuses, %s slice references; %s missing, %s unknown statuses, %s undefined slices",
         checked,
         baton_checked,
         checked,
+        len(defined),
         len(missing) + len(baton_missing),
         len(bad_status),
+        len(bad_code),
     )
-    return 0 if not (missing or baton_missing or bad_status) else 1
+    return 0 if not (missing or baton_missing or bad_status or bad_code) else 1
 
 
 if __name__ == "__main__":

@@ -53,12 +53,12 @@ Every check below is a real command in `ci/`, and `ci/selftest.sh` proves at lea
 |---|---|---|
 | Budgets | `ci/budget.sh` | `timeout` with a Perl fallback; a miss exits 124 and fails the job |
 | Path selection | `ci/classify-paths.sh` | `--event`, `--files`, first-match precedence `unknown` > `code` > `meta` > docs |
-| Workflow invariants | `ci/check-ci.sh` | Rules CI001 to CI017 |
-| Gate integrity | `ci/gate-integrity.sh` | Rules GI001 to GI004 |
-| Test inventory | `ci/test-inventory.sh` | Rules TI001 to TI004 against `ci/test-inventory-floor.txt` and the captured test log |
+| Workflow invariants | `ci/check-ci.sh` | Rules CI001 to CI015 and CI017 (CI016 is unused) |
+| Gate integrity | `ci/gate-integrity.sh` | Rules GI001 to GI006 |
+| Test inventory | `ci/test-inventory.sh` | Rules TI001 to TI005 against `ci/test-inventory-floor.txt` and the captured test log |
 | Format debt | `ci/fmt-debt.sh` | Count of `Diff in ` lines must not exceed the baseline |
 | Clippy debt | `ci/clippy-debt.sh` | Count of `error:` lines must not exceed the baseline |
-| Self-test | `ci/selftest.sh` | Runs every fixture and the budget negative test |
+| Self-test | `ci/selftest.sh` | Runs every fixture, the budget negative test, and the inventory floor cases |
 
 Workflow invariants:
 
@@ -99,11 +99,15 @@ The base supplies every pass/fail script on every event. The head supplies only 
 - `push` uses `github.event.before`, falling back to `HEAD~1` for a first push or a zero SHA.
 - `workflow_dispatch` uses `github.event.before`, falling back to `HEAD~1`.
 
-The base copy is sparse-checked out to `base/` with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`.
+The base copy is sparse-checked out to `base/` with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`. Each job then copies `base/ci` to `$RUNNER_TEMP/trusted-ci`, marks it read-only, records a SHA-256 manifest, and executes only from that copy. The `test` job re-verifies the manifest after `cargo test` and fails if any tool changed.
+
+That staging is a detection boundary, not a sandbox. `cargo test` runs arbitrary repository code with write access to the runner's filesystem, so a determined change can still tamper with the process. What staging buys is that tampering after the first gate step is visible as a manifest mismatch instead of silently changing the harness. A real sandbox needs a separate container or a read-only mount, which is a Phase 3 decision.
 
 Head-controlled process configuration is rejected rather than compared. A workflow or job `env` block can shadow `cargo` on `PATH`. A job-level `permissions` block can grant write access while the top-level block stays read. A job-level `container`, `services`, or reusable workflow moves the gate somewhere the guard cannot see. CI015 and CI006 reject all of these outright, and `persist-credentials: false` keeps the checkout token out of the git config.
 
 `rust-toolchain.toml` is compared byte for byte with the base copy in the `selection` job. There is no `RUSTUP_TOOLCHAIN` environment override anywhere in the workflow.
+
+On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run on `main`; the PR run is where command drift is rejected.
 
 Changing a gate command is not a PR-level decision. There is no `ci-change` label and the workflow never passes `--allow-change`; that flag exists only for a local `ci-repair` run. A PR that changes a command, a `needs` edge, a gate `if`, a timeout, or a runner fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
 
@@ -202,7 +206,7 @@ Shards are filled from recorded per-test times, never from a guess.
 
 `ci/formal/ci-admission/BatonCiAdmission.tla` models gate admission, not test correctness. `Gates` holds the six jobs plus the workflow-guard step (`changes`, `selection`, `workflow_guard`, `check`, `build`, `test`, `debt`); `verify` is modeled as the aggregator that reads them, because it never runs a check itself.
 
-The real configuration, `BatonCiAdmission.cfg`, runs 2,332,700 states and 371,420 distinct states. Six mutation configs must each fail with a named invariant:
+The real configuration, `BatonCiAdmission.cfg`, runs 583,175 states and 92,855 distinct states. Six mutation configs must each fail with a named invariant:
 
 | Config | Invariant that must break |
 |---|---|

@@ -65,7 +65,14 @@ mkdir -p "$integrity_root/wrapper/.cargo"
 printf '[build]\nrustc-wrapper = "./x.sh"\n' > "$integrity_root/wrapper/.cargo/config.toml"
 printf '[lints.clippy]\nall = "allow"\n' > "$integrity_root/lints/Cargo.toml"
 printf '#![allow(clippy::all)]\n' > "$integrity_root/allow/src/lib.rs"
-for pair in rustfmt:GI001 wrapper:GI002 lints:GI003 allow:GI004; do
+for case in warnings cfgattr skip; do
+  mkdir -p "$integrity_root/$case/src"
+done
+printf 'fn a() {}\n' > "$integrity_root/warnings/src/lib.rs"
+printf '#![allow(warnings)]\n' > "$integrity_root/warnings/src/lib.rs"
+printf '#[cfg_attr(test, allow(clippy::all))]\nfn a() {}\n' > "$integrity_root/cfgattr/src/lib.rs"
+printf '#[rustfmt::skip]\nfn a() {}\n' > "$integrity_root/skip/src/lib.rs"
+for pair in rustfmt:GI001 wrapper:GI002 lints:GI003 allow:GI004 warnings:GI005 cfgattr:GI005 skip:GI006; do
   case_name=${pair%%:*}
   rule=${pair##*:}
   set +e

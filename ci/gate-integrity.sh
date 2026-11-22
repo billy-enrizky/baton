@@ -28,4 +28,12 @@ if grep -rqE '#!?\[allow\(clippy::(all|pedantic|nursery|correctness)' --include=
   fail "GI004 blanket Clippy allow in tracked Rust sources"
 fi
 
+if grep -rqE 'allow\(warnings\)|cfg_attr\([^)]*allow\(clippy::' --include='*.rs' src tests 2>/dev/null; then
+  fail "GI005 warning or conditional Clippy suppression in tracked Rust sources"
+fi
+
+if grep -rqE '#\[rustfmt::skip\]' --include='*.rs' src tests 2>/dev/null; then
+  fail "GI006 rustfmt skip in tracked Rust sources"
+fi
+
 echo "gate integrity passed"

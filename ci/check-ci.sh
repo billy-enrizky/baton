@@ -52,6 +52,8 @@ def canonical_steps(job)
       "if" => step["if"],
       "continue-on-error" => step["continue-on-error"],
       "env" => step["env"],
+      "shell" => step["shell"],
+      "working-directory" => step["working-directory"],
     }
   end
 end
@@ -97,7 +99,10 @@ jobs.each do |name, job|
   fail!("CI015", "job #{name} sets services") if job.key?("services")
   fail!("CI015", "job #{name} runs a reusable workflow") if job.key?("uses")
   fail!("CI006", "job #{name} sets permissions") if job.key?("permissions")
-  fail!("CI003", "job #{name} sets continue-on-error") if job["continue-on-error"].to_s == "true"
+  continue_on_error = job["continue-on-error"]
+  if job.key?("continue-on-error") && continue_on_error.to_s != "false"
+    fail!("CI003", "job #{name} sets continue-on-error")
+  end
   fail!("CI002", "job #{name} has no runs-on") unless job.key?("runs-on")
   timeout = job["timeout-minutes"]
   fail!("CI002", "job #{name} timeout must be numeric and below 360") unless timeout.is_a?(Numeric) && timeout.positive? && timeout < 360
@@ -106,7 +111,11 @@ jobs.each do |name, job|
   steps.each do |step|
     uses = step["uses"].to_s
     fail!("CI003", "job #{name} uses a retry action") if uses.match?(/retry/i)
-    fail!("CI003", "job #{name} uses continue-on-error") if step["continue-on-error"] == true
+    if step.key?("continue-on-error") && step["continue-on-error"].to_s != "false"
+      fail!("CI003", "job #{name} uses continue-on-error")
+    end
+    fail!("CI015", "job #{name} sets a step shell") if step.key?("shell")
+    fail!("CI015", "job #{name} sets a step working-directory") if step.key?("working-directory")
     run = step["run"].to_s
     fail!("CI004", "job #{name} masks a shell failure with || true") if run.include?("|| true")
     fail!("CI004", "job #{name} masks a shell failure with set +e") if run.include?("set +e") || run.include?("set +o errexit")

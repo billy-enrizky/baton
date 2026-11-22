@@ -6,6 +6,7 @@ use baton::types::PermissionMode;
 use baton::types::{NativeSessionRef, ProviderId};
 use serde_json::{json, Value};
 use std::io::{Read, Write};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -178,6 +179,63 @@ fn respond(
             send(&mut stream, &json!({"type": "session.next.step.ended", "data": {"sessionID": session, "finish": "stop", "tokens": {"input": 5, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}}}}));
         }
         _ => respond_json(&mut stream, "404 Not Found", "{}"),
+    }
+}
+
+#[tokio::test]
+async fn dropping_an_opencode_adapter_kills_the_runtime_child() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        serve_opencode(
+            listener,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+    });
+
+    let pid_slot = Arc::new(Mutex::new(None));
+    let pid_for_spawner = pid_slot.clone();
+    let spawner: OpenCodeSpawner = Arc::new(move |_auth_env: &[(String, String)]| {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        *pid_for_spawner.lock().unwrap() = child.id();
+        Ok(OpenCodeChild {
+            port,
+            password: "pw".to_string(),
+            child,
+        })
+    });
+    let mut adapter = OpenCodeAdapter::new(spawner);
+    adapter
+        .list_models(ModelListInput {
+            cwd: "/work".into(),
+            auth_env: vec![],
+        })
+        .await
+        .unwrap();
+    let pid = pid_slot.lock().unwrap().expect("runtime child pid");
+    drop(adapter);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "dropping OpenCodeAdapter left process {pid} alive"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 

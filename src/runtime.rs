@@ -752,6 +752,12 @@ async fn execute_turn(
         store.lock().unwrap().rename_thread(thread_id, &title)?;
     }
 
+    let secrets = crate::redact::collect(
+        config
+            .providers
+            .values()
+            .filter_map(|provider| provider.api_key.as_deref()),
+    );
     let mut prompt = prompt_text.clone();
     // A native session has already read the turns up to its marker. Sending it
     // again would spend cache and repeat context, so only unseen turns travel.
@@ -767,7 +773,7 @@ async fn execute_turn(
                 role: message.role.clone(),
                 provider: message.provider.clone(),
                 model: message.model.clone(),
-                text: message.text.clone(),
+                text: crate::redact::redact(&message.text, &secrets).into_owned(),
             })
             .collect();
         let git_status = git_status_summary(std::path::Path::new(&cwd), 50);
@@ -1378,6 +1384,79 @@ mod tests {
             .unwrap()
             .covered_turn;
         assert_eq!(covered, 3, "a completed turn advances the marker");
+    }
+
+    #[tokio::test]
+    async fn a_handoff_redacts_configured_secrets() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"codex":{"api_key":"sk-live-abcdef123456"}}"#,
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let cwd = home.path().to_string_lossy().to_string();
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "redact".into(),
+                cwd: cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        {
+            let store = store.lock().unwrap();
+            store
+                .add_message(
+                    &thread.id,
+                    1,
+                    "user",
+                    Some("claude"),
+                    Some("m"),
+                    "the token is sk-live-abcdef123456, do not repeat it",
+                )
+                .unwrap();
+            store
+                .add_message(&thread.id, 1, "assistant", Some("claude"), Some("m"), "noted")
+                .unwrap();
+        }
+
+        let captured = Arc::new(Mutex::new(None));
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
+            Box::new(CapturingAdapter {
+                prompt: captured.clone(),
+                session_id: None,
+            }) as Box<dyn BatonAdapter>,
+        ))];
+        let adapter_indices = HashMap::from([(ProviderId::Codex, 0)]);
+        let provider_claims: ProviderClaims = Arc::new(Mutex::new(HashMap::new()));
+        let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        execute_turn(
+            &store,
+            &home.path().to_path_buf(),
+            &adapters,
+            &adapter_indices,
+            &provider_claims,
+            cancel_receiver,
+            &thread.id,
+            "next",
+            PermissionMode::Default,
+            &engine_sender,
+            &turn_sender,
+        )
+        .await
+        .expect("turn completes");
+
+        let prompt = captured.lock().unwrap().clone().expect("prompt captured");
+        assert!(
+            !prompt.contains("sk-live-abcdef123456"),
+            "the configured key must not reach another provider: {prompt}"
+        );
+        assert!(prompt.contains(crate::redact::PLACEHOLDER), "{prompt}");
     }
 
     #[tokio::test]

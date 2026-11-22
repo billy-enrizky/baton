@@ -6,6 +6,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 |---|---|---|
 | Doctor | CLI | `baton doctor` next action, six providers, readiness, database count |
 | TUI status | TUI | `/status` shows thread, phase, queue, and adapter lifecycle |
+| Slash choices | TUI | typing a command argument lists valid choices or its syntax, filters them, and completes with Tab or Enter |
 | Status next action | CLI | `baton status` and `--json` answer what to do now |
 | Provider readiness | CLI and TUI | doctor summarizes ready/missing; pickers mark missing harnesses |
 | Default provider | CLI and TUI | new work starts on an installed harness, with an explicit override |

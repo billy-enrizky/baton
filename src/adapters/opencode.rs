@@ -46,6 +46,14 @@ struct OpenCodeRuntime {
     active_turn: AsyncMutex<Option<ActiveTurn>>,
 }
 
+impl Drop for OpenCodeRuntime {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.try_lock() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 pub struct OpenCodeAdapter {
     spawner: OpenCodeSpawner,
     runtime: Arc<AsyncMutex<Option<Arc<OpenCodeRuntime>>>>,

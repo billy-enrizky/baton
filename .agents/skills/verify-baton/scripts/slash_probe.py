@@ -139,6 +139,40 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
+        os.write(master, b"/grep ")
+        pump(master, 0.5, transcript)
+        grep_hint = screen_text(transcript, args.width, args.height)
+        if "grep [--case] [--word] [--regex] <query>" not in grep_hint:
+            missing.append("/grep usage hint")
+        (evidence / "grep-hint-screen.txt").write_text(grep_hint + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/grep parse\r")
+        pump(master, 1.5, transcript)
+        grep_picker = screen_text(transcript, args.width, args.height)
+        grep_required = [
+            'grep "parse"',
+            "src/parser/mod.rs:1",
+            "enter insert",
+            "esc close",
+        ]
+        missing.extend(value for value in grep_required if value not in grep_picker)
+        os.write(master, b"pa")
+        pump(master, 0.4, transcript)
+        grep_filtered = screen_text(transcript, args.width, args.height)
+        if "src/parser/mod.rs:1" not in grep_filtered:
+            missing.append("grep filtered row")
+        (evidence / "grep-picker-screen.txt").write_text(grep_filtered + "\n")
+        os.write(master, b"\r")
+        pump(master, 1.0, transcript)
+        grep_result = screen_text(transcript, args.width, args.height)
+        if "inserted src/parser/mod.rs:1" not in grep_result:
+            missing.append("grep insert notice")
+        (evidence / "grep-result-screen.txt").write_text(grep_result + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
         os.write(master, b"/pin\r")
         pump(master, 1.5, transcript)
         pin_picker = screen_text(transcript, args.width, args.height)

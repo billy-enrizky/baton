@@ -301,6 +301,23 @@ pub enum Commands {
         #[arg(long)]
         print: bool,
     },
+    /// Search project file contents
+    Grep {
+        /// Search text
+        query: Vec<String>,
+        /// Match case exactly
+        #[arg(long)]
+        case_sensitive: bool,
+        /// Match whole words only
+        #[arg(long)]
+        word: bool,
+        /// Treat the query as a regular expression
+        #[arg(long)]
+        regex: bool,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     /// List durable turn phases for a thread
     Turns {
         thread_id: Option<String>,
@@ -459,6 +476,30 @@ mod tests {
                 json: true,
             }) => assert_eq!(query, vec!["parser"]),
             _ => panic!("expected files"),
+        }
+    }
+
+    #[test]
+    fn grep_accepts_flags_and_json() {
+        let cli = Cli::try_parse_from([
+            "baton",
+            "grep",
+            "alpha",
+            "--case-sensitive",
+            "--word",
+            "--regex",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Grep {
+                query,
+                case_sensitive: true,
+                word: true,
+                regex: true,
+                json: true,
+            }) => assert_eq!(query, vec!["alpha"]),
+            _ => panic!("expected grep"),
         }
     }
 

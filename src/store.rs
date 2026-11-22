@@ -1,5 +1,9 @@
 use anyhow::Result;
-use rusqlite::{params, Connection, OptionalExtension};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use rusqlite::{
+    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+};
+use std::collections::HashMap;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -18,8 +22,18 @@ pub struct ThreadRow {
     pub goal_paused: bool,
     pub session_mode: SessionMode,
     pub pinned: bool,
+    pub pin_order_key: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinMoveOutcome {
+    Moved,
+    AlreadyFirst,
+    AlreadyLast,
+    NotPinned,
+    NotFound,
 }
 
 #[derive(Debug, Clone)]
@@ -210,6 +224,7 @@ CREATE TABLE IF NOT EXISTS threads (
   goal_paused INTEGER NOT NULL DEFAULT 0,
   session_mode TEXT NOT NULL DEFAULT 'single',
   pinned INTEGER NOT NULL DEFAULT 0,
+  pin_order_key TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -419,6 +434,113 @@ fn ensure_thread_columns(db: &Connection) -> Result<()> {
         "TEXT NOT NULL DEFAULT 'single'",
     )?;
     ensure_column(db, "threads", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
+    ensure_column(db, "threads", "pin_order_key", "TEXT")?;
+    db.execute_batch(
+        "CREATE INDEX IF NOT EXISTS threads_pin_order_idx ON threads(pin_order_key DESC) WHERE pin_order_key IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS threads_pin_backfill_idx ON threads(updated_at) WHERE pinned = 1 AND (pin_order_key IS NULL OR pin_order_key = '');",
+    )?;
+    backfill_pin_order_keys(db)
+}
+
+fn path_candidates(cwd: &Path) -> Vec<std::path::PathBuf> {
+    let mut candidates = vec![cwd.to_path_buf()];
+    if let Ok(canonical) = cwd.canonicalize() {
+        if canonical != cwd {
+            candidates.push(canonical);
+        }
+    }
+    if let Ok(target) = cwd.read_link() {
+        let target = if target.is_absolute() {
+            target
+        } else {
+            cwd.parent().unwrap_or(Path::new(".")).join(target)
+        };
+        if !candidates.contains(&target) {
+            candidates.push(target);
+        }
+    }
+    candidates
+}
+
+fn parse_pin_order_key(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|value| value.with_timezone(&Utc))
+}
+
+fn format_pin_order_key(value: DateTime<Utc>) -> String {
+    value.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+fn truncate_to_microseconds(value: DateTime<Utc>) -> DateTime<Utc> {
+    DateTime::from_timestamp_micros(value.timestamp_micros()).unwrap_or(value)
+}
+
+fn next_pin_order_key_from(now: DateTime<Utc>, max: Option<DateTime<Utc>>) -> String {
+    let now = truncate_to_microseconds(now);
+    let next = match max {
+        Some(max) if now <= max => max + Duration::microseconds(1),
+        _ => now,
+    };
+    format_pin_order_key(next)
+}
+
+fn backfill_pin_order_keys(db: &Connection) -> Result<()> {
+    let needs_repair: Option<i64> = db
+        .query_row(
+            "SELECT 1 FROM threads WHERE pinned = 1 AND (pin_order_key IS NULL OR pin_order_key = '') LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if needs_repair.is_none() {
+        return Ok(());
+    }
+    let transaction = Transaction::new_unchecked(db, TransactionBehavior::Immediate)?;
+    let max: Option<String> = transaction.query_row(
+        "SELECT MAX(pin_order_key) FROM threads WHERE pin_order_key IS NOT NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    let mut last = max.as_deref().and_then(parse_pin_order_key);
+    let missing = {
+        let mut statement = transaction.prepare(
+            "SELECT id, updated_at, created_at FROM threads WHERE pinned = 1 AND (pin_order_key IS NULL OR pin_order_key = '') ORDER BY updated_at ASC, rowid ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows
+    };
+    for (id, updated_at, created_at) in missing {
+        let base = match parse_pin_order_key(&updated_at) {
+            Some(value) => truncate_to_microseconds(value),
+            None => last
+                .map(truncate_to_microseconds)
+                .or_else(|| parse_pin_order_key(&created_at).map(truncate_to_microseconds))
+                .unwrap_or_else(|| DateTime::from_timestamp(0, 0).unwrap_or_else(Utc::now)),
+        };
+        let normalized_last = last.map(truncate_to_microseconds);
+        let key = match normalized_last {
+            Some(last) if base <= last => last + Duration::microseconds(1),
+            _ => base,
+        };
+        let changed = transaction.execute(
+            "UPDATE threads SET pin_order_key = ? WHERE id = ?",
+            params![format_pin_order_key(key), id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("thread {id} not found while backfilling pin order");
+        }
+        last = Some(key);
+    }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -444,13 +566,14 @@ fn migrate_thread_model_nullable(db: &Connection) -> Result<()> {
                   goal TEXT,
                   goal_paused INTEGER NOT NULL DEFAULT 0,
                   pinned INTEGER NOT NULL DEFAULT 0,
+                  pin_order_key TEXT,
                   created_at TEXT NOT NULL,
                   updated_at TEXT NOT NULL
                 );
-                INSERT INTO threads_migrated (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, pinned, created_at, updated_at)
+                INSERT INTO threads_migrated (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, pinned, pin_order_key, created_at, updated_at)
                   SELECT id, title, cwd, current_provider,
                     CASE WHEN current_model IN ('gpt-6.1-sol', 'claude-sonnet-4-5') THEN NULL ELSE current_model END,
-                    'default', NULL, 0, 0, created_at, updated_at
+                    'default', NULL, 0, 0, NULL, created_at, updated_at
                   FROM threads;
                 DROP TABLE threads;
                 ALTER TABLE threads_migrated RENAME TO threads;
@@ -493,6 +616,7 @@ fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
         goal_paused: row.get::<_, i64>(9)? != 0,
         session_mode: SessionMode::parse(&session_mode).unwrap_or(SessionMode::Single),
         pinned: row.get::<_, i64>(12)? != 0,
+        pin_order_key: row.get(13)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
     })
@@ -544,7 +668,7 @@ fn map_orchestration_task(row: &rusqlite::Row) -> rusqlite::Result<Orchestration
     })
 }
 
-const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode, reasoning_effort, pinned";
+const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode, reasoning_effort, pinned, pin_order_key";
 
 /// Per-project prompt history cap, Claude Code style.
 pub const PROMPT_HISTORY_LIMIT: i64 = 100;
@@ -608,6 +732,7 @@ impl BatonStore {
             goal_paused: false,
             session_mode,
             pinned: false,
+            pin_order_key: None,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -751,6 +876,7 @@ impl BatonStore {
             goal_paused: false,
             session_mode: SessionMode::Single,
             pinned: false,
+            pin_order_key: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -774,42 +900,17 @@ impl BatonStore {
         cwd: &Path,
         pinned_first: bool,
     ) -> Result<Vec<ThreadRow>> {
-        let mut candidates = vec![cwd.to_path_buf()];
-        if let Ok(canonical) = cwd.canonicalize() {
-            if canonical != cwd {
-                candidates.push(canonical);
-            }
-        }
-        if let Ok(target) = cwd.read_link() {
-            let target = if target.is_absolute() {
-                target
-            } else {
-                cwd.parent().unwrap_or(Path::new(".")).join(target)
-            };
-            if !candidates.contains(&target) {
-                candidates.push(target);
-            }
-        }
-        for candidate in candidates {
-            let rows = self.list_threads_ordered(
-                Some(candidate.to_string_lossy().as_ref()),
-                pinned_first,
-            )?;
-            if !rows.is_empty() {
-                return Ok(rows);
-            }
-        }
-        // The stored cwd may be the symlinked form while the caller uses the
-        // real path. Compare canonical stored paths as the final fallback.
         let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let rows = self.list_threads_ordered(None, pinned_first)?;
         Ok(rows
             .into_iter()
             .filter(|thread| {
-                Path::new(&thread.cwd)
-                    .canonicalize()
-                    .map(|stored| stored == canonical)
-                    .unwrap_or(false)
+                let stored = Path::new(&thread.cwd);
+                stored == cwd
+                    || stored
+                        .canonicalize()
+                        .map(|stored| stored == canonical)
+                        .unwrap_or(false)
             })
             .collect())
     }
@@ -822,13 +923,36 @@ impl BatonStore {
         self.list_threads_ordered(cwd, true)
     }
 
+    pub fn latest_turn_phases(&self, thread_ids: &[String]) -> Result<HashMap<String, TurnPhase>> {
+        if thread_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut phases = HashMap::new();
+        for chunk in thread_ids.chunks(500) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let mut statement = self.db.prepare(&format!(
+                "SELECT t.thread_id, t.phase FROM turns t JOIN (SELECT thread_id, MAX(turn) AS turn FROM turns WHERE thread_id IN ({placeholders}) GROUP BY thread_id) latest ON latest.thread_id = t.thread_id AND latest.turn = t.turn"
+            ))?;
+            let rows = statement.query_map(params_from_iter(chunk.iter()), |row| {
+                let id: String = row.get(0)?;
+                let phase: String = row.get(1)?;
+                Ok((id, TurnPhase::parse(&phase).unwrap_or(TurnPhase::Unverified)))
+            })?;
+            for row in rows {
+                let (id, phase) = row?;
+                phases.insert(id, phase);
+            }
+        }
+        Ok(phases)
+    }
+
     fn list_threads_ordered(
         &self,
         cwd: Option<&str>,
         pinned_first: bool,
     ) -> Result<Vec<ThreadRow>> {
         let order = if pinned_first {
-            "pinned DESC, updated_at DESC, rowid DESC"
+            "pinned DESC, pin_order_key DESC, updated_at DESC, rowid DESC"
         } else {
             "updated_at DESC, rowid DESC"
         };
@@ -867,11 +991,101 @@ impl BatonStore {
     }
 
     pub fn set_thread_pinned(&self, id: &str, pinned: bool) -> Result<()> {
-        self.db.execute(
-            "UPDATE threads SET pinned = ? WHERE id = ?",
-            params![pinned as i64, id],
-        )?;
+        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if pinned {
+            let key = self.next_pin_order_key()?;
+            let changed = transaction.execute(
+                "UPDATE threads SET pinned = 1, pin_order_key = COALESCE(pin_order_key, ?) WHERE id = ?",
+                params![key, id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("thread {id} not found");
+            }
+        } else {
+            let changed = transaction.execute(
+                "UPDATE threads SET pinned = 0, pin_order_key = NULL WHERE id = ?",
+                params![id],
+            )?;
+            if changed != 1 {
+                anyhow::bail!("thread {id} not found");
+            }
+        }
+        transaction.commit()?;
         Ok(())
+    }
+
+    pub fn move_thread_pin(&self, id: &str, cwd: &Path, up: bool) -> Result<PinMoveOutcome> {
+        let candidates = path_candidates(cwd)
+            .into_iter()
+            .map(|candidate| candidate.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let thread = match self.get_thread(id)? {
+            Some(thread) => thread,
+            None => return Ok(PinMoveOutcome::NotFound),
+        };
+        if !thread.pinned {
+            return Ok(PinMoveOutcome::NotPinned);
+        }
+        let pinned = {
+            let placeholders = vec!["?"; candidates.len()].join(", ");
+            let mut statement = transaction.prepare(&format!(
+                "SELECT {THREAD_COLUMNS} FROM threads WHERE pinned = 1 AND cwd IN ({placeholders}) ORDER BY pin_order_key DESC, updated_at DESC, rowid DESC"
+            ))?;
+            let rows = statement
+                .query_map(params_from_iter(candidates.iter()), map_thread)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let Some(index) = pinned.iter().position(|thread| thread.id == id) else {
+            return Ok(PinMoveOutcome::NotPinned);
+        };
+        let neighbor = if up {
+            index.checked_sub(1)
+        } else {
+            (index + 1 < pinned.len()).then_some(index + 1)
+        };
+        let Some(neighbor) = neighbor else {
+            return Ok(if up {
+                PinMoveOutcome::AlreadyFirst
+            } else {
+                PinMoveOutcome::AlreadyLast
+            });
+        };
+        let Some(current_key) = pinned[index].pin_order_key.as_deref() else {
+            return Ok(PinMoveOutcome::NotFound);
+        };
+        let Some(neighbor_key) = pinned[neighbor].pin_order_key.as_deref() else {
+            return Ok(PinMoveOutcome::NotFound);
+        };
+        let changed = transaction.execute(
+            "UPDATE threads SET pin_order_key = ? WHERE id = ?",
+            params![neighbor_key, pinned[index].id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("thread {} not found while moving pin", pinned[index].id);
+        }
+        let changed = transaction.execute(
+            "UPDATE threads SET pin_order_key = ? WHERE id = ?",
+            params![current_key, pinned[neighbor].id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("thread {} not found while moving pin", pinned[neighbor].id);
+        }
+        transaction.commit()?;
+        Ok(PinMoveOutcome::Moved)
+    }
+
+    fn next_pin_order_key(&self) -> Result<String> {
+        let max: Option<String> = self.db.query_row(
+            "SELECT MAX(pin_order_key) FROM threads WHERE pin_order_key IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(next_pin_order_key_from(
+            Utc::now(),
+            max.as_deref().and_then(parse_pin_order_key),
+        ))
     }
 
     pub fn set_thread_cwd(&self, id: &str, cwd: &str) -> Result<()> {
@@ -1247,7 +1461,7 @@ impl BatonStore {
     pub fn find_thread_by_native_session(&self, provider: ProviderId, native_session_id: &str) -> Result<Option<ThreadRow>> {
         self.db
             .query_row(
-                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode, t.reasoning_effort, t.pinned FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
+                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode, t.reasoning_effort, t.pinned, t.pin_order_key FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
                 params![provider.as_str(), native_session_id],
                 |row| {
                     let provider: String = row.get(3)?;
@@ -1267,6 +1481,7 @@ impl BatonStore {
                         session_mode: SessionMode::parse(&session_mode)
                             .unwrap_or(SessionMode::Single),
                         pinned: row.get::<_, i64>(12)? != 0,
+                        pin_order_key: row.get(13)?,
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
                     })
@@ -2275,5 +2490,27 @@ pub struct ImportedMessage {
     pub role: &'static str,
     pub text: String,
     pub created_at: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pin_order_keys_advance_within_one_microsecond() {
+        let base = DateTime::parse_from_rfc3339("2026-01-02T03:04:05.006000Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let now = base + Duration::nanoseconds(789);
+        assert_eq!(
+            next_pin_order_key_from(now, Some(base)),
+            "2026-01-02T03:04:05.006001Z"
+        );
+        let later = base + Duration::microseconds(2);
+        assert_eq!(
+            next_pin_order_key_from(later, Some(base)),
+            "2026-01-02T03:04:05.006002Z"
+        );
+    }
 }
 

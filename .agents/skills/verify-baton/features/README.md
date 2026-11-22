@@ -12,7 +12,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Default provider | CLI and TUI | new work starts on an installed harness, with an explicit override |
 | Recent thread hint | TUI | a new session points at existing threads in the folder |
 | Attention inbox | TUI | `/inbox` lists failed, unverified, interrupted, needs-input, and queued work and opens the selected thread |
-| Thread pins | TUI; CLI read | `/pin` toggles a durable pin, pinned threads sort first, and `baton threads --json` exposes it |
+| Thread pins | TUI; CLI read | `/pin` toggles a durable pin, `/pin move` orders pinned threads, pinned rows sort first, and `baton threads --json` exposes `pinned` and `pin_order_key` |
 | Shell completions | CLI | `baton completions <shell>` generates from the clap command graph and handles a broken pipe |
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |
@@ -20,7 +20,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Review | TUI | `/review` shows the turn diff, saves a line note, and leaves it unsent |
 | TUI native rewind | TUI | `/rewind --native` truncates the provider and store history and prefills the message |
 | Greeting | TUI | `hi` in default orchestrate mode answers directly, with no planner run |
-| MCP stdio | CLI | `baton mcp` handshakes, lists 12 tools, and answers status, turns, threads, and doctor |
+| MCP stdio | CLI | `baton mcp` handshakes, lists 14 tools, and answers status, turns, threads, and doctor |
 | Antigravity | CLI | `agy acp` completes one turn with the ICA key and custom base URL |
 | Output sanitization | CLI and TUI | Control sequences are replaced before `exec` stdout and the transcript; unit proof only |
 | Activity | TUI and CLI | `/activity` and `baton activity --json` index every turn's tools, diff, and usage |

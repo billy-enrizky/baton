@@ -268,6 +268,7 @@ mod tests {
             goal_paused: false,
             session_mode: crate::types::SessionMode::Single,
             pinned: false,
+            pin_order_key: None,
             created_at: String::new(),
             updated_at: String::new(),
         }

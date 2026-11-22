@@ -396,7 +396,7 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/test-output.log"
-          if "$RUNNER_TEMP/trusted-ci/budget.sh" 300 cargo test --locked >"$log" 2>&1; then
+          if "$RUNNER_TEMP/trusted-ci/budget.sh" 300 cargo test --locked -- --test-threads=8 >"$log" 2>&1; then
             status=0
           else
             status=$?

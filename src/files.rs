@@ -367,7 +367,7 @@ fn parse_null_paths(bytes: &[u8], tokens: &[&str]) -> CandidateSet {
     CandidateSet { items, truncated }
 }
 
-fn should_include_path(path: &str) -> bool {
+pub(crate) fn should_include_path(path: &str) -> bool {
     if HIDDEN_PATHS.iter().any(|hidden| {
         path == *hidden
             || path.starts_with(&format!("{hidden}/"))

@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, files, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -1778,6 +1778,70 @@ fn main_result(started: Instant) -> Result<()> {
                     eprintln!("results truncated at the 20,001-match cap; refine the query");
                 } else if listing.truncated {
                     eprintln!("showing {} files; raise --limit", listing.files.len());
+                }
+            }
+            Ok(())
+        }
+        cli::Commands::Grep {
+            query,
+            case_sensitive,
+            word,
+            regex,
+            json,
+        } => {
+            let query = query.join(" ");
+            let root = std::fs::canonicalize(&cwd).map_err(|error| {
+                anyhow::anyhow!("cannot resolve -C directory {}: {error}", cwd.display())
+            })?;
+            let listing = grep::search(
+                &root,
+                grep::ContentOptions {
+                    query: query.trim(),
+                    limit: cli.limit,
+                    case_sensitive,
+                    word,
+                    regex,
+                },
+            )?;
+            if json {
+                let matches = listing
+                    .matches
+                    .iter()
+                    .map(|matched| {
+                        serde_json::json!({
+                            "path": matched.path,
+                            "line": matched.line,
+                            "text": matched.text,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                print_json(&serde_json::json!({
+                    "schema_version": grep::SCHEMA_VERSION,
+                    "cwd": root.to_string_lossy(),
+                    "query": query.trim(),
+                    "case_sensitive": case_sensitive,
+                    "word": word,
+                    "regex": regex,
+                    "limit": cli.limit,
+                    "truncated": listing.truncated,
+                    "count": listing.matches.len(),
+                    "matches": matches,
+                }))?;
+            } else {
+                let lines = listing
+                    .matches
+                    .iter()
+                    .map(|matched| {
+                        if matched.text.is_empty() {
+                            format!("{}:{}", matched.path, matched.line)
+                        } else {
+                            format!("{}:{}: {}", matched.path, matched.line, matched.text)
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                print_file_paths(&lines)?;
+                if listing.truncated {
+                    eprintln!("results truncated; refine the query or raise --limit");
                 }
             }
             Ok(())

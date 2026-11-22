@@ -100,6 +100,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/files",
         "pick a project file and insert its path, optionally with :line",
     ),
+    ("/grep", "search project contents and insert path:line"),
     ("/usage", "token usage and cache hit rate"),
     ("/checkpoints", "list checkpoints for this thread"),
     ("/review", "review the latest turn diff with line notes"),
@@ -162,6 +163,7 @@ Common
   /switch <provider> [model]  use one harness
   /model                      choose a model
   /files [query][:line]       insert a project path or path:line
+  /grep [flags] <query>       insert a content match as path:line
   /new                        start a new thread
   /threads                    list threads here
   /pin                        pin or unpin; /pin move <id> up or down
@@ -350,6 +352,17 @@ enum OrchestrationEvent {
     ShipFailed(String),
 }
 
+enum GrepPickerEvent {
+    Loaded {
+        request: u64,
+        base_query: String,
+        case_sensitive: bool,
+        word: bool,
+        regex: bool,
+        result: Result<crate::grep::ContentListing, String>,
+    },
+}
+
 enum FilesPickerEvent {
     Loaded {
         request: u64,
@@ -461,6 +474,19 @@ enum Overlay {
         selected: usize,
         items: Vec<InboxItem>,
     },
+    GrepPicker {
+        selected: usize,
+        query: String,
+        matches: Vec<crate::grep::ContentMatch>,
+        filtered: Vec<usize>,
+        base_query: String,
+        case_sensitive: bool,
+        word: bool,
+        regex: bool,
+        truncated: bool,
+        loading: bool,
+        request: u64,
+    },
     FilesPicker {
         selected: usize,
         query: String,
@@ -510,6 +536,7 @@ struct HandoffPrompt {
 }
 
 const FILES_PICKER_LIMIT: usize = crate::files::MAX_FILES;
+const GREP_PICKER_LIMIT: usize = 200;
 
 const PROVIDERS: [ProviderId; 6] = [
     ProviderId::Claude,
@@ -587,6 +614,9 @@ pub struct TuiState {
     files_picker_sender: std::sync::mpsc::Sender<FilesPickerEvent>,
     files_picker_receiver: std::sync::mpsc::Receiver<FilesPickerEvent>,
     files_picker_request: u64,
+    grep_picker_sender: std::sync::mpsc::Sender<GrepPickerEvent>,
+    grep_picker_receiver: std::sync::mpsc::Receiver<GrepPickerEvent>,
+    grep_picker_request: u64,
 }
 
 pub fn run_tui(
@@ -627,6 +657,7 @@ pub fn run_tui(
     let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
     let (native_rewind_sender, native_rewind_receiver) = std::sync::mpsc::channel();
     let (files_picker_sender, files_picker_receiver) = std::sync::mpsc::channel();
+    let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
     let bell_enabled = crate::config::notifications(&home).bell;
     let mut state = TuiState {
         bell_enabled,
@@ -694,6 +725,9 @@ pub fn run_tui(
         files_picker_sender,
         files_picker_receiver,
         files_picker_request: 0,
+        grep_picker_sender,
+        grep_picker_receiver,
+        grep_picker_request: 0,
     };
 
     let mut startup_notes = Vec::new();
@@ -788,6 +822,13 @@ pub fn run_tui(
         }
         for event in files_events {
             apply_files_picker_event(&mut state, event);
+        }
+        let mut grep_events = Vec::new();
+        while let Ok(event) = state.grep_picker_receiver.try_recv() {
+            grep_events.push(event);
+        }
+        for event in grep_events {
+            apply_grep_picker_event(&mut state, event);
         }
         if crossterm::event::poll(Duration::from_millis(32))? {
             match crossterm::event::read()? {
@@ -2214,6 +2255,28 @@ fn split_line_target(query: &str) -> (String, Option<u32>) {
     (query.replace("\\:", ":"), None)
 }
 
+fn grep_filter_indices(matches: &[crate::grep::ContentMatch], query: &str) -> Vec<usize> {
+    let tokens = query
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return (0..matches.len()).collect();
+    }
+    matches
+        .iter()
+        .enumerate()
+        .filter(|(_, matched)| {
+            let haystack =
+                format!("{}:{} {}", matched.path, matched.line, matched.text).to_lowercase();
+            tokens.iter().all(|token| haystack.contains(token))
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn files_filter_indices(entries: &[String], query: &str) -> Vec<usize> {
     if query.trim().is_empty() {
         return (0..entries.len()).collect();
@@ -2335,6 +2398,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/worktree", _) => Some("worktree [title]"),
         ("/open", _) => Some("open <thread id prefix>"),
         ("/files", _) => Some("files [query] [:<line>]"),
+        ("/grep", _) => Some("grep [--case] [--word] [--regex] <query>"),
         ("/pin", "move") => Some("pin move <id> up or down"),
         ("/review", _) => Some("review [turn]"),
         ("/diff", _) => Some("diff [turn]"),
@@ -3642,6 +3706,90 @@ fn handle_key(
                 state.overlay = Overlay::InboxPicker { selected, items };
             }
         },
+        Overlay::GrepPicker {
+            mut selected,
+            mut query,
+            matches,
+            mut filtered,
+            base_query,
+            case_sensitive,
+            word,
+            regex,
+            truncated,
+            loading,
+            request,
+        } => {
+            match key.code {
+                KeyCode::Esc => {
+                    if loading || query.is_empty() {
+                        return;
+                    }
+                    query.clear();
+                    selected = 0;
+                    filtered = grep_filter_indices(&matches, &query);
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    selected = 0;
+                    filtered = grep_filter_indices(&matches, &query);
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    query.push(character);
+                    selected = 0;
+                    filtered = grep_filter_indices(&matches, &query);
+                }
+                KeyCode::Up => {
+                    if !filtered.is_empty() {
+                        selected = (selected + filtered.len() - 1) % filtered.len();
+                    }
+                }
+                KeyCode::Down => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 1) % filtered.len();
+                    }
+                }
+                KeyCode::PageUp => selected = selected.saturating_sub(10),
+                KeyCode::PageDown => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 10).min(filtered.len() - 1);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(index) = filtered.get(selected) {
+                        if let Some(found) = matches.get(*index) {
+                            let target = crate::sanitize::sanitize_terminal_text(&format!(
+                                "{}:{}",
+                                found.path, found.line
+                            ))
+                            .into_owned();
+                            state.insert_input_str(&format!("{target} "));
+                            state.notice = Some(format!("inserted {target}"));
+                            return;
+                        }
+                    } else if !loading {
+                        state.notice = Some("grep: no matches".into());
+                    }
+                }
+                _ => {}
+            }
+            state.overlay = Overlay::GrepPicker {
+                selected,
+                query,
+                matches,
+                filtered,
+                base_query,
+                case_sensitive,
+                word,
+                regex,
+                truncated,
+                loading,
+                request,
+            };
+        }
         Overlay::FilesPicker {
             mut selected,
             mut query,
@@ -3940,6 +4088,51 @@ fn start_native_rewind(
         };
         let _ = sender.send(event);
     });
+}
+
+fn apply_grep_picker_event(state: &mut TuiState, event: GrepPickerEvent) {
+    let GrepPickerEvent::Loaded {
+        request,
+        base_query,
+        case_sensitive,
+        word,
+        regex,
+        result,
+    } = event;
+    let query = match &state.overlay {
+        Overlay::GrepPicker {
+            request: current,
+            query,
+            ..
+        } if *current == request => query.clone(),
+        _ => return,
+    };
+    match result {
+        Ok(listing) if listing.matches.is_empty() => {
+            state.overlay = Overlay::None;
+            state.notice = Some(format!("grep: no matches for \"{base_query}\""));
+        }
+        Ok(listing) => {
+            let filtered = grep_filter_indices(&listing.matches, &query);
+            state.overlay = Overlay::GrepPicker {
+                selected: 0,
+                query,
+                matches: listing.matches,
+                filtered,
+                base_query,
+                case_sensitive,
+                word,
+                regex,
+                truncated: listing.truncated,
+                loading: false,
+                request,
+            };
+        }
+        Err(error) => {
+            state.overlay = Overlay::None;
+            state.notice = Some(format!("grep: {error}"));
+        }
+    }
 }
 
 fn apply_files_picker_event(state: &mut TuiState, event: FilesPickerEvent) {
@@ -6378,6 +6571,71 @@ fn handle_command(
                 });
             });
         }
+        "/grep" => {
+            let mut case_sensitive = false;
+            let mut word = false;
+            let mut regex = false;
+            let mut terms = Vec::new();
+            for arg in &args {
+                match arg.as_str() {
+                    "--case" | "--case-sensitive" => case_sensitive = true,
+                    "--word" => word = true,
+                    "--regex" => regex = true,
+                    flag if flag.starts_with("--") => {
+                        state.overlay = Overlay::None;
+                        state.notice = Some(format!(
+                            "grep: unknown flag {flag} · /grep [--case] [--word] [--regex] <query>"
+                        ));
+                        return;
+                    }
+                    _ => terms.push(arg.clone()),
+                }
+            }
+            let base_query = terms.join(" ").trim().to_string();
+            if base_query.is_empty() {
+                state.overlay = Overlay::None;
+                state.notice = Some("grep: /grep [--case] [--word] [--regex] <query>".to_string());
+                return;
+            }
+            let request = state.grep_picker_request + 1;
+            state.grep_picker_request = request;
+            state.overlay = Overlay::GrepPicker {
+                selected: 0,
+                query: String::new(),
+                matches: Vec::new(),
+                filtered: Vec::new(),
+                base_query: base_query.clone(),
+                case_sensitive,
+                word,
+                regex,
+                truncated: false,
+                loading: true,
+                request,
+            };
+            let cwd = state.thread.cwd.clone();
+            let sender = state.grep_picker_sender.clone();
+            std::thread::spawn(move || {
+                let result = crate::grep::search(
+                    std::path::Path::new(&cwd),
+                    crate::grep::ContentOptions {
+                        query: &base_query,
+                        limit: GREP_PICKER_LIMIT,
+                        case_sensitive,
+                        word,
+                        regex,
+                    },
+                )
+                .map_err(|error| error.to_string());
+                let _ = sender.send(GrepPickerEvent::Loaded {
+                    request,
+                    base_query,
+                    case_sensitive,
+                    word,
+                    regex,
+                    result,
+                });
+            });
+        }
         "/usage" => {
             let lines = {
                 let guard = store.lock().unwrap();
@@ -7334,6 +7592,15 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::AuthPicker { .. } => 9,
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
             Overlay::InboxPicker { items, .. } => items.len().min(8) + 4,
+            Overlay::GrepPicker {
+                filtered, loading, ..
+            } => {
+                if *loading {
+                    7
+                } else {
+                    filtered.len().min(8) + 5
+                }
+            }
             Overlay::FilesPicker {
                 filtered, loading, ..
             } => {
@@ -7427,6 +7694,35 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::InboxPicker { selected, items } => {
                 draw_inbox_picker(frame, chunks[1], items, *selected)
             }
+            Overlay::GrepPicker {
+                selected,
+                query,
+                matches,
+                filtered,
+                base_query,
+                case_sensitive,
+                word,
+                regex,
+                truncated,
+                loading,
+                ..
+            } => draw_grep_picker(
+                frame,
+                chunks[1],
+                GrepPickerView {
+                    matches,
+                    filtered,
+                    selected: *selected,
+                    query,
+                    base_query,
+                    case_sensitive: *case_sensitive,
+                    word: *word,
+                    regex: *regex,
+                    truncated: *truncated,
+                    loading: *loading,
+                    spinner: spinner_frame,
+                },
+            ),
             Overlay::FilesPicker {
                 selected,
                 query,
@@ -8199,6 +8495,140 @@ fn draw_thread_picker(
             style,
         ));
     }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+struct GrepPickerView<'a> {
+    matches: &'a [crate::grep::ContentMatch],
+    filtered: &'a [usize],
+    selected: usize,
+    query: &'a str,
+    base_query: &'a str,
+    case_sensitive: bool,
+    word: bool,
+    regex: bool,
+    truncated: bool,
+    loading: bool,
+    spinner: usize,
+}
+
+fn grep_options_label(case_sensitive: bool, word: bool, regex: bool) -> String {
+    let mut parts = Vec::new();
+    if case_sensitive {
+        parts.push("case");
+    }
+    if word {
+        parts.push("word");
+    }
+    if regex {
+        parts.push("regex");
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", parts.join(" · "))
+    }
+}
+
+fn draw_grep_picker(frame: &mut ratatui::Frame, area: Rect, view: GrepPickerView<'_>) {
+    let GrepPickerView {
+        matches,
+        filtered,
+        selected,
+        query,
+        base_query,
+        case_sensitive,
+        word,
+        regex,
+        truncated,
+        loading,
+        spinner,
+    } = view;
+    let filter = query.trim();
+    let options = grep_options_label(case_sensitive, word, regex);
+    let filter_label = if filter.is_empty() {
+        String::new()
+    } else {
+        format!(" · filter \"{filter}\"")
+    };
+    if loading {
+        let spinner = SPINNER_FRAMES[spinner % SPINNER_FRAMES.len()];
+        let lines = vec![
+            Line::styled(
+                format!("grep \"{base_query}\"{options}{filter_label} · searching {spinner}"),
+                Style::default().fg(COLORS.muted),
+            ),
+            Line::styled(
+                "searching project files · esc closes",
+                Style::default().fg(COLORS.muted),
+            ),
+        ];
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(COLORS.border));
+        frame.render_widget(Paragraph::new(lines).block(block), area);
+        return;
+    }
+    let count = if filtered.is_empty() && !filter.is_empty() {
+        "no matches".to_string()
+    } else {
+        filtered.len().to_string()
+    };
+    let action = if filter.is_empty() {
+        "enter insert · esc close"
+    } else {
+        "enter insert · esc clears"
+    };
+    let heading = format!("grep \"{base_query}\"{options}{filter_label} · {count} · {action}");
+    let mut lines: Vec<Line> = vec![Line::styled(heading, Style::default().fg(COLORS.muted))];
+    let highlight = if filter.is_empty() {
+        base_query
+    } else {
+        filter
+    };
+    let visible = 8;
+    if filtered.is_empty() {
+        let empty = if truncated {
+            "no matches in the loaded results"
+        } else {
+            "no matches"
+        };
+        lines.push(Line::styled(empty, Style::default().fg(COLORS.muted)));
+    } else {
+        let start = if filtered.len() <= visible {
+            0
+        } else {
+            selected
+                .saturating_sub(visible - 1)
+                .min(filtered.len() - visible)
+        };
+        for (offset, index) in filtered.iter().skip(start).take(visible).enumerate() {
+            let position = start + offset;
+            let style = if position == selected {
+                Style::default()
+                    .fg(COLORS.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLORS.muted)
+            };
+            let cursor = if position == selected { "❯" } else { " " };
+            let matched = &matches[*index];
+            let raw = format!("{}:{}  {}", matched.path, matched.line, matched.text);
+            let label = crate::sanitize::sanitize_terminal_text(&raw);
+            lines.push(file_row(cursor, &label, highlight, style));
+        }
+    }
+    let hint = if truncated {
+        format!("first {GREP_PICKER_LIMIT} matches · esc, then rerun /grep <query>")
+    } else if filter.is_empty() {
+        "type to narrow · esc close".to_string()
+    } else {
+        "type to narrow · backspace edits · esc clears".to_string()
+    };
+    lines.push(Line::styled(hint, Style::default().fg(COLORS.muted)));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.border));
@@ -9593,6 +10023,7 @@ mod tests {
             .list_queued_messages(&thread.id)
             .unwrap_or_default();
         let (files_picker_sender, files_picker_receiver) = std::sync::mpsc::channel();
+        let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
         TuiState {
             bell_enabled: crate::config::notifications(home).bell,
             bell: crate::notify::BellLimiter::new(),
@@ -9659,6 +10090,9 @@ mod tests {
             files_picker_sender,
             files_picker_receiver,
             files_picker_request: 0,
+            grep_picker_sender,
+            grep_picker_receiver,
+            grep_picker_request: 0,
         }
     }
 
@@ -9668,6 +10102,14 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("files picker load");
         apply_files_picker_event(state, event);
+    }
+
+    fn finish_grep_picker_load(state: &mut TuiState) {
+        let event = state
+            .grep_picker_receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("grep picker load");
+        apply_grep_picker_event(state, event);
     }
 
     fn history_message(thread_id: &str, index: usize) -> MessageRow {
@@ -9747,6 +10189,7 @@ mod tests {
             "/worktree",
             "/open",
             "/files",
+            "/grep",
             "/pin",
             "/review",
             "/diff",
@@ -13521,6 +13964,325 @@ mod tests {
             std::fs::write(path, contents).unwrap();
         }
         project
+    }
+
+    #[test]
+    fn grep_picker_inserts_a_match() {
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[
+            ("src/main.rs", "fn main() {\n    println!(\"hello\");\n}\n"),
+            ("README.md", "# hello\n"),
+        ]);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/grep hello");
+        match &state.overlay {
+            Overlay::GrepPicker { loading, .. } => assert!(*loading),
+            _ => panic!("expected loading grep picker"),
+        }
+        finish_grep_picker_load(&mut state);
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(text.contains("grep \"hello\""), "{text}");
+        assert!(text.contains("src/main.rs:2"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "src/main.rs:2 ");
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn grep_picker_parses_search_flags() {
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[("src/words.txt", "Alpha\nalpha\nalphabet\n")]);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/grep --case --word alpha",
+        );
+        match &state.overlay {
+            Overlay::GrepPicker {
+                base_query,
+                case_sensitive,
+                word,
+                regex,
+                ..
+            } => {
+                assert_eq!(base_query, "alpha");
+                assert!(*case_sensitive);
+                assert!(*word);
+                assert!(!*regex);
+            }
+            _ => panic!("expected grep picker"),
+        }
+        finish_grep_picker_load(&mut state);
+        match &state.overlay {
+            Overlay::GrepPicker { matches, .. } => {
+                assert_eq!(matches.len(), 1);
+                assert_eq!(matches[0].line, 2);
+                assert_eq!(matches[0].text, "alpha");
+            }
+            _ => panic!("expected grep picker"),
+        }
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(text.contains("case · word"), "{text}");
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/grep --case-sensitive alpha",
+        );
+        match &state.overlay {
+            Overlay::GrepPicker { case_sensitive, .. } => assert!(*case_sensitive),
+            _ => panic!("expected grep picker"),
+        }
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/grep --json alpha",
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown flag"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn grep_picker_filters_and_escape_resets() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::GrepPicker {
+            selected: 0,
+            query: String::new(),
+            matches: vec![
+                crate::grep::ContentMatch {
+                    path: "src/alpha.rs".into(),
+                    line: 3,
+                    text: "fn alpha()".into(),
+                },
+                crate::grep::ContentMatch {
+                    path: "src/beta.rs".into(),
+                    line: 7,
+                    text: "fn beta()".into(),
+                },
+            ],
+            filtered: vec![0, 1],
+            base_query: "fn".into(),
+            case_sensitive: false,
+            word: false,
+            regex: false,
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        for character in "beta".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        match &state.overlay {
+            Overlay::GrepPicker { filtered, .. } => assert_eq!(filtered, &vec![1]),
+            _ => panic!("expected grep picker"),
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        match &state.overlay {
+            Overlay::GrepPicker { query, .. } => assert!(query.is_empty()),
+            _ => panic!("first escape must clear the filter"),
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn grep_picker_reports_usage_and_no_matches() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/grep");
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("--word"),
+            "{:?}",
+            state.notice
+        );
+
+        let project = files_project(&[("src/main.rs", "fn main() {}\n")]);
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        handle_command(&mut state, &store, &engine_command_sender, "/grep absent");
+        finish_grep_picker_load(&mut state);
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("no matches for \"absent\""),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn grep_picker_shows_loading_and_ignores_a_superseded_load() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::GrepPicker {
+            selected: 0,
+            query: String::new(),
+            matches: Vec::new(),
+            filtered: Vec::new(),
+            base_query: "hello".into(),
+            case_sensitive: false,
+            word: false,
+            regex: false,
+            truncated: false,
+            loading: true,
+            request: 2,
+        };
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(text.contains("searching"), "{text}");
+        apply_grep_picker_event(
+            &mut state,
+            GrepPickerEvent::Loaded {
+                request: 1,
+                base_query: "hello".into(),
+                case_sensitive: false,
+                word: false,
+                regex: false,
+                result: Ok(crate::grep::ContentListing {
+                    matches: vec![crate::grep::ContentMatch {
+                        path: "stale.rs".into(),
+                        line: 1,
+                        text: "hello".into(),
+                    }],
+                    truncated: false,
+                }),
+            },
+        );
+        match &state.overlay {
+            Overlay::GrepPicker {
+                request,
+                loading,
+                matches,
+                ..
+            } => {
+                assert_eq!(*request, 2);
+                assert!(*loading);
+                assert!(matches.is_empty());
+            }
+            _ => panic!("expected the newer grep picker to stay loading"),
+        }
+        apply_grep_picker_event(
+            &mut state,
+            GrepPickerEvent::Loaded {
+                request: 2,
+                base_query: "hello".into(),
+                case_sensitive: false,
+                word: false,
+                regex: false,
+                result: Ok(crate::grep::ContentListing {
+                    matches: vec![crate::grep::ContentMatch {
+                        path: "src/main.rs".into(),
+                        line: 2,
+                        text: "hello".into(),
+                    }],
+                    truncated: false,
+                }),
+            },
+        );
+        match &state.overlay {
+            Overlay::GrepPicker {
+                loading, matches, ..
+            } => {
+                assert!(!*loading);
+                assert_eq!(matches.len(), 1);
+                assert_eq!(matches[0].path, "src/main.rs");
+            }
+            _ => panic!("expected grep picker"),
+        }
+    }
+
+    #[test]
+    fn grep_picker_sanitizes_match_text_and_insertion() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::GrepPicker {
+            selected: 0,
+            query: String::new(),
+            matches: vec![crate::grep::ContentMatch {
+                path: "src/evil\u{1b}]0;spoof\u{7}.rs".into(),
+                line: 3,
+                text: "needle \u{1b}[2J".into(),
+            }],
+            filtered: vec![0],
+            base_query: "needle".into(),
+            case_sensitive: false,
+            word: false,
+            regex: false,
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(!text.contains('\u{7}'), "{text}");
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(state.input.contains('\u{fffd}'), "{:?}", state.input);
+        assert!(!state.input.contains('\u{1b}'), "{:?}", state.input);
+        assert!(!state.input.contains('\u{7}'), "{:?}", state.input);
     }
 
     #[test]

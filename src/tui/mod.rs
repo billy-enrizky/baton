@@ -380,6 +380,16 @@ enum Overlay {
     EffortPicker {
         selected: usize,
     },
+    HandoffPreview {
+        pending: Box<HandoffPrompt>,
+    },
+}
+
+struct HandoffPrompt {
+    prompt: String,
+    payload: String,
+    unseen: usize,
+    provider: ProviderId,
 }
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -3142,6 +3152,37 @@ fn handle_key(
             }
             _ => {}
         },
+        Overlay::HandoffPreview { pending } => match key.code {
+            KeyCode::Enter => {
+                state.overlay = Overlay::None;
+                dispatch_submit(
+                    state,
+                    store,
+                    engine_command_sender,
+                    pending.prompt.clone(),
+                    false,
+                );
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                state.overlay = Overlay::None;
+                state.notice = Some("sending without a handoff".into());
+                dispatch_submit(
+                    state,
+                    store,
+                    engine_command_sender,
+                    pending.prompt.clone(),
+                    true,
+                );
+            }
+            KeyCode::Esc => {
+                state.overlay = Overlay::None;
+                state.set_input(pending.prompt.clone());
+                state.notice = Some("handoff cancelled; the prompt is back in the composer".into());
+            }
+            _ => {
+                state.overlay = Overlay::HandoffPreview { pending };
+            }
+        },
         Overlay::OrchestrationPreview { preview } => match key.code {
             KeyCode::Esc => {
                 state.set_input(preview.goal.clone());
@@ -4169,7 +4210,6 @@ fn submit(
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     text: String,
 ) {
-    remember_prompt(state, store, &text);
     let text = if let Some(goal) = &state.goal {
         if state.goal_paused {
             text
@@ -4179,6 +4219,90 @@ fn submit(
     } else {
         text
     };
+    if let Some(pending) = handoff_preview(state, store, &text) {
+        state.overlay = Overlay::HandoffPreview {
+            pending: Box::new(pending),
+        };
+        state.set_input(String::new());
+        return;
+    }
+    dispatch_submit(state, store, engine_command_sender, text, false);
+}
+
+/// Builds the payload another provider would receive, so the user can see it
+/// before it leaves the thread. Returns `None` when there is nothing to send.
+fn handoff_preview(
+    state: &TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    text: &str,
+) -> Option<HandoffPrompt> {
+    let (prior, session) = {
+        let guard = store.lock().unwrap();
+        let prior = guard.list_messages(&state.thread.id).ok()?;
+        let session = guard
+            .get_provider_session(&state.thread.id, state.thread.current_provider)
+            .ok()?;
+        (prior, session)
+    };
+    if prior.is_empty() {
+        return None;
+    }
+    let covered_turn = session.as_ref().map(|row| row.covered_turn).unwrap_or(0);
+    let unseen: Vec<&crate::store::MessageRow> = prior
+        .iter()
+        .filter(|message| message.turn > covered_turn)
+        .collect();
+    if unseen.is_empty() {
+        return None;
+    }
+    let config = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let secrets = crate::redact::collect(
+        config
+            .providers
+            .values()
+            .filter_map(|provider| provider.api_key.as_deref()),
+    );
+    let messages: Vec<crate::handoff::HandoffMessage> = unseen
+        .iter()
+        .map(|message| crate::handoff::HandoffMessage {
+            role: message.role.clone(),
+            provider: message.provider.clone(),
+            model: message.model.clone(),
+            text: crate::redact::redact(&message.text, &secrets).into_owned(),
+        })
+        .collect();
+    let git_status =
+        crate::handoff::git_status_summary(std::path::Path::new(&state.thread.cwd), 50);
+    let intro = if session.is_some() {
+        crate::handoff::RESUME_INTRO
+    } else {
+        crate::handoff::NEW_HARNESS_INTRO
+    };
+    let payload = crate::handoff::handoff_prompt_with_intro(
+        &state.thread.cwd,
+        &state.thread.title,
+        &messages,
+        git_status.as_deref(),
+        text,
+        None,
+        intro,
+    );
+    Some(HandoffPrompt {
+        prompt: text.to_string(),
+        payload,
+        unseen: unseen.len(),
+        provider: state.thread.current_provider,
+    })
+}
+
+fn dispatch_submit(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    text: String,
+    skip_handoff: bool,
+) {
+    remember_prompt(state, store, &text);
     let result = {
         let guard = store.lock().unwrap();
         ensure_persisted(&guard, &mut state.thread)
@@ -4194,6 +4318,7 @@ fn submit(
         thread_id,
         text,
         permission_mode,
+        skip_handoff,
     });
 }
 
@@ -4517,6 +4642,7 @@ fn handle_command(
                     thread_id: thread.id.clone(),
                     text: prompt.clone(),
                     permission_mode: state.permission_mode,
+                    skip_handoff: false,
                 });
             }
             state.multi = Some(MultiView {
@@ -6491,6 +6617,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::EffortPicker { .. } => 10,
             Overlay::OrchestrationPreview { preview } => preview.plan.tasks.len().min(8) * 2 + 8,
+            Overlay::HandoffPreview { .. } => 14,
         }
     };
     let chunks = Layout::vertical([
@@ -6564,6 +6691,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::OrchestrationPreview { preview } => {
                 draw_orchestration_preview(frame, chunks[1], state, preview)
             }
+            Overlay::HandoffPreview { pending } => draw_handoff_preview(frame, chunks[1], pending),
             Overlay::None => {}
         }
     }
@@ -7608,6 +7736,39 @@ fn draw_rewind_picker(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn draw_handoff_preview(frame: &mut ratatui::Frame, area: Rect, pending: &HandoffPrompt) {
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "handoff preview · {} unseen turn(s) go to {} · enter send · n no handoff · esc cancel",
+                pending.unseen, pending.provider
+            ),
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            "the payload below is redacted of configured keys",
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::from(""),
+    ];
+    for line in pending.payload.lines().take(9) {
+        lines.push(Line::styled(
+            line.to_string(),
+            Style::default().fg(COLORS.text),
+        ));
+    }
+    lines.push(Line::styled(
+        format!("... {} bytes total", pending.payload.len()),
+        Style::default().fg(COLORS.muted),
+    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_orchestration_preview(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -8506,6 +8667,152 @@ mod tests {
                 .map(|suggestion| suggestion.insert)
                 .collect::<Vec<_>>(),
             vec!["/copy 1".to_string()]
+        );
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        }
+    }
+
+    fn state_with_prior_turn(home: &std::path::Path, store: &Arc<Mutex<BatonStore>>) -> TuiState {
+        let mut state = test_state(home, store, Vec::new());
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .add_message(
+                    &state.thread.id,
+                    1,
+                    "user",
+                    Some("claude"),
+                    Some("m"),
+                    "older question",
+                )
+                .unwrap();
+            guard
+                .add_message(
+                    &state.thread.id,
+                    1,
+                    "assistant",
+                    Some("claude"),
+                    Some("m"),
+                    "older answer",
+                )
+                .unwrap();
+        }
+        state
+    }
+
+    #[test]
+    fn a_handoff_opens_a_preview_instead_of_sending() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = state_with_prior_turn(home.path(), &store);
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        submit(&mut state, &store, &engine_command_sender, "next".into());
+
+        let Overlay::HandoffPreview { pending } = &state.overlay else {
+            panic!("expected a handoff preview");
+        };
+        assert_eq!(pending.unseen, 2, "both prior messages are unseen");
+        assert!(
+            pending.payload.contains("older question"),
+            "{}",
+            pending.payload
+        );
+        assert!(pending.payload.contains("next"), "{}", pending.payload);
+        assert!(
+            engine_command_receiver.try_recv().is_err(),
+            "nothing sends before confirmation"
+        );
+    }
+
+    #[test]
+    fn the_preview_sends_with_a_handoff_or_without_one() {
+        for (choice, expected_skip) in [(KeyCode::Enter, false), (KeyCode::Char('n'), true)] {
+            let home = tempfile::tempdir().unwrap();
+            let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+            let mut state = state_with_prior_turn(home.path(), &store);
+            let (engine_command_sender, mut engine_command_receiver) =
+                tokio::sync::mpsc::unbounded_channel();
+            submit(&mut state, &store, &engine_command_sender, "next".into());
+            handle_key(&mut state, &store, &engine_command_sender, key(choice));
+            assert!(matches!(state.overlay, Overlay::None));
+            match engine_command_receiver
+                .try_recv()
+                .expect("a submit is dispatched")
+            {
+                EngineCommand::Submit {
+                    text, skip_handoff, ..
+                } => {
+                    assert_eq!(text, "next");
+                    assert_eq!(skip_handoff, expected_skip, "{choice:?}");
+                }
+                _ => panic!("expected a submit"),
+            }
+        }
+    }
+
+    #[test]
+    fn escaping_the_preview_returns_the_prompt_to_the_composer() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = state_with_prior_turn(home.path(), &store);
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        submit(&mut state, &store, &engine_command_sender, "next".into());
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.input, "next");
+        assert!(
+            engine_command_receiver.try_recv().is_err(),
+            "cancelling sends nothing"
+        );
+    }
+
+    #[test]
+    fn a_first_turn_or_a_caught_up_provider_sends_without_a_preview() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        submit(&mut state, &store, &engine_command_sender, "first".into());
+        assert!(
+            matches!(state.overlay, Overlay::None),
+            "nothing to hand off"
+        );
+
+        let mut state = state_with_prior_turn(home.path(), &store);
+        {
+            let guard = store.lock().unwrap();
+            guard
+                .upsert_provider_session(
+                    &state.thread.id,
+                    state.thread.current_provider,
+                    "s1",
+                    None,
+                    None,
+                )
+                .unwrap();
+            guard
+                .mark_provider_session_covered(&state.thread.id, state.thread.current_provider, 1)
+                .unwrap();
+        }
+        submit(&mut state, &store, &engine_command_sender, "next".into());
+        assert!(
+            matches!(state.overlay, Overlay::None),
+            "a caught-up provider needs no handoff"
         );
     }
 

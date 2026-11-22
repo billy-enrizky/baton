@@ -16,8 +16,8 @@ use crate::config::{describe_auth, load_config_file, resolve_config, save_config
 use crate::handoff::git_branch_label;
 use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
-use crate::sync;
 use crate::store::{BatonStore, MessageRow, NewThread, ThreadRow};
+use crate::sync;
 use crate::types::{
     normalize_reasoning_effort, ApprovalDecision, PermissionMode, ProviderId, SessionMode,
     TurnPhase,
@@ -70,14 +70,26 @@ const LOGO_ROWS: [&str; 6] = [
 ];
 
 const SLASH_COMMANDS: &[(&str, &str)] = &[
-    ("/switch", "switch to a single harness: /switch <provider> [model]"),
+    (
+        "/switch",
+        "switch to a single harness: /switch <provider> [model]",
+    ),
     ("/model", "set model for this thread"),
-    ("/effort", "set reasoning effort: /effort opens a picker or takes low|medium|high|xhigh|max|default"),
-    ("/mode", "permission mode: default|acceptEdits|bypassPermissions|plan"),
+    (
+        "/effort",
+        "set reasoning effort: /effort opens a picker or takes low|medium|high|xhigh|max|default",
+    ),
+    (
+        "/mode",
+        "permission mode: default|acceptEdits|bypassPermissions|plan",
+    ),
     ("/auth", "billing mode: /auth <provider> <subscription|api>"),
     ("/new", "start a new thread"),
     ("/fork", "branch this conversation into a new thread"),
-    ("/worktree", "fork this conversation into an isolated git worktree"),
+    (
+        "/worktree",
+        "fork this conversation into an isolated git worktree",
+    ),
     ("/threads", "list threads in this directory"),
     ("/open", "open a thread by id prefix"),
     ("/usage", "token usage and cache hit rate"),
@@ -88,14 +100,29 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/goal", "set a multi-turn objective the agent works toward"),
     ("/memories", "list, add, remove, or clear governed memories"),
     ("/find", "search the conversation"),
-    ("/multi", "same prompt to multiple providers; --worktrees isolates them"),
-    ("/orchestrate", "orchestrate mode or one-off: /orchestrate [on|off] [goal]"),
+    (
+        "/multi",
+        "same prompt to multiple providers; --worktrees isolates them",
+    ),
+    (
+        "/orchestrate",
+        "orchestrate mode or one-off: /orchestrate [on|off] [goal]",
+    ),
     ("/runs", "list or reopen orchestration runs"),
-    ("/activity", "inspect every turn, its tool calls, diff, and usage"),
-    ("/commands", "deep dive into every command this thread ran; /commands <turn>"),
+    (
+        "/activity",
+        "inspect every turn, its tool calls, diff, and usage",
+    ),
+    (
+        "/commands",
+        "deep dive into every command this thread ran; /commands <turn>",
+    ),
     ("/queue", "show or clear queued follow-ups"),
     ("/turns", "list durable turn phases"),
-    ("/status", "show thread phase, goal, queue, and adapter states"),
+    (
+        "/status",
+        "show thread phase, goal, queue, and adapter states",
+    ),
     ("/compact", "compact the conversation to free context"),
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),
@@ -293,21 +320,66 @@ struct TranscriptPoint {
 
 enum Overlay {
     None,
-    RewindPicker { selected: usize, native: bool },
-    CodeConfirm { turn: i64, git_ref: String },
-    SwitchPicker { selected: usize },
-    ModelPicker { provider: ProviderId, models: Vec<String>, selected: usize, filter: String },
-    SettingsPicker { provider: ProviderId, categories: Vec<(String, Vec<String>)>, category_index: usize, value_index: usize },
-    McpPicker { selected: usize },
-    SkillsPicker { selected: usize, skills: Vec<(String, String)> },
-    ModePicker { selected: usize },
-    AuthPicker { selected: usize },
-    ThreadPicker { selected: usize, threads: Vec<ThreadChoice> },
-    CheckpointPicker { selected: usize, checkpoints: Vec<(i64, String)> },
-    DirtyConfirm { goal: String, max_tasks: usize, plan_file: Option<String> },
-    OrchestrationPreview { preview: Box<OrchestrationPreview> },
-    CommandList { selected: usize, expanded: bool, turn: Option<i64> },
-    EffortPicker { selected: usize },
+    RewindPicker {
+        selected: usize,
+        native: bool,
+    },
+    CodeConfirm {
+        turn: i64,
+        git_ref: String,
+    },
+    SwitchPicker {
+        selected: usize,
+    },
+    ModelPicker {
+        provider: ProviderId,
+        models: Vec<String>,
+        selected: usize,
+        filter: String,
+    },
+    SettingsPicker {
+        provider: ProviderId,
+        categories: Vec<(String, Vec<String>)>,
+        category_index: usize,
+        value_index: usize,
+    },
+    McpPicker {
+        selected: usize,
+    },
+    SkillsPicker {
+        selected: usize,
+        skills: Vec<(String, String)>,
+    },
+    ModePicker {
+        selected: usize,
+    },
+    AuthPicker {
+        selected: usize,
+    },
+    ThreadPicker {
+        selected: usize,
+        threads: Vec<ThreadChoice>,
+    },
+    CheckpointPicker {
+        selected: usize,
+        checkpoints: Vec<(i64, String)>,
+    },
+    DirtyConfirm {
+        goal: String,
+        max_tasks: usize,
+        plan_file: Option<String>,
+    },
+    OrchestrationPreview {
+        preview: Box<OrchestrationPreview>,
+    },
+    CommandList {
+        selected: usize,
+        expanded: bool,
+        turn: Option<i64>,
+    },
+    EffortPicker {
+        selected: usize,
+    },
 }
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -402,7 +474,11 @@ pub fn run_tui(
         .unwrap()
         .list_queued_messages(&thread.id)
         .unwrap_or_default();
-    let prompt_history = store.lock().unwrap().list_prompt_history(&thread.cwd).unwrap_or_default();
+    let prompt_history = store
+        .lock()
+        .unwrap()
+        .list_prompt_history(&thread.cwd)
+        .unwrap_or_default();
     let branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
     let permission_mode = permission_override.unwrap_or(thread.permission_mode);
     let goal = thread.goal.clone();
@@ -412,8 +488,8 @@ pub fn run_tui(
         .unwrap()
         .reconcile_running_turns(Some(thread.cwd.as_str()))
         .unwrap_or_default();
-    let recovered_runs = orchestrate::reconcile_abandoned_runs(&store.lock().unwrap())
-        .unwrap_or_default();
+    let recovered_runs =
+        orchestrate::reconcile_abandoned_runs(&store.lock().unwrap()).unwrap_or_default();
 
     let custom_commands = discover_custom_commands(&thread.cwd);
     let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
@@ -530,11 +606,7 @@ pub fn run_tui(
             {
                 let guard = store.lock().unwrap();
                 let _ = guard.set_thread_permission_mode(&thread_id, state.permission_mode);
-                let _ = guard.set_thread_goal(
-                    &thread_id,
-                    state.goal.as_deref(),
-                    state.goal_paused,
-                );
+                let _ = guard.set_thread_goal(&thread_id, state.goal.as_deref(), state.goal_paused);
             }
             dispatch_message(&mut state, &store, &engine_command_sender, prompt, false);
         }
@@ -740,11 +812,7 @@ fn transcript_point_at(state: &TuiState, column: u16, row: u16) -> Option<Transc
     })
 }
 
-fn transcript_point_for_drag(
-    state: &TuiState,
-    column: u16,
-    row: u16,
-) -> Option<TranscriptPoint> {
+fn transcript_point_for_drag(state: &TuiState, column: u16, row: u16) -> Option<TranscriptPoint> {
     let line = transcript_line_for_drag(state, row)?;
     let view = state.transcript_view.borrow();
     let view = view.as_ref()?;
@@ -870,7 +938,13 @@ fn apply_engine_event(
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
 ) {
     match event {
-        EngineEvent::UserEcho { thread_id, turn, text, provider, model } => {
+        EngineEvent::UserEcho {
+            thread_id,
+            turn,
+            text,
+            provider,
+            model,
+        } => {
             if thread_id == state.thread.id {
                 state.history.push(MessageRow {
                     id: -(turn as i64),
@@ -885,12 +959,16 @@ fn apply_engine_event(
                 state.scroll_offset = 0;
             }
         }
-        EngineEvent::TurnQueued { thread_id, provider } => {
-            if let Some(child) = state
-                .multi
-                .as_mut()
-                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
-            {
+        EngineEvent::TurnQueued {
+            thread_id,
+            provider,
+        } => {
+            if let Some(child) = state.multi.as_mut().and_then(|multi| {
+                multi
+                    .children
+                    .iter_mut()
+                    .find(|child| child.thread_id == thread_id)
+            }) {
                 child.status = MultiStatus::Queued;
                 child.error = None;
             }
@@ -906,12 +984,15 @@ fn apply_engine_event(
             ));
         }
         EngineEvent::TurnStarted { thread_id } => {
-            state.approvals.retain(|approval| approval.thread_id != thread_id);
-            if let Some(child) = state
-                .multi
-                .as_mut()
-                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
-            {
+            state
+                .approvals
+                .retain(|approval| approval.thread_id != thread_id);
+            if let Some(child) = state.multi.as_mut().and_then(|multi| {
+                multi
+                    .children
+                    .iter_mut()
+                    .find(|child| child.thread_id == thread_id)
+            }) {
                 child.status = MultiStatus::Running;
                 child.error = None;
             }
@@ -925,15 +1006,27 @@ fn apply_engine_event(
             state.notice = None;
             state.diff_output = None;
         }
-        EngineEvent::TurnFinished { thread_id, ok, error, phase } => {
+        EngineEvent::TurnFinished {
+            thread_id,
+            ok,
+            error,
+            phase,
+        } => {
             record_worker_followup(state, store, &thread_id, ok, error.as_deref(), phase);
-            state.approvals.retain(|approval| approval.thread_id != thread_id);
-            if let Some(child) = state
-                .multi
-                .as_mut()
-                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
-            {
-                child.status = if ok { MultiStatus::Done } else { MultiStatus::Failed };
+            state
+                .approvals
+                .retain(|approval| approval.thread_id != thread_id);
+            if let Some(child) = state.multi.as_mut().and_then(|multi| {
+                multi
+                    .children
+                    .iter_mut()
+                    .find(|child| child.thread_id == thread_id)
+            }) {
+                child.status = if ok {
+                    MultiStatus::Done
+                } else {
+                    MultiStatus::Failed
+                };
                 child.error = error.clone();
                 if ok {
                     let reply = store
@@ -998,16 +1091,25 @@ fn apply_engine_event(
                         .unwrap_or_default();
                     let remaining = state.queued_messages.len();
                     let preview: String = next.chars().take(60).collect();
-                    state.notice = Some(format!("sending queued message ({remaining} remaining): {preview}"));
+                    state.notice = Some(format!(
+                        "sending queued message ({remaining} remaining): {preview}"
+                    ));
                     submit(state, store, engine_command_sender, next);
                 }
             } else if !state.queued_messages.is_empty() {
                 let waiting = state.queued_messages.len();
                 let prefix = state.notice.take().unwrap_or_default();
-                state.notice = Some(format!("{prefix} · {waiting} queued message(s) kept; press enter to send"));
+                state.notice = Some(format!(
+                    "{prefix} · {waiting} queued message(s) kept; press enter to send"
+                ));
             }
             if ok && state.queued_messages.is_empty() {
-                let latest = state.history.iter().map(|message| message.turn).max().unwrap_or(0);
+                let latest = state
+                    .history
+                    .iter()
+                    .map(|message| message.turn)
+                    .max()
+                    .unwrap_or(0);
                 let tools = state
                     .history
                     .iter()
@@ -1071,21 +1173,22 @@ fn apply_engine_event(
                 *current = live;
                 let filtered = model_filter_indices(current, filter);
                 *selected = previous
-                    .and_then(|model| {
-                        filtered
-                            .iter()
-                            .position(|index| current[*index] == model)
-                    })
+                    .and_then(|model| filtered.iter().position(|index| current[*index] == model))
                     .unwrap_or(0);
             }
             state.notice = Some(format!("loaded {count} live model(s) for {provider}"));
         }
-        EngineEvent::TurnRejected { thread_id, text, reason } => {
-            if let Some(child) = state
-                .multi
-                .as_mut()
-                .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
-            {
+        EngineEvent::TurnRejected {
+            thread_id,
+            text,
+            reason,
+        } => {
+            if let Some(child) = state.multi.as_mut().and_then(|multi| {
+                multi
+                    .children
+                    .iter_mut()
+                    .find(|child| child.thread_id == thread_id)
+            }) {
                 child.status = MultiStatus::Failed;
                 child.error = Some(reason.clone());
             }
@@ -1097,7 +1200,11 @@ fn apply_engine_event(
                 ));
             }
         }
-        EngineEvent::SteerRejected { thread_id, text, reason } => {
+        EngineEvent::SteerRejected {
+            thread_id,
+            text,
+            reason,
+        } => {
             if thread_id == state.thread.id {
                 if state.running {
                     enqueue_message(state, store, text);
@@ -1173,10 +1280,7 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             }
             record_orchestration_message(state, summary);
             state.notice = Some(if report.status == "cancelled" {
-                format!(
-                    "orchestration cancelled: {} worker(s)",
-                    report.tasks.len()
-                )
+                format!("orchestration cancelled: {} worker(s)", report.tasks.len())
             } else {
                 format!(
                     "orchestration {}: {} worker(s)",
@@ -1211,8 +1315,7 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
                     .map(|(index, task)| OrchestrationWorkerView {
                         index: index + 1,
                         title: task.title.clone(),
-                        provider: ProviderId::parse(&task.provider)
-                            .unwrap_or(ProviderId::Codex),
+                        provider: ProviderId::parse(&task.provider).unwrap_or(ProviderId::Codex),
                         model: String::new(),
                         status: "queued".to_string(),
                         worktree: None,
@@ -1363,9 +1466,8 @@ fn start_integration(state: &mut TuiState) {
     state.notice = Some("integrating worker branches...".into());
     let sender = state.orchestration_sender.clone();
     std::thread::spawn(move || {
-        let result = BatonStore::open(&home.join("baton.sqlite")).and_then(|store| {
-            orchestrate::integrate(&store, &cwd, &run_id, &[])
-        });
+        let result = BatonStore::open(&home.join("baton.sqlite"))
+            .and_then(|store| orchestrate::integrate(&store, &cwd, &run_id, &[]));
         let event = match result {
             Ok(report) => OrchestrationEvent::Integrated(Box::new(report)),
             Err(error) => OrchestrationEvent::IntegrateFailed(error.to_string()),
@@ -1478,9 +1580,7 @@ fn recent_thread_notice(
         .iter()
         .filter(|thread| thread.id != current_thread_id)
         .count();
-    (count > 0).then(|| {
-        format!("{count} recent thread(s) in this folder · /threads to open one")
-    })
+    (count > 0).then(|| format!("{count} recent thread(s) in this folder · /threads to open one"))
 }
 
 fn record_orchestration_message(state: &mut TuiState, text: String) {
@@ -1604,16 +1704,12 @@ fn start_orchestration_preview(
     let cwd = state.thread.cwd.clone();
     let home = state.home.clone();
     let provider = state.thread.current_provider;
-    let model = state
-        .thread
-        .current_model
-        .clone()
-        .unwrap_or_else(|| {
-            resolve_config(&home, std::path::Path::new(&cwd))
-                .for_provider(provider)
-                .model
-                .clone()
-        });
+    let model = state.thread.current_model.clone().unwrap_or_else(|| {
+        resolve_config(&home, std::path::Path::new(&cwd))
+            .for_provider(provider)
+            .model
+            .clone()
+    });
     let permission_mode = state.permission_mode;
     let plan_path = resolve_plan_path(&cwd, plan_file);
     let effective_goal = effective_orchestration_goal(&goal, plan_path.as_deref());
@@ -1727,11 +1823,12 @@ fn start_orchestration(
     let cwd = state.thread.cwd.clone();
     let home = state.home.clone();
     let provider = state.thread.current_provider;
-    let model = state
-        .thread
-        .current_model
-        .clone()
-        .unwrap_or_else(|| resolve_config(&home, std::path::Path::new(&cwd)).for_provider(provider).model.clone());
+    let model = state.thread.current_model.clone().unwrap_or_else(|| {
+        resolve_config(&home, std::path::Path::new(&cwd))
+            .for_provider(provider)
+            .model
+            .clone()
+    });
     let permission_mode = state.permission_mode;
     let plan_path = resolve_plan_path(&cwd, plan_file);
     let effective_goal = effective_orchestration_goal(&goal, plan_path.as_deref());
@@ -1818,30 +1915,38 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                 None => tool,
             };
             if let Some(id) = id.as_deref() {
-                if let Some(line) = state
-                    .tool_lines
-                    .iter_mut()
-                    .rev()
-                    .find(|line| line.status == ToolStatus::Running && line.id.as_deref() == Some(id))
-                {
+                if let Some(line) = state.tool_lines.iter_mut().rev().find(|line| {
+                    line.status == ToolStatus::Running && line.id.as_deref() == Some(id)
+                }) {
                     line.label = label;
                     return;
                 }
             }
-            state.tool_lines.push(ToolLine { id, label, status: ToolStatus::Running });
+            state.tool_lines.push(ToolLine {
+                id,
+                label,
+                status: ToolStatus::Running,
+            });
         }
-        TurnEvent::ToolCompleted { id, tool, detail, exit_code } => {
+        TurnEvent::ToolCompleted {
+            id,
+            tool,
+            detail,
+            exit_code,
+        } => {
             let label = match detail {
                 Some(detail) => format!("{tool} {detail}"),
                 None => tool,
             };
-            let status = if exit_code.unwrap_or(0) != 0 { ToolStatus::Failed } else { ToolStatus::Done };
+            let status = if exit_code.unwrap_or(0) != 0 {
+                ToolStatus::Failed
+            } else {
+                ToolStatus::Done
+            };
             let matched = match id.as_deref() {
-                Some(id) => state
-                    .tool_lines
-                    .iter_mut()
-                    .rev()
-                    .find(|line| line.status == ToolStatus::Running && line.id.as_deref() == Some(id)),
+                Some(id) => state.tool_lines.iter_mut().rev().find(|line| {
+                    line.status == ToolStatus::Running && line.id.as_deref() == Some(id)
+                }),
                 None => state
                     .tool_lines
                     .iter_mut()
@@ -1867,11 +1972,12 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
 }
 
 fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: TurnEvent) {
-    if let Some(child) = state
-        .multi
-        .as_mut()
-        .and_then(|multi| multi.children.iter_mut().find(|child| child.thread_id == thread_id))
-    {
+    if let Some(child) = state.multi.as_mut().and_then(|multi| {
+        multi
+            .children
+            .iter_mut()
+            .find(|child| child.thread_id == thread_id)
+    }) {
         match &event {
             TurnEvent::TextDelta { text } => child.reply.push_str(text),
             TurnEvent::TurnFailed { error } => {
@@ -1898,11 +2004,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
     }
 }
 
-fn load_thread_state(
-    state: &mut TuiState,
-    store: &Arc<Mutex<BatonStore>>,
-    thread: ThreadRow,
-) {
+fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread: ThreadRow) {
     state.permission_mode = thread.permission_mode;
     state.goal = thread.goal.clone();
     state.goal_paused = thread.goal_paused;
@@ -2136,7 +2238,12 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
         }
         "/mode" => {
             for mode in PERMISSION_MODE_VALUES {
-                push_suggestion(&mut suggestions, command, mode, format!("permission mode {mode}"));
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    mode,
+                    format!("permission mode {mode}"),
+                );
             }
         }
         "/auth" => {
@@ -2175,7 +2282,14 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 .list_memories(&cwd)
                 .unwrap_or_default();
             for memory in memories.into_iter().take(10) {
-                let preview: String = memory.text.lines().next().unwrap_or("").chars().take(60).collect();
+                let preview: String = memory
+                    .text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(60)
+                    .collect();
                 push_suggestion(
                     &mut suggestions,
                     command,
@@ -2219,7 +2333,11 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 .unwrap_or_default();
             for run in runs {
                 let id = run.id[..8.min(run.id.len())].to_string();
-                let archived = if run.archived_at.is_some() { " (archived)" } else { "" };
+                let archived = if run.archived_at.is_some() {
+                    " (archived)"
+                } else {
+                    ""
+                };
                 push_suggestion(
                     &mut suggestions,
                     command,
@@ -2333,7 +2451,12 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
             }
         }
         "/rewind" => {
-            push_suggestion(&mut suggestions, command, "--native", "use native provider rewind");
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "--native",
+                "use native provider rewind",
+            );
         }
         "/help" => {
             push_suggestion(&mut suggestions, command, "all", "show every command");
@@ -2363,7 +2486,9 @@ fn handle_key(
 ) {
     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
         if state.running {
-            let _ = engine_command_sender.send(EngineCommand::Interrupt { thread_id: state.thread.id.clone() });
+            let _ = engine_command_sender.send(EngineCommand::Interrupt {
+                thread_id: state.thread.id.clone(),
+            });
             state.notice = Some("interrupting...".into());
             return;
         }
@@ -2470,7 +2595,10 @@ fn handle_key(
     }
 
     match std::mem::replace(&mut state.overlay, Overlay::None) {
-        Overlay::RewindPicker { mut selected, native } => {
+        Overlay::RewindPicker {
+            mut selected,
+            native,
+        } => {
             let user_messages: Vec<(i64, String)> = state
                 .history
                 .iter()
@@ -2509,7 +2637,11 @@ fn handle_key(
                 }
             }
         }
-        Overlay::CommandList { mut selected, mut expanded, turn } => {
+        Overlay::CommandList {
+            mut selected,
+            mut expanded,
+            turn,
+        } => {
             let commands = tool_messages(state, turn);
             let mut keep = true;
             match key.code {
@@ -2522,21 +2654,29 @@ fn handle_key(
                 }
                 KeyCode::Enter => expanded = !expanded,
                 KeyCode::Char('y') => {
-                    if let Some(message) = commands.get(selected.min(commands.len().saturating_sub(1))) {
+                    if let Some(message) =
+                        commands.get(selected.min(commands.len().saturating_sub(1)))
+                    {
                         let provider = message.provider.as_deref().unwrap_or("-");
                         match crate::clipboard::copy(&format!(
                             "turn {} · {} · {}",
                             message.turn, provider, message.text
                         )) {
                             Ok(()) => state.notice = Some("tool call copied".into()),
-                            Err(error) => state.notice = Some(format!("cannot copy tool call: {error}")),
+                            Err(error) => {
+                                state.notice = Some(format!("cannot copy tool call: {error}"))
+                            }
                         }
                     }
                 }
                 _ => {}
             }
             if keep {
-                state.overlay = Overlay::CommandList { selected, expanded, turn };
+                state.overlay = Overlay::CommandList {
+                    selected,
+                    expanded,
+                    turn,
+                };
             }
         }
         Overlay::EffortPicker { mut selected } => {
@@ -2629,7 +2769,9 @@ fn handle_key(
                     selected = 0;
                 }
                 KeyCode::Char(character)
-                    if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
                 {
                     filter.push(character);
                     selected = 0;
@@ -2669,7 +2811,12 @@ fn handle_key(
                 filter,
             };
         }
-        Overlay::SettingsPicker { provider, categories, mut category_index, mut value_index } => match key.code {
+        Overlay::SettingsPicker {
+            provider,
+            categories,
+            mut category_index,
+            mut value_index,
+        } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Left => {
                 state.overlay = Overlay::SwitchPicker { selected: 0 };
@@ -2679,14 +2826,24 @@ fn handle_key(
                     category_index = (category_index + categories.len() - 1) % categories.len();
                     value_index = 0;
                 }
-                state.overlay = Overlay::SettingsPicker { provider, categories, category_index, value_index };
+                state.overlay = Overlay::SettingsPicker {
+                    provider,
+                    categories,
+                    category_index,
+                    value_index,
+                };
             }
             KeyCode::Down => {
                 if !categories.is_empty() {
                     category_index = (category_index + 1) % categories.len();
                     value_index = 0;
                 }
-                state.overlay = Overlay::SettingsPicker { provider, categories, category_index, value_index };
+                state.overlay = Overlay::SettingsPicker {
+                    provider,
+                    categories,
+                    category_index,
+                    value_index,
+                };
             }
             KeyCode::Right | KeyCode::Tab => {
                 if let Some((_, values)) = categories.get(category_index) {
@@ -2694,7 +2851,12 @@ fn handle_key(
                         value_index = (value_index + 1) % values.len();
                     }
                 }
-                state.overlay = Overlay::SettingsPicker { provider, categories, category_index, value_index };
+                state.overlay = Overlay::SettingsPicker {
+                    provider,
+                    categories,
+                    category_index,
+                    value_index,
+                };
             }
             KeyCode::Enter => {
                 if let Some((label, values)) = categories.get(category_index) {
@@ -2704,7 +2866,12 @@ fn handle_key(
                 }
             }
             _ => {
-                state.overlay = Overlay::SettingsPicker { provider, categories, category_index, value_index };
+                state.overlay = Overlay::SettingsPicker {
+                    provider,
+                    categories,
+                    category_index,
+                    value_index,
+                };
             }
         },
         Overlay::McpPicker { mut selected } => match key.code {
@@ -2717,40 +2884,46 @@ fn handle_key(
                 selected = (selected + 1) % 4;
                 state.overlay = Overlay::McpPicker { selected };
             }
-            KeyCode::Enter => {
-                match selected {
-                    0 => {
-                        let registry = sync::load_mcp_registry(&state.home);
-                        let lines: Vec<String> = if registry.servers.is_empty() {
-                            vec!["no MCP servers configured in baton".to_string()]
-                        } else {
-                            registry.servers.iter().map(|(name, server)| {
+            KeyCode::Enter => match selected {
+                0 => {
+                    let registry = sync::load_mcp_registry(&state.home);
+                    let lines: Vec<String> = if registry.servers.is_empty() {
+                        vec!["no MCP servers configured in baton".to_string()]
+                    } else {
+                        registry
+                            .servers
+                            .iter()
+                            .map(|(name, server)| {
                                 format!("  {name}: {} {}", server.command, server.args.join(" "))
-                            }).collect()
-                        };
-                        state.notice = Some(format!("MCP servers:\n{}", lines.join("\n")));
-                    }
-                    1 => {
-                        state.notice = Some("usage: /mcp add <name> <command> [args...] (typed command)".into());
-                    }
-                    2 => {
-                        state.notice = Some("usage: /mcp remove <name> (typed command)".into());
-                    }
-                    3 => {
-                        let registry = sync::load_mcp_registry(&state.home);
-                        match sync::sync_mcp_to_all(&registry) {
-                            Ok(results) => {
-                                let lines: Vec<String> = results.iter().map(|(harness, names)| {
-                                    format!("  {harness}: {} synced", names.len())
-                                }).collect();
-                                state.notice = Some(format!("MCP sync complete\n{}", lines.join("\n")));
-                            }
-                            Err(error) => state.notice = Some(format!("sync failed: {error}")),
-                        }
-                    }
-                    _ => {}
+                            })
+                            .collect()
+                    };
+                    state.notice = Some(format!("MCP servers:\n{}", lines.join("\n")));
                 }
-            }
+                1 => {
+                    state.notice =
+                        Some("usage: /mcp add <name> <command> [args...] (typed command)".into());
+                }
+                2 => {
+                    state.notice = Some("usage: /mcp remove <name> (typed command)".into());
+                }
+                3 => {
+                    let registry = sync::load_mcp_registry(&state.home);
+                    match sync::sync_mcp_to_all(&registry) {
+                        Ok(results) => {
+                            let lines: Vec<String> = results
+                                .iter()
+                                .map(|(harness, names)| {
+                                    format!("  {harness}: {} synced", names.len())
+                                })
+                                .collect();
+                            state.notice = Some(format!("MCP sync complete\n{}", lines.join("\n")));
+                        }
+                        Err(error) => state.notice = Some(format!("sync failed: {error}")),
+                    }
+                }
+                _ => {}
+            },
             _ => {
                 state.overlay = Overlay::McpPicker { selected };
             }
@@ -2760,13 +2933,19 @@ fn handle_key(
             KeyCode::Up => {
                 if !skills.is_empty() {
                     let new_selected = (selected + skills.len() - 1) % skills.len();
-                    state.overlay = Overlay::SkillsPicker { selected: new_selected, skills };
+                    state.overlay = Overlay::SkillsPicker {
+                        selected: new_selected,
+                        skills,
+                    };
                 }
             }
             KeyCode::Down => {
                 if !skills.is_empty() {
                     let new_selected = (selected + 1) % skills.len();
-                    state.overlay = Overlay::SkillsPicker { selected: new_selected, skills };
+                    state.overlay = Overlay::SkillsPicker {
+                        selected: new_selected,
+                        skills,
+                    };
                 }
             }
             _ => {
@@ -2784,7 +2963,12 @@ fn handle_key(
                 state.overlay = Overlay::ModePicker { selected };
             }
             KeyCode::Enter => {
-                let modes = [PermissionMode::Default, PermissionMode::AcceptEdits, PermissionMode::BypassPermissions, PermissionMode::Plan];
+                let modes = [
+                    PermissionMode::Default,
+                    PermissionMode::AcceptEdits,
+                    PermissionMode::BypassPermissions,
+                    PermissionMode::Plan,
+                ];
                 if let Some(mode) = modes.get(selected) {
                     state.apply_permission_mode(store, *mode);
                     state.notice = Some(format!("permission mode: {mode}"));
@@ -2808,8 +2992,13 @@ fn handle_key(
                 let provider_index = selected / 2;
                 let is_api = selected % 2 == 1;
                 if let Some(provider) = PROVIDERS.get(provider_index).copied() {
-                    let mode = if is_api { crate::config::AuthMode::Api } else { crate::config::AuthMode::Subscription };
-                    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+                    let mode = if is_api {
+                        crate::config::AuthMode::Api
+                    } else {
+                        crate::config::AuthMode::Subscription
+                    };
+                    let resolved =
+                        resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
                     let provider_config = resolved.for_provider(provider);
                     if mode == crate::config::AuthMode::Api && provider_config.api_key.is_none() {
                         state.notice = Some(format!(
@@ -2819,7 +3008,10 @@ fn handle_key(
                         return;
                     }
                     let mut file = load_config_file(&state.home).unwrap_or_default();
-                    file.providers.entry(provider.as_str().to_string()).or_default().mode = Some(mode);
+                    file.providers
+                        .entry(provider.as_str().to_string())
+                        .or_default()
+                        .mode = Some(mode);
                     if let Err(error) = save_config_file(&state.home, &file) {
                         state.notice = Some(format!("cannot save config: {error}"));
                         return;
@@ -2837,13 +3029,19 @@ fn handle_key(
             KeyCode::Up => {
                 if !threads.is_empty() {
                     let new_selected = (selected + threads.len() - 1) % threads.len();
-                    state.overlay = Overlay::ThreadPicker { selected: new_selected, threads };
+                    state.overlay = Overlay::ThreadPicker {
+                        selected: new_selected,
+                        threads,
+                    };
                 }
             }
             KeyCode::Down => {
                 if !threads.is_empty() {
                     let new_selected = (selected + 1) % threads.len();
-                    state.overlay = Overlay::ThreadPicker { selected: new_selected, threads };
+                    state.overlay = Overlay::ThreadPicker {
+                        selected: new_selected,
+                        threads,
+                    };
                 }
             }
             KeyCode::Enter => {
@@ -2851,7 +3049,10 @@ fn handle_key(
                     let thread_id = &choice.id;
                     let found = {
                         let guard = store.lock().unwrap();
-                        guard.list_threads(None).unwrap_or_default().into_iter()
+                        guard
+                            .list_threads(None)
+                            .unwrap_or_default()
+                            .into_iter()
                             .find(|thread| thread.id.starts_with(thread_id.as_str()))
                     };
                     if let Some(thread) = found {
@@ -2861,7 +3062,8 @@ fn handle_key(
                         state.thread = thread.clone();
                         let guard = store.lock().unwrap();
                         state.history = guard.list_messages(&thread.id).unwrap_or_default();
-                        state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
+                        state.queued_messages =
+                            guard.list_queued_messages(&thread.id).unwrap_or_default();
                         state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
                         state.diff_output = None;
                         state.scroll_offset = 0;
@@ -2873,18 +3075,27 @@ fn handle_key(
                 state.overlay = Overlay::ThreadPicker { selected, threads };
             }
         },
-        Overlay::CheckpointPicker { selected, checkpoints } => match key.code {
+        Overlay::CheckpointPicker {
+            selected,
+            checkpoints,
+        } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
                 if !checkpoints.is_empty() {
                     let new_selected = (selected + checkpoints.len() - 1) % checkpoints.len();
-                    state.overlay = Overlay::CheckpointPicker { selected: new_selected, checkpoints };
+                    state.overlay = Overlay::CheckpointPicker {
+                        selected: new_selected,
+                        checkpoints,
+                    };
                 }
             }
             KeyCode::Down => {
                 if !checkpoints.is_empty() {
                     let new_selected = (selected + 1) % checkpoints.len();
-                    state.overlay = Overlay::CheckpointPicker { selected: new_selected, checkpoints };
+                    state.overlay = Overlay::CheckpointPicker {
+                        selected: new_selected,
+                        checkpoints,
+                    };
                 }
             }
             KeyCode::Enter => {
@@ -2892,10 +3103,15 @@ fn handle_key(
                     let cwd = std::path::PathBuf::from(&state.thread.cwd);
                     let result = {
                         let guard = store.lock().unwrap();
-                        guard.get_checkpoint(&state.thread.id, *turn).unwrap_or(None)
+                        guard
+                            .get_checkpoint(&state.thread.id, *turn)
+                            .unwrap_or(None)
                     };
                     if let Some(checkpoint) = result {
-                        match crate::checkpoints::diff_checkpoint_against_worktree(&cwd, &checkpoint.git_ref) {
+                        match crate::checkpoints::diff_checkpoint_against_worktree(
+                            &cwd,
+                            &checkpoint.git_ref,
+                        ) {
                             Ok(diff) => {
                                 let lines: Vec<&str> = diff.lines().take(200).collect();
                                 let mut text = lines.join("\n");
@@ -2910,7 +3126,10 @@ fn handle_key(
                 }
             }
             _ => {
-                state.overlay = Overlay::CheckpointPicker { selected, checkpoints };
+                state.overlay = Overlay::CheckpointPicker {
+                    selected,
+                    checkpoints,
+                };
             }
         },
         Overlay::CodeConfirm { turn, git_ref } => match key.code {
@@ -2948,16 +3167,18 @@ fn handle_key(
                         max_tasks,
                         plan_file,
                     };
-                    state.notice =
-                        Some("a single harness needs a prompt; esc returns it to the composer".into());
+                    state.notice = Some(
+                        "a single harness needs a prompt; esc returns it to the composer".into(),
+                    );
                 } else {
                     submit(state, store, engine_command_sender, goal);
                 }
             }
             KeyCode::Esc => {
                 state.set_input(goal);
-                state.notice =
-                    Some("orchestration cancelled; commit or stash, or run a single harness".into());
+                state.notice = Some(
+                    "orchestration cancelled; commit or stash, or run a single harness".into(),
+                );
             }
             _ => {
                 state.overlay = Overlay::DirtyConfirm {
@@ -2991,9 +3212,8 @@ fn start_native_rewind(
         state.thread.current_provider,
         ProviderId::Codex | ProviderId::OpenCode
     ) {
-        state.notice = Some(
-            "native rewind is Codex and OpenCode-only; use /rewind without --native".into(),
-        );
+        state.notice =
+            Some("native rewind is Codex and OpenCode-only; use /rewind without --native".into());
         return;
     }
     let persisted = {
@@ -3020,14 +3240,9 @@ fn start_native_rewind(
                 .build()?;
             let recorder_store =
                 Arc::new(Mutex::new(BatonStore::open(&home.join("baton.sqlite"))?));
-            let recorder =
-                crate::process::ProcessRecorder::new(recorder_store, source.cwd.clone());
+            let recorder = crate::process::ProcessRecorder::new(recorder_store, source.cwd.clone());
             let outcome = runtime.block_on(crate::provider_runtime::rewind_to_turn(
-                &store,
-                &home,
-                &source,
-                turn,
-                recorder,
+                &store, &home, &source, turn, recorder,
             ))?;
             Ok(outcome.provider_retry_skipped)
         })();
@@ -3105,7 +3320,10 @@ fn apply_rewind(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, turn: i64,
             {
                 let guard = store.lock().unwrap();
                 state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
-                if let Some(checkpoint) = guard.get_checkpoint(&state.thread.id, turn - 1).unwrap_or(None) {
+                if let Some(checkpoint) = guard
+                    .get_checkpoint(&state.thread.id, turn - 1)
+                    .unwrap_or(None)
+                {
                     state.overlay = Overlay::CodeConfirm {
                         turn,
                         git_ref: checkpoint.git_ref,
@@ -3115,7 +3333,9 @@ fn apply_rewind(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, turn: i64,
             state.scroll_offset = 0;
             state.queued_messages.clear();
             state.set_input(text);
-            state.notice = Some(format!("rewound to before turn {turn}; message restored to composer"));
+            state.notice = Some(format!(
+                "rewound to before turn {turn}; message restored to composer"
+            ));
         }
         Err(error) => {
             state.notice = Some(format!("rewind failed: {error}"));
@@ -3241,9 +3461,7 @@ fn escape_review_text(text: &str) -> String {
 }
 
 fn format_review_notes(turn: i64, notes: &[ReviewNote]) -> String {
-    let mut text = format!(
-        "Review the following line-anchored notes from turn {turn}:\n\n"
-    );
+    let mut text = format!("Review the following line-anchored notes from turn {turn}:\n\n");
     for note in notes {
         text.push_str(&format!(
             "File: {}\nLine: {}\nChange: {}\nUser comment: \"{}\"\n\n",
@@ -3381,7 +3599,10 @@ fn handle_review_key(
                 }
             }
             KeyCode::Char(character) => {
-                if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                {
                     input.push(character);
                 }
             }
@@ -3472,7 +3693,8 @@ fn handle_review_key(
         }
         KeyCode::Char('s') => {
             if review.notes.is_empty() {
-                state.notice = Some("no review notes to send yet; press n on a changed line".into());
+                state.notice =
+                    Some("no review notes to send yet; press n on a changed line".into());
                 state.review = Some(review);
                 return;
             }
@@ -3490,9 +3712,9 @@ fn handle_review_key(
                     format!("steering {count} review note(s) into the current turn")
                 }
                 Ok(()) => format!("sent {count} review note(s)"),
-                Err(error) => format!(
-                    "sent {count} review note(s), but could not mark them sent: {error}"
-                ),
+                Err(error) => {
+                    format!("sent {count} review note(s), but could not mark them sent: {error}")
+                }
             });
             return;
         }
@@ -3502,11 +3724,7 @@ fn handle_review_key(
     state.review = Some(review);
 }
 
-fn handle_orchestration_key(
-    state: &mut TuiState,
-    store: &Arc<Mutex<BatonStore>>,
-    key: KeyEvent,
-) {
+fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, key: KeyEvent) {
     let Some(worker_count) = state
         .orchestration_report
         .as_ref()
@@ -3647,11 +3865,7 @@ fn handle_orchestration_key(
                 .and_then(|task| task.thread_id.clone());
             match thread_id {
                 Some(thread_id) => {
-                    let thread = store
-                        .lock()
-                        .unwrap()
-                        .get_thread(&thread_id)
-                        .unwrap_or(None);
+                    let thread = store.lock().unwrap().get_thread(&thread_id).unwrap_or(None);
                     match thread {
                         Some(thread) => {
                             state.orchestration_report = None;
@@ -3681,7 +3895,9 @@ fn handle_composer_key(
     key: KeyEvent,
 ) {
     let suggestions = suggestions_for(state);
-    let clamped = state.suggestion_index.min(suggestions.len().saturating_sub(1));
+    let clamped = state
+        .suggestion_index
+        .min(suggestions.len().saturating_sub(1));
     let force_newline = (key.code == KeyCode::Enter
         && key
             .modifiers
@@ -3718,7 +3934,10 @@ fn handle_composer_key(
             }
             KeyCode::Enter => {
                 let typed = state.input.trim().to_string();
-                if suggestions.iter().any(|suggestion| suggestion.insert == typed) {
+                if suggestions
+                    .iter()
+                    .any(|suggestion| suggestion.insert == typed)
+                {
                     state.set_input(String::new());
                     handle_command(state, store, engine_command_sender, &typed);
                 } else if let Some(suggestion) = suggestions.get(clamped) {
@@ -3804,7 +4023,10 @@ fn handle_composer_key(
         // Claude Code style recall: with an empty input (or while already
         // recalling), Up walks back through this project's prompt history
         // and Down walks forward. Otherwise the arrows scroll the transcript.
-        KeyCode::Up if !state.prompt_history.is_empty() && (state.input.is_empty() || state.prompt_history_index.is_some()) => {
+        KeyCode::Up
+            if !state.prompt_history.is_empty()
+                && (state.input.is_empty() || state.prompt_history_index.is_some()) =>
+        {
             if !state.prompt_history.is_empty() {
                 let next = match state.prompt_history_index {
                     None => state.prompt_history.len() - 1,
@@ -3840,12 +4062,17 @@ fn handle_composer_key(
         }
         KeyCode::Esc => {
             if state.running {
-                let _ = engine_command_sender.send(EngineCommand::Interrupt { thread_id: state.thread.id.clone() });
+                let _ = engine_command_sender.send(EngineCommand::Interrupt {
+                    thread_id: state.thread.id.clone(),
+                });
                 state.notice = Some("interrupting...".into());
             } else if state.input.is_empty() {
                 if state.esc_primed {
                     state.esc_primed = false;
-                    state.overlay = Overlay::RewindPicker { selected: 0, native: false };
+                    state.overlay = Overlay::RewindPicker {
+                        selected: 0,
+                        native: false,
+                    };
                 } else {
                     state.esc_primed = true;
                 }
@@ -3856,7 +4083,10 @@ fn handle_composer_key(
             }
         }
         KeyCode::Char(character) => {
-            if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
                 state.insert_input_char(character);
                 state.suggestion_index = 0;
                 state.esc_primed = false;
@@ -3869,8 +4099,7 @@ fn handle_composer_key(
     }
 }
 
-const MULTI_USAGE: &str =
-    "usage: /multi [--worktrees] <provider> [<provider> ...] <prompt>";
+const MULTI_USAGE: &str = "usage: /multi [--worktrees] <provider> [<provider> ...] <prompt>";
 
 #[derive(Debug, PartialEq, Eq)]
 struct MultiArgs {
@@ -3881,7 +4110,10 @@ struct MultiArgs {
 
 fn parse_multi_args(args: &[String]) -> std::result::Result<MultiArgs, String> {
     let mut start = 0usize;
-    let worktrees = matches!(args.first().map(String::as_str), Some("--worktrees") | Some("--wt"));
+    let worktrees = matches!(
+        args.first().map(String::as_str),
+        Some("--worktrees") | Some("--wt")
+    );
     if worktrees {
         start = 1;
     }
@@ -3924,14 +4156,8 @@ fn multi_worktree_plan(providers: &[ProviderId], prompt: &str) -> orchestrate::P
     }
 }
 
-fn write_multi_worktree_plan(
-    providers: &[ProviderId],
-    prompt: &str,
-) -> Result<String> {
-    let path = std::env::temp_dir().join(format!(
-        "baton-multi-{}.json",
-        uuid::Uuid::new_v4()
-    ));
+fn write_multi_worktree_plan(providers: &[ProviderId], prompt: &str) -> Result<String> {
+    let path = std::env::temp_dir().join(format!("baton-multi-{}.json", uuid::Uuid::new_v4()));
     let plan = multi_worktree_plan(providers, prompt);
     std::fs::write(&path, serde_json::to_string_pretty(&plan)?)?;
     Ok(path.to_string_lossy().to_string())
@@ -3964,7 +4190,11 @@ fn submit(
     let thread_id = state.thread.id.clone();
     let permission_mode = state.permission_mode;
     state.persist_thread_state(store);
-    let _ = engine_command_sender.send(EngineCommand::Submit { thread_id, text, permission_mode });
+    let _ = engine_command_sender.send(EngineCommand::Submit {
+        thread_id,
+        text,
+        permission_mode,
+    });
 }
 
 fn handle_command(
@@ -4008,7 +4238,11 @@ fn handle_command(
             let cwd = crate::memory::project_key(&state.thread.cwd);
             match args.first().map(String::as_str) {
                 None | Some("list") => {
-                    let memories = store.lock().unwrap().list_memories(&cwd).unwrap_or_default();
+                    let memories = store
+                        .lock()
+                        .unwrap()
+                        .list_memories(&cwd)
+                        .unwrap_or_default();
                     if memories.is_empty() {
                         state.notice = Some(
                             "memories: none · /memories add <text> · /memories add --global <text> · use $memories in a prompt"
@@ -4028,7 +4262,10 @@ fn handle_command(
                                 .chars()
                                 .take(80)
                                 .collect();
-                            text.push_str(&format!("\n  {}. {} · {preview}", memory.id, memory.scope));
+                            text.push_str(&format!(
+                                "\n  {}. {} · {preview}",
+                                memory.id, memory.scope
+                            ));
                         }
                         text.push_str("\n\n/memories add [--global] <text> · /memories remove <id> · /memories clear [--global]");
                         state.notice = Some(text);
@@ -4053,7 +4290,9 @@ fn handle_command(
                                     "memory {id} saved ({scope}) · use $memories in a prompt"
                                 ));
                             }
-                            Err(error) => state.notice = Some(format!("cannot save memory: {error}")),
+                            Err(error) => {
+                                state.notice = Some(format!("cannot save memory: {error}"))
+                            }
                         }
                     }
                 }
@@ -4081,7 +4320,9 @@ fn handle_command(
                                 if global { "global" } else { "project" }
                             ));
                         }
-                        Err(error) => state.notice = Some(format!("cannot clear memories: {error}")),
+                        Err(error) => {
+                            state.notice = Some(format!("cannot clear memories: {error}"))
+                        }
                     }
                 }
                 Some(_) => {
@@ -4101,7 +4342,8 @@ fn handle_command(
                     }
                     "pause" => {
                         if state.goal.is_none() {
-                            state.notice = Some("no goal to pause; set one with /goal <criteria>".into());
+                            state.notice =
+                                Some("no goal to pause; set one with /goal <criteria>".into());
                         } else {
                             let goal = state.goal.clone();
                             state.set_goal_state(store, goal, true);
@@ -4110,7 +4352,8 @@ fn handle_command(
                     }
                     "resume" => {
                         if state.goal.is_none() {
-                            state.notice = Some("no goal to resume; set one with /goal <criteria>".into());
+                            state.notice =
+                                Some("no goal to resume; set one with /goal <criteria>".into());
                         } else {
                             let goal = state.goal.clone();
                             state.set_goal_state(store, goal, false);
@@ -4127,7 +4370,8 @@ fn handle_command(
                 let suffix = if state.goal_paused { " (paused)" } else { "" };
                 state.notice = Some(format!("current goal{suffix}: {goal}"));
             } else {
-                state.notice = Some("usage: /goal <done criteria> · /goal pause|resume|clear".into());
+                state.notice =
+                    Some("usage: /goal <done criteria> · /goal pause|resume|clear".into());
             }
         }
         "/find" => {
@@ -4142,7 +4386,11 @@ fn handle_command(
                 .iter()
                 .filter(|message| message.text.to_lowercase().contains(&query_lower))
                 .map(|message| {
-                    let speaker = if message.role == "user" { "you" } else { "agent" };
+                    let speaker = if message.role == "user" {
+                        "you"
+                    } else {
+                        "agent"
+                    };
                     let context = message
                         .text
                         .lines()
@@ -4235,7 +4483,8 @@ fn handle_command(
             for provider in valid_providers.clone() {
                 let thread = {
                     let guard = store.lock().unwrap();
-                    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+                    let resolved =
+                        resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
                     let model = resolved.for_provider(provider).model.clone();
                     let mut thread = guard.draft_thread(crate::store::NewThread {
                         title: format!("[multi] {prompt}"),
@@ -4278,7 +4527,11 @@ fn handle_command(
             state.notice = Some(format!(
                 "sent to {} providers in parallel: {} · esc closes the merged view",
                 valid_providers.len(),
-                valid_providers.iter().map(|provider| provider.to_string()).collect::<Vec<_>>().join(", ")
+                valid_providers
+                    .iter()
+                    .map(|provider| provider.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         "/orchestrate" => {
@@ -4341,10 +4594,8 @@ fn handle_command(
                         state.orchestration_integrate_report = None;
                         state.orchestration_confirm_ship = false;
                         state.orchestration_ship_report = None;
-                        state.notice = Some(format!(
-                            "opened run {}",
-                            &run_id[..8.min(run_id.len())]
-                        ));
+                        state.notice =
+                            Some(format!("opened run {}", &run_id[..8.min(run_id.len())]));
                     }
                     Err(error) => state.notice = Some(format!("cannot open run: {error}")),
                 }
@@ -4361,7 +4612,8 @@ fn handle_command(
                     state.notice = Some(if include_archived {
                         "no orchestration runs yet".to_string()
                     } else {
-                        "no active orchestration runs; /runs --all includes archived runs".to_string()
+                        "no active orchestration runs; /runs --all includes archived runs"
+                            .to_string()
                     });
                 } else {
                     let lines = runs
@@ -4372,7 +4624,11 @@ fn handle_command(
                                 &run.id[..8.min(run.id.len())],
                                 run.status,
                                 run.summary.as_deref().unwrap_or(&run.goal),
-                                if run.archived_at.is_some() { " (archived)" } else { "" }
+                                if run.archived_at.is_some() {
+                                    " (archived)"
+                                } else {
+                                    ""
+                                }
                             )
                         })
                         .collect::<Vec<_>>()
@@ -4397,7 +4653,11 @@ fn handle_command(
                 state.thread.title,
                 state.thread.current_provider,
                 state.thread.current_model.as_deref().unwrap_or("-"),
-                state.thread.reasoning_effort.as_deref().unwrap_or("default"),
+                state
+                    .thread
+                    .reasoning_effort
+                    .as_deref()
+                    .unwrap_or("default"),
                 state.thread.session_mode,
                 state.permission_mode
             );
@@ -4410,9 +4670,7 @@ fn handle_command(
             }
             let open_turn = latest
                 .as_ref()
-                .map(|turn| {
-                    !turn.phase.is_terminal()
-                })
+                .map(|turn| !turn.phase.is_terminal())
                 .unwrap_or(false);
             let latest_error = latest.as_ref().and_then(|turn| turn.error.clone());
             text.push_str(&format!(
@@ -4486,7 +4744,9 @@ fn handle_command(
         "/activity" => {
             let rows = {
                 let store = store.lock().unwrap();
-                let turns = store.list_turn_records(&state.thread.id).unwrap_or_default();
+                let turns = store
+                    .list_turn_records(&state.thread.id)
+                    .unwrap_or_default();
                 let messages = store.list_messages(&state.thread.id).unwrap_or_default();
                 let usage = store.list_usage(Some(&state.thread.id)).unwrap_or_default();
                 crate::activity::build(&state.thread, &turns, &messages, &usage)
@@ -4516,9 +4776,7 @@ fn handle_command(
             if commands.is_empty() {
                 state.notice = Some(match turn {
                     Some(turn) => format!("no tool calls for turn {turn}"),
-                    None => {
-                        "no tool calls recorded yet; run a turn, then /commands".to_string()
-                    }
+                    None => "no tool calls recorded yet; run a turn, then /commands".to_string(),
                 });
             } else {
                 state.overlay = Overlay::CommandList {
@@ -4625,14 +4883,23 @@ fn handle_command(
             } else {
                 let summary = crate::memory::build_compact_summary(&messages, 8000);
                 let thread_id = state.thread.id.clone();
-                let next_turn = store.lock().unwrap().next_turn_number(&thread_id).unwrap_or(1);
+                let next_turn = store
+                    .lock()
+                    .unwrap()
+                    .next_turn_number(&thread_id)
+                    .unwrap_or(1);
                 {
                     let guard = store.lock().unwrap();
                     let _ = guard.rewind_thread(&thread_id, 1);
                     let _ = guard.add_message(&thread_id, next_turn, "user", None, None, "compact");
-                    let _ = guard.add_message(&thread_id, next_turn, "assistant", None, None, &summary);
+                    let _ =
+                        guard.add_message(&thread_id, next_turn, "assistant", None, None, &summary);
                 }
-                state.history = store.lock().unwrap().list_messages(&thread_id).unwrap_or_default();
+                state.history = store
+                    .lock()
+                    .unwrap()
+                    .list_messages(&thread_id)
+                    .unwrap_or_default();
                 state.scroll_offset = 0;
                 state.notice = Some(format!("compacted {} messages", messages.len()));
             }
@@ -4641,7 +4908,11 @@ fn handle_command(
             let messages: Vec<&crate::store::MessageRow> = state.history.iter().collect();
             let total_chars: usize = messages.iter().map(|message| message.text.len()).sum();
             let streaming_chars = state.streaming_text.len();
-            let usage_rows = store.lock().unwrap().list_usage(Some(&state.thread.id)).unwrap_or_default();
+            let usage_rows = store
+                .lock()
+                .unwrap()
+                .list_usage(Some(&state.thread.id))
+                .unwrap_or_default();
             let usage_line = if usage_rows.is_empty() {
                 "no token usage recorded".to_string()
             } else {
@@ -4654,25 +4925,30 @@ fn handle_command(
                 streaming_chars as f64 / 1000.0
             ));
         }
-        "/init" => {
-            match crate::memory::init_memory_file(std::path::Path::new(&state.thread.cwd)) {
-                Ok(result) => state.notice = Some(result),
-                Err(error) => state.notice = Some(format!("cannot create memory file: {error}")),
-            }
-        }
+        "/init" => match crate::memory::init_memory_file(std::path::Path::new(&state.thread.cwd)) {
+            Ok(result) => state.notice = Some(result),
+            Err(error) => state.notice = Some(format!("cannot create memory file: {error}")),
+        },
         "/export" => {
             let lines: Vec<String> = state
                 .history
                 .iter()
                 .map(|message| {
-                    let speaker = if message.role == "user" { "you" } else { message.provider.as_deref().unwrap_or("assistant") };
+                    let speaker = if message.role == "user" {
+                        "you"
+                    } else {
+                        message.provider.as_deref().unwrap_or("assistant")
+                    };
                     format!("[{speaker}]\n{}", message.text)
                 })
                 .collect();
             if lines.is_empty() {
                 state.notice = Some("nothing to export".into());
             } else {
-                let export_path = std::env::temp_dir().join(format!("baton-export-{}.md", state.thread.id[..8].to_string()));
+                let export_path = std::env::temp_dir().join(format!(
+                    "baton-export-{}.md",
+                    state.thread.id[..8].to_string()
+                ));
                 match std::fs::write(&export_path, lines.join("\n\n---\n\n")) {
                     Ok(()) => state.notice = Some(format!("exported to {}", export_path.display())),
                     Err(error) => state.notice = Some(format!("export failed: {error}")),
@@ -4680,10 +4956,16 @@ fn handle_command(
             }
         }
         "/settings" => {
-            let categories: Vec<(String, Vec<String>)> = sync::settings_for_provider(state.thread.current_provider)
-                .into_iter()
-                .map(|(label, values)| (label.to_string(), values.into_iter().map(str::to_string).collect()))
-                .collect();
+            let categories: Vec<(String, Vec<String>)> =
+                sync::settings_for_provider(state.thread.current_provider)
+                    .into_iter()
+                    .map(|(label, values)| {
+                        (
+                            label.to_string(),
+                            values.into_iter().map(str::to_string).collect(),
+                        )
+                    })
+                    .collect();
             state.overlay = Overlay::SettingsPicker {
                 provider: state.thread.current_provider,
                 categories,
@@ -4704,9 +4986,13 @@ fn handle_command(
                 .map(|skill| (skill.name, skill.source))
                 .collect();
             if skills.is_empty() {
-                state.notice = Some("no skills found in ~/.claude/skills or ~/.codex/skills".into());
+                state.notice =
+                    Some("no skills found in ~/.claude/skills or ~/.codex/skills".into());
             } else {
-                state.overlay = Overlay::SkillsPicker { selected: 0, skills };
+                state.overlay = Overlay::SkillsPicker {
+                    selected: 0,
+                    skills,
+                };
             }
         }
         "/switch" => {
@@ -4716,101 +5002,99 @@ fn handle_command(
                 Some(provider) => perform_switch(state, store, provider, args.get(1).cloned()),
             }
         }
-        "/model" => {
-            match args.first() {
-                None => {
-                    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
-                    let effective = state
-                        .thread
-                        .current_model
+        "/model" => match args.first() {
+            None => {
+                let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+                let effective = state.thread.current_model.clone().unwrap_or_else(|| {
+                    resolved
+                        .for_provider(state.thread.current_provider)
+                        .model
                         .clone()
-                        .unwrap_or_else(|| resolved.for_provider(state.thread.current_provider).model.clone());
-                    let source = if state.thread.current_model.is_some() { "thread" } else { "harness config" };
+                });
+                let source = if state.thread.current_model.is_some() {
+                    "thread"
+                } else {
+                    "harness config"
+                };
+                state.notice = Some(format!(
+                    "current model: {}/{} ({source})",
+                    state.thread.current_provider, effective
+                ));
+            }
+            Some(model) => {
+                let result = {
+                    let guard = store.lock().unwrap();
+                    ensure_persisted(&guard, &mut state.thread)
+                        .and_then(|()| guard.set_thread_model(&state.thread.id, model))
+                };
+                match result {
+                    Ok(()) => {
+                        state.thread.current_model = Some(model.clone());
+                        state.notice = Some(format!("model set to {model}"));
+                    }
+                    Err(error) => state.notice = Some(format!("cannot set model: {error}")),
+                }
+            }
+        },
+        "/effort" => match args.first().map(String::as_str) {
+            None => {
+                let levels = ["default", "low", "medium", "high", "xhigh", "max"];
+                let selected = state
+                    .thread
+                    .reasoning_effort
+                    .as_deref()
+                    .and_then(|effort| levels.iter().position(|level| *level == effort))
+                    .unwrap_or(0);
+                state.overlay = Overlay::EffortPicker { selected };
+            }
+            Some(value) if matches!(value, "off" | "default" | "none") => {
+                let result = {
+                    let guard = store.lock().unwrap();
+                    ensure_persisted(&guard, &mut state.thread)
+                        .and_then(|()| guard.set_thread_effort(&state.thread.id, None))
+                };
+                match result {
+                    Ok(()) => {
+                        state.thread.reasoning_effort = None;
+                        state.banner_cache.borrow_mut().take();
+                        state.notice = Some("reasoning effort cleared".into());
+                    }
+                    Err(error) => state.notice = Some(format!("cannot clear effort: {error}")),
+                }
+            }
+            Some(value) => match normalize_reasoning_effort(value) {
+                Some(effort) if state.thread.current_provider.supports_effort() => {
+                    let result = {
+                        let guard = store.lock().unwrap();
+                        ensure_persisted(&guard, &mut state.thread)
+                            .and_then(|()| guard.set_thread_effort(&state.thread.id, Some(&effort)))
+                    };
+                    match result {
+                        Ok(()) => {
+                            state.thread.reasoning_effort = Some(effort.clone());
+                            state.banner_cache.borrow_mut().take();
+                            state.notice = Some(format!("reasoning effort set to {effort}"));
+                        }
+                        Err(error) => state.notice = Some(format!("cannot set effort: {error}")),
+                    }
+                }
+                Some(_) => {
                     state.notice = Some(format!(
-                        "current model: {}/{} ({source})",
-                        state.thread.current_provider, effective
+                        "{} does not support reasoning effort; use codex or claude",
+                        state.thread.current_provider
                     ));
                 }
-                Some(model) => {
-                    let result = {
-                        let guard = store.lock().unwrap();
-                        ensure_persisted(&guard, &mut state.thread)
-                            .and_then(|()| guard.set_thread_model(&state.thread.id, model))
-                    };
-                    match result {
-                        Ok(()) => {
-                            state.thread.current_model = Some(model.clone());
-                            state.notice = Some(format!("model set to {model}"));
-                        }
-                        Err(error) => state.notice = Some(format!("cannot set model: {error}")),
-                    }
-                }
-            }
-        }
-        "/effort" => {
-            match args.first().map(String::as_str) {
                 None => {
-                    let levels = ["default", "low", "medium", "high", "xhigh", "max"];
-                    let selected = state
-                        .thread
-                        .reasoning_effort
-                        .as_deref()
-                        .and_then(|effort| levels.iter().position(|level| *level == effort))
-                        .unwrap_or(0);
-                    state.overlay = Overlay::EffortPicker { selected };
+                    state.notice = Some("usage: /effort low|medium|high|xhigh|max|default".into());
                 }
-                Some(value) if matches!(value, "off" | "default" | "none") => {
-                    let result = {
-                        let guard = store.lock().unwrap();
-                        ensure_persisted(&guard, &mut state.thread)
-                            .and_then(|()| guard.set_thread_effort(&state.thread.id, None))
-                    };
-                    match result {
-                        Ok(()) => {
-                            state.thread.reasoning_effort = None;
-                            state.banner_cache.borrow_mut().take();
-                            state.notice = Some("reasoning effort cleared".into());
-                        }
-                        Err(error) => {
-                            state.notice = Some(format!("cannot clear effort: {error}"))
-                        }
-                    }
-                }
-                Some(value) => match normalize_reasoning_effort(value) {
-                    Some(effort) if state.thread.current_provider.supports_effort() => {
-                        let result = {
-                            let guard = store.lock().unwrap();
-                            ensure_persisted(&guard, &mut state.thread).and_then(|()| {
-                                guard.set_thread_effort(&state.thread.id, Some(&effort))
-                            })
-                        };
-                        match result {
-                            Ok(()) => {
-                                state.thread.reasoning_effort = Some(effort.clone());
-                                state.banner_cache.borrow_mut().take();
-                                state.notice = Some(format!("reasoning effort set to {effort}"));
-                            }
-                            Err(error) => {
-                                state.notice = Some(format!("cannot set effort: {error}"))
-                            }
-                        }
-                    }
-                    Some(_) => {
-                        state.notice = Some(format!(
-                            "{} does not support reasoning effort; use codex or claude",
-                            state.thread.current_provider
-                        ));
-                    }
-                    None => {
-                        state.notice = Some(
-                            "usage: /effort low|medium|high|xhigh|max|default".into(),
-                        );
-                    }
-                },
-            }
-        }
+            },
+        },
         "/mode" => {
-            if let Some(mode) = args.first().map(String::as_str).and_then(PermissionMode::parse) {
+            if let Some(mode) = args
+                .first()
+                .map(String::as_str)
+                .and_then(PermissionMode::parse)
+            {
                 state.apply_permission_mode(store, mode);
                 state.notice = Some(format!("permission mode: {mode}"));
             } else {
@@ -4819,7 +5103,10 @@ fn handle_command(
         }
         "/auth" => {
             let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
-            match (args.first().map(String::as_str), args.get(1).map(String::as_str)) {
+            match (
+                args.first().map(String::as_str),
+                args.get(1).map(String::as_str),
+            ) {
                 (None, _) => {
                     state.overlay = Overlay::AuthPicker { selected: 0 };
                 }
@@ -4827,14 +5114,16 @@ fn handle_command(
                     let provider = match ProviderId::parse(provider) {
                         Some(provider) => provider,
                         None => {
-                            state.notice = Some("usage: /auth <claude|codex> <subscription|api>".into());
+                            state.notice =
+                                Some("usage: /auth <claude|codex> <subscription|api>".into());
                             return;
                         }
                     };
                     let mode = match crate::config::AuthMode::parse(mode) {
                         Some(mode) => mode,
                         None => {
-                            state.notice = Some("usage: /auth <claude|codex> <subscription|api>".into());
+                            state.notice =
+                                Some("usage: /auth <claude|codex> <subscription|api>".into());
                             return;
                         }
                     };
@@ -4858,18 +5147,20 @@ fn handle_command(
                     state.banner_cache.borrow_mut().take();
                     state.notice = Some(format!("{provider} billing set to {}", mode.as_str()));
                 }
-                (Some(provider), None) => {
-                    match ProviderId::parse(provider) {
-                        Some(parsed) => {
-                            state.notice = Some(describe_auth(resolved.for_provider(parsed)));
-                        }
-                        None => state.notice = Some("unknown provider".into()),
+                (Some(provider), None) => match ProviderId::parse(provider) {
+                    Some(parsed) => {
+                        state.notice = Some(describe_auth(resolved.for_provider(parsed)));
                     }
-                }
+                    None => state.notice = Some("unknown provider".into()),
+                },
             }
         }
         "/new" => {
-            let title = if args.is_empty() { "New thread".to_string() } else { args.join(" ") };
+            let title = if args.is_empty() {
+                "New thread".to_string()
+            } else {
+                args.join(" ")
+            };
             state.thread = {
                 let guard = store.lock().unwrap();
                 guard.draft_thread(NewThread {
@@ -4896,7 +5187,10 @@ fn handle_command(
         "/fork" => {
             let mut title_args = args.clone();
             let through_turn = if title_args.first().map(String::as_str) == Some("--turn") {
-                let Some(turn) = title_args.get(1).and_then(|value| value.parse::<i64>().ok()) else {
+                let Some(turn) = title_args
+                    .get(1)
+                    .and_then(|value| value.parse::<i64>().ok())
+                else {
                     state.notice = Some("usage: /fork [--turn N] [title]".into());
                     return;
                 };
@@ -4931,10 +5225,11 @@ fn handle_command(
                 title_args.join(" ")
             };
             let source_title = state.thread.title.clone();
-            let result = store
-                .lock()
-                .unwrap()
-                .fork_thread_through_turn(&state.thread.id, &title, through_turn);
+            let result = store.lock().unwrap().fork_thread_through_turn(
+                &state.thread.id,
+                &title,
+                through_turn,
+            );
             match result {
                 Ok(thread) => {
                     load_thread_state(state, store, thread);
@@ -4952,7 +5247,8 @@ fn handle_command(
         }
         "/worktree" => {
             if state.running {
-                state.notice = Some("wait for the current turn to finish before creating a worktree".into());
+                state.notice =
+                    Some("wait for the current turn to finish before creating a worktree".into());
                 return;
             }
             let source_id = state.thread.id.clone();
@@ -5113,9 +5409,7 @@ fn handle_command(
                     "orchestration",
                     None,
                     None,
-                    &format!(
-                        "worktree · run {short_run} · next successful turn commits here"
-                    ),
+                    &format!("worktree · run {short_run} · next successful turn commits here"),
                 );
             }
             let mut fork = fork;
@@ -5165,7 +5459,10 @@ fn handle_command(
             if threads.is_empty() {
                 state.notice = Some("no threads in this directory".into());
             } else {
-                state.overlay = Overlay::ThreadPicker { selected: 0, threads };
+                state.overlay = Overlay::ThreadPicker {
+                    selected: 0,
+                    threads,
+                };
             }
         }
         "/open" => {
@@ -5183,7 +5480,8 @@ fn handle_command(
                         state.thread = thread.clone();
                         let guard = store.lock().unwrap();
                         state.history = guard.list_messages(&thread.id).unwrap_or_default();
-                        state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
+                        state.queued_messages =
+                            guard.list_queued_messages(&thread.id).unwrap_or_default();
                         state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
                         state.diff_output = None;
                         state.scroll_offset = 0;
@@ -5203,7 +5501,9 @@ fn handle_command(
                             let status = guard
                                 .list_turn_records(&thread.id)
                                 .ok()
-                                .map(|turns| short_thread_status(turns.last().map(|turn| turn.phase)))
+                                .map(|turns| {
+                                    short_thread_status(turns.last().map(|turn| turn.phase))
+                                })
                                 .unwrap_or("new")
                                 .to_string();
                             ThreadChoice {
@@ -5217,7 +5517,10 @@ fn handle_command(
                 if threads.is_empty() {
                     state.notice = Some("no threads".into());
                 } else {
-                    state.overlay = Overlay::ThreadPicker { selected: 0, threads };
+                    state.overlay = Overlay::ThreadPicker {
+                        selected: 0,
+                        threads,
+                    };
                 }
             }
         }
@@ -5246,7 +5549,10 @@ fn handle_command(
             if checkpoints.is_empty() {
                 state.notice = Some("no checkpoints yet".into());
             } else {
-                state.overlay = Overlay::CheckpointPicker { selected: checkpoints.len().saturating_sub(1), checkpoints };
+                state.overlay = Overlay::CheckpointPicker {
+                    selected: checkpoints.len().saturating_sub(1),
+                    checkpoints,
+                };
             }
         }
         "/review" => {
@@ -5257,7 +5563,11 @@ fn handle_command(
                     .iter()
                     .rev()
                     .find(|message| message.role == "diff" && message.turn == turn),
-                None => state.history.iter().rev().find(|message| message.role == "diff"),
+                None => state
+                    .history
+                    .iter()
+                    .rev()
+                    .find(|message| message.role == "diff"),
             };
             match message {
                 Some(message) => {
@@ -5299,14 +5609,13 @@ fn handle_command(
                             notes,
                             note_input: None,
                         });
-                        state.notice = load_error
-                            .map(|error| format!("cannot restore review notes: {error}"));
+                        state.notice =
+                            load_error.map(|error| format!("cannot restore review notes: {error}"));
                     }
                 }
                 None => {
-                    state.notice = Some(
-                        "no turn diff yet; run a turn or use /review <turn>".into(),
-                    );
+                    state.notice =
+                        Some("no turn diff yet; run a turn or use /review <turn>".into());
                 }
             }
         }
@@ -5324,7 +5633,10 @@ fn handle_command(
                 if checkpoints.is_empty() {
                     state.notice = Some("no checkpoints yet".into());
                 } else {
-                    state.overlay = Overlay::CheckpointPicker { selected: checkpoints.len().saturating_sub(1), checkpoints };
+                    state.overlay = Overlay::CheckpointPicker {
+                        selected: checkpoints.len().saturating_sub(1),
+                        checkpoints,
+                    };
                 }
                 return;
             }
@@ -5339,10 +5651,17 @@ fn handle_command(
                     .and_then(|turn| turn.parse::<i64>().ok())
                     .or_else(|| checkpoints.last().map(|checkpoint| checkpoint.turn));
                 let checkpoint = turn
-                    .and_then(|turn| checkpoints.into_iter().find(|checkpoint| checkpoint.turn == turn))
+                    .and_then(|turn| {
+                        checkpoints
+                            .into_iter()
+                            .find(|checkpoint| checkpoint.turn == turn)
+                    })
                     .ok_or_else(|| anyhow::anyhow!("checkpoint not found"))?;
                 drop(guard);
-                let diff = diff_checkpoint_against_worktree(std::path::Path::new(&state.thread.cwd), &checkpoint.git_ref)?;
+                let diff = diff_checkpoint_against_worktree(
+                    std::path::Path::new(&state.thread.cwd),
+                    &checkpoint.git_ref,
+                )?;
                 Ok(diff)
             })();
             match result {
@@ -5370,7 +5689,9 @@ fn handle_command(
             }
         }
         other => {
-            if let Some((_, template)) = state.custom_commands.iter().find(|(name, _)| name == other) {
+            if let Some((_, template)) =
+                state.custom_commands.iter().find(|(name, _)| name == other)
+            {
                 let expanded = template
                     .replace("{{args}}", &args.join(" "))
                     .replace("{{cwd}}", &state.thread.cwd);
@@ -5382,12 +5703,7 @@ fn handle_command(
     }
 }
 
-fn draw_activity(
-    frame: &mut ratatui::Frame,
-    area: Rect,
-    state: &TuiState,
-    view: &ActivityView,
-) {
+fn draw_activity(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, view: &ActivityView) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.accent));
@@ -5411,7 +5727,9 @@ fn draw_activity(
                     row.model.as_deref().unwrap_or("harness default"),
                     row.phase
                 ),
-                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLORS.accent)
+                    .add_modifier(Modifier::BOLD),
             ));
             lines.push(Line::styled(
                 format!(
@@ -5434,7 +5752,10 @@ fn draw_activity(
                     Style::default().fg(COLORS.muted),
                 ));
             }
-            lines.push(Line::styled("tool calls", Style::default().fg(COLORS.muted)));
+            lines.push(Line::styled(
+                "tool calls",
+                Style::default().fg(COLORS.muted),
+            ));
             if row.tool_calls.is_empty() {
                 lines.push(Line::styled("  none", Style::default().fg(COLORS.muted)));
             } else {
@@ -5480,7 +5801,9 @@ fn draw_activity(
             let marker = if index == selected { "›" } else { " " };
             let text = format!("{marker} {}", crate::activity::summary(row));
             let style = if index == selected {
-                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(COLORS.accent)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(COLORS.text)
             };
@@ -5576,7 +5899,10 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
             .map(|row| format!("{}:{}", row.path, row.line_number))
             .unwrap_or_else(|| "no line".into());
         lines.push(Line::from(vec![
-            Span::styled(format!("note {target} › "), Style::default().fg(COLORS.accent)),
+            Span::styled(
+                format!("note {target} › "),
+                Style::default().fg(COLORS.accent),
+            ),
             Span::styled(input.clone(), Style::default().fg(COLORS.text)),
             Span::styled("█", Style::default().fg(COLORS.accent)),
         ]));
@@ -5606,11 +5932,17 @@ fn draw_multi(frame: &mut ratatui::Frame, area: Rect, multi: &MultiView) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = inner.width as usize;
-    let prompt: String = multi.prompt.chars().take(width.saturating_sub(14)).collect();
+    let prompt: String = multi
+        .prompt
+        .chars()
+        .take(width.saturating_sub(14))
+        .collect();
     let mut lines: Vec<Line> = vec![
         Line::styled(
             format!("multi · {} provider(s) · {prompt}", multi.children.len()),
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD),
         ),
         Line::styled(
             "↑↓ select · enter opens the thread · esc closes this view",
@@ -5691,11 +6023,15 @@ fn draw_orchestration_report(
         Line::from(vec![
             Span::styled(
                 format!("orchestration {short_run} "),
-                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLORS.accent)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 report.status.clone(),
-                Style::default().fg(status_color).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(status_color)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" · {} worker(s)", report.tasks.len()),
@@ -5717,7 +6053,9 @@ fn draw_orchestration_report(
                         .map(|path| path.display().to_string())
                         .unwrap_or_else(|| "the source checkout".to_string())
                 ),
-                Style::default().fg(COLORS.warning).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLORS.warning)
+                    .add_modifier(Modifier::BOLD),
             )
         } else if state.orchestration_confirm_ship {
             Line::styled(
@@ -5736,7 +6074,9 @@ fn draw_orchestration_report(
         } else if state.orchestration_integrating {
             Line::styled(
                 "integrating worker branches...",
-                Style::default().fg(COLORS.secondary).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(COLORS.secondary)
+                    .add_modifier(Modifier::BOLD),
             )
         } else if state.orchestration_shipping {
             Line::styled(
@@ -5899,7 +6239,11 @@ fn draw_orchestration_report(
         lines.push(Line::from(vec![
             Span::styled("integration: ", Style::default().fg(COLORS.muted)),
             Span::styled(
-                if integrate.conflict.is_some() { "conflict" } else { "done" },
+                if integrate.conflict.is_some() {
+                    "conflict"
+                } else {
+                    "done"
+                },
                 Style::default()
                     .fg(if integrate.conflict.is_some() {
                         COLORS.error
@@ -5926,7 +6270,10 @@ fn draw_orchestration_report(
         for task in &integrate.skipped {
             lines.push(Line::styled(
                 truncate_chars(
-                    &format!("  skipped [{}] {} · {}", task.index, task.title, task.reason),
+                    &format!(
+                        "  skipped [{}] {} · {}",
+                        task.index, task.title, task.reason
+                    ),
                     width,
                 ),
                 Style::default().fg(COLORS.muted),
@@ -6143,9 +6490,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                     + if *expanded { 4 } else { 0 }
             }
             Overlay::EffortPicker { .. } => 10,
-            Overlay::OrchestrationPreview { preview } => {
-                preview.plan.tasks.len().min(8) * 2 + 8
-            }
+            Overlay::OrchestrationPreview { preview } => preview.plan.tasks.len().min(8) * 2 + 8,
         }
     };
     let chunks = Layout::vertical([
@@ -6175,13 +6520,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 selected,
                 filter,
             } => draw_model_picker(
-                frame,
-                chunks[1],
-                state,
-                *provider,
-                models,
-                *selected,
-                filter,
+                frame, chunks[1], state, *provider, models, *selected, filter,
             ),
             Overlay::SettingsPicker {
                 provider,
@@ -6214,9 +6553,11 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 checkpoints,
             } => draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected),
             Overlay::DirtyConfirm { .. } => draw_dirty_confirm(frame, chunks[1]),
-            Overlay::CommandList { selected, expanded, turn } => {
-                draw_command_list(frame, chunks[1], state, *selected, *expanded, *turn)
-            }
+            Overlay::CommandList {
+                selected,
+                expanded,
+                turn,
+            } => draw_command_list(frame, chunks[1], state, *selected, *expanded, *turn),
             Overlay::EffortPicker { selected } => {
                 draw_effort_picker(frame, chunks[1], state, *selected)
             }
@@ -6227,7 +6568,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         }
     }
     if let Some(notice) = &state.notice {
-        let paragraph = Paragraph::new(notice.clone()).style(Style::default().fg(COLORS.warning)).wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(notice.clone())
+            .style(Style::default().fg(COLORS.warning))
+            .wrap(Wrap { trim: false });
         frame.render_widget(paragraph, chunks[2]);
     }
     draw_composer(frame, state, chunks[3], &suggestions);
@@ -6237,8 +6580,12 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
 fn discover_custom_commands(cwd: &str) -> Vec<(String, String)> {
     let mut commands = Vec::new();
     let dirs = [
-        std::path::PathBuf::from(cwd).join(".baton").join("commands"),
-        std::path::PathBuf::from(cwd).join(".claude").join("commands"),
+        std::path::PathBuf::from(cwd)
+            .join(".baton")
+            .join("commands"),
+        std::path::PathBuf::from(cwd)
+            .join(".claude")
+            .join("commands"),
     ];
     for dir in dirs {
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -6263,12 +6610,16 @@ fn handle_mcp_command(state: &mut TuiState, action: &str, args: &[String]) {
     match action {
         "list" => {
             if registry.servers.is_empty() {
-                state.notice = Some("no MCP servers configured. Use /mcp add <name> <command> [args...]".into());
+                state.notice = Some(
+                    "no MCP servers configured. Use /mcp add <name> <command> [args...]".into(),
+                );
             } else {
                 let lines: Vec<String> = registry
                     .servers
                     .iter()
-                    .map(|(name, server)| format!("  {name}: {} {}", server.command, server.args.join(" ")))
+                    .map(|(name, server)| {
+                        format!("  {name}: {} {}", server.command, server.args.join(" "))
+                    })
                     .collect();
                 state.notice = Some(format!("MCP servers:\n{}", lines.join("\n")));
             }
@@ -6290,25 +6641,27 @@ fn handle_mcp_command(state: &mut TuiState, action: &str, args: &[String]) {
                 },
             );
             match sync::save_mcp_registry(&state.home, &registry) {
-                Ok(()) => state.notice = Some(format!("added MCP server {name}. Run /mcp sync to push to all harnesses")),
+                Ok(()) => {
+                    state.notice = Some(format!(
+                        "added MCP server {name}. Run /mcp sync to push to all harnesses"
+                    ))
+                }
                 Err(error) => state.notice = Some(format!("cannot save: {error}")),
             }
         }
-        "remove" => {
-            match args.first() {
-                Some(name) => {
-                    if registry.servers.remove(name).is_some() {
-                        match sync::save_mcp_registry(&state.home, &registry) {
-                            Ok(()) => state.notice = Some(format!("removed MCP server {name}")),
-                            Err(error) => state.notice = Some(format!("cannot save: {error}")),
-                        }
-                    } else {
-                        state.notice = Some(format!("no MCP server named {name}"));
+        "remove" => match args.first() {
+            Some(name) => {
+                if registry.servers.remove(name).is_some() {
+                    match sync::save_mcp_registry(&state.home, &registry) {
+                        Ok(()) => state.notice = Some(format!("removed MCP server {name}")),
+                        Err(error) => state.notice = Some(format!("cannot save: {error}")),
                     }
+                } else {
+                    state.notice = Some(format!("no MCP server named {name}"));
                 }
-                None => state.notice = Some("usage: /mcp remove <name>".into()),
             }
-        }
+            None => state.notice = Some("usage: /mcp remove <name>".into()),
+        },
         "sync" => match sync::sync_mcp_to_all(&registry) {
             Ok(results) => {
                 let lines: Vec<String> = results
@@ -6318,8 +6671,12 @@ fn handle_mcp_command(state: &mut TuiState, action: &str, args: &[String]) {
                 state.notice = Some(format!("MCP sync complete\n{}", lines.join("\n")));
             }
             Err(error) => state.notice = Some(format!("sync failed: {error}")),
+        },
+        other => {
+            state.notice = Some(format!(
+                "unknown /mcp action {other}. Use list, add, remove, or sync"
+            ))
         }
-        other => state.notice = Some(format!("unknown /mcp action {other}. Use list, add, remove, or sync")),
     }
 }
 
@@ -6355,9 +6712,10 @@ fn perform_switch(
             }
             state.banner_cache.borrow_mut().take();
             state.set_session_mode(store, SessionMode::Single);
-            state.permission_mode = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd))
-                .for_provider(provider)
-                .permission_mode;
+            state.permission_mode =
+                resolve_config(&state.home, std::path::Path::new(&state.thread.cwd))
+                    .for_provider(provider)
+                    .permission_mode;
             let existing = store
                 .lock()
                 .unwrap()
@@ -6401,11 +6759,17 @@ fn draw_switch_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
     for (index, provider) in PROVIDERS.iter().enumerate() {
         let provider_config = resolved.for_provider(*provider);
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
-        let marker = if *provider == state.thread.current_provider { "●" } else { " " };
+        let marker = if *provider == state.thread.current_provider {
+            "●"
+        } else {
+            " "
+        };
         lines.push(Line::styled(
             format!(
                 "❯ {marker} {} · {} · {}",
@@ -6416,7 +6780,9 @@ fn draw_switch_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
             style,
         ));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -6471,13 +6837,17 @@ fn draw_model_picker(
         let model = &models[*model_index];
         let marker = if *model == selected_model { "●" } else { " " };
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ {marker} {model}"), style));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -6495,55 +6865,80 @@ fn draw_settings_picker(
     )];
     for (index, (label, values)) in categories.iter().enumerate() {
         let style = if index == category_index {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
-        let current_value = values.get(value_index).map(|value| value.as_str()).unwrap_or("?");
-        lines.push(Line::styled(
-            format!("❯ {label}: {current_value}"),
-            style,
-        ));
+        let current_value = values
+            .get(value_index)
+            .map(|value| value.as_str())
+            .unwrap_or("?");
+        lines.push(Line::styled(format!("❯ {label}: {current_value}"), style));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_mcp_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
-    let actions = ["list servers", "add server (typed)", "remove server (typed)", "sync to all harnesses"];
+    let actions = [
+        "list servers",
+        "add server (typed)",
+        "remove server (typed)",
+        "sync to all harnesses",
+    ];
     let mut lines: Vec<Line> = vec![Line::styled(
         "MCP servers · enter select · esc close",
         Style::default().fg(COLORS.muted),
     )];
     for (index, action) in actions.iter().enumerate() {
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ {action}"), style));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_skills_picker(frame: &mut ratatui::Frame, area: Rect, skills: &[(String, String)], selected: usize) {
+fn draw_skills_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    skills: &[(String, String)],
+    selected: usize,
+) {
     let mut lines: Vec<Line> = vec![Line::styled(
         format!("skills ({}) · esc close", skills.len()),
         Style::default().fg(COLORS.muted),
     )];
     for (index, (name, source)) in skills.iter().take(8).enumerate() {
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ {name} ({source})"), style));
     }
     if skills.len() > 8 {
-        lines.push(Line::styled(format!("... and {} more", skills.len() - 8), Style::default().fg(COLORS.muted)));
+        lines.push(Line::styled(
+            format!("... and {} more", skills.len() - 8),
+            Style::default().fg(COLORS.muted),
+        ));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -6557,13 +6952,17 @@ fn draw_mode_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
         let is_current = state.permission_mode.as_str() == *mode;
         let marker = if is_current { "●" } else { " " };
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ {marker} {mode}"), style));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -6581,7 +6980,9 @@ fn draw_effort_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
     for (index, level) in levels.iter().enumerate() {
         let marker = if *level == current { "●" } else { " " };
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
@@ -6593,7 +6994,9 @@ fn draw_effort_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
             Style::default().fg(COLORS.warning),
         ));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -6601,9 +7004,7 @@ fn tool_messages(state: &TuiState, turn: Option<i64>) -> Vec<&MessageRow> {
     state
         .history
         .iter()
-        .filter(|message| {
-            message.role == "tool" && turn.map_or(true, |turn| message.turn == turn)
-        })
+        .filter(|message| message.role == "tool" && turn.map_or(true, |turn| message.turn == turn))
         .collect()
 }
 
@@ -6629,9 +7030,7 @@ fn draw_command_list(
         Style::default().fg(COLORS.muted),
     )];
     let extra = if expanded { 4 } else { 0 };
-    let visible = area
-        .height
-        .saturating_sub(3 + extra) as usize;
+    let visible = area.height.saturating_sub(3 + extra) as usize;
     let visible = visible.max(1);
     let selected = selected.min(commands.len().saturating_sub(1));
     let start = if commands.len() <= visible {
@@ -6649,7 +7048,9 @@ fn draw_command_list(
             message.turn, message.text
         );
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.text)
         };
@@ -6657,9 +7058,15 @@ fn draw_command_list(
     }
     if expanded {
         if let Some(message) = commands.get(selected) {
-            lines.push(Line::styled("── expanded ──", Style::default().fg(COLORS.muted)));
+            lines.push(Line::styled(
+                "── expanded ──",
+                Style::default().fg(COLORS.muted),
+            ));
             for line in message.text.lines().take(3) {
-                lines.push(Line::styled(truncate_chars(line, width), Style::default().fg(COLORS.text)));
+                lines.push(Line::styled(
+                    truncate_chars(line, width),
+                    Style::default().fg(COLORS.text),
+                ));
             }
             if state
                 .history
@@ -6673,7 +7080,9 @@ fn draw_command_list(
             }
         }
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -6691,7 +7100,9 @@ fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
             let is_current = (config.mode == crate::config::AuthMode::Api) == is_api;
             let marker = if is_current { "●" } else { " " };
             let style = if flat_index == selected {
-                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(COLORS.accent)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(COLORS.muted)
             };
@@ -6701,18 +7112,27 @@ fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
             ));
         }
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_thread_picker(frame: &mut ratatui::Frame, area: Rect, threads: &[ThreadChoice], selected: usize) {
+fn draw_thread_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    threads: &[ThreadChoice],
+    selected: usize,
+) {
     let mut lines: Vec<Line> = vec![Line::styled(
         "threads · enter open · esc close",
         Style::default().fg(COLORS.muted),
     )];
     for (index, choice) in threads.iter().take(8).enumerate() {
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
@@ -6721,24 +7141,35 @@ fn draw_thread_picker(frame: &mut ratatui::Frame, area: Rect, threads: &[ThreadC
             style,
         ));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn draw_checkpoint_picker(frame: &mut ratatui::Frame, area: Rect, checkpoints: &[(i64, String)], selected: usize) {
+fn draw_checkpoint_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    checkpoints: &[(i64, String)],
+    selected: usize,
+) {
     let mut lines: Vec<Line> = vec![Line::styled(
         "checkpoints · enter diff · esc close",
         Style::default().fg(COLORS.muted),
     )];
     for (index, (turn, _)) in checkpoints.iter().take(8).enumerate() {
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ turn {turn}"), style));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -6871,7 +7302,10 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         }
         if message.role == "user" {
             for line in wrap(&message.text) {
-                all_lines.push(Line::styled(line, Style::default().fg(COLORS.text).bg(COLORS.user_bg)));
+                all_lines.push(Line::styled(
+                    line,
+                    Style::default().fg(COLORS.text).bg(COLORS.user_bg),
+                ));
             }
         } else {
             all_lines.push(Line::styled(
@@ -6901,7 +7335,10 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
             all_lines.push(Line::from(vec![
                 Span::styled("·", Style::default().fg(COLORS.muted)),
                 Span::raw(" "),
-                Span::styled(format!("Queued for {provider}"), Style::default().fg(COLORS.muted)),
+                Span::styled(
+                    format!("Queued for {provider}"),
+                    Style::default().fg(COLORS.muted),
+                ),
             ]));
         } else {
             all_lines.push(Line::from(vec![
@@ -6919,8 +7356,14 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
                 Span::raw(" "),
                 Span::styled(tool_line.label.clone(), Style::default().fg(COLORS.accent)),
             ]),
-            ToolStatus::Done => Line::styled(format!("✓ {}", tool_line.label), Style::default().fg(COLORS.success)),
-            ToolStatus::Failed => Line::styled(format!("✗ {}", tool_line.label), Style::default().fg(COLORS.error)),
+            ToolStatus::Done => Line::styled(
+                format!("✓ {}", tool_line.label),
+                Style::default().fg(COLORS.success),
+            ),
+            ToolStatus::Failed => Line::styled(
+                format!("✗ {}", tool_line.label),
+                Style::default().fg(COLORS.error),
+            ),
         };
         all_lines.push(line);
         live_lines += 1;
@@ -7077,7 +7520,11 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
     };
     *state.transcript_view.borrow_mut() = Some(TranscriptViewport {
         area,
-        content_top: if scroll_offset > 0 { area.y.saturating_add(1) } else { area.y },
+        content_top: if scroll_offset > 0 {
+            area.y.saturating_add(1)
+        } else {
+            area.y
+        },
         content_start,
         content_rows,
         total,
@@ -7099,17 +7546,25 @@ fn draw_approval(
     let target = if approval.thread_id == state.thread.id {
         String::new()
     } else {
-        format!(" for thread {} ", &approval.thread_id[..approval.thread_id.len().min(8)])
+        format!(
+            " for thread {} ",
+            &approval.thread_id[..approval.thread_id.len().min(8)]
+        )
     };
     let lines = vec![
         Line::styled(
             format!("approval needed{target}: {}", approval.summary),
             Style::default().fg(COLORS.warning),
         ),
-        Line::styled("[y] allow once · [a] allow for session · [n] deny", Style::default().fg(COLORS.muted)),
+        Line::styled(
+            "[y] allow once · [a] allow for session · [n] deny",
+            Style::default().fg(COLORS.muted),
+        ),
     ];
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).block(block),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
         area,
     );
 }
@@ -7127,7 +7582,7 @@ fn draw_rewind_picker(
         .filter(|message| message.role == "user")
         .map(|message| (&message.turn, &message.text))
         .collect();
-    let newest_first: Vec<&(&i64, &String) > = user_messages.iter().rev().collect();
+    let newest_first: Vec<&(&i64, &String)> = user_messages.iter().rev().collect();
     let mut lines: Vec<Line> = vec![Line::styled(
         if native {
             "rewind to message · native history · enter select · esc cancel"
@@ -7139,13 +7594,17 @@ fn draw_rewind_picker(
     for (index, (turn, text)) in newest_first.iter().take(8).enumerate() {
         let summary: String = text.lines().next().unwrap_or("").chars().take(60).collect();
         let style = if index == selected {
-            Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ turn {turn}: {summary}"), style));
     }
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.border));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -7163,7 +7622,10 @@ fn draw_orchestration_preview(
                 .fg(COLORS.accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::styled(format!("goal: {}", preview.goal), Style::default().fg(COLORS.text)),
+        Line::styled(
+            format!("goal: {}", preview.goal),
+            Style::default().fg(COLORS.text),
+        ),
         Line::styled(
             format!(
                 "coordinator: {}/{}",
@@ -7264,9 +7726,14 @@ fn draw_code_confirm(frame: &mut ratatui::Frame, area: Rect, turn: i64) {
             format!("restore working tree to the end of turn {}?", turn - 1),
             Style::default().fg(COLORS.warning),
         ),
-        Line::styled("[y] restore code · [n] conversation only", Style::default().fg(COLORS.muted)),
+        Line::styled(
+            "[y] restore code · [n] conversation only",
+            Style::default().fg(COLORS.muted),
+        ),
     ];
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(COLORS.warning));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.warning));
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
@@ -7283,7 +7750,9 @@ fn composer_hint(state: &TuiState) -> Option<String> {
             state.queued_messages.len()
         ))
     } else if let Some(usage) = command_usage(&state.input) {
-        Some(format!("/{usage} · tab or enter completes the selected choice"))
+        Some(format!(
+            "/{usage} · tab or enter completes the selected choice"
+        ))
     } else {
         None
     }
@@ -7313,7 +7782,9 @@ fn draw_composer(
         for (index, suggestion) in suggestions[start..end].iter().enumerate() {
             let actual_index = start + index;
             let style = if actual_index == clamped {
-                Style::default().fg(COLORS.accent).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(COLORS.accent)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(COLORS.muted)
             };
@@ -7366,10 +7837,7 @@ fn draw_composer(
                 } else {
                     "Ask anything..."
                 };
-                spans.push(Span::styled(
-                    placeholder,
-                    Style::default().fg(COLORS.muted),
-                ));
+                spans.push(Span::styled(placeholder, Style::default().fg(COLORS.muted)));
             } else {
                 for absolute in start..end {
                     let mut style = Style::default().fg(COLORS.text);
@@ -7414,7 +7882,9 @@ fn draw_composer(
         line_char_start = line_end + 1;
     }
     if let Some(first) = layout.first() {
-        state.input_origin.set((first.screen_x_start, first.screen_y));
+        state
+            .input_origin
+            .set((first.screen_x_start, first.screen_y));
     }
     state.input_layout.replace(layout);
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
@@ -7447,7 +7917,11 @@ fn draw_composer(
     if let Some(hint) = composer_hint(state) {
         rows.push(Line::styled(hint, Style::default().fg(COLORS.accent)));
     }
-    let border_color = if state.running { COLORS.border } else { COLORS.accent };
+    let border_color = if state.running {
+        COLORS.border
+    } else {
+        COLORS.accent
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color));
@@ -7455,15 +7929,15 @@ fn draw_composer(
         height: (rows.len() as u16 + 2).min(area.height),
         ..area
     };
-    frame.render_widget(
-        Paragraph::new(rows).block(block),
-        composer_area,
-    );
+    frame.render_widget(Paragraph::new(rows).block(block), composer_area);
 }
 
 fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     let left = if state.esc_primed {
-        Line::styled("esc again to edit previous message", Style::default().fg(COLORS.muted))
+        Line::styled(
+            "esc again to edit previous message",
+            Style::default().fg(COLORS.muted),
+        )
     } else {
         let home = std::env::var("HOME").unwrap_or_default();
         let location = state.thread.cwd.replace(&home, "~");
@@ -7478,9 +7952,7 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
         Line::from(vec![
             Span::styled(
                 mode_label,
-                Style::default()
-                    .fg(mode_color)
-                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!(" · {location} · {}", state.thread.title),
@@ -7504,17 +7976,25 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
                 Some(rate) if rate >= 0.4 => COLORS.warning,
                 Some(_) => COLORS.error,
             };
-            (badge, color, totals.input_tokens + totals.cache_read_tokens + totals.cache_creation_tokens)
+            (
+                badge,
+                color,
+                totals.input_tokens + totals.cache_read_tokens + totals.cache_creation_tokens,
+            )
         }
         None => ("cache n/a".to_string(), COLORS.muted, 0),
     };
 
     let right = Line::from(vec![
         Span::styled(cache_badge, Style::default().fg(cache_color)),
-        Span::styled(format!(" · {} in", format_token_count(total_input)), Style::default().fg(COLORS.muted)),
+        Span::styled(
+            format!(" · {} in", format_token_count(total_input)),
+            Style::default().fg(COLORS.muted),
+        ),
     ]);
 
-    let chunks = Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
+    let chunks =
+        Layout::horizontal([Constraint::Percentage(60), Constraint::Percentage(40)]).split(area);
     frame.render_widget(Paragraph::new(left), chunks[0]);
     frame.render_widget(
         Paragraph::new(right).alignment(ratatui::layout::Alignment::Right),
@@ -7529,11 +8009,7 @@ impl TuiState {
             return;
         }
         let _ = guard.set_thread_permission_mode(&self.thread.id, self.permission_mode);
-        let _ = guard.set_thread_goal(
-            &self.thread.id,
-            self.goal.as_deref(),
-            self.goal_paused,
-        );
+        let _ = guard.set_thread_goal(&self.thread.id, self.goal.as_deref(), self.goal_paused);
     }
 
     fn apply_permission_mode(&mut self, store: &Arc<Mutex<BatonStore>>, mode: PermissionMode) {
@@ -7754,7 +8230,10 @@ impl TuiState {
     fn cursor_line_column(&self) -> (usize, usize) {
         let chars: Vec<char> = self.input.chars().collect();
         let cursor = self.input_cursor.min(chars.len());
-        let line = chars[..cursor].iter().filter(|character| **character == '\n').count();
+        let line = chars[..cursor]
+            .iter()
+            .filter(|character| **character == '\n')
+            .count();
         let column = chars[..cursor]
             .iter()
             .rposition(|character| *character == '\n')
@@ -7768,7 +8247,11 @@ impl TuiState {
     }
 
     fn store_rows(&self) -> Option<Vec<crate::store::UsageRow>> {
-        self.store.lock().unwrap().list_usage(Some(&self.thread.id)).ok()
+        self.store
+            .lock()
+            .unwrap()
+            .list_usage(Some(&self.thread.id))
+            .ok()
     }
 }
 
@@ -7793,7 +8276,11 @@ mod tests {
             .collect()
     }
 
-    fn test_state(home: &std::path::Path, store: &Arc<Mutex<BatonStore>>, history: Vec<MessageRow>) -> TuiState {
+    fn test_state(
+        home: &std::path::Path,
+        store: &Arc<Mutex<BatonStore>>,
+        history: Vec<MessageRow>,
+    ) -> TuiState {
         let thread = store
             .lock()
             .unwrap()
@@ -7927,7 +8414,9 @@ mod tests {
                 .collect::<Vec<_>>();
             for provider in PROVIDERS {
                 assert!(
-                    rendered.iter().any(|value| value.contains(provider.as_str())),
+                    rendered
+                        .iter()
+                        .any(|value| value.contains(provider.as_str())),
                     "{command} must offer {provider}"
                 );
             }
@@ -8084,7 +8573,9 @@ mod tests {
         state.input = "/mcp add ".to_string();
         assert_eq!(
             composer_hint(&state).as_deref(),
-            Some("/mcp add <name> <command> [args...] · tab or enter completes the selected choice")
+            Some(
+                "/mcp add <name> <command> [args...] · tab or enter completes the selected choice"
+            )
         );
     }
 
@@ -8132,9 +8623,18 @@ mod tests {
             "position indicator must reflect the selection"
         );
         let selected = suggestions[10].insert.clone();
-        assert!(text.contains(&selected), "selected command {selected} must be visible");
-        assert!(!text.contains("/switch"), "commands above the window must be hidden");
-        assert!(!text.contains("/clear"), "commands below the window must be hidden");
+        assert!(
+            text.contains(&selected),
+            "selected command {selected} must be visible"
+        );
+        assert!(
+            !text.contains("/switch"),
+            "commands above the window must be hidden"
+        );
+        assert!(
+            !text.contains("/clear"),
+            "commands below the window must be hidden"
+        );
 
         let row = buffer_lines(&buffer)
             .iter()
@@ -8185,7 +8685,12 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         };
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('n')),
+        );
         assert_eq!(second_receiver.try_recv().unwrap(), ApprovalDecision::Deny);
         assert_eq!(state.approvals.len(), 1, "the older approval stays queued");
         assert!(
@@ -8193,11 +8698,23 @@ mod tests {
             "answering a request must not destroy the picker underneath"
         );
 
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('y')));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('y')),
+        );
         assert_eq!(first_receiver.try_recv().unwrap(), ApprovalDecision::Accept);
         assert!(state.approvals.is_empty());
-        assert!(matches!(state.overlay, Overlay::SwitchPicker { selected: 2 }));
-        assert!(state.notice.as_deref().unwrap_or("").contains("accepted once"));
+        assert!(matches!(
+            state.overlay,
+            Overlay::SwitchPicker { selected: 2 }
+        ));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("accepted once"));
     }
 
     #[test]
@@ -8309,7 +8826,10 @@ mod tests {
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(text.contains("16/20"), "position header: {text}");
         assert!(text.contains("model-15"), "selected model: {text}");
-        assert!(!text.contains("model-00"), "first row should be outside the window");
+        assert!(
+            !text.contains("model-00"),
+            "first row should be outside the window"
+        );
     }
 
     #[test]
@@ -8319,7 +8839,11 @@ mod tests {
         let mut state = test_state(home.path(), &store, Vec::new());
         state.overlay = Overlay::ModelPicker {
             provider: ProviderId::Codex,
-            models: vec!["alpha-model".into(), "beta-model".into(), "gamma-model".into()],
+            models: vec![
+                "alpha-model".into(),
+                "beta-model".into(),
+                "gamma-model".into(),
+            ],
             selected: 0,
             filter: String::new(),
         };
@@ -8330,12 +8854,22 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         };
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('b')));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('b')),
+        );
         let text = buffer_lines(&render_state(&state, 80, 30)).join("\n");
         assert!(text.contains("beta-model"), "filtered row: {text}");
         assert!(!text.contains("alpha-model"), "non-match hidden: {text}");
         assert!(text.contains("filter \"b\""), "filter visible: {text}");
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
         assert!(matches!(state.overlay, Overlay::None));
         assert_eq!(state.thread.current_provider, ProviderId::Codex);
         assert_eq!(state.thread.current_model.as_deref(), Some("beta-model"));
@@ -8372,7 +8906,10 @@ mod tests {
                 models, selected, ..
             } => {
                 assert!(models.iter().any(|model| model == "live-model"));
-                assert_eq!(models.get(*selected).map(String::as_str), Some("selected-model"));
+                assert_eq!(
+                    models.get(*selected).map(String::as_str),
+                    Some("selected-model")
+                );
             }
             _ => panic!("model picker closed"),
         }
@@ -8451,18 +8988,35 @@ mod tests {
             })
             .unwrap()
             .id;
-        let history: Vec<MessageRow> = (1..=30).map(|index| history_message(&thread_id, index)).collect();
+        let history: Vec<MessageRow> = (1..=30)
+            .map(|index| history_message(&thread_id, index))
+            .collect();
         let mut state = test_state(home.path(), &store, history);
 
         let bottom = buffer_lines(&render_state(&state, 100, 30)).join("\n");
-        assert!(bottom.contains("message 30"), "bottom view shows the newest message");
-        assert!(!bottom.contains("message 01"), "oldest message is off-screen");
+        assert!(
+            bottom.contains("message 30"),
+            "bottom view shows the newest message"
+        );
+        assert!(
+            !bottom.contains("message 01"),
+            "oldest message is off-screen"
+        );
 
         state.scroll_offset = 8;
         let scrolled = buffer_lines(&render_state(&state, 100, 30)).join("\n");
-        assert!(scrolled.contains("8 lines above"), "scroll indicator must render");
-        assert!(!scrolled.contains("message 30"), "scrolled view must move away from the bottom");
-        assert!(scrolled.contains("message 15"), "scrolled view must show older content");
+        assert!(
+            scrolled.contains("8 lines above"),
+            "scroll indicator must render"
+        );
+        assert!(
+            !scrolled.contains("message 30"),
+            "scrolled view must move away from the bottom"
+        );
+        assert!(
+            scrolled.contains("message 15"),
+            "scrolled view must show older content"
+        );
     }
 
     #[test]
@@ -8488,7 +9042,10 @@ mod tests {
         let (area, content_start, content_rows, second_line_len) = {
             let view = state.transcript_view.borrow();
             let view = view.as_ref().expect("transcript viewport recorded");
-            assert!(view.total > view.content_rows, "history must overflow the viewport");
+            assert!(
+                view.total > view.content_rows,
+                "history must overflow the viewport"
+            );
             assert!(view.content_rows >= 2);
             let second_len = view
                 .plain
@@ -8525,7 +9082,13 @@ mod tests {
             .transcript_selection
             .get()
             .expect("drag creates a character range");
-        assert_eq!(start, TranscriptPoint { line: content_start, column: 0 });
+        assert_eq!(
+            start,
+            TranscriptPoint {
+                line: content_start,
+                column: 0
+            }
+        );
         assert_eq!(
             end,
             TranscriptPoint {
@@ -8554,7 +9117,10 @@ mod tests {
 
         let buffer = render_state(&state, 100, 30);
         let highlighted = (0..100).any(|x| buffer.get(x, area.y).bg == COLORS.selection_bg);
-        assert!(highlighted, "selected transcript row must carry the selection background");
+        assert!(
+            highlighted,
+            "selected transcript row must carry the selection background"
+        );
     }
 
     #[test]
@@ -8576,14 +9142,8 @@ mod tests {
             plain: vec!["alpha beta".to_string(), "gamma delta".to_string()],
         });
         state.transcript_selection.set(Some((
-            TranscriptPoint {
-                line: 0,
-                column: 2,
-            },
-            TranscriptPoint {
-                line: 1,
-                column: 5,
-            },
+            TranscriptPoint { line: 0, column: 2 },
+            TranscriptPoint { line: 1, column: 5 },
         )));
         let (text, lines, chars) = transcript_selection_text(&state).expect("selected text");
         assert_eq!(text, "pha beta\ngamma");
@@ -8591,14 +9151,8 @@ mod tests {
         assert_eq!(chars, 14);
 
         state.transcript_selection.set(Some((
-            TranscriptPoint {
-                line: 1,
-                column: 5,
-            },
-            TranscriptPoint {
-                line: 0,
-                column: 2,
-            },
+            TranscriptPoint { line: 1, column: 5 },
+            TranscriptPoint { line: 0, column: 2 },
         )));
         let (reversed, _, _) = transcript_selection_text(&state).expect("reversed selection");
         assert_eq!(reversed, text, "a reverse drag copies the same range");
@@ -8657,11 +9211,28 @@ mod tests {
         let mut state = test_state(home.path(), &store, Vec::new());
         assert_eq!(state.thread.current_provider, ProviderId::Claude);
 
-        perform_switch(&mut state, &store, ProviderId::Codex, Some("rits/zai-org/glm-5-3".to_string()));
+        perform_switch(
+            &mut state,
+            &store,
+            ProviderId::Codex,
+            Some("rits/zai-org/glm-5-3".to_string()),
+        );
 
-        assert_eq!(state.thread.current_provider, ProviderId::Codex, "in-memory thread must reflect the switch");
-        assert_eq!(state.thread.current_model.as_deref(), Some("rits/zai-org/glm-5-3"));
-        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(
+            state.thread.current_provider,
+            ProviderId::Codex,
+            "in-memory thread must reflect the switch"
+        );
+        assert_eq!(
+            state.thread.current_model.as_deref(),
+            Some("rits/zai-org/glm-5-3")
+        );
+        let persisted = store
+            .lock()
+            .unwrap()
+            .get_thread(&state.thread.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted.current_provider, ProviderId::Codex);
 
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
@@ -8669,8 +9240,14 @@ mod tests {
             .lines()
             .find(|line| line.contains("codex") || line.contains("claude"))
             .expect("composer provider row rendered");
-        assert!(composer_row.contains("codex"), "composer must show the new provider: {composer_row}");
-        assert!(composer_row.contains("rits/zai-org/glm-5-3"), "composer must show the new model: {composer_row}");
+        assert!(
+            composer_row.contains("codex"),
+            "composer must show the new provider: {composer_row}"
+        );
+        assert!(
+            composer_row.contains("rits/zai-org/glm-5-3"),
+            "composer must show the new model: {composer_row}"
+        );
     }
 
     #[test]
@@ -8678,15 +9255,32 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let (engine_command_sender, _engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
 
-        handle_command(&mut state, &store, &engine_command_sender, "/model claude-opus-5-5");
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/model claude-opus-5-5",
+        );
 
-        assert_eq!(state.thread.current_model.as_deref(), Some("claude-opus-5-5"));
-        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        assert_eq!(
+            state.thread.current_model.as_deref(),
+            Some("claude-opus-5-5")
+        );
+        let persisted = store
+            .lock()
+            .unwrap()
+            .get_thread(&state.thread.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted.current_model.as_deref(), Some("claude-opus-5-5"));
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
-        assert!(text.contains("claude-opus-5-5"), "composer must show the new model immediately");
+        assert!(
+            text.contains("claude-opus-5-5"),
+            "composer must show the new model immediately"
+        );
     }
 
     #[test]
@@ -8694,18 +9288,37 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let (engine_command_sender, _engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
 
         handle_command(&mut state, &store, &engine_command_sender, "/effort High");
         assert_eq!(state.thread.reasoning_effort.as_deref(), Some("high"));
-        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        let persisted = store
+            .lock()
+            .unwrap()
+            .get_thread(&state.thread.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted.reasoning_effort.as_deref(), Some("high"));
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
-        assert!(text.contains("@high"), "banner must show the effort immediately: {text}");
+        assert!(
+            text.contains("@high"),
+            "banner must show the effort immediately: {text}"
+        );
 
-        handle_command(&mut state, &store, &engine_command_sender, "/effort default");
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/effort default",
+        );
         assert_eq!(state.thread.reasoning_effort, None);
-        let persisted = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        let persisted = store
+            .lock()
+            .unwrap()
+            .get_thread(&state.thread.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted.reasoning_effort, None);
     }
 
@@ -8723,8 +9336,15 @@ mod tests {
         let selected_cells_orange = (origin_x..origin_x + 5)
             .filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent)
             .count();
-        assert_eq!(selected_cells_orange, 5, "selected 'hello' must carry the orange background");
-        assert_ne!(buffer.get(origin_x + 6, origin_y).bg, COLORS.accent, "unselected text must not be highlighted");
+        assert_eq!(
+            selected_cells_orange, 5,
+            "selected 'hello' must carry the orange background"
+        );
+        assert_ne!(
+            buffer.get(origin_x + 6, origin_y).bg,
+            COLORS.accent,
+            "unselected text must not be highlighted"
+        );
 
         state.selection = Some((6, 11));
         let buffer = render_state(&state, 100, 30);
@@ -8743,19 +9363,41 @@ mod tests {
         render_state(&state, 100, 30);
         let (origin_x, origin_y) = state.input_origin.get();
 
-        let mouse = |kind: crossterm::event::MouseEventKind, column: u16| crossterm::event::MouseEvent {
-            kind,
-            column,
-            row: origin_y,
-            modifiers: KeyModifiers::empty(),
-        };
-        handle_mouse(&mut state, mouse(crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left), origin_x));
-        handle_mouse(&mut state, mouse(crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left), origin_x + 5));
-        assert_eq!(state.selection, Some((0, 5)), "drag from the first column selects 'hello'");
+        let mouse =
+            |kind: crossterm::event::MouseEventKind, column: u16| crossterm::event::MouseEvent {
+                kind,
+                column,
+                row: origin_y,
+                modifiers: KeyModifiers::empty(),
+            };
+        handle_mouse(
+            &mut state,
+            mouse(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                origin_x,
+            ),
+        );
+        handle_mouse(
+            &mut state,
+            mouse(
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+                origin_x + 5,
+            ),
+        );
+        assert_eq!(
+            state.selection,
+            Some((0, 5)),
+            "drag from the first column selects 'hello'"
+        );
 
         let buffer = render_state(&state, 100, 30);
-        let orange = (origin_x..origin_x + 5).filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent).count();
-        assert_eq!(orange, 5, "the dragged range renders with the orange background");
+        let orange = (origin_x..origin_x + 5)
+            .filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent)
+            .count();
+        assert_eq!(
+            orange, 5,
+            "the dragged range renders with the orange background"
+        );
     }
 
     #[test]
@@ -8778,18 +9420,46 @@ mod tests {
 
         state.running = true;
         let lines = buffer_lines(&render_state(&state, 100, 30));
-        let user_row = lines.iter().position(|line| line.contains("message 01")).expect("user message rendered");
-        let thinking_row = lines.iter().position(|line| line.contains("Thinking")).expect("thinking spinner in transcript");
-        assert!(thinking_row > user_row, "thinking renders after the user message, not above the composer");
+        let user_row = lines
+            .iter()
+            .position(|line| line.contains("message 01"))
+            .expect("user message rendered");
+        let thinking_row = lines
+            .iter()
+            .position(|line| line.contains("Thinking"))
+            .expect("thinking spinner in transcript");
+        assert!(
+            thinking_row > user_row,
+            "thinking renders after the user message, not above the composer"
+        );
 
-        state.tool_lines.push(ToolLine { id: None, label: "shell cargo test".into(), status: ToolStatus::Running });
+        state.tool_lines.push(ToolLine {
+            id: None,
+            label: "shell cargo test".into(),
+            status: ToolStatus::Running,
+        });
         state.streaming_text = "partial answer".into();
         let lines = buffer_lines(&render_state(&state, 100, 30));
-        let user_row = lines.iter().position(|line| line.contains("message 01")).expect("user message rendered");
-        let tool_row = lines.iter().position(|line| line.contains("cargo test")).expect("tool line in transcript");
-        let stream_row = lines.iter().position(|line| line.contains("partial answer")).expect("streaming text in transcript");
-        assert!(user_row < tool_row && tool_row < stream_row, "tools and streaming follow the user message in order");
-        assert!(!lines.iter().any(|line| line.contains("Working [")), "the status bar no longer shows a Working spinner");
+        let user_row = lines
+            .iter()
+            .position(|line| line.contains("message 01"))
+            .expect("user message rendered");
+        let tool_row = lines
+            .iter()
+            .position(|line| line.contains("cargo test"))
+            .expect("tool line in transcript");
+        let stream_row = lines
+            .iter()
+            .position(|line| line.contains("partial answer"))
+            .expect("streaming text in transcript");
+        assert!(
+            user_row < tool_row && tool_row < stream_row,
+            "tools and streaming follow the user message in order"
+        );
+        assert!(
+            !lines.iter().any(|line| line.contains("Working [")),
+            "the status bar no longer shows a Working spinner"
+        );
     }
 
     #[test]
@@ -8850,8 +9520,11 @@ mod tests {
         let lines = buffer_lines(&buffer);
         let text = lines.join("\n");
         assert!(text.contains("Title"), "heading stripped: {text}");
-        assert!(!text.contains('#' ), "heading marker removed: {text}");
-        assert!(text.contains("• one with code"), "inline markers stripped: {text}");
+        assert!(!text.contains('#'), "heading marker removed: {text}");
+        assert!(
+            text.contains("• one with code"),
+            "inline markers stripped: {text}"
+        );
         assert!(text.contains("let x = 1;"), "code body visible: {text}");
         assert!(!text.contains("```"), "fence markers removed: {text}");
         let code_row = lines
@@ -8906,30 +9579,84 @@ mod tests {
             .id;
         {
             let guard = store.lock().unwrap();
-            guard.add_message(&thread_id, 1, "user", None, None, "run the tests").unwrap();
-            guard.add_message(&thread_id, 1, "tool", Some("codex"), None, "✓ shell cargo test").unwrap();
-            guard.add_message(&thread_id, 1, "tool", Some("codex"), None, "✗ shell npm build").unwrap();
-            guard.add_message(&thread_id, 1, "assistant", Some("codex"), None, "tests pass").unwrap();
+            guard
+                .add_message(&thread_id, 1, "user", None, None, "run the tests")
+                .unwrap();
+            guard
+                .add_message(
+                    &thread_id,
+                    1,
+                    "tool",
+                    Some("codex"),
+                    None,
+                    "✓ shell cargo test",
+                )
+                .unwrap();
+            guard
+                .add_message(
+                    &thread_id,
+                    1,
+                    "tool",
+                    Some("codex"),
+                    None,
+                    "✗ shell npm build",
+                )
+                .unwrap();
+            guard
+                .add_message(
+                    &thread_id,
+                    1,
+                    "assistant",
+                    Some("codex"),
+                    None,
+                    "tests pass",
+                )
+                .unwrap();
         }
         let history = store.lock().unwrap().list_messages(&thread_id).unwrap();
         let state = test_state(home.path(), &store, history);
 
         let buffer = render_state(&state, 100, 30);
         let lines = buffer_lines(&buffer);
-        let user_row = lines.iter().position(|line| line.contains("run the tests")).expect("user message");
-        let ok_row = lines.iter().position(|line| line.contains("✓ shell cargo test")).expect("succeeded tool");
-        let fail_row = lines.iter().position(|line| line.contains("✗ shell npm build")).expect("failed tool");
-        let reply_row = lines.iter().position(|line| line.contains("tests pass")).expect("assistant reply");
-        assert!(user_row < ok_row && ok_row < fail_row && fail_row < reply_row, "tool history stays in conversation order");
+        let user_row = lines
+            .iter()
+            .position(|line| line.contains("run the tests"))
+            .expect("user message");
+        let ok_row = lines
+            .iter()
+            .position(|line| line.contains("✓ shell cargo test"))
+            .expect("succeeded tool");
+        let fail_row = lines
+            .iter()
+            .position(|line| line.contains("✗ shell npm build"))
+            .expect("failed tool");
+        let reply_row = lines
+            .iter()
+            .position(|line| line.contains("tests pass"))
+            .expect("assistant reply");
+        assert!(
+            user_row < ok_row && ok_row < fail_row && fail_row < reply_row,
+            "tool history stays in conversation order"
+        );
 
         let ok_line: Vec<(u16, u16)> = (0..buffer.area.width)
             .filter(|&x| buffer.get(x, ok_row as u16).symbol() == "✓")
             .map(|x| (x, ok_row as u16))
             .collect();
         assert!(!ok_line.is_empty());
-        assert_eq!(buffer.get(ok_line[0].0, ok_line[0].1).fg, COLORS.success, "succeeded tool renders green");
-        let fail_cell = (0..buffer.area.width).find(|&x| buffer.get(x, fail_row as u16).symbol() == "✗").expect("marker");
-        assert_eq!(buffer.get(fail_cell, fail_row as u16).fg, COLORS.error, "failed tool renders red");
+        assert_eq!(
+            buffer.get(ok_line[0].0, ok_line[0].1).fg,
+            COLORS.success,
+            "succeeded tool renders green"
+        );
+        let fail_cell = (0..buffer.area.width)
+            .find(|&x| buffer.get(x, fail_row as u16).symbol() == "✗")
+            .expect("marker");
+        assert_eq!(
+            buffer.get(fail_cell, fail_row as u16).fg,
+            COLORS.error,
+            "failed tool renders red"
+        );
     }
 
     #[test]
@@ -8949,8 +9676,12 @@ mod tests {
             .id;
         {
             let guard = store.lock().unwrap();
-            guard.add_message(&thread_id, 1, "user", None, None, "edit the file").unwrap();
-            guard.add_message(&thread_id, 1, "assistant", Some("codex"), None, "edited").unwrap();
+            guard
+                .add_message(&thread_id, 1, "user", None, None, "edit the file")
+                .unwrap();
+            guard
+                .add_message(&thread_id, 1, "assistant", Some("codex"), None, "edited")
+                .unwrap();
             guard
                 .add_message(&thread_id, 1, "diff", None, None, "diff --git a/notes.txt b/notes.txt\nindex 123..456 100644\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1 @@\n-old line\n+new line\n")
                 .unwrap();
@@ -8960,18 +9691,46 @@ mod tests {
 
         let buffer = render_state(&state, 100, 30);
         let lines = buffer_lines(&buffer);
-        let find_row = |needle: &str| lines.iter().position(|line| line.contains(needle)).unwrap_or_else(|| panic!("{needle} rendered"));
+        let find_row = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} rendered"))
+        };
         let header_row = find_row("• Edited notes.txt (+1 -1)");
         let added_row = find_row("+new line");
         let removed_row = find_row("-old line");
         let reply_row = find_row("edited");
-        assert!(reply_row < header_row && header_row < added_row, "the diff block renders after the reply, in conversation order");
-        let added_cell = (0..buffer.area.width).find(|&x| buffer.get(x, added_row as u16).symbol() == "+").unwrap();
-        let removed_cell = (0..buffer.area.width).find(|&x| buffer.get(x, removed_row as u16).symbol() == "-").unwrap();
-        assert_eq!(buffer.get(added_cell, added_row as u16).fg, COLORS.success, "added lines render green");
-        assert_eq!(buffer.get(removed_cell, removed_row as u16).fg, COLORS.error, "removed lines render red");
-        assert_eq!(buffer.get(0, added_row as u16).bg, ratatui::style::Color::Rgb(33, 58, 43), "added rows carry the tinted background");
-        assert_eq!(buffer.get(0, removed_row as u16).bg, ratatui::style::Color::Rgb(74, 34, 29), "removed rows carry the tinted background");
+        assert!(
+            reply_row < header_row && header_row < added_row,
+            "the diff block renders after the reply, in conversation order"
+        );
+        let added_cell = (0..buffer.area.width)
+            .find(|&x| buffer.get(x, added_row as u16).symbol() == "+")
+            .unwrap();
+        let removed_cell = (0..buffer.area.width)
+            .find(|&x| buffer.get(x, removed_row as u16).symbol() == "-")
+            .unwrap();
+        assert_eq!(
+            buffer.get(added_cell, added_row as u16).fg,
+            COLORS.success,
+            "added lines render green"
+        );
+        assert_eq!(
+            buffer.get(removed_cell, removed_row as u16).fg,
+            COLORS.error,
+            "removed lines render red"
+        );
+        assert_eq!(
+            buffer.get(0, added_row as u16).bg,
+            ratatui::style::Color::Rgb(33, 58, 43),
+            "added rows carry the tinted background"
+        );
+        assert_eq!(
+            buffer.get(0, removed_row as u16).bg,
+            ratatui::style::Color::Rgb(74, 34, 29),
+            "removed rows carry the tinted background"
+        );
     }
 
     #[test]
@@ -9131,7 +9890,12 @@ mod tests {
                 .current_dir(cwd)
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
         };
         git(&["init", "-q"], repo.path());
         git(&["config", "user.email", "test@test"], repo.path());
@@ -9143,13 +9907,9 @@ mod tests {
 
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
-        let worktree = crate::worktree::create(
-            home.path(),
-            &repo_root,
-            "run-followup",
-            "worker task",
-        )
-        .unwrap();
+        let worktree =
+            crate::worktree::create(home.path(), &repo_root, "run-followup", "worker task")
+                .unwrap();
         let worker = store
             .lock()
             .unwrap()
@@ -9258,7 +10018,11 @@ mod tests {
             "answering the question resolves the run"
         );
         assert!(
-            state.notice.as_deref().unwrap_or("").contains("worker follow-up recorded"),
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("worker follow-up recorded"),
             "notice: {:?}",
             state.notice
         );
@@ -9303,7 +10067,10 @@ mod tests {
             .orchestration_task_for_thread(&worker.id)
             .unwrap()
             .unwrap();
-        assert_eq!(task.status, "needs_input", "a second question keeps the gate");
+        assert_eq!(
+            task.status, "needs_input",
+            "a second question keeps the gate"
+        );
         assert_eq!(
             task.text.as_deref(),
             Some("BATON_QUESTION: choose the follow-up path?")
@@ -9321,7 +10088,11 @@ mod tests {
             "needs_input"
         );
         assert!(
-            state.notice.as_deref().unwrap_or("").contains("worker question recorded"),
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("worker question recorded"),
             "notice: {:?}",
             state.notice
         );
@@ -9339,7 +10110,10 @@ mod tests {
         ])
         .unwrap();
         assert!(parsed.worktrees);
-        assert_eq!(parsed.providers, vec![ProviderId::Codex, ProviderId::OpenCode]);
+        assert_eq!(
+            parsed.providers,
+            vec![ProviderId::Codex, ProviderId::OpenCode]
+        );
         assert_eq!(parsed.prompt, "compare notes");
 
         let live = parse_multi_args(&[
@@ -9358,10 +10132,7 @@ mod tests {
 
     #[test]
     fn multi_worktree_plan_has_one_task_per_provider() {
-        let plan = multi_worktree_plan(
-            &[ProviderId::Codex, ProviderId::Claude],
-            "compare the API",
-        );
+        let plan = multi_worktree_plan(&[ProviderId::Codex, ProviderId::Claude], "compare the API");
         assert_eq!(plan.tasks.len(), 2);
         assert_eq!(plan.tasks[0].provider, "codex");
         assert_eq!(plan.tasks[0].prompt, "compare the API");
@@ -9447,14 +10218,23 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         state.apply_permission_mode(&store, PermissionMode::Plan);
 
-        handle_command(&mut state, &store, &engine_command_sender, "/multi codex opencode compare notes");
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/multi codex opencode compare notes",
+        );
 
         let mut submitted = Vec::new();
         while let Ok(command) = engine_command_receiver.try_recv() {
-            if let EngineCommand::Submit { thread_id, text, .. } = command {
+            if let EngineCommand::Submit {
+                thread_id, text, ..
+            } = command
+            {
                 submitted.push((thread_id, text));
             }
         }
@@ -9462,10 +10242,16 @@ mod tests {
         assert!(submitted.iter().all(|(_, text)| text == "compare notes"));
         let multi = state.multi.as_ref().expect("multi view opens");
         assert_eq!(multi.children.len(), 2);
-        assert!(multi.children.iter().all(|child| child.status == MultiStatus::Running));
+        assert!(multi
+            .children
+            .iter()
+            .all(|child| child.status == MultiStatus::Running));
         for (thread_id, _) in &submitted {
             let thread = store.lock().unwrap().get_thread(thread_id).unwrap();
-            assert!(thread.is_some(), "parallel thread {thread_id} must be persisted before submit");
+            assert!(
+                thread.is_some(),
+                "parallel thread {thread_id} must be persisted before submit"
+            );
             assert_eq!(
                 thread.unwrap().permission_mode,
                 PermissionMode::Plan,
@@ -9505,9 +10291,17 @@ mod tests {
         ];
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &engine_command_sender, "/copy 2");
-        assert!(state.notice.as_deref().unwrap_or("").contains("copied assistant reply 2"));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("copied assistant reply 2"));
         handle_command(&mut state, &store, &engine_command_sender, "/copy 3");
-        assert!(state.notice.as_deref().unwrap_or("").contains("no assistant reply at position 3"));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("no assistant reply at position 3"));
         std::env::remove_var("BATON_CLIPBOARD_COMMAND");
     }
 
@@ -9548,7 +10342,14 @@ mod tests {
         store
             .lock()
             .unwrap()
-            .add_message(&child.id, 1, "assistant", Some("codex"), None, "final answer")
+            .add_message(
+                &child.id,
+                1,
+                "assistant",
+                Some("codex"),
+                None,
+                "final answer",
+            )
             .unwrap();
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         apply_engine_event(
@@ -9568,7 +10369,10 @@ mod tests {
         let rendered = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(rendered.contains("multi"), "merged view: {rendered}");
         assert!(rendered.contains("codex"), "provider row: {rendered}");
-        assert!(rendered.contains("final answer"), "reply preview: {rendered}");
+        assert!(
+            rendered.contains("final answer"),
+            "reply preview: {rendered}"
+        );
 
         handle_key(
             &mut state,
@@ -9583,7 +10387,10 @@ mod tests {
         );
         assert!(state.multi.is_none());
         assert_eq!(state.thread.id, child.id);
-        assert!(state.history.iter().any(|message| message.text == "final answer"));
+        assert!(state
+            .history
+            .iter()
+            .any(|message| message.text == "final answer"));
     }
 
     #[test]
@@ -9591,7 +10398,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         let key = |code: KeyCode, modifiers: KeyModifiers| KeyEvent {
             code,
             modifiers,
@@ -9600,7 +10408,12 @@ mod tests {
         };
 
         state.set_input("first".into());
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter, KeyModifiers::SHIFT));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter, KeyModifiers::SHIFT),
+        );
         state.set_input(format!("{}second", state.input));
         assert_eq!(state.input, "first\nsecond");
         assert!(
@@ -9608,7 +10421,12 @@ mod tests {
             "shift+enter must not submit"
         );
 
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter, KeyModifiers::empty()));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter, KeyModifiers::empty()),
+        );
         assert_eq!(state.input, "", "plain enter still submits");
         let command = engine_command_receiver.try_recv().expect("submit command");
         match command {
@@ -9631,16 +10449,41 @@ mod tests {
         };
 
         state.set_input("abc".into());
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Left));
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('X')));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Left),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('X')),
+        );
         assert_eq!(state.input, "abXc");
         assert_eq!(state.input_cursor, 3);
 
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Home));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Home),
+        );
         assert_eq!(state.input_cursor, 0);
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Delete));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Delete),
+        );
         assert_eq!(state.input, "bXc");
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::End));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::End),
+        );
         assert_eq!(state.input_cursor, 3);
     }
 
@@ -9709,12 +10552,27 @@ mod tests {
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
         state.history = vec![review_diff_message(&state.thread.id)];
-        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &engine_command_sender, "/review");
         let review = state.review.as_ref().expect("review opens");
-        assert_eq!(review.rows.len(), 4, "review keeps context and changed rows");
-        assert_eq!(review.rows.iter().filter(|row| row.added || row.removed).count(), 3);
-        assert_eq!(review.rows[review.selected].text, "old line", "selection starts on the first change");
+        assert_eq!(
+            review.rows.len(),
+            4,
+            "review keeps context and changed rows"
+        );
+        assert_eq!(
+            review
+                .rows
+                .iter()
+                .filter(|row| row.added || row.removed)
+                .count(),
+            3
+        );
+        assert_eq!(
+            review.rows[review.selected].text, "old line",
+            "selection starts on the first change"
+        );
 
         let key = |code: KeyCode| KeyEvent {
             code,
@@ -9722,8 +10580,18 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         };
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('n')),
+        );
         for character in "fix this".chars() {
             handle_key(
                 &mut state,
@@ -9732,7 +10600,12 @@ mod tests {
                 key(KeyCode::Char(character)),
             );
         }
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
         let review = state.review.as_ref().expect("review stays open");
         assert_eq!(review.notes.len(), 1);
         assert_eq!(review.notes[0].path, "src/lib.rs");
@@ -9740,7 +10613,12 @@ mod tests {
         assert!(review.notes[0].added);
         assert_eq!(review.notes[0].body, "fix this");
 
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('s')));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('s')),
+        );
         assert!(state.review.is_none(), "sending closes review");
         match engine_command_receiver.try_recv().expect("submit") {
             EngineCommand::Submit { text, .. } => {
@@ -9778,11 +10656,24 @@ mod tests {
             state: crossterm::event::KeyEventState::empty(),
         };
         handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
-        assert!(!state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].added);
-        assert!(!state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].removed);
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        assert!(
+            !state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].added
+        );
+        assert!(
+            !state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].removed
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('n')),
+        );
         assert!(state.review.as_ref().unwrap().note_input.is_none());
-        assert!(state.notice.as_deref().unwrap_or("").contains("added or removed"));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("added or removed"));
     }
 
     #[test]
@@ -9810,10 +10701,26 @@ mod tests {
             kind: KeyEventKind::Press,
             state: crossterm::event::KeyEventState::empty(),
         };
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char(']')));
-        assert_eq!(state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].path, "src/b.rs");
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('[')));
-        assert_eq!(state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].path, "src/a.rs");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char(']')),
+        );
+        assert_eq!(
+            state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].path,
+            "src/b.rs"
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('[')),
+        );
+        assert_eq!(
+            state.review.as_ref().unwrap().rows[state.review.as_ref().unwrap().selected].path,
+            "src/a.rs"
+        );
     }
 
     #[test]
@@ -9832,7 +10739,12 @@ mod tests {
         };
 
         handle_command(&mut state, &store, &engine_command_sender, "/review");
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('n')));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('n')),
+        );
         for character in "persist me".chars() {
             handle_key(
                 &mut state,
@@ -9841,7 +10753,12 @@ mod tests {
                 key(KeyCode::Char(character)),
             );
         }
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Enter));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
         let fingerprint = diff_render::fingerprint(&diff.text);
         assert_eq!(
             store
@@ -9854,13 +10771,23 @@ mod tests {
             "adding a note persists it before sending"
         );
 
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
         handle_command(&mut state, &store, &engine_command_sender, "/review");
         let review = state.review.as_ref().expect("review reopens");
         assert_eq!(review.notes.len(), 1);
         assert_eq!(review.notes[0].body, "persist me");
 
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('d')));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('d')),
+        );
         assert!(state.review.as_ref().unwrap().notes.is_empty());
         assert!(
             store
@@ -9872,7 +10799,12 @@ mod tests {
             "deleting a note removes its persisted row"
         );
 
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
         handle_command(&mut state, &store, &engine_command_sender, "/review");
         assert!(
             state.review.as_ref().unwrap().notes.is_empty(),
@@ -9886,7 +10818,8 @@ mod tests {
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
         state.history = vec![review_diff_message(&state.thread.id)];
-        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &engine_command_sender, "/review");
         state.running = true;
         let thread_id = state.thread.id.clone();
@@ -9948,7 +10881,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         state.running = true;
         state.set_input("change direction".into());
         handle_key(
@@ -9969,7 +10903,10 @@ mod tests {
             }
             _ => panic!("expected a steer command"),
         }
-        assert!(state.queued_messages.is_empty(), "a steer is not a queued turn");
+        assert!(
+            state.queued_messages.is_empty(),
+            "a steer is not a queued turn"
+        );
     }
 
     #[test]
@@ -9992,7 +10929,11 @@ mod tests {
         );
         assert_eq!(state.queued_messages, vec!["follow up".to_string()]);
         assert_eq!(
-            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
             vec!["follow up".to_string()],
             "a rejected steer is durable"
         );
@@ -10074,7 +11015,10 @@ mod tests {
             "steer this".into(),
             true,
         );
-        assert_eq!(state.prompt_history.last().map(String::as_str), Some("steer this"));
+        assert_eq!(
+            state.prompt_history.last().map(String::as_str),
+            Some("steer this")
+        );
         assert_eq!(
             store
                 .lock()
@@ -10101,7 +11045,10 @@ mod tests {
             "after the run".into(),
             true,
         );
-        assert_eq!(state.prompt_history.last().map(String::as_str), Some("after the run"));
+        assert_eq!(
+            state.prompt_history.last().map(String::as_str),
+            Some("after the run")
+        );
         assert_eq!(
             store
                 .lock()
@@ -10150,7 +11097,10 @@ mod tests {
             "after the run".into(),
             true,
         );
-        assert!(receiver.try_recv().is_err(), "an orchestration is already live");
+        assert!(
+            receiver.try_recv().is_err(),
+            "an orchestration is already live"
+        );
         assert_eq!(state.queued_messages, vec!["after the run".to_string()]);
         assert_eq!(
             store
@@ -10250,7 +11200,11 @@ mod tests {
             .list_queued_messages(&state.thread.id)
             .unwrap()
             .is_empty());
-        assert!(state.notice.as_deref().unwrap_or("").contains("new message"));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("new message"));
     }
 
     #[test]
@@ -10298,10 +11252,18 @@ mod tests {
         );
         assert_eq!(state.queued_messages, vec!["second".to_string()]);
         assert_eq!(
-            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
             vec!["second".to_string()]
         );
-        assert!(state.notice.as_deref().unwrap_or("").contains("already running"));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("already running"));
     }
 
     #[test]
@@ -10316,11 +11278,17 @@ mod tests {
         let lifecycle = AdapterLifecycle::new();
         lifecycle.starting("thread-1");
         lifecycle.turn_running("thread-1");
-        state.adapter_lifecycles.insert(ProviderId::Codex, lifecycle);
+        state
+            .adapter_lifecycles
+            .insert(ProviderId::Codex, lifecycle);
         {
             let guard = store.lock().unwrap();
-            guard.start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m")).unwrap();
-            guard.finish_turn_record(&state.thread.id, 1, TurnPhase::Failed, Some("boom")).unwrap();
+            guard
+                .start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m"))
+                .unwrap();
+            guard
+                .finish_turn_record(&state.thread.id, 1, TurnPhase::Failed, Some("boom"))
+                .unwrap();
         }
         handle_command(&mut state, &store, &engine_command_sender, "/status");
         let notice = state.notice.clone().unwrap_or_default();
@@ -10362,9 +11330,15 @@ mod tests {
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         {
             let guard = store.lock().unwrap();
-            guard.start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m")).unwrap();
-            guard.finish_turn_record(&state.thread.id, 1, TurnPhase::Completed, None).unwrap();
-            guard.start_turn_record(&state.thread.id, 2, ProviderId::Codex, Some("m")).unwrap();
+            guard
+                .start_turn_record(&state.thread.id, 1, ProviderId::Codex, Some("m"))
+                .unwrap();
+            guard
+                .finish_turn_record(&state.thread.id, 1, TurnPhase::Completed, None)
+                .unwrap();
+            guard
+                .start_turn_record(&state.thread.id, 2, ProviderId::Codex, Some("m"))
+                .unwrap();
         }
         handle_command(&mut state, &store, &engine_command_sender, "/turns");
         let notice = state.notice.clone().unwrap_or_default();
@@ -10405,10 +11379,15 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         enqueue_message(&mut state, &store, "follow up".into());
         assert_eq!(
-            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
             vec!["follow up".to_string()]
         );
 
@@ -10432,7 +11411,10 @@ mod tests {
             .list_queued_messages(&state.thread.id)
             .unwrap()
             .is_empty());
-        match engine_command_receiver.try_recv().expect("queued message is sent") {
+        match engine_command_receiver
+            .try_recv()
+            .expect("queued message is sent")
+        {
             EngineCommand::Submit { text, .. } => assert_eq!(text, "follow up"),
             _ => panic!("expected submit"),
         }
@@ -10443,23 +11425,57 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
 
         handle_command(&mut state, &store, &engine_command_sender, "/mode plan");
-        let saved = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
-        assert_eq!(saved.permission_mode, PermissionMode::Plan, "mode persists on the thread");
+        let saved = store
+            .lock()
+            .unwrap()
+            .get_thread(&state.thread.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.permission_mode,
+            PermissionMode::Plan,
+            "mode persists on the thread"
+        );
 
-        handle_command(&mut state, &store, &engine_command_sender, "/goal ship the fix");
-        let saved = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/goal ship the fix",
+        );
+        let saved = store
+            .lock()
+            .unwrap()
+            .get_thread(&state.thread.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(saved.goal.as_deref(), Some("ship the fix"));
         assert!(!saved.goal_paused);
 
         handle_command(&mut state, &store, &engine_command_sender, "/goal pause");
-        let saved = store.lock().unwrap().get_thread(&state.thread.id).unwrap().unwrap();
+        let saved = store
+            .lock()
+            .unwrap()
+            .get_thread(&state.thread.id)
+            .unwrap()
+            .unwrap();
         assert!(saved.goal_paused, "pause is durable, not just a notice");
-        submit(&mut state, &store, &engine_command_sender, "while paused".into());
+        submit(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "while paused".into(),
+        );
         match engine_command_receiver.try_recv().expect("submit") {
-            EngineCommand::Submit { text, permission_mode, .. } => {
+            EngineCommand::Submit {
+                text,
+                permission_mode,
+                ..
+            } => {
                 assert_eq!(text, "while paused", "a paused goal must not be injected");
                 assert_eq!(permission_mode, PermissionMode::Plan);
             }
@@ -10467,7 +11483,12 @@ mod tests {
         }
 
         handle_command(&mut state, &store, &engine_command_sender, "/goal resume");
-        submit(&mut state, &store, &engine_command_sender, "after resume".into());
+        submit(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "after resume".into(),
+        );
         match engine_command_receiver.try_recv().expect("submit") {
             EngineCommand::Submit { text, .. } => {
                 assert_eq!(text, "[goal: ship the fix]\nafter resume");
@@ -10494,7 +11515,9 @@ mod tests {
             .unwrap();
         {
             let guard = store.lock().unwrap();
-            guard.set_thread_permission_mode(&other.id, PermissionMode::BypassPermissions).unwrap();
+            guard
+                .set_thread_permission_mode(&other.id, PermissionMode::BypassPermissions)
+                .unwrap();
             guard
                 .set_thread_goal(&other.id, Some("other goal"), true)
                 .unwrap();
@@ -10537,7 +11560,12 @@ mod tests {
                 .current_dir(repo.path())
                 .output()
                 .unwrap();
-            assert!(output.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "test@test"]);
@@ -10554,20 +11582,13 @@ mod tests {
         state.thread.session_mode = SessionMode::Orchestrate;
         {
             let guard = store.lock().unwrap();
-            guard
-                .set_thread_cwd(&source_id, &state.thread.cwd)
-                .unwrap();
+            guard.set_thread_cwd(&source_id, &state.thread.cwd).unwrap();
             guard
                 .set_thread_session_mode(&source_id, SessionMode::Orchestrate)
                 .unwrap();
         }
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        handle_command(
-            &mut state,
-            &store,
-            &engine_command_sender,
-            "/worktree",
-        );
+        handle_command(&mut state, &store, &engine_command_sender, "/worktree");
 
         assert_ne!(state.thread.id, source_id);
         assert_eq!(state.thread.title, "test (worktree)");
@@ -10597,8 +11618,14 @@ mod tests {
             .list_orchestration_tasks(&runs[0].id)
             .unwrap();
         assert_eq!(tasks.len(), 1);
-        assert_eq!(tasks[0].thread_id.as_deref(), Some(state.thread.id.as_str()));
-        assert_eq!(tasks[0].worktree_path.as_deref(), Some(state.thread.cwd.as_str()));
+        assert_eq!(
+            tasks[0].thread_id.as_deref(),
+            Some(state.thread.id.as_str())
+        );
+        assert_eq!(
+            tasks[0].worktree_path.as_deref(),
+            Some(state.thread.cwd.as_str())
+        );
         assert_eq!(tasks[0].status, "completed");
         assert!(tasks[0].commit_sha.is_none());
 
@@ -10764,7 +11791,11 @@ mod tests {
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &engine_command_sender, "/commands");
         match &state.overlay {
-            Overlay::CommandList { selected, expanded, turn } => {
+            Overlay::CommandList {
+                selected,
+                expanded,
+                turn,
+            } => {
                 assert_eq!(*selected, 1, "the newest command is selected");
                 assert!(!expanded);
                 assert_eq!(*turn, None);
@@ -10784,7 +11815,9 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
         );
         match &state.overlay {
-            Overlay::CommandList { selected, expanded, .. } => {
+            Overlay::CommandList {
+                selected, expanded, ..
+            } => {
                 assert_eq!(*selected, 0);
                 assert!(expanded);
             }
@@ -10816,7 +11849,12 @@ mod tests {
             notes: Vec::new(),
             note_input: Some("ab".into()),
         });
-        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()));
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()),
+        );
         assert_eq!(
             state.review.as_ref().unwrap().note_input.as_deref(),
             Some("abc"),
@@ -10834,7 +11872,12 @@ mod tests {
             "ctrl+y copies without typing"
         );
         state.review.as_mut().unwrap().note_input = None;
-        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()));
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()),
+        );
         assert!(state.notice.as_deref().unwrap_or("").contains("copied"));
     }
 
@@ -10846,32 +11889,74 @@ mod tests {
         let thread_id = state.thread.id.clone();
         {
             let guard = store.lock().unwrap();
-            guard.start_turn_record(&thread_id, 1, ProviderId::Codex, Some("model")).unwrap();
-            guard.finish_turn_record(&thread_id, 1, TurnPhase::Completed, None).unwrap();
-            guard.add_message(&thread_id, 1, "tool", Some("codex"), Some("model"), "✓ shell cargo test").unwrap();
-            guard.add_message(
-                &thread_id,
-                1,
-                "diff",
-                None,
-                None,
-                "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n",
-            ).unwrap();
+            guard
+                .start_turn_record(&thread_id, 1, ProviderId::Codex, Some("model"))
+                .unwrap();
+            guard
+                .finish_turn_record(&thread_id, 1, TurnPhase::Completed, None)
+                .unwrap();
+            guard
+                .add_message(
+                    &thread_id,
+                    1,
+                    "tool",
+                    Some("codex"),
+                    Some("model"),
+                    "✓ shell cargo test",
+                )
+                .unwrap();
+            guard
+                .add_message(
+                    &thread_id,
+                    1,
+                    "diff",
+                    None,
+                    None,
+                    "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n",
+                )
+                .unwrap();
         }
         state.history = store.lock().unwrap().list_messages(&thread_id).unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &sender, "/activity");
-        assert!(matches!(state.activity, Some(ActivityView { expanded: false, .. })));
+        assert!(matches!(
+            state.activity,
+            Some(ActivityView {
+                expanded: false,
+                ..
+            })
+        ));
         assert_eq!(state.activity.as_ref().unwrap().rows.len(), 1);
-        assert!(crate::activity::summary(&state.activity.as_ref().unwrap().rows[0]).contains("1 tool call"));
-        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(
+            crate::activity::summary(&state.activity.as_ref().unwrap().rows[0])
+                .contains("1 tool call")
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
         assert!(state.activity.as_ref().unwrap().expanded);
-        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()));
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::empty()),
+        );
         assert!(state.review.is_some(), "d opens the turn diff");
         assert!(state.activity.is_some(), "activity stays behind review");
-        handle_key(&mut state, &store, &sender, KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()));
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
         assert!(state.review.is_none());
-        assert!(state.activity.is_some(), "closing review returns to activity");
+        assert!(
+            state.activity.is_some(),
+            "closing review returns to activity"
+        );
     }
 
     #[test]
@@ -10887,7 +11972,11 @@ mod tests {
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &sender, "/commands 1");
         match &state.overlay {
-            Overlay::CommandList { selected, expanded, turn } => {
+            Overlay::CommandList {
+                selected,
+                expanded,
+                turn,
+            } => {
                 assert_eq!(*turn, Some(1));
                 assert_eq!(*selected, 0);
                 assert!(!expanded);
@@ -10895,7 +11984,11 @@ mod tests {
             _ => panic!("expected the command list"),
         }
         handle_command(&mut state, &store, &sender, "/commands 99");
-        assert!(state.notice.as_deref().unwrap_or("").contains("no tool calls for turn 99"));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("no tool calls for turn 99"));
     }
 
     #[test]
@@ -10906,9 +11999,22 @@ mod tests {
         let thread_id = state.thread.id.clone();
         {
             let guard = store.lock().unwrap();
-            guard.start_turn_record(&thread_id, 1, ProviderId::Codex, Some("model")).unwrap();
-            guard.finish_turn_record(&thread_id, 1, TurnPhase::Completed, None).unwrap();
-            guard.add_message(&thread_id, 1, "tool", Some("codex"), Some("model"), "✓ shell cargo test").unwrap();
+            guard
+                .start_turn_record(&thread_id, 1, ProviderId::Codex, Some("model"))
+                .unwrap();
+            guard
+                .finish_turn_record(&thread_id, 1, TurnPhase::Completed, None)
+                .unwrap();
+            guard
+                .add_message(
+                    &thread_id,
+                    1,
+                    "tool",
+                    Some("codex"),
+                    Some("model"),
+                    "✓ shell cargo test",
+                )
+                .unwrap();
         }
         state.history = store.lock().unwrap().list_messages(&thread_id).unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -10963,21 +12069,36 @@ mod tests {
         let mut state = test_state(home.path(), &store, Vec::new());
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        handle_command(&mut state, &store, &engine_command_sender, "/memories add Use tabs");
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/memories add Use tabs",
+        );
         assert!(state.notice.as_deref().unwrap_or("").contains("saved"));
         handle_command(&mut state, &store, &engine_command_sender, "/memories");
         let listed = state.notice.as_deref().unwrap_or("");
         assert!(listed.contains("Use tabs"), "{listed}");
         assert!(listed.contains("project"), "{listed}");
 
-        let id = store.lock().unwrap().list_memories(&crate::memory::project_key(&state.thread.cwd)).unwrap()[0].id;
+        let id = store
+            .lock()
+            .unwrap()
+            .list_memories(&crate::memory::project_key(&state.thread.cwd))
+            .unwrap()[0]
+            .id;
         handle_command(
             &mut state,
             &store,
             &engine_command_sender,
             &format!("/memories remove {id}"),
         );
-        assert!(store.lock().unwrap().list_memories(&crate::memory::project_key(&state.thread.cwd)).unwrap().is_empty());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_memories(&crate::memory::project_key(&state.thread.cwd))
+            .unwrap()
+            .is_empty());
 
         handle_command(
             &mut state,
@@ -10985,7 +12106,11 @@ mod tests {
             &engine_command_sender,
             "/memories add --global Answer briefly",
         );
-        let memories = store.lock().unwrap().list_memories(&crate::memory::project_key(&state.thread.cwd)).unwrap();
+        let memories = store
+            .lock()
+            .unwrap()
+            .list_memories(&crate::memory::project_key(&state.thread.cwd))
+            .unwrap();
         assert_eq!(memories.len(), 1);
         assert_eq!(memories[0].scope, "global");
         assert_eq!(memories[0].text, "Answer briefly");
@@ -10996,7 +12121,12 @@ mod tests {
             &engine_command_sender,
             "/memories clear --global",
         );
-        assert!(store.lock().unwrap().list_memories(&crate::memory::project_key(&state.thread.cwd)).unwrap().is_empty());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_memories(&crate::memory::project_key(&state.thread.cwd))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -11021,7 +12151,10 @@ mod tests {
         }
         assert!(text.contains("paste a multi-line prompt"), "{text}");
         assert!(text.contains("typing during a turn steers it"), "{text}");
-        assert!(text.contains("enter on an empty composer sends the next queued message"), "{text}");
+        assert!(
+            text.contains("enter on an empty composer sends the next queued message"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -11029,7 +12162,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        assert!(composer_hint(&state).is_none(), "an idle composer stays quiet");
+        assert!(
+            composer_hint(&state).is_none(),
+            "an idle composer stays quiet"
+        );
 
         state.running = true;
         assert!(composer_hint(&state).unwrap().contains("enter steers"));
@@ -11040,10 +12176,15 @@ mod tests {
 
         state.orchestration_pending = false;
         enqueue_message(&mut state, &store, "later".into());
-        assert!(composer_hint(&state).unwrap().contains("enter sends the next queued message (1 waiting)"));
+        assert!(composer_hint(&state)
+            .unwrap()
+            .contains("enter sends the next queued message (1 waiting)"));
 
         let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
-        assert!(text.contains("enter sends the next queued message (1 waiting)"), "{text}");
+        assert!(
+            text.contains("enter sends the next queued message (1 waiting)"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -11069,7 +12210,12 @@ mod tests {
         let history = store.lock().unwrap().list_messages(&thread_id).unwrap();
         let mut state = test_state(home.path(), &store, history);
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        handle_command(&mut state, &store, &engine_command_sender, "/rewind --native");
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/rewind --native",
+        );
         assert!(matches!(
             state.overlay,
             Overlay::RewindPicker { native: true, .. }
@@ -11125,7 +12271,11 @@ mod tests {
         );
         assert!(!state.native_rewind_running);
         assert!(
-            state.notice.as_deref().unwrap_or("").contains("native rewind failed: boom"),
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("native rewind failed: boom"),
             "notice: {:?}",
             state.notice
         );
@@ -11158,8 +12308,12 @@ mod tests {
         let source_id = state.thread.id.clone();
         {
             let guard = store.lock().unwrap();
-            guard.set_thread_permission_mode(&source_id, PermissionMode::Plan).unwrap();
-            guard.set_thread_goal(&source_id, Some("fork goal"), false).unwrap();
+            guard
+                .set_thread_permission_mode(&source_id, PermissionMode::Plan)
+                .unwrap();
+            guard
+                .set_thread_goal(&source_id, Some("fork goal"), false)
+                .unwrap();
             guard
                 .add_message(&source_id, 1, "user", Some("claude"), None, "hello")
                 .unwrap();
@@ -11169,24 +12323,20 @@ mod tests {
         }
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        handle_command(
-            &mut state,
-            &store,
-            &engine_command_sender,
-            "/fork branched",
-        );
+        handle_command(&mut state, &store, &engine_command_sender, "/fork branched");
 
         assert_ne!(state.thread.id, source_id);
         assert_eq!(state.thread.title, "branched");
         assert_eq!(state.permission_mode, PermissionMode::Plan);
         assert_eq!(state.goal.as_deref(), Some("fork goal"));
         assert_eq!(state.history.len(), 2);
-        assert!(state
-            .notice
-            .as_deref()
-            .unwrap_or("")
-            .contains("forked"));
-        assert!(store.lock().unwrap().get_thread(&source_id).unwrap().is_some());
+        assert!(state.notice.as_deref().unwrap_or("").contains("forked"));
+        assert!(store
+            .lock()
+            .unwrap()
+            .get_thread(&source_id)
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -11253,30 +12403,74 @@ mod tests {
         let mut state = test_state(home.path(), &store, Vec::new());
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        submit(&mut state, &store, &engine_command_sender, "first prompt".to_string());
-        submit(&mut state, &store, &engine_command_sender, "second prompt".to_string());
+        submit(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "first prompt".to_string(),
+        );
+        submit(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "second prompt".to_string(),
+        );
         assert_eq!(
-            store.lock().unwrap().list_prompt_history(&state.thread.cwd).unwrap(),
+            store
+                .lock()
+                .unwrap()
+                .list_prompt_history(&state.thread.cwd)
+                .unwrap(),
             vec!["first prompt", "second prompt"],
             "submits persist to the project history"
         );
 
-        let key = |code: KeyCode| KeyEvent { code, modifiers: KeyModifiers::empty(), kind: KeyEventKind::Press, state: crossterm::event::KeyEventState::empty() };
+        let key = |code: KeyCode| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
         handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
-        assert_eq!(state.input, "second prompt", "Up on an empty composer recalls the newest prompt");
+        assert_eq!(
+            state.input, "second prompt",
+            "Up on an empty composer recalls the newest prompt"
+        );
         handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
         assert_eq!(state.input, "first prompt", "Up again walks back");
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
         assert_eq!(state.input, "second prompt", "Down walks forward");
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
-        assert_eq!(state.input, "", "Down past the newest returns to an empty composer");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        assert_eq!(
+            state.input, "",
+            "Down past the newest returns to an empty composer"
+        );
 
         // editing exits recall mode; Up then scrolls instead
         handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Char('x')));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('x')),
+        );
         let scrolled = state.scroll_offset;
         handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Up));
-        assert_eq!(state.scroll_offset, scrolled + 1, "Up with edited input scrolls the transcript");
+        assert_eq!(
+            state.scroll_offset,
+            scrolled + 1,
+            "Up with edited input scrolls the transcript"
+        );
     }
 
     fn sample_report(thread_id: Option<String>) -> RunReport {
@@ -11400,9 +12594,20 @@ mod tests {
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         {
             let guard = store.lock().unwrap();
-            for (id, goal) in [("run-active", "active goal"), ("run-archived", "archived goal")] {
+            for (id, goal) in [
+                ("run-active", "active goal"),
+                ("run-archived", "archived goal"),
+            ] {
                 guard
-                    .create_orchestration_run(id, goal, ProviderId::Codex, "model-1", None, "{}", false)
+                    .create_orchestration_run(
+                        id,
+                        goal,
+                        ProviderId::Codex,
+                        "model-1",
+                        None,
+                        "{}",
+                        false,
+                    )
                     .unwrap();
                 guard.finish_orchestration_run(id, "completed").unwrap();
             }
@@ -11459,7 +12664,11 @@ mod tests {
         );
         assert!(state.orchestration_report.is_none());
         assert!(
-            state.notice.as_deref().unwrap_or("").contains("archived run abcdef12"),
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("archived run abcdef12"),
             "notice: {:?}",
             state.notice
         );
@@ -11522,12 +12731,7 @@ mod tests {
             state.notice
         );
 
-        handle_command(
-            &mut state,
-            &store,
-            &engine_command_sender,
-            "/runs run-1234",
-        );
+        handle_command(&mut state, &store, &engine_command_sender, "/runs run-1234");
         let report = state.orchestration_report.as_ref().expect("report opened");
         assert_eq!(report.run_id, "run-12345678");
         assert_eq!(report.status, "completed");
@@ -11556,10 +12760,7 @@ mod tests {
     #[test]
     fn effective_permission_uses_the_provider_default_until_overridden() {
         assert_eq!(
-            effective_permission_mode(
-                PermissionMode::Default,
-                PermissionMode::BypassPermissions
-            ),
+            effective_permission_mode(PermissionMode::Default, PermissionMode::BypassPermissions),
             PermissionMode::BypassPermissions
         );
         assert_eq!(
@@ -11734,7 +12935,9 @@ mod tests {
         assert!(orchestrate::is_conversational_greeting("hi"));
         assert!(orchestrate::is_conversational_greeting(" hello! "));
         assert!(orchestrate::is_conversational_greeting("thanks."));
-        assert!(!orchestrate::is_conversational_greeting("hi, fix the tests"));
+        assert!(!orchestrate::is_conversational_greeting(
+            "hi, fix the tests"
+        ));
         assert!(!orchestrate::is_conversational_greeting("fix the bug"));
     }
 
@@ -11753,7 +12956,12 @@ mod tests {
         state.thread.cwd = repo.path().to_string_lossy().to_string();
         state.thread.session_mode = SessionMode::Orchestrate;
         let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        handle_command(&mut state, &store, &engine_command_sender, "/orchestrate hi");
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/orchestrate hi",
+        );
         assert!(!state.orchestration_pending);
         assert!(
             matches!(
@@ -11908,12 +13116,7 @@ mod tests {
         let mut state = test_state(home.path(), &store, Vec::new());
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         state.set_session_mode(&store, SessionMode::Orchestrate);
-        handle_command(
-            &mut state,
-            &store,
-            &engine_command_sender,
-            "/switch claude",
-        );
+        handle_command(&mut state, &store, &engine_command_sender, "/switch claude");
         assert_eq!(state.thread.session_mode, SessionMode::Single);
         assert_eq!(
             store
@@ -12076,14 +13279,40 @@ mod tests {
             state: crossterm::event::KeyEventState::empty(),
         };
 
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
         assert_eq!(state.orchestration_selected, 1);
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Down));
-        assert_eq!(state.orchestration_selected, 1, "selection stops at the last worker");
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::PageDown));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        assert_eq!(
+            state.orchestration_selected, 1,
+            "selection stops at the last worker"
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::PageDown),
+        );
         assert_eq!(state.orchestration_scroll, 10);
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
-        assert!(state.orchestration_report.is_none(), "esc closes the report");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(
+            state.orchestration_report.is_none(),
+            "esc closes the report"
+        );
         assert_eq!(state.orchestration_selected, 0);
         assert_eq!(state.orchestration_scroll, 0);
     }
@@ -12113,7 +13342,10 @@ mod tests {
         };
         handle_key(&mut state, &store, &engine_command_sender, enter);
         assert!(state.orchestration_report.is_none());
-        assert_eq!(state.thread.id, worker.id, "enter switches to the worker thread");
+        assert_eq!(
+            state.thread.id, worker.id,
+            "enter switches to the worker thread"
+        );
         assert_eq!(state.thread.current_provider, ProviderId::Codex);
     }
 
@@ -12172,7 +13404,10 @@ mod tests {
         let buffer = render_state(&state, 120, 30);
         let text = buffer_lines(&buffer).join("\n");
         assert!(text.contains("Orchestrating"), "{text}");
-        assert!(text.contains("[1] first task · codex/gpt-test · running"), "{text}");
+        assert!(
+            text.contains("[1] first task · codex/gpt-test · running"),
+            "{text}"
+        );
         assert!(text.contains("[2] second task"), "{text}");
         assert!(text.contains("failed · boom"), "{text}");
     }
@@ -12199,16 +13434,28 @@ mod tests {
         );
         assert!(state.orchestration_confirm_integrate);
         assert!(
-            state.notice.as_deref().unwrap_or("").contains("merge 1 worker"),
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("merge 1 worker"),
             "notice: {:?}",
             state.notice
         );
         let buffer = render_state(&state, 100, 30);
         assert!(buffer_lines(&buffer).join("\n").contains("enter confirms"));
 
-        handle_key(&mut state, &store, &engine_command_sender, key(KeyCode::Esc));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
         assert!(!state.orchestration_confirm_integrate);
-        assert!(state.orchestration_report.is_some(), "esc only cancels the merge");
+        assert!(
+            state.orchestration_report.is_some(),
+            "esc only cancels the merge"
+        );
     }
 
     #[test]
@@ -12226,7 +13473,11 @@ mod tests {
         assert!(!state.orchestration_confirm_integrate);
         assert!(state.orchestration_integrate_report.is_some());
         assert!(
-            state.notice.as_deref().unwrap_or("").contains("integration done"),
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("integration done"),
             "notice: {:?}",
             state.notice
         );
@@ -12360,7 +13611,10 @@ mod tests {
         state.orchestration_report = Some(report);
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(text.contains("needs_input"), "{text}");
-        assert!(text.contains("question: approve the worker change?"), "{text}");
+        assert!(
+            text.contains("question: approve the worker change?"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -12383,36 +13637,72 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let (engine_command_sender, mut engine_command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
         for text in ["first", "second", "third"] {
-            store.lock().unwrap().enqueue_message(&state.thread.id, text).unwrap();
+            store
+                .lock()
+                .unwrap()
+                .enqueue_message(&state.thread.id, text)
+                .unwrap();
         }
-        state.queued_messages = store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap();
+        state.queued_messages = store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap();
 
-        handle_command(&mut state, &store, &engine_command_sender, "/queue move 1 3");
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/queue move 1 3",
+        );
         assert_eq!(state.queued_messages, vec!["second", "third", "first"]);
         assert_eq!(
-            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
             vec!["second", "third", "first"],
             "the move is durable, not only in the state"
         );
 
-        handle_command(&mut state, &store, &engine_command_sender, "/queue edit 2 rewritten prompt");
-        assert_eq!(state.queued_messages, vec!["second", "rewritten prompt", "first"]);
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/queue edit 2 rewritten prompt",
+        );
         assert_eq!(
-            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            state.queued_messages,
+            vec!["second", "rewritten prompt", "first"]
+        );
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
             vec!["second", "rewritten prompt", "first"]
         );
 
         handle_command(&mut state, &store, &engine_command_sender, "/queue send 2");
         assert_eq!(state.queued_messages, vec!["second", "first"]);
-        let command = engine_command_receiver.try_recv().expect("send dispatches the item");
+        let command = engine_command_receiver
+            .try_recv()
+            .expect("send dispatches the item");
         match command {
             EngineCommand::Submit { text, .. } => assert_eq!(text, "rewritten prompt"),
             _ => panic!("expected a submit for the sent item"),
         }
         assert_eq!(
-            store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap(),
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
             vec!["second", "first"],
             "a sent item leaves the durable queue"
         );
@@ -12424,8 +13714,16 @@ mod tests {
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        store.lock().unwrap().enqueue_message(&state.thread.id, "only").unwrap();
-        state.queued_messages = store.lock().unwrap().list_queued_messages(&state.thread.id).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&state.thread.id, "only")
+            .unwrap();
+        state.queued_messages = store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap();
 
         handle_command(&mut state, &store, &engine_command_sender, "/queue send 9");
         assert_eq!(state.queued_messages, vec!["only"]);

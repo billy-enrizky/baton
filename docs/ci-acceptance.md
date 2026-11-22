@@ -73,6 +73,20 @@ That changes the optimization order. Sharding tests would move 32 seconds across
 
 A per-test harness is also visible: `tests/cli_bench.rs` spawns the binary twice and costs more than 35 core tests together, so it is a candidate to fold into an existing binary rather than a shard.
 
+## Rejected: smaller test debug info
+
+PR #117 set `[profile.test] debug = "line-tables-only"`. Measured locally on a cold target it looked promising: 65.3 user seconds and a 1.0 GB target against 72.9 and 1.2 GB, and `debug = false` reached 60.9 and 821 MB.
+
+On the runner it moved nothing: test job 160 s and 163 s across two runs, against a 155 to 171 s band on `main`. The PR was closed unmerged rather than keeping a setting whose benefit could not be shown. Local CPU time was the wrong proxy; the job is not bound by that slice.
+
+## Cache behaviour
+
+The test job restores a 157 MB cache in about a second, reported as `full match: false`, which means it is a restore-key prefix match rather than the exact key. Dependencies are therefore mostly present and the remaining time is the crate's own compile and the linking of nine test binaries.
+
+That points at two unmeasured candidates, in order:
+1. Fewer test binaries. Nine links of one large crate is a structural cost that sharding cannot remove.
+2. A larger runner. Standard hosted is four vCPU; a bigger runner is an owner decision with a monthly cost, so it needs the first candidate measured before it is worth asking for.
+
 The target is 60s median and 120s p95. The gap is the test job, which compiles the suite and then runs it, and the compile is repeated in Check, Build, and Debt. Optimization order: record per-test-binary times, shard from that data, then look at sharing compilation between jobs.
 
 That is the first recorded Actions observation. It proves the workflow file parses and schedules every job. No step ran, so it is not evidence about any gate.

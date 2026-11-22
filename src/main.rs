@@ -1,7 +1,7 @@
 use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -687,6 +687,18 @@ fn main_result(started: Instant) -> Result<()> {
                 );
             }
             Ok(())
+        }
+        cli::Commands::Completions { shell } => {
+            let mut command = cli::Cli::command();
+            let mut output = Vec::new();
+            clap_complete::generate(shell, &mut command, "baton", &mut output);
+            if let Err(error) = std::io::stdout().write_all(&output) {
+                if error.kind() == std::io::ErrorKind::BrokenPipe {
+                    return Ok(());
+                }
+                return Err(error.into());
+            }
+            return Ok(());
         }
         cli::Commands::New { title } => {
             let store = BatonStore::open(&paths::baton_db_path())?;

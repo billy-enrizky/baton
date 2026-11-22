@@ -117,6 +117,12 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Print a shell completion script
+    Completions {
+        /// Shell to generate for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Start a new thread with a title
     New {
         title: Vec<String>,
@@ -431,6 +437,29 @@ mod tests {
             Some(Commands::Inbox { json: true }) => {}
             _ => panic!("expected inbox"),
         }
+    }
+
+    #[test]
+    fn completions_accept_every_supported_shell() {
+        use clap::CommandFactory;
+
+        for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+            let cli = Cli::try_parse_from(["baton", "completions", shell]).unwrap();
+            assert!(
+                matches!(cli.command, Some(Commands::Completions { .. })),
+                "expected completions for {shell}"
+            );
+        }
+        let mut command = Cli::command();
+        let mut output = Vec::new();
+        clap_complete::generate(
+            clap_complete::Shell::Bash,
+            &mut command,
+            "baton",
+            &mut output,
+        );
+        let output = String::from_utf8(output).unwrap();
+        assert!(output.contains("baton"), "completion script is not empty");
     }
 
     #[test]

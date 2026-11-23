@@ -237,18 +237,14 @@ jobs:
         id: rustup-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ~/.rustup
-          key: rustup-1.100.0-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
+          path: |
+            ~/.rustup/toolchains/1.100.0-*
+            ~/.rustup/update-hashes/1.100.0-*
+          key: rustup-min-1.100.0-${{ runner.os }}-${{ runner.arch }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
-      - name: Save Rust toolchain cache
-        if: github.ref == 'refs/heads/main' && steps.rustup-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
@@ -312,18 +308,14 @@ jobs:
         id: rustup-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ~/.rustup
-          key: rustup-1.100.0-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
+          path: |
+            ~/.rustup/toolchains/1.100.0-*
+            ~/.rustup/update-hashes/1.100.0-*
+          key: rustup-min-1.100.0-${{ runner.os }}-${{ runner.arch }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
-      - name: Save Rust toolchain cache
-        if: github.ref == 'refs/heads/main' && steps.rustup-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
@@ -390,17 +382,21 @@ jobs:
         id: rustup-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ~/.rustup
-          key: rustup-1.100.0-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
+          path: |
+            ~/.rustup/toolchains/1.100.0-*
+            ~/.rustup/update-hashes/1.100.0-*
+          key: rustup-min-1.100.0-${{ runner.os }}-${{ runner.arch }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
       - name: Save Rust toolchain cache
-        if: github.ref == 'refs/heads/main' && steps.rustup-cache.outputs.cache-hit != 'true'
+        if: github.job == 'test' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && steps.rustup-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ~/.rustup
+          path: |
+            ~/.rustup/toolchains/1.100.0-*
+            ~/.rustup/update-hashes/1.100.0-*
           key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
@@ -488,18 +484,22 @@ jobs:
         id: rustup-cache
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ~/.rustup
-          key: rustup-1.100.0-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
+          path: |
+            ~/.rustup/toolchains/1.100.0-*
+            ~/.rustup/update-hashes/1.100.0-*
+          key: rustup-lint-1.100.0-${{ runner.os }}-${{ runner.arch }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
           components: rustfmt, clippy
       - name: Save Rust toolchain cache
-        if: github.ref == 'refs/heads/main' && steps.rustup-cache.outputs.cache-hit != 'true'
+        if: github.job == 'debt' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && steps.rustup-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
-          path: ~/.rustup
+          path: |
+            ~/.rustup/toolchains/1.100.0-*
+            ~/.rustup/update-hashes/1.100.0-*
           key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0

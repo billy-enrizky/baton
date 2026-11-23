@@ -879,7 +879,11 @@ async fn execute_turn(
             intro,
         );
     }
-    prompt = crate::skill_dispatch::prompt_for_provider_from(provider, &prompt, Some(&prompt_text));
+    prompt = crate::skill_dispatch::prompt_for_provider_from(
+        provider,
+        &prompt,
+        Some(crate::skill_dispatch::current_message(&prompt_text)),
+    );
 
     let cwd_for_checkpoint = cwd.clone();
     let input = TurnStartInput {

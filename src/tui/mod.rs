@@ -5570,7 +5570,7 @@ fn handoff_preview(
     let payload = crate::skill_dispatch::prompt_for_provider_from(
         state.thread.current_provider,
         &payload,
-        Some(text),
+        Some(crate::skill_dispatch::current_message(text)),
     );
     Some(HandoffPrompt {
         prompt: text.to_string(),
@@ -8975,9 +8975,9 @@ fn draw_skills_picker(
     skills: &[(String, String)],
     selected: usize,
 ) {
-    let visible = 8;
+    let visible = (area.height.saturating_sub(3) as usize).min(8);
     let selected = selected.min(skills.len().saturating_sub(1));
-    let start = if skills.len() <= visible {
+    let start = if visible == 0 || skills.len() <= visible {
         0
     } else {
         selected
@@ -14584,6 +14584,22 @@ mod tests {
             Overlay::SkillsPicker { selected, .. } => assert_eq!(selected, 0),
             _ => panic!("expected skills picker"),
         }
+    }
+
+    #[test]
+    fn skills_picker_visible_window_fits_a_short_terminal() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::SkillsPicker {
+            selected: 9,
+            skills: (0..10)
+                .map(|index| (format!("skill-{index}"), "codex".into()))
+                .collect(),
+        };
+        let text = buffer_lines(&render_state(&state, 80, 16)).join("\n");
+        assert!(text.contains("skill-9 (codex)"), "{text}");
+        assert_eq!(text.lines().filter(|line| line.contains('❯')).count(), 1);
     }
 
     #[test]

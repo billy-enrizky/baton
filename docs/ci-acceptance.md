@@ -68,6 +68,7 @@ The test profile now keeps line tables and drops full debuginfo. The Cargo cache
 | [45111377033](https://github.com/billy-enrizky/baton/actions/runs/45111377033) | workflow_dispatch | warm cache, unchanged Rust source | 51 seconds | 5 seconds | 32 seconds | Test step reused the Baton artifacts; descriptive only |
 | [45115234795](https://github.com/billy-enrizky/baton/actions/runs/45115234795) | workflow_dispatch | warm cache, head tools | 53 seconds | 6 seconds | 33 seconds | Post-merge proof path; merged self-test, workflow guard, required commands, and budgets all passed |
 | [45117405274](https://github.com/billy-enrizky/baton/actions/runs/45117405274) | workflow_dispatch | warm cache, head tools | 62 seconds | 7 seconds | 48 seconds | Slower runner repeat; 5-second setup, 5-second checkout, 8-second toolchain restore, 7-second Cargo restore; all checks passed |
+| [45119247835](https://github.com/billy-enrizky/baton/actions/runs/45119247835) | workflow_dispatch | warm cache, head tools | 48 seconds | 5 seconds | 32 seconds | Final head-tools run; debt self-test passed, Clippy debt 61 <= 61, all gates green |
 | [45111201206](https://github.com/billy-enrizky/baton/actions/runs/45111201206) | pull_request | cold after profile change | 85 seconds | 5 seconds | 71 seconds | Pull-request cache did not inherit the branch cache; Selection failed at the expected CI013 workflow comparison |
 
 The 51-second run is the critical-path proof for this slice. It is not counted as a PR p50 sample because it is a dispatch. The 53-second head-tools branch dispatch proves the merged scripts and required-command enforcement on a branch; the first main push and the first post-merge pull request are still the acceptance samples.
@@ -238,6 +239,8 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Fast classifier warm path | Branch dispatch 45114396442 with a forced Rust rebuild: 51 seconds, Changes complete at 6 seconds, Test 35 seconds | Passed 2026-11-23; post-merge PR sample pending |
 | Head-tools branch proof | Branch dispatch 45115234795: 53 seconds, Selection 12 seconds, merged self-test and workflow guard passed | Passed 2026-11-23; main-push proof pending |
 | Head-tools repeat | Branch dispatch 45117405274: 62 seconds, no skipped checks, slower setup and cache steps | Passed 2026-11-23; recorded without exclusion |
+| Head-tools final dispatch | Branch dispatch 45119247835: 48 seconds, Debt ratchet 32 seconds, debt self-test passed, Clippy debt 61 <= 61 | Passed 2026-11-23 |
+| Clippy ratchet color and count | `CARGO_TERM_COLOR=never` in the ratchet; compiler summary lines excluded; one-lint fixture passes a one-entry baseline | Passed locally and in 45119247835 |
 
 ## v0.4.0 release assets
 

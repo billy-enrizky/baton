@@ -55,6 +55,8 @@ def main() -> int:
     )
     editor.chmod(0o755)
     subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
+    (Path(workdir) / ".git" / "info" / "exclude").write_text(".env\n")
+    (Path(workdir) / ".env").write_text("IGNORED_MARKER=present\n")
     evidence = Path(args.evidence_dir) / f"slash-probe-{int(time.time())}"
     evidence.mkdir(parents=True, exist_ok=True)
     pid, master = pty.fork()
@@ -136,9 +138,32 @@ def main() -> int:
         os.write(master, b"/files ")
         pump(master, 0.5, transcript)
         files_hint = screen_text(transcript, args.width, args.height)
-        if "files [query]" not in files_hint:
-            missing.append("/files <query> hint")
+        if "files [--ignored] [query]" not in files_hint:
+            missing.append("/files [--ignored] [query] hint")
         (evidence / "files-hint-screen.txt").write_text(files_hint + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/files --")
+        pump(master, 0.5, transcript)
+        files_flags = screen_text(transcript, args.width, args.height)
+        if "/files --ignored" not in files_flags:
+            missing.append("/files --ignored completion")
+        (evidence / "files-flags-screen.txt").write_text(files_flags + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/files --ignored env\r")
+        pump(master, 1.5, transcript)
+        ignored_picker = screen_text(transcript, args.width, args.height)
+        ignored_required = [
+            'files --ignored matching "env"',
+            "ignored files included",
+        ]
+        missing.extend(value for value in ignored_required if value not in ignored_picker)
+        if not any("❯ .env" in line for line in ignored_picker.splitlines()):
+            missing.append("ignored .env row")
+        (evidence / "files-ignored-screen.txt").write_text(ignored_picker + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
@@ -219,9 +244,24 @@ def main() -> int:
         os.write(master, b"/grep ")
         pump(master, 0.5, transcript)
         grep_hint = screen_text(transcript, args.width, args.height)
-        if "grep [--case] [--word] [--regex] <query>" not in grep_hint:
+        if "grep [--case|--case-sensitive] [--word] [--regex] <query>" not in grep_hint:
             missing.append("/grep usage hint")
         (evidence / "grep-hint-screen.txt").write_text(grep_hint + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/grep --")
+        pump(master, 0.5, transcript)
+        grep_flags = screen_text(transcript, args.width, args.height)
+        for flag in [
+            "/grep --case",
+            "/grep --case-sensitive",
+            "/grep --word",
+            "/grep --regex",
+        ]:
+            if flag not in grep_flags:
+                missing.append(f"{flag} completion")
+        (evidence / "grep-flags-screen.txt").write_text(grep_flags + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 

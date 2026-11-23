@@ -165,7 +165,7 @@ Type what you want to do. Baton picks a harness.
 Common
   /switch <provider> [model]  use one harness
   /model                      choose a model
-  /files [query][:line]       insert a project path or path:line
+  /files [--ignored] [query][:line]  insert a project path or path:line
   /grep [flags] <query>       insert a content match as path:line
   /new                        start a new thread
   /threads                    list threads here
@@ -649,6 +649,7 @@ pub struct TuiState {
     files_picker_sender: std::sync::mpsc::Sender<FilesPickerEvent>,
     files_picker_receiver: std::sync::mpsc::Receiver<FilesPickerEvent>,
     files_picker_request: u64,
+    files_picker_include_ignored: bool,
     pending_editor_open: Option<PendingEditorOpen>,
     grep_picker_sender: std::sync::mpsc::Sender<GrepPickerEvent>,
     grep_picker_receiver: std::sync::mpsc::Receiver<GrepPickerEvent>,
@@ -761,6 +762,7 @@ pub fn run_tui(
         files_picker_sender,
         files_picker_receiver,
         files_picker_request: 0,
+        files_picker_include_ignored: false,
         pending_editor_open: None,
         grep_picker_sender,
         grep_picker_receiver,
@@ -2574,8 +2576,8 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/fork", _) => Some("fork [--turn N] [title]"),
         ("/worktree", _) => Some("worktree [title]"),
         ("/open", _) => Some("open <thread id prefix>"),
-        ("/files", _) => Some("files [query] [:<line>]"),
-        ("/grep", _) => Some("grep [--case] [--word] [--regex] <query>"),
+        ("/files", _) => Some("files [--ignored] [query] [:<line>]"),
+        ("/grep", _) => Some("grep [--case|--case-sensitive] [--word] [--regex] <query>"),
         ("/pin", "move") => Some("pin move <id> up or down"),
         ("/review", _) => Some("review [turn]"),
         ("/diff", _) => Some("diff [turn]"),
@@ -2679,6 +2681,30 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
         "/goal" => {
             for action in ["pause", "resume", "clear"] {
                 push_suggestion(&mut suggestions, command, action, format!("goal {action}"));
+            }
+        }
+        "/files" => {
+            let rest = state.input.strip_prefix("/files ").unwrap_or_default();
+            if rest.starts_with('-') {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    "--ignored",
+                    "include gitignored files; build output and secrets can appear",
+                );
+            }
+        }
+        "/grep" => {
+            let rest = state.input.strip_prefix("/grep ").unwrap_or_default();
+            if rest.starts_with('-') {
+                for (flag, description) in [
+                    ("--case", "match case exactly"),
+                    ("--case-sensitive", "match case exactly"),
+                    ("--word", "match whole words"),
+                    ("--regex", "treat the query as a regex"),
+                ] {
+                    push_suggestion(&mut suggestions, command, flag, description);
+                }
             }
         }
         "/memories" => {
@@ -4433,7 +4459,12 @@ fn apply_grep_picker_event(state: &mut TuiState, event: GrepPickerEvent) {
     match result {
         Ok(listing) if listing.matches.is_empty() => {
             state.overlay = Overlay::None;
-            state.notice = Some(format!("grep: no matches for \"{base_query}\""));
+            state.notice = Some(
+                crate::sanitize::sanitize_terminal_text(&format!(
+                    "grep: no matches for \"{base_query}\""
+                ))
+                .into_owned(),
+            );
         }
         Ok(listing) => {
             let filtered = grep_filter_indices(&listing.matches, &query);
@@ -4453,7 +4484,9 @@ fn apply_grep_picker_event(state: &mut TuiState, event: GrepPickerEvent) {
         }
         Err(error) => {
             state.overlay = Overlay::None;
-            state.notice = Some(format!("grep: {error}"));
+            state.notice = Some(
+                crate::sanitize::sanitize_terminal_text(&format!("grep: {error}")).into_owned(),
+            );
         }
     }
 }
@@ -4482,11 +4515,21 @@ fn apply_files_picker_event(state: &mut TuiState, event: FilesPickerEvent) {
             let line_note = line
                 .map(|line| format!(" (line {line})"))
                 .unwrap_or_default();
-            state.notice = Some(if base_query.is_empty() {
-                "files: no files here · caches and build output are pruned".to_string()
+            let surface = if state.files_picker_include_ignored {
+                "files --ignored"
             } else {
-                format!("files: no matches for \"{base_query}\"{line_note}")
-            });
+                "files"
+            };
+            let notice = if base_query.is_empty() {
+                if state.files_picker_include_ignored {
+                    format!("{surface}: no files here · cache directories are still pruned")
+                } else {
+                    format!("{surface}: no files here · caches and build output are pruned")
+                }
+            } else {
+                format!("{surface}: no matches for \"{base_query}\"{line_note}")
+            };
+            state.notice = Some(crate::sanitize::sanitize_terminal_text(&notice).into_owned());
         }
         Ok(listing) => {
             let filtered = files_filter_indices(&listing.files, &filter, &recent);
@@ -4506,7 +4549,9 @@ fn apply_files_picker_event(state: &mut TuiState, event: FilesPickerEvent) {
         }
         Err(error) => {
             state.overlay = Overlay::None;
-            state.notice = Some(format!("files: {error}"));
+            state.notice = Some(
+                crate::sanitize::sanitize_terminal_text(&format!("files: {error}")).into_owned(),
+            );
         }
     }
 }
@@ -7058,16 +7103,26 @@ fn handle_command(
             }
         }
         "/files" => {
-            if args.iter().any(|arg| arg == "--ignored") {
-                state.notice = Some(
-                    "/files lists nonignored files; use `baton files --ignored` for ignored paths"
-                        .to_string(),
-                );
-                return;
+            let mut include_ignored = false;
+            let mut terms = Vec::new();
+            for arg in &args {
+                match arg.as_str() {
+                    "--ignored" => include_ignored = true,
+                    flag if flag.starts_with("--") => {
+                        state.overlay = Overlay::None;
+                        let flag = crate::sanitize::sanitize_terminal_text(flag);
+                        state.notice = Some(format!(
+                            "files: unknown flag {flag} · /files [--ignored] [query] [:<line>]"
+                        ));
+                        return;
+                    }
+                    _ => terms.push(arg.clone()),
+                }
             }
-            let (base_query, line) = split_line_target(&args.join(" "));
+            let (base_query, line) = split_line_target(&terms.join(" "));
             let request = state.files_picker_request + 1;
             state.files_picker_request = request;
+            state.files_picker_include_ignored = include_ignored;
             let project = crate::files::recent_project_key(&state.thread.cwd);
             let recent = store
                 .lock()
@@ -7093,7 +7148,7 @@ fn handle_command(
                 let options = crate::files::FileOptions {
                     query: (!base_query.is_empty()).then_some(base_query.as_str()),
                     limit: FILES_PICKER_LIMIT,
-                    include_ignored: false,
+                    include_ignored,
                     recent: &recent,
                 };
                 let result = crate::files::list_files(std::path::Path::new(&cwd), options)
@@ -7117,8 +7172,9 @@ fn handle_command(
                     "--regex" => regex = true,
                     flag if flag.starts_with("--") => {
                         state.overlay = Overlay::None;
+                        let flag = crate::sanitize::sanitize_terminal_text(flag);
                         state.notice = Some(format!(
-                            "grep: unknown flag {flag} · /grep [--case] [--word] [--regex] <query>"
+                            "grep: unknown flag {flag} · /grep [--case|--case-sensitive] [--word] [--regex] <query>"
                         ));
                         return;
                     }
@@ -7128,7 +7184,9 @@ fn handle_command(
             let base_query = terms.join(" ").trim().to_string();
             if base_query.is_empty() {
                 state.overlay = Overlay::None;
-                state.notice = Some("grep: /grep [--case] [--word] [--regex] <query>".to_string());
+                state.notice = Some(
+                    "grep: /grep [--case|--case-sensitive] [--word] [--regex] <query>".to_string(),
+                );
                 return;
             }
             let request = state.grep_picker_request + 1;
@@ -8181,9 +8239,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 filtered, loading, ..
             } => {
                 if *loading {
-                    6
+                    6 + usize::from(state.files_picker_include_ignored)
                 } else {
-                    filtered.len().min(8) + 5
+                    filtered.len().min(8) + 5 + usize::from(state.files_picker_include_ignored)
                 }
             }
             Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
@@ -8322,6 +8380,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                     query,
                     base_query,
                     line: *line,
+                    include_ignored: state.files_picker_include_ignored,
                     truncated: *truncated,
                     loading: *loading,
                     spinner: spinner_frame,
@@ -9228,6 +9287,7 @@ struct FilesPickerView<'a> {
     query: &'a str,
     base_query: &'a str,
     line: Option<u64>,
+    include_ignored: bool,
     truncated: bool,
     loading: bool,
     spinner: usize,
@@ -9241,6 +9301,7 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
         query,
         base_query,
         line,
+        include_ignored,
         truncated,
         loading,
         spinner,
@@ -9260,23 +9321,28 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
     } else {
         format!(" · filter \"{filter}\"")
     };
+    let mode = if include_ignored { " --ignored" } else { "" };
+    let warning = "ignored files included · build output and secrets such as .env can appear";
     if loading {
         let spinner = SPINNER_FRAMES[spinner % SPINNER_FRAMES.len()];
         let line_label = line
             .map(|line| format!(" · line {line}"))
             .unwrap_or_default();
         let heading = if base_query.is_empty() {
-            format!("files{filter_label}{line_label} · loading {spinner}")
+            format!("files{mode}{filter_label}{line_label} · loading {spinner}")
         } else {
-            format!("files matching \"{base_query}\"{filter_label}{line_label} · loading {spinner}")
+            format!("files{mode} matching \"{base_query}\"{filter_label}{line_label} · loading {spinner}")
         };
-        let lines = vec![
+        let mut lines = vec![
             Line::styled(heading, Style::default().fg(COLORS.muted)),
             Line::styled(
                 "scanning the project directory · esc closes",
                 Style::default().fg(COLORS.muted),
             ),
         ];
+        if include_ignored {
+            lines.push(Line::styled(warning, Style::default().fg(COLORS.warning)));
+        }
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(COLORS.border));
@@ -9284,9 +9350,9 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
         return;
     }
     let scope = if base_query.is_empty() {
-        "files".to_string()
+        format!("files{mode}")
     } else {
-        format!("files matching \"{base_query}\"")
+        format!("files{mode} matching \"{base_query}\"")
     };
     let count = if filtered.is_empty() && !filter.is_empty() {
         "no matches".to_string()
@@ -9303,6 +9369,9 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
         .unwrap_or_default();
     let heading = format!("{scope}{filter_label}{line_label} · {count} · {action}");
     let mut lines: Vec<Line> = vec![Line::styled(heading, Style::default().fg(COLORS.muted))];
+    if include_ignored {
+        lines.push(Line::styled(warning, Style::default().fg(COLORS.warning)));
+    }
     let visible = 8;
     if filtered.is_empty() {
         let empty = if truncated {
@@ -9334,11 +9403,16 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
         }
     }
     let hint = if truncated {
-        "inventory capped at 20,001 · rerun /files <query> to search the full tree"
+        let rerun = if include_ignored {
+            "/files --ignored <query>"
+        } else {
+            "/files <query>"
+        };
+        format!("inventory capped at 20,001 · rerun {rerun} to search the full tree")
     } else if filter.is_empty() {
-        "type to filter · esc close"
+        "type to filter · esc close".to_string()
     } else {
-        "type to narrow · backspace edits · esc clears"
+        "type to narrow · backspace edits · esc clears".to_string()
     };
     lines.push(Line::styled(hint, Style::default().fg(COLORS.muted)));
     let block = Block::default()
@@ -10775,6 +10849,7 @@ mod tests {
             files_picker_sender,
             files_picker_receiver,
             files_picker_request: 0,
+            files_picker_include_ignored: false,
             pending_editor_open: None,
             grep_picker_sender,
             grep_picker_receiver,
@@ -10835,6 +10910,30 @@ mod tests {
             .map(|suggestion| suggestion.insert)
             .collect::<Vec<_>>();
         assert_eq!(efforts, vec!["/effort high".to_string()]);
+
+        state.input = "/files ".to_string();
+        assert!(suggestions_for(&state).is_empty());
+        state.input = "/grep ".to_string();
+        assert!(suggestions_for(&state).is_empty());
+
+        state.input = "/files --".to_string();
+        let files = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .collect::<Vec<_>>();
+        assert!(files.contains(&"/files --ignored".to_string()), "{files:?}");
+
+        state.input = "/grep --".to_string();
+        let grep = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .collect::<Vec<_>>();
+        for flag in ["--case", "--case-sensitive", "--word", "--regex"] {
+            assert!(
+                grep.contains(&format!("/grep {flag}")),
+                "missing {flag}: {grep:?}"
+            );
+        }
     }
 
     #[test]
@@ -16116,6 +16215,18 @@ mod tests {
             "{:?}",
             state.notice
         );
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/grep --bad\u{1b}]0;spoof\u{7} alpha",
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("unknown flag"), "{notice:?}");
+        assert!(!notice.contains('\u{1b}'), "{notice:?}");
+        assert!(!notice.contains('\u{7}'), "{notice:?}");
     }
 
     #[test]
@@ -17433,20 +17544,116 @@ mod tests {
         assert!(text.contains("filter \"parse\""), "{text}");
         assert!(text.contains("inventory capped at 20,001"), "{text}");
         assert!(text.contains("rerun /files <query>"), "{text}");
+        assert!(!text.contains("rerun /files --ignored <query>"), "{text}");
+
+        state.files_picker_include_ignored = true;
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("rerun /files --ignored <query>"), "{text}");
     }
 
     #[test]
-    fn files_picker_rejects_the_ignored_flag_with_a_hint() {
+    fn files_picker_loads_ignored_files_with_a_warning() {
         let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[
+            ("src/parser.rs", "fn parse() {}\n"),
+            (".gitignore", ".env\n"),
+            (".env", "TOKEN=secret\n"),
+        ]);
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
         let (engine_command_sender, _engine_command_receiver) =
             tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/files env");
+        finish_files_picker_load(&mut state);
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("no matches for \"env\""),
+            "{:?}",
+            state.notice
+        );
+
         handle_command(
             &mut state,
             &store,
             &engine_command_sender,
-            "/files --ignored",
+            "/files --ignored env",
+        );
+        finish_files_picker_load(&mut state);
+        assert!(state.files_picker_include_ignored);
+        match &state.overlay {
+            Overlay::FilesPicker { entries, .. } => {
+                assert!(
+                    entries.iter().any(|entry| entry == ".env"),
+                    "ignored files must be listed: {entries:?}"
+                );
+            }
+            _ => panic!("expected the ignored files picker"),
+        }
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(text.contains("files --ignored matching \"env\""), "{text}");
+        assert!(text.contains("ignored files included"), "{text}");
+        assert!(text.contains("secrets such as .env"), "{text}");
+        assert!(text.contains(".env"), "{text}");
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/files --bad\u{1b}]0;spoof\u{7}",
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("unknown flag"), "{notice:?}");
+        assert!(!notice.contains('\u{1b}'), "{notice:?}");
+        assert!(!notice.contains('\u{7}'), "{notice:?}");
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/files --ignored absent\u{1b}]0;spoof\u{7}",
+        );
+        finish_files_picker_load(&mut state);
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("files --ignored: no matches for"),
+            "{notice:?}"
+        );
+        assert!(!notice.contains('\u{1b}'), "{notice:?}");
+        assert!(!notice.contains('\u{7}'), "{notice:?}");
+
+        state.files_picker_include_ignored = true;
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: Vec::new(),
+            filtered: Vec::new(),
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: true,
+            request: 42,
+        };
+        apply_files_picker_event(
+            &mut state,
+            FilesPickerEvent::Loaded {
+                request: 42,
+                base_query: String::new(),
+                result: Ok(crate::files::FileListing {
+                    files: Vec::new(),
+                    truncated: false,
+                    capped: false,
+                }),
+            },
         );
         assert!(matches!(state.overlay, Overlay::None));
         assert!(
@@ -17454,7 +17661,7 @@ mod tests {
                 .notice
                 .as_deref()
                 .unwrap_or("")
-                .contains("baton files --ignored"),
+                .contains("files --ignored: no files here · cache directories are still pruned"),
             "{:?}",
             state.notice
         );

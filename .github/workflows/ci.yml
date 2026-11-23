@@ -29,86 +29,59 @@ jobs:
       has_tests: ${{ steps.classify.outputs.has_tests }}
       docs_only: ${{ steps.classify.outputs.docs_only }}
     steps:
-      - name: Checkout head
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-      - name: Resolve trusted base ref
-        id: base
-        run: |
-          set -euo pipefail
-          ref='${{ github.event.pull_request.base.sha }}'
-          if [ -z "$ref" ]; then ref='${{ github.event.merge_group.base_sha }}'; fi
-          if [ -z "$ref" ]; then ref='${{ github.event.before }}'; fi
-          if [ -z "$ref" ] || [ "$ref" = "0000000000000000000000000000000000000000" ]; then
-            ref=$(git rev-parse HEAD~1)
-          fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-      - name: Checkout trusted base tools
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          ref: ${{ steps.base.outputs.ref }}
-          fetch-depth: 1
-          path: base
-          persist-credentials: false
-          sparse-checkout: |
-            /ci/
-            /.github/workflows/
-            /rust-toolchain.toml
-          sparse-checkout-cone-mode: false
-      - name: Stage trusted tools
-        run: |
-          set -euo pipefail
-          dest="$RUNNER_TEMP/trusted-ci"
-          rm -rf "$dest"
-          cp -R base/ci "$dest"
-          chmod -R a-w "$dest"
-          (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
       - name: Classify changed paths
         id: classify
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 30 "$RUNNER_TEMP/trusted-ci/classify-paths.sh" --event '${{ github.event_name }}' . base | tee -a "$GITHUB_OUTPUT"
-      - name: Self-test trusted CI tools
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/selftest.sh" --quick
-      - name: Validate workflow invariants
-        run: |
-          set -euo pipefail
-          if [ -f base/.github/workflows/ci.yml ]; then
-            if [ '${{ github.event_name }}' = "pull_request" ]; then
-              "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/check-ci.sh" --base base/.github/workflows/ci.yml .github/workflows/ci.yml
-            else
-              "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/check-ci.sh" --base base/.github/workflows/ci.yml .github/workflows/ci.yml --allow-change
-            fi
-          else
-            "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/check-ci.sh" --bootstrap .github/workflows/ci.yml
+          dest="$RUNNER_TEMP/classify"
+          mkdir -p "$dest"
+          emit_full() {
+            printf '%s\n' \
+              'build_needed=true' \
+              'check_needed=true' \
+              'debt_needed=true' \
+              'docs_only=false' \
+              "full_suite_reason=$1" \
+              'has_tests=true' \
+              'test_needed=true'
+          }
+          if [ '${{ github.event_name }}' != "pull_request" ]; then
+            reason='${{ github.event_name }}'
+            case "$reason" in
+              push|merge_group|workflow_dispatch) ;;
+              *) reason=unknown ;;
+            esac
+            emit_full "$reason" | tee -a "$GITHUB_OUTPUT"
+            exit 0
           fi
-      - name: Validate gate integrity
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/gate-integrity.sh" .
-      - name: Baselines may only tighten
-        run: |
-          set -euo pipefail
-          fail() {
-            echo "::error::$*" >&2
-            exit 1
-          }
-          number() {
-            tr -dc '0-9' < "$1"
-          }
-          head_fmt=$(number ci/fmt-baseline.txt)
-          base_fmt=$(number base/ci/fmt-baseline.txt)
-          [ "$head_fmt" -le "$base_fmt" ] || fail "fmt baseline grew from $base_fmt to $head_fmt"
-          head_clippy=$(number ci/clippy-baseline.txt)
-          base_clippy=$(number base/ci/clippy-baseline.txt)
-          [ "$head_clippy" -le "$base_clippy" ] || fail "clippy baseline grew from $base_clippy to $head_clippy"
-          head_floor=$(number ci/test-inventory-floor.txt)
-          base_floor=$(number base/ci/test-inventory-floor.txt)
-          [ "$head_floor" -ge "$base_floor" ] || fail "test inventory floor fell from $base_floor to $head_floor"
+          base='${{ github.event.pull_request.base.sha }}'
+          pr='${{ github.event.pull_request.number }}'
+          git init --quiet "$dest/repo"
+          git -C "$dest/repo" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
+          if ! git -C "$dest/repo" fetch --no-tags --quiet --depth=1 origin "$base" "refs/pull/$pr/merge:refs/remotes/pull/merge"; then
+            echo "trusted commits are unavailable; selecting every gate" >&2
+            emit_full unknown | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git -C "$dest/repo" diff --name-only --no-renames --diff-filter=ACDMRT "$base" refs/remotes/pull/merge > "$dest/files.txt"; then
+            echo "changed files are unavailable; selecting every gate" >&2
+            emit_full unknown | tee -a "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for name in budget.sh classify-paths.sh; do
+            if ! git -C "$dest/repo" show "${base}:ci/$name" > "$dest/$name"; then
+              echo "trusted $name is unavailable; selecting every gate" >&2
+              emit_full unknown | tee -a "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            chmod +x "$dest/$name"
+          done
+          if "$dest/budget.sh" 30 "$dest/classify-paths.sh" --files "$dest/files.txt" . . > "$dest/selection.txt"; then
+            cat "$dest/selection.txt" >> "$GITHUB_OUTPUT"
+          else
+            echo "classification failed; selecting every gate" >&2
+            emit_full unknown | tee -a "$GITHUB_OUTPUT"
+          fi
 
   selection:
     name: Selection guard
@@ -149,13 +122,40 @@ jobs:
           set -euo pipefail
           dest="$RUNNER_TEMP/trusted-ci"
           rm -rf "$dest"
-          cp -R base/ci "$dest"
+          if [ '${{ github.event_name }}' = "push" ] || [ '${{ github.event_name }}' = "workflow_dispatch" ]; then
+            cp -R ci "$dest"
+          else
+            cp -R base/ci "$dest"
+          fi
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
+      - name: Validate gate integrity
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/gate-integrity.sh" .
       - name: Full self-test trusted CI tools
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/selftest.sh"
+      - name: Baselines may only tighten
+        run: |
+          set -euo pipefail
+          fail() {
+            echo "::error::$*" >&2
+            exit 1
+          }
+          number() {
+            tr -dc '0-9' < "$1"
+          }
+          head_fmt=$(number ci/fmt-baseline.txt)
+          base_fmt=$(number base/ci/fmt-baseline.txt)
+          [ "$head_fmt" -le "$base_fmt" ] || fail "fmt baseline grew from $base_fmt to $head_fmt"
+          head_clippy=$(number ci/clippy-baseline.txt)
+          base_clippy=$(number base/ci/clippy-baseline.txt)
+          [ "$head_clippy" -le "$base_clippy" ] || fail "clippy baseline grew from $base_clippy to $head_clippy"
+          head_floor=$(number ci/test-inventory-floor.txt)
+          base_floor=$(number base/ci/test-inventory-floor.txt)
+          [ "$head_floor" -ge "$base_floor" ] || fail "test inventory floor fell from $base_floor to $head_floor"
       - name: Recompute gates and guard commands
         run: |
           set -euo pipefail
@@ -226,7 +226,11 @@ jobs:
           set -euo pipefail
           dest="$RUNNER_TEMP/trusted-ci"
           rm -rf "$dest"
-          cp -R base/ci "$dest"
+          if [ '${{ github.event_name }}' = "push" ] || [ '${{ github.event_name }}' = "workflow_dispatch" ]; then
+            cp -R ci "$dest"
+          else
+            cp -R base/ci "$dest"
+          fi
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
       - name: Restore Rust toolchain cache
@@ -249,7 +253,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           shared-key: baton-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
-          key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
+          key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check
         run: |
@@ -297,7 +301,11 @@ jobs:
           set -euo pipefail
           dest="$RUNNER_TEMP/trusted-ci"
           rm -rf "$dest"
-          cp -R base/ci "$dest"
+          if [ '${{ github.event_name }}' = "push" ] || [ '${{ github.event_name }}' = "workflow_dispatch" ]; then
+            cp -R ci "$dest"
+          else
+            cp -R base/ci "$dest"
+          fi
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
       - name: Restore Rust toolchain cache
@@ -320,7 +328,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           shared-key: baton-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
-          key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
+          key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build
         run: |
@@ -371,7 +379,11 @@ jobs:
           set -euo pipefail
           dest="$RUNNER_TEMP/trusted-ci"
           rm -rf "$dest"
-          cp -R base/ci "$dest"
+          if [ '${{ github.event_name }}' = "push" ] || [ '${{ github.event_name }}' = "workflow_dispatch" ]; then
+            cp -R ci "$dest"
+          else
+            cp -R base/ci "$dest"
+          fi
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
       - name: Restore Rust toolchain cache
@@ -394,7 +406,7 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           shared-key: baton-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
-          key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
+          key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Test
         run: |
@@ -465,7 +477,11 @@ jobs:
           set -euo pipefail
           dest="$RUNNER_TEMP/trusted-ci"
           rm -rf "$dest"
-          cp -R base/ci "$dest"
+          if [ '${{ github.event_name }}' = "push" ] || [ '${{ github.event_name }}' = "workflow_dispatch" ]; then
+            cp -R ci "$dest"
+          else
+            cp -R base/ci "$dest"
+          fi
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
       - name: Restore Rust toolchain cache
@@ -489,16 +505,20 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
           shared-key: baton-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
-          key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('rust-toolchain.toml') }}
+          key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml') }}-${{ hashFiles('rust-toolchain.toml') }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Format debt
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/fmt-debt.sh" . "$GITHUB_WORKSPACE/base/ci/fmt-baseline.txt"
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/fmt-debt.sh" . "$RUNNER_TEMP/trusted-ci/fmt-baseline.txt"
       - name: Clippy debt
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 300 "$RUNNER_TEMP/trusted-ci/clippy-debt.sh" . "$GITHUB_WORKSPACE/base/ci/clippy-baseline.txt"
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 300 "$RUNNER_TEMP/trusted-ci/clippy-debt.sh" . "$RUNNER_TEMP/trusted-ci/clippy-baseline.txt"
+      - name: Debt self-test
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/debt-selftest.sh"
       - name: Verify trusted tools are unchanged
         run: |
           set -euo pipefail

@@ -7,7 +7,7 @@ baseline_file=${2:-$script_dir/fmt-baseline.txt}
 baseline=$(tr -d '[:space:]' < "$baseline_file")
 
 set +e
-output=$(cd "$root" && cargo fmt --all -- --check 2>&1)
+output=$(cd "$root" && CARGO_TERM_COLOR=never cargo fmt --all -- --check 2>&1)
 code=$?
 set -e
 

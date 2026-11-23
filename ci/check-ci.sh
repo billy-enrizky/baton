@@ -58,7 +58,7 @@ def canonical_steps(job)
   end
 end
 
-def canonical_job(job)
+def canonical_job_shell(job)
   {
     "needs" => job["needs"],
     "if" => job["if"],
@@ -68,8 +68,11 @@ def canonical_job(job)
     "outputs" => job["outputs"],
     "with" => job["with"],
     "secrets" => job["secrets"],
-    "steps" => canonical_steps(job),
   }
+end
+
+def canonical_job(job)
+  canonical_job_shell(job).merge("steps" => canonical_steps(job))
 end
 
 head_path, base_path, allow_change, bootstrap = ARGV
@@ -87,6 +90,16 @@ on = head["on"] || head[true]
 push = on.is_a?(Hash) ? on["push"] : nil
 branches = push.is_a?(Hash) ? Array(push["branches"]).map(&:to_s) : []
 fail!("CI001", "push trigger must target main") unless branches.include?("main")
+if on.is_a?(Hash)
+  %w[pull_request push merge_group].each do |event|
+    config = on[event]
+    next unless config.is_a?(Hash)
+    %w[paths paths-ignore].each do |filter|
+      fail!("CI001", "#{event} must not use #{filter}; a filtered trigger can skip the required run") if config.key?(filter)
+    end
+    fail!("CI001", "#{event} must not use branches-ignore; a filtered trigger can skip the required run") if config.key?("branches-ignore")
+  end
+end
 
 fail!("CI015", "top-level env is not allowed; a head-controlled env can shadow cargo on PATH") if head.key?("env")
 fail!("CI015", "top-level defaults is not allowed") if head.key?("defaults")
@@ -170,35 +183,32 @@ end
   fail!("CI010", "#{job_name} must read changes.outputs.#{output}") unless condition.include?(output)
 end
 
-unless allow_change
-  required_commands = {
-    "changes" => ["classify-paths.sh", "selftest.sh", "check-ci.sh"],
-    "selection" => ["classify-paths.sh", "check-ci.sh", "--base"],
-    "check" => ["cargo check --locked"],
-    "build" => ["cargo build --locked"],
-    "test" => ["cargo test --locked"],
-    "debt" => ["fmt-debt.sh", "clippy-debt.sh"],
-    "verify" => ["check_gate"],
-  }
-  job_text = {}
-  required_commands.each do |job_name, commands|
-    job = jobs[job_name]
-    fail!("CI014", "missing #{job_name} job") unless job.is_a?(Hash)
-    text = Array(job["steps"]).map { |step| step["run"].to_s }.join("\n")
-    job_text[job_name] = text
-    commands.each do |command|
-      fail!("CI014", "#{job_name} is missing required command #{command}") unless text.include?(command)
-    end
+required_commands = {
+  "changes" => ["classify-paths.sh"],
+  "selection" => ["classify-paths.sh", "check-ci.sh", "--base", "selftest.sh", "gate-integrity.sh"],
+  "check" => ["cargo check --locked"],
+  "build" => ["cargo build --locked"],
+  "test" => ["cargo test --locked"],
+  "debt" => ["fmt-debt.sh", "clippy-debt.sh", "debt-selftest.sh"],
+  "verify" => ["check_gate"],
+}
+job_text = {}
+required_commands.each do |job_name, commands|
+  job = jobs[job_name]
+  fail!("CI014", "missing #{job_name} job") unless job.is_a?(Hash)
+  text = Array(job["steps"]).map { |step| step["run"].to_s }.join("\n")
+  job_text[job_name] = text
+  commands.each do |command|
+    fail!("CI014", "#{job_name} is missing required command #{command}") unless text.include?(command)
   end
-  required_commands.each do |job_name, commands|
-    text = job_text[job_name]
-    commands.each do |command|
-      next if command == "check_gate" || command.start_with?("--")
-      budgeted = Regexp.new("budget\\.sh\"?\\s+\\d+\\s+\\S*" + Regexp.escape(command))
-      fail!("CI017", "#{job_name} runs #{command} outside ci/budget.sh") unless text.match?(budgeted)
-    end
+end
+required_commands.each do |job_name, commands|
+  text = job_text[job_name]
+  commands.each do |command|
+    next if command == "check_gate" || command.start_with?("--")
+    budgeted = Regexp.new("budget\\.sh\"?\\s+\\d+\\s+\\S*" + Regexp.escape(command))
+    fail!("CI017", "#{job_name} runs #{command} outside ci/budget.sh") unless text.match?(budgeted)
   end
-
 end
 
 if base_path.to_s.empty? || !File.file?(base_path)
@@ -215,6 +225,9 @@ elsif File.file?(base_path)
 
   changed = []
   head_jobs.each do |name|
+    unless canonical_job_shell(jobs[name]) == canonical_job_shell(base_jobs[name])
+      fail!("CI013", "job #{name} wiring changed; job wiring is never allowed to drift")
+    end
     next if canonical_job(jobs[name]) == canonical_job(base_jobs[name])
     changed << name
   end

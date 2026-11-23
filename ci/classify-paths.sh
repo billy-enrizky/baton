@@ -34,7 +34,7 @@ elif [[ "$event" == merge_group || "$event" == push || "$event" == workflow_disp
 elif [[ "$event" == pull_request ]]; then
   if ! base_sha=$(git -C "$base_dir" rev-parse HEAD 2>/dev/null); then
     full_reason=unknown
-  elif ! files=$(git -C "$head_dir" diff --name-only --no-renames --diff-filter=ACDMR "$base_sha" HEAD 2>/dev/null); then
+  elif ! files=$(git -C "$head_dir" diff --name-only --no-renames --diff-filter=ACDMRT "$base_sha" HEAD 2>/dev/null); then
     full_reason=unknown
   fi
 else

@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-Status on 2026-11-22: the current warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds. A separate CI-docs PR finished at 59 seconds. The Rust median is 63.5 seconds, above the target. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The trusted-input proof main push was 54 seconds. Recent meta PRs were 51 and 64 seconds, so the p50 target is still not robustly met. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
+Status on 2026-11-23: the historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds, with a 63.5-second median. The new fast classifier plus line-table test profile measured 51 seconds on a branch dispatch with a forced Rust rebuild: `Changes` completed at 6 seconds and `Test` at 35 seconds. This is a provisional critical-path result, not yet a PR p50; the first post-merge PR sample is still required. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
 
 This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 
@@ -8,7 +8,7 @@ This file records the runs that changed a decision. It is not a complete archive
 
 | Target | Current evidence | Status |
 |---|---|---|
-| Rust PR feedback p50 under 60 seconds | 16 warm Rust PRs: 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds; median 63.5 seconds, max 74 seconds | Provisional; above the target, not met. Accepted only at 100 runs or four weeks |
+| Rust PR feedback p50 under 60 seconds | Historical 16 warm Rust PRs: 52 to 74 seconds, median 63.5. Final branch dispatch with a forced Rust rebuild: 51 seconds | Provisional; the new critical path is under 60 on the branch, but a post-merge PR sample is required before acceptance |
 | Rust PR feedback p95 under 120 seconds | Sixteen Rust samples, n=16, max 74 seconds | Provisional |
 | Docs-only PR feedback p50 under 45 seconds | n=2: 44 seconds historical, 38 seconds in run 45077008165; median 41 seconds, max 44 seconds | Provisional met |
 | Queue p50 under 10 seconds | n=26 non-retry attempts, median 0 seconds, max 0 seconds; the one manual retry is excluded | Provisional met |
@@ -16,7 +16,7 @@ This file records the runs that changed a decision. It is not a complete archive
 | Setup p95 under 15 seconds | Warm Test setup was 16 seconds in PR 45004705055 | Provisional miss, n=1, max 16 seconds |
 | Hidden retries | `ci/check-ci.sh` rejects retry actions and `continue-on-error` | Enforced |
 | Skipped required checks | `verify` requires every selected job | Enforced |
-| Failed required check reported as success | `verify` and the formal admission model | Enforced |
+| Workflow-level false green | `verify` and the formal admission model | Enforced for the workflow and aggregator; adversarial test-process tampering is a recorded residual risk |
 
 A p50 or p95 from a small sample is provisional. Until 100 runs or four weeks exist, p50 rows report n, median, and maximum; p95 rows report n and maximum. This record does not claim an accepted percentile.
 
@@ -54,6 +54,26 @@ PR 45005544007 is a `meta` selection, not a Rust sample. It is recorded for the 
 For PR 45004705055, Test job setup was 16 seconds, including 4 seconds for the rustup cache, 3 seconds for the Cargo cache, and 9 seconds for checkouts and job setup. The test step contained about 13 seconds of compile and link plus 1.73 seconds of lib tests. Test inventory recorded 401 tests. The inbox PR 45009466461 recorded 404 tests. The inbox CLI PR 45010710576 recorded 405 tests. The completions PR 45011836996 recorded 406 tests; its lib binary ran 331 tests in 1.67 seconds and its integration binaries ran 75 tests in 0.40 seconds.
 
 The slowest test binary was no longer a 30-second outlier. The lib binary ran 326 tests in 1.73 seconds. The seven integration binaries together ran 75 tests in 0.4 seconds.
+
+## 2026-11-23 fast classifier and test profile
+
+The `changes` job no longer checks out the repository. For a pull request it fetches only the base commit and `refs/pull/<number>/merge` at depth one, exports the base-owned classifier and budget script from the base commit, and classifies the base-to-merge diff. The trusted guards moved to `selection`, which still gates `verify`.
+
+The test profile now keeps line tables and drops full debuginfo. The Cargo cache key includes `Cargo.toml`, so the profile change cannot restore incompatible artifacts.
+
+| Run | Event | State | Create to Verify | Changes complete | Test job | Notes |
+|---|---|---|---|---|---|---|
+| [45114396442](https://github.com/billy-enrizky/baton/actions/runs/45114396442) | workflow_dispatch | warm cache, forced Rust rebuild | 51 seconds | 6 seconds | 35 seconds | Final classifier branch; realistic Rust source rebuild, 509 tests |
+| [45111528561](https://github.com/billy-enrizky/baton/actions/runs/45111528561) | workflow_dispatch | warm cache, forced Rust rebuild | 52 seconds | 6 seconds | 38 seconds | Earlier combined branch; kept as a corroborating sample |
+| [45111377033](https://github.com/billy-enrizky/baton/actions/runs/45111377033) | workflow_dispatch | warm cache, unchanged Rust source | 51 seconds | 5 seconds | 32 seconds | Test step reused the Baton artifacts; descriptive only |
+| [45115234795](https://github.com/billy-enrizky/baton/actions/runs/45115234795) | workflow_dispatch | warm cache, head tools | 53 seconds | 6 seconds | 33 seconds | Post-merge proof path; merged self-test, workflow guard, required commands, and budgets all passed |
+| [45117405274](https://github.com/billy-enrizky/baton/actions/runs/45117405274) | workflow_dispatch | warm cache, head tools | 62 seconds | 7 seconds | 48 seconds | Slower runner repeat; 5-second setup, 5-second checkout, 8-second toolchain restore, 7-second Cargo restore; all checks passed |
+| [45119247835](https://github.com/billy-enrizky/baton/actions/runs/45119247835) | workflow_dispatch | warm cache, head tools | 48 seconds | 5 seconds | 32 seconds | Final head-tools run; debt self-test passed, Clippy debt 61 <= 61, all gates green |
+| [45111201206](https://github.com/billy-enrizky/baton/actions/runs/45111201206) | pull_request | cold after profile change | 85 seconds | 5 seconds | 71 seconds | Pull-request cache did not inherit the branch cache; Selection failed at the expected CI013 workflow comparison |
+
+The 51-second run is the critical-path proof for this slice. It is not counted as a PR p50 sample because it is a dispatch. The 53-second head-tools branch dispatch proves the merged scripts and required-command enforcement on a branch; the first main push and the first post-merge pull request are still the acceptance samples.
+
+The toolchain-cache removal experiment was rejected. Removing the 391 MB `~/.rustup` restore made Setup Rust take about 9 seconds instead of about 6 seconds of restore plus 1 second of activation. Matched samples were 57 and 69 seconds with the cache removed, against 69 and 71 seconds with the cache retained; the difference was noise, not a gain. Runs 45108914603, 45109176611, 45109045484, and 45109314728 are recorded for that decision.
 
 ## Rejected ARM runner experiment
 
@@ -106,6 +126,10 @@ The two PR samples around that work were 51 seconds for the ARM rejection docs (
 | [45060456619](https://github.com/billy-enrizky/baton/actions/runs/45060456619) | push | 69 seconds | Line-target main push; 464 tests, Test 50 seconds |
 | [45064707055](https://github.com/billy-enrizky/baton/actions/runs/45064707055) | pull_request | 74 seconds | Content search; 486 tests, Test 48 seconds |
 | [45064863755](https://github.com/billy-enrizky/baton/actions/runs/45064863755) | push | 69 seconds | Content-search main push; 486 tests, Test 52 seconds |
+| [45111201206](https://github.com/billy-enrizky/baton/actions/runs/45111201206) | pull_request | 85 seconds, cold | Fast classifier; PR cache did not inherit the seeded branch cache |
+| [45114396442](https://github.com/billy-enrizky/baton/actions/runs/45114396442) | workflow_dispatch | 51 seconds, warm | Final classifier plus line-table test profile; forced Rust rebuild |
+| [45113871281](https://github.com/billy-enrizky/baton/actions/runs/45113871281) | pull_request | 97 seconds, cold | Profile prerequisite PR; old cache key, 75-second Test, then merged as `b854a27` |
+| [45114063161](https://github.com/billy-enrizky/baton/actions/runs/45114063161) | push | 102 seconds, cold | Profile main push; same old cache key, 82-second Test; new-key seed follows the classifier PR |
 
 The 30-second long pole was `orchestrate::tests::cancellation_stops_the_worker_group_and_marks_the_run_cancelled`. On Linux, `kill -TERM -PGID` was accepted but did not signal the process group. The shell leader died, its `sleep` child kept the output pipe open, and the reader threads waited the full 30 seconds. Adding `--` before the negative group operand fixed the signal. `group_alive` then used `ps` to ignore the unreaped leader zombie instead of spending another 2.5 seconds on `kill -0`.
 
@@ -131,6 +155,7 @@ Saves are restricted to `main`. A PR cannot write the cache that another PR rest
 | Put test repositories in `/dev/shm` | [45002182299](https://github.com/billy-enrizky/baton/actions/runs/45002182299) | Test 64 seconds; `/dev/shm` had 7.9 GB free | Rejected; the suite is not disk-bound |
 | Count-based nextest shards | [45002437721](https://github.com/billy-enrizky/baton/actions/runs/45002437721) | Shard 1 33 seconds, shard 2 61 seconds | Rejected; count partitions were unbalanced, and the run was red because the experiment changed the job list |
 | Install the pinned toolchain instead of restoring 391 MB | [45004219154](https://github.com/billy-enrizky/baton/actions/runs/45004219154), [45004357746](https://github.com/billy-enrizky/baton/actions/runs/45004357746) | Test 40 and 43 seconds against a 44 to 45 second baseline | Rejected; no consistent gain |
+| Remove the rustup cache again on the current workflow | [45108914603](https://github.com/billy-enrizky/baton/actions/runs/45108914603), [45109176611](https://github.com/billy-enrizky/baton/actions/runs/45109176611), [45109045484](https://github.com/billy-enrizky/baton/actions/runs/45109045484), [45109314728](https://github.com/billy-enrizky/baton/actions/runs/45109314728) | Removed-cache runs 57 and 69 seconds; retained-cache runs 69 and 71 seconds; Setup Rust about 9 seconds without cache versus 6 restore plus 1 activation | Rejected; no proven gain and a slower Test setup path |
 | Temporary ARM Test job evaluated as a replacement | [45012384561](https://github.com/billy-enrizky/baton/actions/runs/45012384561), [45012538857](https://github.com/billy-enrizky/baton/actions/runs/45012538857) | Cold 85-second and warm 33-second ARM jobs; 406 tests each | Rejected; would remove x64 runtime from the pre-merge gate while merge queue is unavailable |
 
 The nextest experiment is not evidence for sharding. It showed that a count partition can put one 30-second test into a 61-second shard. After the cancellation fix the whole lib binary takes 1.73 seconds, so sharding is no longer on the critical path.
@@ -210,6 +235,12 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Installed feature smoke | PTY slash probe passed against the curl and Homebrew binaries; summaries in gitignored `v0.4.0-release/curl/summary.json` and `v0.4.0-release/brew/summary.json` | Passed 2026-11-22 |
 | Formal gates | All 15 suites under `local_docs/verification/*/run.sh` | Passed 2026-11-22 |
 | CI admission model | `ci/formal/ci-admission/run.sh` | Passed locally |
+| Branch protection | `main` requires `Verify`, requires an up-to-date branch, blocks force pushes and deletions, and has admin enforcement off. User push restrictions are not available on a user-owned repository | Configured 2026-11-23; direct owner push remains a documented residual risk |
+| Fast classifier warm path | Branch dispatch 45114396442 with a forced Rust rebuild: 51 seconds, Changes complete at 6 seconds, Test 35 seconds | Passed 2026-11-23; post-merge PR sample pending |
+| Head-tools branch proof | Branch dispatch 45115234795: 53 seconds, Selection 12 seconds, merged self-test and workflow guard passed | Passed 2026-11-23; main-push proof pending |
+| Head-tools repeat | Branch dispatch 45117405274: 62 seconds, no skipped checks, slower setup and cache steps | Passed 2026-11-23; recorded without exclusion |
+| Head-tools final dispatch | Branch dispatch 45119247835: 48 seconds, Debt ratchet 32 seconds, debt self-test passed, Clippy debt 61 <= 61 | Passed 2026-11-23 |
+| Clippy ratchet color and count | `CARGO_TERM_COLOR=never` in the ratchet; compiler summary lines excluded; one-lint fixture passes a one-entry baseline | Passed locally and in 45119247835 |
 
 ## v0.4.0 release assets
 
@@ -238,8 +269,8 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 - Queue p50 is 0 seconds on cited non-retry runs. Queue p95, setup p95, and cache hit rate are not established; setup has one 16-second sample against a 15-second target.
 - The repository is public. Standard GitHub-hosted runners are free. No paid-runner cost is approved or required by the current measurements.
 - A paid 8-core runner remains an unmeasured option. It is not recommended until both Rust-target metrics miss across at least 100 runs or four weeks.
-- Official merge queue requires organization ownership or GitHub Enterprise Cloud. Until then, the PR `verify` run plus the following `main` push are the merge proof.
-- Branch protection must require `verify` and block direct pushes. This remains an owner action.
+- Official merge queue requires organization ownership; private organization repositories additionally require GitHub Enterprise Cloud. Until then, the PR `verify` run plus the following `main` push are the merge proof.
+- Branch protection on `main` was configured on 2026-11-23: required `Verify`, strict up-to-date, no force pushes, no deletions, and admin enforcement off for the documented `ci-repair` override. GitHub rejected user push restrictions on this user-owned repository, so direct owner pushes remain a visible residual risk. The branch-protection API response is the proof.
 
 ## Collection commands
 

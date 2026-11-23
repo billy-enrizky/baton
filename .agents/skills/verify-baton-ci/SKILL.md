@@ -5,7 +5,9 @@ description: "Drive Baton's local CI helpers and prove the classifier, workflow 
 
 # Verify Baton CI
 
-This skill proves the zero-cost CI control plane without running a model turn or a GitHub runner. The real workflow run is recorded separately in `docs/ci-acceptance.md`.
+This skill proves the CI control plane without running a model turn or a GitHub runner. It compiles only tiny fixture crates for the debt-ratchet checks. The real workflow run is recorded separately in `docs/ci-acceptance.md`.
+
+The workflow has two pre-gate jobs. `changes` is the fast path: it fetches only the base and PR merge ref at depth one, exports the base-owned classifier and budget script, and emits the seven gate-selection outputs. It intentionally has no checkout and no pass/fail guards. `selection` is the trust gate: it stages the base tools read-only on pull requests and merge groups, stages the head tools on main pushes and dispatches, validates gate integrity, runs the full self-test, enforces the baseline ratchets, recomputes classification, compares every output with `changes`, and runs the workflow guard. `verify` requires both jobs, so moving the checks into `selection` cannot produce a green run without them.
 
 ## Launch
 
@@ -37,7 +39,9 @@ The command must print `CI013 skipped: bootstrap workflow` and `workflow checks 
 The probe runs:
 
 - `ci/selftest.sh`.
+- `ci/debt-selftest.sh`.
 - The valid workflow fixture with `--bootstrap`.
+- The real workflow with `--bootstrap`.
 - A changed test command with and without `--allow-change`.
 - `ci/budget.sh 1 sleep 2`, which must exit 124.
 - `ci/budget.sh 5 true`, which must exit 0.
@@ -48,6 +52,7 @@ The probe writes a timestamped directory under the evidence path with:
 
 - `selftest.log`
 - `guard-valid.log`
+- `guard-workflow.log`
 - `guard-change-rejected.log`
 - `guard-change-allowed.log`
 - `budget-overrun.log`
@@ -70,3 +75,8 @@ Start with `features/README.md`.
 - The budget wrapper uses GNU `timeout` when present and a Perl alarm fallback on macOS.
 - `ci/check-ci.sh` requires either `--base`, `--bootstrap`, or both. A missing trust mode is a failure.
 - The workflow command guard rejects required command changes unless `--allow-change` is explicit.
+- `--allow-change` never skips `CI014` or `CI017`, and it never permits job-level wiring changes. It only permits the reviewed base-to-head step comparison.
+- Do not add a checkout, self-test, or workflow guard back to `changes`; that puts 5 to 10 seconds on the critical path. The fast path must keep only the shallow fetch and classifier.
+- `selection` must keep `gate-integrity.sh`, `selftest.sh`, and `classify-paths.sh` under `ci/budget.sh`. `ci/check-ci.sh` requires all three.
+- The pull-request fast path must diff the base tip against `refs/pull/<number>/merge`, not the PR head. The head comparison includes base-side changes when the base advances and disagrees with the checked-out merge ref.
+- Git typechanges (`T`) are included in both the workflow diff and `classify-paths.sh`; a `.rs` file converted to a symlink must not fall into the docs-only path.

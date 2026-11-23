@@ -4,6 +4,21 @@ This document defines the GitHub Actions system for Baton, the measurements that
 
 The design is staged. Phase 1 creates one honest full-suite gate with hard budgets and real CI data. Sharding and diff-aware selection arrive only after that data exists, because a shard plan built from macOS timings would be a guess. Formatting and Clippy ratchets prevent new debt while the full lint baseline is cleaned.
 
+## Problem and scope
+
+Baton's pull-request feedback was above the one-minute target even when the test suite itself took only a few seconds. The critical path was dominated by a full `Changes` checkout, two trusted-tool checkouts, serialized guards, a Rust toolchain cache restore, a Cargo cache restore, and a test build with full debuginfo. The CI must stay honest while it gets faster: no skipped gate, no retry that hides a failure, no weaker command, and no invented measurement.
+
+The scope is the GitHub Actions workflow for the public Baton repository, the trusted `ci/` control plane, path classification, cache and budget policy, the recorded acceptance evidence, and the project-local verification skills. This slice covers Linux x64 pull requests and main pushes.
+
+## Non-goals
+
+- Replacing `cargo test` with a new test framework or changing test semantics.
+- Moving the required x64 runtime gate to ARM or a paid runner without matched evidence.
+- Enabling the official merge queue before the repository has an eligible organization owner.
+- Running the TLA+ formal gate inside GitHub Actions before the JDK and jar are pinned artifacts.
+- Per-test sharding before recorded per-test durations show that test execution, not setup or compile, is the bottleneck.
+- A full adversarial sandbox for test code in this slice. The manifest and log checks remain detection controls, not a security boundary.
+
 ## Goals
 
 | Metric | Target | Gated from |
@@ -11,19 +26,35 @@ The design is staged. Phase 1 creates one honest full-suite gate with hard budge
 | PR feedback p50, Rust PR | Under 60 seconds | Phase 3 |
 | PR feedback p95, Rust PR | Under 120 seconds | Phase 3 |
 | PR feedback p50, docs-only PR | Under 45 seconds | Phase 3 |
-| Any single gate command's budget | Under 90 seconds | Phase 3 |
+| Any single build or test command's warm budget | Under 90 seconds; Clippy and format debt are separate ratchets with their own ceilings | Phase 3 |
 | Queue p50 | Under 10 seconds | Phase 2 |
 | Queue p95 | Under 20 seconds | Phase 5, after 100 runs exist |
 | Setup p95 | Under 15 seconds | Phase 2 |
 | Hidden retries | Zero | Now |
 | Skipped required checks | Zero | Now |
-| Failed required check reported as success | Zero | Now |
+| Workflow-level false green | Zero in the workflow and aggregator; adversarial test-process tampering remains a residual risk | Now for the workflow; Phase 3 for a sandbox |
 
-Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command, and `--version` runs only after a build that is already budgeted.
+The false-green goal is scoped to the workflow and aggregator. A test process with write access can alter its own log or manifest; that residual risk is listed in Risks and mitigations and is why the manifest check is called detection, not a sandbox.
 
-Phase 2 is in progress from recorded runs. The current warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds. The Rust median is 63.5 seconds, above the target. A free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
+Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every required command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command. The post-build `--version` smoke check runs outside the budget because the build it checks is already budgeted.
+
+Phase 2 is in progress from recorded runs. The historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds. The historical median is 63.5 seconds. The critical-path change in this slice moves path classification to a shallow merge-ref fetch and moves every trusted guard into `Selection`; the final branch dispatch with a forced Rust rebuild completed in 51 seconds, with `Changes` at 6 seconds and `Test` at 35 seconds. Head-tools branch dispatches completed in 53, 62, and 48 seconds; the 62-second repeat had slower setup and cache restores and skipped no check. The four warm runs have a 52-second median. The final head-tools run also proved the trusted debt baselines, the debt self-test, and the Clippy count of 61 against the 61 baseline. The real main-push proof, a real warm PR sample, and the cache seed are still pending. A free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
 
 Budget rule, applied at every phase: Phase 1 uses three times a conservative cold estimate. Phase 2 sets each budget to the measured Linux p95 plus 20 percent. That reset is the only allowed increase. After it, a budget may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
+
+## Design alternatives
+
+| Alternative | Why it was not adopted |
+|---|---|
+| Keep the full head and base checkout in `Changes` | The fast path replaced a 16-second checkout and guard sequence with a shallow two-commit fetch and a base-owned classifier. The guards still run in `Selection`, so no check is removed. |
+| List changed files through the GitHub pull request API | The API returns merge-base changes, while `Selection` classifies the checked-out pull request merge ref against the base tip. A shallow fetch of the base and `refs/pull/<number>/merge` uses the exact same two commits as `Selection` and takes about one to two seconds. A stale base therefore cannot change the selection between jobs. |
+| Move classification into every gate job | Each job would repeat GitHub API or git work and would still need a trusted cross-check. One fast `Changes` job plus a `Selection` recomputation gives one shared result and one place to fail closed. |
+| Remove the Rust toolchain cache | Measured against a retained cache, Setup Rust took about 9 seconds instead of about 6 seconds of restore plus 1 second of activation. The removed-cache runs were 57 and 69 seconds against 69 and 71 seconds retained. No gain was proven. |
+| Keep full debuginfo in the test profile | Line tables keep readable backtraces and cut the warm compile from 18.94 to 14.13 seconds on the measured run. The cache key includes `Cargo.toml`, so the profile change cannot silently reuse incompatible artifacts. |
+| Shard tests immediately | Execution is about 2.5 seconds across all binaries. Sharding would duplicate the 30-second setup and cache path. The existing nextest count-shard experiment was unbalanced and is retained as a rejected experiment. |
+| Replace the x64 Test job with the free ARM runner | The ARM run was faster, but it would remove pre-merge Linux x64 runtime coverage while the official merge queue is unavailable. The x64 job stays required. |
+| Move to a self-hosted or paid larger runner | No matched measurement or approved spend exists. The plan records this as an owner decision after 100 runs or four weeks of data. |
+| Configure the official merge queue now | The repository is public but user-owned. Merge queue requires an organization owner; that is an ownership action, not a workflow change. |
 
 ## Current baseline
 
@@ -41,8 +72,11 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
+| Warm Rust rebuild after this slice | 51 seconds; `Changes` 6, `Test` 35, `Verify` 5 | Branch dispatch 45114396442 |
+| Final head-tools dispatch | 48 seconds; `Changes` 6, `Test` 32, `Debt ratchet` 32 | Branch dispatch 45119247835 |
+| Toolchain-cache removal | Not adopted; setup without the cache was slower than restore plus setup | Runs 45108914603, 45109176611, 45109045484, 45109314728 |
 
-The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 509 floor is a lower bound, not a per-test lock; Linux executes one additional non-UTF-8 test. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff.
+The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 509 floor is a lower bound, not a per-test lock; Linux executes one additional non-UTF-8 test. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff. The Cargo cache key includes `Cargo.toml` as well as `Cargo.lock` and `rust-toolchain.toml`, so a test-profile change cannot restore incompatible compiler artifacts.
 
 Older local macOS measurements are historical and are not acceptance evidence. The acceptance record contains the Linux run-level data and the rejected experiments.
 
@@ -52,11 +86,11 @@ The free `ubuntu-24.04-arm` runner is not adopted for Test. A temporary ARM job 
 
 Replacing the x64 Test job would move Linux x64 runtime tests after merge, and official merge queue is unavailable for this repository. A runtime-only x64 regression could then land without a pre-merge test. That violates the rule that no phase removes a passing check. Test stays on `ubuntu-24.04`. The option is closed unless a future proposal is additive, not a replacement, keeps an independent required x64 pre-merge Test job, and provides a matched rerun with identical steps, event shape, cache policy, and command under the 100-run or four-week policy. A merge queue alone is insufficient if it runs the same ARM job.
 
-The experiment is recorded in [ci-acceptance.md](ci-acceptance.md#rejected-arm-runner-experiment) with its runs, timings, cache sizes, and CI013 failure. The p50 miss remains at 61.0 seconds; the next levers are measured critical-path work, not architecture substitution.
+The experiment is recorded in [ci-acceptance.md](ci-acceptance.md#rejected-arm-runner-experiment) with its runs, timings, cache sizes, and CI013 failure. The historical Rust median remains 63.5 seconds; this slice's provisional warm result is 51 seconds.
 
 ## What the gate enforces
 
-Every check below is a real command in `ci/`, and `ci/selftest.sh` proves at least one failing fixture per rule.
+Every check below is a real command in `ci/`. `ci/selftest.sh` proves the workflow rules, and `ci/debt-selftest.sh` runs the negative format and Clippy ratchet fixtures in the debt job.
 
 | Area | File | Enforcement |
 |---|---|---|
@@ -66,14 +100,15 @@ Every check below is a real command in `ci/`, and `ci/selftest.sh` proves at lea
 | Gate integrity | `ci/gate-integrity.sh` | Rules GI001 to GI006 |
 | Test inventory | `ci/test-inventory.sh` | Rules TI001 to TI005. Run mode compares announced and executed totals; list mode counts discovered tests |
 | Format debt | `ci/fmt-debt.sh` | Count of `Diff in ` lines must not exceed the baseline |
-| Clippy debt | `ci/clippy-debt.sh` | Count of `error:` lines must not exceed the baseline |
-| Self-test | `ci/selftest.sh` | Runs every fixture, the budget negative test, and the inventory floor, short-execution, and missing-total cases |
+| Clippy debt | `ci/clippy-debt.sh` | Count of lint diagnostics, excluding compiler summary lines, must not exceed the baseline |
+| Self-test | `ci/selftest.sh` | Runs every workflow fixture, stale-base and Git typechange fixtures, the budget negative test, and the inventory floor, short-execution, and missing-total cases |
+| Debt self-test | `ci/debt-selftest.sh` | Runs in the debt job and proves a format diff and a Clippy lint over a zero baseline both fail |
 
 Workflow invariants:
 
 | Rule | Rejects |
 |---|---|
-| CI001 | Missing trigger, or a `push` trigger that does not target `main` |
+| CI001 | Missing trigger, a `push` trigger that does not target `main`, or `paths`, `paths-ignore`, or `branches-ignore` on `pull_request`, `push`, or `merge_group` |
 | CI002 | Missing or non-numeric `timeout-minutes`, or a timeout of 360 minutes or more |
 | CI003 | A retry action, or `continue-on-error` at step or job level |
 | CI004 | `\|\| true`, `set +e`, or `set +o errexit` in a step |
@@ -101,16 +136,31 @@ Gate-integrity rules:
 | GI005 | A warning suppression or conditional Clippy suppression in tracked Rust sources |
 | GI006 | A `#[rustfmt::skip]` attribute in tracked Rust sources |
 
+## Risks and mitigations
+
+| Risk | Mitigation | Residual risk |
+|---|---|---|
+| A PR changes the workflow to skip a selected gate | `check-ci.sh` compares the base and head workflow, `Changes` and `Selection` must both succeed, and `verify` checks every selected result | A repository owner can still merge with an explicit override; the override is visible in the PR and merge record |
+| A test process tampers with its log or the trusted-tool manifest | The base supplies the harness, the log is captured as untrusted input, and the manifest is rechecked after the test gate | Test code runs with write access to the runner filesystem. This is detection, not a sandbox, until the Phase 3 boundary exists |
+| The shallow fetch or base classifier is unavailable | `changes` selects every gate on failure; `selection` recomputes and fails closed on a mismatch | A transient GitHub failure can block a PR instead of silently shrinking the gate |
+| A profile or dependency change reuses incompatible Cargo artifacts | The cache key includes `Cargo.lock`, `Cargo.toml`, and `rust-toolchain.toml`; the first main run after a profile change is a cold seed | One cache-miss run is slower and must be recorded separately from warm samples |
+| Diff-aware test selection is mistaken for full-suite coverage | This slice only classifies which gates run. Every code or meta PR still runs the full Rust suite; docs-only is the only fast path | The Phase 3 selector is not shipped and its union proof is still required |
+| A direct push or owner bypass skips `Verify` | `main` requires `Verify` and an up-to-date branch for PR merges, blocks force pushes and deletions, and keeps admin enforcement off. GitHub rejects user push restrictions on a user-owned repository, so the owner can still push directly | Owner-only direct push remains a visible residual risk; move to an organization if it must be blocked. Every push still runs `Verify` after the fact |
+| The 51-second warm result is mistaken for a PR p50 | Acceptance keeps the historical 16-sample distribution and labels the new result provisional until a post-merge PR sample exists | A future regression still needs 100 runs or four weeks before the percentile is acceptance-bearing |
+| Paid runner or merge-queue capacity is assumed | Costs table and owner actions state that no paid capacity is approved and merge queue is blocked on ownership | The target may require an owner decision if the free runner cannot meet p95 |
+
 ## Trust model
 
-The base supplies every pass/fail script on every event. The head supplies only the measured source.
+Pull requests and merge groups use base-owned pass/fail scripts. Main pushes and owner-controlled dispatches use the checked-out head scripts, so the first push after a CI change proves the merged tools rather than the previous tools.
 
 - `pull_request` uses `github.event.pull_request.base.sha`.
 - `merge_group` uses `github.event.merge_group.base_sha`.
 - `push` uses `github.event.before`, falling back to `HEAD~1` for a first push or a zero SHA.
 - `workflow_dispatch` uses `github.event.before`, falling back to `HEAD~1`.
 
-The base copy is sparse-checked out to `base/` with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`. Each job then copies `base/ci` to `$RUNNER_TEMP/trusted-ci`, marks it read-only, records a SHA-256 manifest, and executes only from that copy. The `test` job reads the inventory floor and timing script from `$RUNNER_TEMP/trusted-ci`, treats the captured test log as untrusted input, and re-verifies the manifest after the test gates.
+`changes` is the fast path. It does not check out the worktree. For a pull request it initializes a temporary repository, fetches only the base and `refs/pull/<number>/merge` at depth one, exports the base-owned `budget.sh` and `classify-paths.sh` from the base commit, and classifies the base-to-merge diff. The merge ref is the same tree `Selection` checks out, so an advancing base cannot produce different selections. A failed fetch or classification selects every gate. The job deliberately carries no pass/fail guards, so the Rust jobs can start before the trusted tools finish staging.
+
+`selection` is the trust gate. It sparse-checks out the base copy with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`. On pull requests and merge groups it stages `base/ci`; on main pushes and dispatches it stages the checked-out head `ci/`, because main merges require `Verify` and an up-to-date branch and dispatches are owner-controlled. A direct owner push is a visible bypass, not a proved tree. It marks the staged copy read-only, records a SHA-256 manifest, and executes only from that copy. It runs gate integrity, the full tool self-test, and the baseline ratchets, then recomputes classification and compares every output with `changes`. It also compares `rust-toolchain.toml` and runs the workflow guard. The `test` job reads the inventory floor and timing script from its own trusted copy, treats the captured test log as untrusted input, and re-verifies the manifest after the test gates. The `debt` job reads both ratchet baselines from the same read-only copy, so a `build.rs` cannot raise its own ceiling before Clippy runs. Moving the guards into `selection` is safe because `verify` still requires both `changes` and `selection` to succeed.
 
 That staging is a detection boundary, not a sandbox. `cargo test` runs arbitrary repository code with write access to the runner's filesystem, so a determined change can still tamper with the process. What staging buys is that tampering after the first gate step is visible as a manifest mismatch instead of silently changing the harness. A real sandbox needs a separate container or a read-only mount, which is a Phase 3 decision.
 
@@ -118,17 +168,17 @@ Head-controlled process configuration is rejected rather than compared. A workfl
 
 `rust-toolchain.toml` is compared byte for byte with the base copy in the `selection` job. There is no `RUSTUP_TOOLCHAIN` environment override anywhere in the workflow.
 
-On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run outside a pull request. Job-list equality is still enforced, and `workflow_dispatch` can target a feature branch, so it is owner-controlled rather than a substitute for the PR gate.
+On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run outside a pull request. `--allow-change` permits only the base-to-head step comparison. Required commands and `CI017` budget enforcement are unconditional, so the override cannot remove a gate or run it outside `ci/budget.sh`. Job-list equality and job-level wiring (`needs`, `if`, timeout, runner, outputs, strategy, `with`, and secrets) are always enforced. `workflow_dispatch` can target a feature branch, so it is owner-controlled rather than a substitute for the PR gate.
 
-Changing a gate command is not a PR-level decision. There is no `ci-change` label. The workflow passes `--allow-change` on `push`, `merge_group`, and `workflow_dispatch`. Push and merge-group commits are protected; `workflow_dispatch` is owner-controlled and can target a feature branch. A job-list change is rejected on every event. A PR that changes a command, `needs`, `if`, timeout, runner, output, or strategy fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
+Changing a gate command is not a PR-level decision. There is no `ci-change` label. The workflow passes `--allow-change` on `push`, `merge_group`, and `workflow_dispatch`. Push and merge-group commits are protected; `workflow_dispatch` is owner-controlled and can target a feature branch. A job-list or job-wiring change is rejected on every event. A PR that changes a command, `needs`, `if`, timeout, runner, output, or strategy fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
 
 The single escape hatch is `ci-repair`, and it is a human action rather than a workflow branch:
 
 1. The repository owner opens a PR that touches only `ci/**`, `.github/**`, or `docs/ci*.md`.
 2. The PR is expected to fail `verify` at the base comparison. That failure is the record of the change.
-3. Before merging, the owner runs `ci/selftest.sh`, `ci/check-ci.sh --base <base workflow> <head workflow> --allow-change`, `actionlint`, and a full local `cargo test --locked` on the same commit.
+3. Before merging, the owner runs `ci/selftest.sh`, `ci/check-ci.sh --base <base workflow> <head workflow> --allow-change`, `actionlint`, and a full local `cargo test --locked` on the same commit. The guard still enforces every required command and budget; `--allow-change` only permits the reviewed command and step changes.
 4. The owner merges with an admin override, quoting the local results in the PR.
-5. The `push` run on `main` is the proof: it runs the new tools against the full suite with all gates selected.
+5. The `push` run on `main` is the proof: it stages the merged head `ci/` tools, runs the full self-test and workflow guard against them, selects every gate, and executes the full suite. The same proof is available on a branch through `workflow_dispatch`, which is owner-controlled.
 
 This is visible in the PR, the merge API, and the next main run. It is not silent, and it cannot be triggered by an outside contributor.
 
@@ -140,7 +190,7 @@ This is visible in the PR, the merge API, and the next main run. It is not silen
 | 1B | Trusted helpers, skills, and formal model | Create `ci/*.sh`, `ci/fixtures/**`, `ci/fmt-baseline.txt`, `ci/clippy-baseline.txt`, `ci/test-inventory-floor.txt`, `ci/formal/ci-admission/**`, `rust-toolchain.toml`, `.agents/skills/verify-baton-ci/**`, `.agents/skills/verify-baton-ci-formal/**` | `ci/selftest.sh` passes; a budget overrun exits 124; the formal gate passes locally; `cargo check`, `cargo build`, `cargo test`, and `ci/test-inventory.sh` pass |
 | 1C | Full-suite workflow | Create `.github/workflows/ci.yml`; modify `docs/ci.md` | Done: run 44982816103 executed every job with `verify` green, and run 44983114852 is the first green `main` push |
 | 2 | Record real timings and choose the test runner | `ci/test-timings.sh` records per-binary times; `docs/ci-acceptance.md` records the warm path and rejected runners | In progress: `cargo test` and the x64 runner retained; nextest count shards and the free ARM runner were rejected; the p50 miss remains |
-| 3 | Diff-aware selection and recorded-time shards | Create `ci/select-tests.sh`, `ci/plan-shards.sh`, `ci/test-groups.json`; modify `.github/workflows/ci.yml`, `ci/check-ci.sh`, `docs/ci.md` | Not started: selector fixtures and shard union proof still required |
+| 3 | Diff-aware selection and recorded-time shards | Extend `ci/test-timings.sh` to emit per-test durations; create `ci/select-tests.sh`, `ci/plan-shards.sh`, `ci/test-groups.json`; modify `.github/workflows/ci.yml`, `ci/check-ci.sh`, `docs/ci.md` | Not started: per-test timings, selector fixtures, and shard union proof still required |
 | 4 | Full format and lint plus local hooks | Create `.githooks/pre-commit`, `.githooks/pre-push`, `ci/install-hooks.sh`; modify `.github/workflows/ci.yml`, `docs/ci.md` | Format and Clippy baselines are zero and both are required; hooks run under budget |
 | 5 | Last-100-run audit and runner decision | Modify `docs/ci-acceptance.md` | PR p50/p95, queue p50/p95, cache hit rate, and a paid-runner decision, all from recorded runs |
 
@@ -152,13 +202,13 @@ Triggers: `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review
 
 | Job | Needs | Timeout | Runs |
 |---|---|---|---|
-| `changes` | none | 5 | Classifier, quick tool preflight, workflow guard, gate integrity, baselines |
-| `selection` | `changes` | 5 | Full tool self-test, recomputes the classifier and compares outputs, compares `rust-toolchain.toml`, re-runs the workflow guard |
+| `changes` | none | 5 | Shallow base/head fetch, trusted classifier from the base, no checkout |
+| `selection` | `changes` | 5 | Gate integrity, full tool self-test, baseline ratchets, recomputes the classifier and compares outputs, compares `rust-toolchain.toml`, runs the workflow guard |
 | `check` | `changes` | 10 | `cargo check --locked --all-targets` under a 120-second budget |
 | `build` | `changes` | 10 | `cargo build --locked --bin baton` under a 150-second budget, then `--version` |
 | `test` | `changes` | 15 | `cargo test --locked` under a 300-second budget, then `ci/test-inventory.sh` |
 | `debt` | `changes` | 15 | Format ratchet under 60 seconds, Clippy ratchet under 300 seconds |
-| `verify` | all six | 2 | The only required branch-protection check |
+| `verify` | all six | 2 | The required branch-protection check; strict up-to-date, with an owner-only `ci-repair` bypass |
 
 `changes` outputs: `check_needed`, `build_needed`, `test_needed`, `debt_needed`, `full_suite_reason`, `has_tests`, `docs_only`. `full_suite_reason` records the selection class (`code`, `meta`, `unknown`, `empty`, `docs`, or the event name for non-PR events); it is not a claim that the full suite ran.
 
@@ -234,7 +284,7 @@ The real configuration, `BatonCiAdmission.cfg`, runs 583,175 states and 92,855 d
 
 What the model proves, with `CommandDriftAllowed = FALSE`: a selected gate cannot be skipped and reported green, an unselected gate cannot report success, merge events cannot use a subset, a retry cannot convert a failure, an unknown selection cannot select nothing, and a command edit cannot pass `CommandsMatch`. The one config that sets `CommandDriftAllowed = TRUE` exists only to show that `CommandsMatch` depends on that constant. The model models the rule, not the shell implementation, so `ci/selftest.sh` remains the executable proof.
 
-What it does not prove: test inventory completeness, shard union coverage, or that the selector's dependency map is correct. Those are covered by the selection union check and its fixtures.
+What it does not prove: test inventory completeness, shard union coverage, or that the selector's dependency map is correct. Those are Phase 3 work and will be covered by the selection union check and its fixtures; they are not covered today.
 
 `ci/formal/ci-admission/run.sh` needs a JDK and downloads `tla2tools.jar` 1.7.4 to `TLA2TOOLS_JAR` when the file is absent. That download is why the gate is local and recorded in `docs/ci-acceptance.md`, not a required PR job: a hosted job that fetches a jar from the internet is a supply-chain and flakiness risk that Phase 1 does not need. Pinning the jar as a committed artifact plus a pinned JDK action is the Phase 3 follow-up.
 
@@ -252,9 +302,10 @@ What it does not prove: test inventory completeness, shard union coverage, or th
 | `cargo test --locked` | 300 seconds | 90 seconds per shard |
 | Test inventory | 120 seconds | 60 seconds |
 | Format ratchet | 60 seconds | 30 seconds |
-| Clippy ratchet | 300 seconds | 180 seconds |
+| Clippy ratchet | 300 seconds | 300 seconds |
+| Debt self-test | 60 seconds | 60 seconds |
 
-Phase 1 values are three times a conservative local cold estimate. They are caps, not targets: a command that exceeds one fails the job. Phase 2 replaces each value with the measured Linux p95 plus 20 percent. That replacement is the only allowed increase; after it, no value may increase.
+Phase 1 values are three times a conservative local cold estimate. They are caps, not targets: a command that exceeds one fails the job. Phase 2 replaces each value with the measured Linux p95 plus 20 percent. That replacement is the only allowed increase; after it, no value may increase. Clippy is a separate debt ratchet, not a build or test command; its 300-second ceiling is recorded here so the 90-second warm build/test goal is not misread as a Clippy ceiling.
 
 ## Debt ratchets
 
@@ -281,7 +332,7 @@ The acceptance record is [ci-acceptance.md](ci-acceptance.md). It records the ru
 
 ## Caching
 
-`Swatinem/rust-cache` uses `shared-key: baton-v2-<os>-<arch>-<job>` and a `key` of the `Cargo.lock` and `rust-toolchain.toml` hashes. The job name is part of the key so a lint job cannot save an archive without the test build. Saves are restricted to `main`, so a PR cannot poison the cache other PRs read.
+`Swatinem/rust-cache` uses `shared-key: baton-v2-<os>-<arch>-<job>` and a `key` of the `Cargo.lock`, `Cargo.toml`, and `rust-toolchain.toml` hashes. The job name is part of the key so a lint job cannot save an archive without the test build. Saves are restricted to `main`, so a PR cannot poison the cache other PRs read. The `Cargo.toml` hash is what makes the test-profile change a deliberate cold seed rather than an incompatible restore.
 
 A cache miss changes the time, never the checks: the cold path runs the same commands under the same budgets. If a cold run regularly exceeds a Phase 1 budget, the fix is to correct the budget from measured data in Phase 2, not to skip the gate.
 
@@ -293,8 +344,8 @@ The pinned Rust toolchain is cached separately per job under `rustup-1.100.0-<os
 |---|---|---|
 | GitHub Actions minutes | Public repository, standard runners are free | No paid capacity is approved |
 | Monthly minute cap | Not applicable to free standard runners | Revisit only if a paid runner is approved |
-| Branch protection | Not configured | Require `verify`, block direct pushes to `main`, and record the ruleset proof |
-| Official merge queue | Blocked | Requires an organization on GitHub Enterprise Cloud; until then, a merge candidate is proved by the PR `verify` run on an up-to-date branch plus the `push` run on `main` |
+| Branch protection | Configured 2026-11-23 on `main` | Require the `Verify` status check, require an up-to-date branch, block force pushes and deletions, and keep admin enforcement off so the documented `ci-repair` override remains possible. GitHub rejects user push restrictions on user-owned repositories; direct owner pushes remain a documented residual risk |
+| Official merge queue | Blocked | A public repository owned by an organization is eligible; private organization repositories additionally require GitHub Enterprise Cloud. This user-owned repository must move under an organization first |
 | Paid runner | Not approved | Revisit only after Rust p50 and p95 both miss across at least 100 runs or four weeks |
 | `ci-repair` merge override | Owner only | Documented in the trust model; every use is quoted in its PR |
 

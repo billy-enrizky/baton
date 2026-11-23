@@ -162,6 +162,8 @@ def main() -> int:
         skills_result = screen_text(transcript, args.width, args.height)
         if "inserted $codex-demo (codex)" not in skills_result:
             missing.append("codex skill insertion notice")
+        if "switch to codex before sending" not in skills_result:
+            missing.append("skills source warning")
         if "/orchestrate off before sending" not in skills_result:
             missing.append("skills orchestrate warning")
         if not any(

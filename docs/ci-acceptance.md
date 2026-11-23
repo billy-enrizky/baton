@@ -57,7 +57,7 @@ The slowest test binary was no longer a 30-second outlier. The lib binary ran 32
 
 ## 2026-11-23 fast classifier and test profile
 
-The `changes` job no longer checks out the repository. For a pull request it fetches only the base commit and `refs/pull/<number>/head` at depth one, exports the base-owned classifier and budget script from the base commit, and classifies the two-commit diff. The trusted guards moved to `selection`, which still gates `verify`.
+The `changes` job no longer checks out the repository. For a pull request it fetches only the base commit and `refs/pull/<number>/merge` at depth one, exports the base-owned classifier and budget script from the base commit, and classifies the base-to-merge diff. The trusted guards moved to `selection`, which still gates `verify`.
 
 The test profile now keeps line tables and drops full debuginfo. The Cargo cache key includes `Cargo.toml`, so the profile change cannot restore incompatible artifacts.
 
@@ -66,9 +66,10 @@ The test profile now keeps line tables and drops full debuginfo. The Cargo cache
 | [45114396442](https://github.com/billy-enrizky/baton/actions/runs/45114396442) | workflow_dispatch | warm cache, forced Rust rebuild | 51 seconds | 6 seconds | 35 seconds | Final classifier branch; realistic Rust source rebuild, 509 tests |
 | [45111528561](https://github.com/billy-enrizky/baton/actions/runs/45111528561) | workflow_dispatch | warm cache, forced Rust rebuild | 52 seconds | 6 seconds | 38 seconds | Earlier combined branch; kept as a corroborating sample |
 | [45111377033](https://github.com/billy-enrizky/baton/actions/runs/45111377033) | workflow_dispatch | warm cache, unchanged Rust source | 51 seconds | 5 seconds | 32 seconds | Test step reused the Baton artifacts; descriptive only |
+| [45115234795](https://github.com/billy-enrizky/baton/actions/runs/45115234795) | workflow_dispatch | warm cache, head tools | 53 seconds | 6 seconds | 33 seconds | Post-merge proof path; merged self-test, workflow guard, required commands, and budgets all passed |
 | [45111201206](https://github.com/billy-enrizky/baton/actions/runs/45111201206) | pull_request | cold after profile change | 85 seconds | 5 seconds | 71 seconds | Pull-request cache did not inherit the branch cache; Selection failed at the expected CI013 workflow comparison |
 
-The 52-second run is the critical-path proof for this slice. It is not counted as a PR p50 sample because it is a dispatch. The first post-merge pull request will be the acceptance sample.
+The 51-second run is the critical-path proof for this slice. It is not counted as a PR p50 sample because it is a dispatch. The 53-second head-tools run proves the merged scripts and required-command enforcement; the first post-merge pull request will be the acceptance sample.
 
 The toolchain-cache removal experiment was rejected. Removing the 391 MB `~/.rustup` restore made Setup Rust take about 9 seconds instead of about 6 seconds of restore plus 1 second of activation. Matched samples were 57 and 69 seconds with the cache removed, against 69 and 71 seconds with the cache retained; the difference was noise, not a gain. Runs 45108914603, 45109176611, 45109045484, and 45109314728 are recorded for that decision.
 
@@ -234,6 +235,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | CI admission model | `ci/formal/ci-admission/run.sh` | Passed locally |
 | Branch protection | `main` requires `Verify`, requires an up-to-date branch, blocks direct and force pushes, and has admin enforcement off for the documented `ci-repair` override | Configured 2026-11-23; branch-protection API response recorded |
 | Fast classifier warm path | Branch dispatch 45114396442 with a forced Rust rebuild: 51 seconds, Changes complete at 6 seconds, Test 35 seconds | Passed 2026-11-23; post-merge PR sample pending |
+| Head-tools post-merge proof | Branch dispatch 45115234795: 53 seconds, Selection 12 seconds, merged self-test and workflow guard passed | Passed 2026-11-23 |
 
 ## v0.4.0 release assets
 

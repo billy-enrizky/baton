@@ -23,6 +23,7 @@ mkdir -p "$evidence"
 
 bash ci/selftest.sh > "$evidence/selftest.log" 2>&1
 bash ci/check-ci.sh --bootstrap ci/fixtures/check-ci/valid.yml > "$evidence/guard-valid.log" 2>&1
+bash ci/check-ci.sh --bootstrap .github/workflows/ci.yml > "$evidence/guard-workflow.log" 2>&1
 if bash ci/check-ci.sh --base ci/fixtures/check-ci/valid.yml ci/fixtures/check-ci/changed-test-command.yml > "$evidence/guard-change-rejected.log" 2>&1; then
   echo "changed command was not rejected" >&2
   exit 1
@@ -45,6 +46,7 @@ cat > "$evidence/summary.json" <<JSON
   "evidence": "$evidence",
   "selftest": "passed",
   "workflow_guard": "passed",
+  "real_workflow": "passed",
   "command_change": "rejected-without-override",
   "budget_overrun_exit": 124
 }

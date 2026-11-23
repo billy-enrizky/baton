@@ -7,15 +7,17 @@ description: "Model-check Baton's CI admission rules. Use when changing ci/class
 
 The CI gate is a state machine: a path classifier selects gates, each selected gate either runs or is skipped, the workflow guard checks command identity, and `verify` decides whether the run is green. A bug here can merge a broken change while every job reports success.
 
+In the workflow, `changes` is an untrusted fast path that only classifies, and `selection` owns the trusted guard and the recomputation check. The model's gate names and admission rules are unchanged; `selection` is the gate that must succeed for the workflow guard to count.
+
 The model is committed at `ci/formal/ci-admission/`.
 
 ## What is verified
 
 - `ci/classify-paths.sh`: selected gates for push, merge group, dispatch, pull request, and unknown paths.
 - `ci/check-ci.sh`: command identity and workflow guard.
-- `.github/workflows/ci.yml`: `changes`, `selection`, `check`, `build`, `test`, `debt`, and `verify` gate names and relationships.
+- `.github/workflows/ci.yml`: `changes`, `selection`, `check`, `build`, `test`, `debt`, and `verify` gate names and relationships. `changes` has no checkout and no pass/fail guards; `selection` runs them.
 
-The model covers selection, start, result, skip cause, command identity, a `CommandDriftAllowed` constant, and the `verify` verdict. The real configuration sets `CommandDriftAllowed = FALSE`; there is no label override in the workflow. It does not cover test inventory completeness, shard union, GitHub API behavior, or the shell implementation inside a gate command beyond its identity.
+The model covers selection, start, result, skip cause, command identity, a `CommandDriftAllowed` constant, and the `verify` verdict. The real configuration sets `CommandDriftAllowed = FALSE`; there is no label override in the workflow. It does not cover test inventory completeness, shard union, the shallow-fetch implementation, or the shell implementation inside a gate command beyond its identity.
 
 ## Properties
 
@@ -52,4 +54,4 @@ Read every failing trace with the pstack `/statechart` skill. It presents the sh
 
 Update the model and this skill together when a gate name, selection output, `verify` rule, or command-identity rule changes. A failing invariant is a finding, not a reason to weaken the model.
 
-Coverage confirmed at: `013dfaf` plus the CI helper hardening in this PR.
+The model does not need a new configuration for the fast path: moving the guard from `changes` to `selection` preserves the `NoFalseGreen` requirement that both gate jobs succeed before `verify` can be green.

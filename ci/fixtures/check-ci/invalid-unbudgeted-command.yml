@@ -35,6 +35,8 @@ jobs:
       - run: |
           base/ci/budget.sh 30 base/ci/classify-paths.sh . base
           base/ci/budget.sh 30 base/ci/check-ci.sh --base base/.github/workflows/ci.yml .github/workflows/ci.yml
+          base/ci/budget.sh 30 base/ci/selftest.sh
+          base/ci/budget.sh 30 base/ci/gate-integrity.sh .
   check:
     needs: changes
     if: needs.changes.outputs.check_needed == 'true'

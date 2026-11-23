@@ -27,6 +27,9 @@ done
 
 valid="$root/fixtures/check-ci/valid.yml"
 bash "$root/check-ci.sh" --bootstrap "$valid" >/dev/null
+if [[ -f "$repo_root/.github/workflows/ci.yml" ]]; then
+  bash "$root/check-ci.sh" --bootstrap "$repo_root/.github/workflows/ci.yml" >/dev/null
+fi
 
 if [[ "$quick" == true ]]; then
     echo "ci quick selftest passed"

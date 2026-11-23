@@ -172,8 +172,8 @@ end
 
 unless allow_change
   required_commands = {
-    "changes" => ["classify-paths.sh", "selftest.sh", "check-ci.sh"],
-    "selection" => ["classify-paths.sh", "check-ci.sh", "--base"],
+    "changes" => ["classify-paths.sh"],
+    "selection" => ["classify-paths.sh", "check-ci.sh", "--base", "selftest.sh", "gate-integrity.sh"],
     "check" => ["cargo check --locked"],
     "build" => ["cargo build --locked"],
     "test" => ["cargo test --locked"],

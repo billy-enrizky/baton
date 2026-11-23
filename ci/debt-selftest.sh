@@ -34,4 +34,15 @@ if [[ $code -eq 0 ]] || ! grep -q 'clippy debt grew' <<< "$output"; then
   exit 1
 fi
 
+printf '1\n' > "$clippy_root/clippy-baseline-one.txt"
+set +e
+output=$(CARGO_TERM_COLOR=always bash "$root/clippy-debt.sh" "$clippy_root" "$clippy_root/clippy-baseline-one.txt" 2>&1)
+code=$?
+set -e
+if [[ $code -ne 0 ]] || ! grep -q 'clippy debt: 1 <= 1' <<< "$output"; then
+  echo "clippy ratchet counted compiler summary lines as debt" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+
 echo "debt self-test passed"

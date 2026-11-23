@@ -23,8 +23,7 @@ if [[ $code -eq 101 ]] && ! grep -q 'clippy::' <<< "$output"; then
   exit 1
 fi
 
-count=$(printf '%s\n' "$output" | grep -c '^error:' || true)
-count=${count:-0}
+count=$(printf '%s\n' "$output" | awk '/^error:/ && $0 !~ /could not compile|aborting due to/ { count++ } END { print count + 0 }')
 
 if (( count > baseline )); then
   echo "clippy debt grew: $count > $baseline" >&2

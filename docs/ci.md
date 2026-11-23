@@ -99,7 +99,7 @@ Every check below is a real command in `ci/`. `ci/selftest.sh` proves the workfl
 | Gate integrity | `ci/gate-integrity.sh` | Rules GI001 to GI006 |
 | Test inventory | `ci/test-inventory.sh` | Rules TI001 to TI005. Run mode compares announced and executed totals; list mode counts discovered tests |
 | Format debt | `ci/fmt-debt.sh` | Count of `Diff in ` lines must not exceed the baseline |
-| Clippy debt | `ci/clippy-debt.sh` | Count of `error:` lines must not exceed the baseline |
+| Clippy debt | `ci/clippy-debt.sh` | Count of lint diagnostics, excluding compiler summary lines, must not exceed the baseline |
 | Self-test | `ci/selftest.sh` | Runs every workflow fixture, stale-base and Git typechange fixtures, the budget negative test, and the inventory floor, short-execution, and missing-total cases |
 | Debt self-test | `ci/debt-selftest.sh` | Runs in the debt job and proves a format diff and a Clippy lint over a zero baseline both fail |
 

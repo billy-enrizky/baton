@@ -2,7 +2,7 @@
 //! each worker runs in its own git worktree through the normal `baton exec`
 //! path, and results are recorded durably.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -11,12 +11,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::config::resolve_config;
+use crate::roles::{RoleId, RoleRegistry, RoleSpec};
 use crate::store::{BatonStore, OrchestrationRunRow, OrchestrationTaskRow};
 use crate::types::{PermissionMode, ProviderId, TurnPhase};
 use crate::worktree::{self, WorktreeInfo};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const CANCELLED_ERROR: &str = "orchestration cancelled";
+pub const MAX_TASKS: usize = 16;
 
 fn is_cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel
@@ -291,36 +293,103 @@ fn available_providers(coordinator: ProviderId) -> Vec<ProviderId> {
     available
 }
 
+fn default_worker_provider(
+    available: &[ProviderId],
+    coordinator: ProviderId,
+    implementor: ProviderId,
+) -> ProviderId {
+    if available.contains(&implementor) {
+        implementor
+    } else {
+        coordinator
+    }
+}
+
 fn planner_prompt(
     goal: &str,
     cwd: &Path,
     max_tasks: usize,
     available: &[ProviderId],
-    coordinator: ProviderId,
+    roles: &RoleRegistry,
+    default_worker: ProviderId,
 ) -> String {
+    let orchestrator = roles.get(RoleId::Orchestrator);
+    let planner = roles.get(RoleId::Planner);
     let providers = available
         .iter()
         .map(|provider| provider.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    let role_context = format!(
+        "{}\n\n{}",
+        orchestrator.prompt.trim(),
+        planner.prompt.trim()
+    );
     let template = r#"You are baton's coordinator. Split the goal into at most MAX independent worker tasks.
 Use the smallest number of tasks that truly parallelizes. Return exactly one task for a question, a small fix, or work that touches one cohesive area. Split only when the tasks are independent, touch disjoint files, and do not need each other's output. Do not invent extra work.
 Each task prompt must be self-contained. Never ask a worker to coordinate with another worker.
 Each worker runs in its own git worktree, so tasks must not depend on another task's output and must avoid overlapping files.
-Choose the best installed harness for each task from: PROVIDERS. Prefer COORDINATOR when the task does not benefit from another harness.
-When the goal explicitly names a model for a task, set that task's "model" field. Otherwise omit "model" so the harness default applies.
-When the goal explicitly names a reasoning effort, set that task's "effort" field. Use a lowercase value such as low, medium, high, xhigh, or max. Only codex and claude support effort. Otherwise omit "effort" so the harness default applies.
+Choose the best installed harness for each task from: PROVIDERS. Default every task to DEFAULT_WORKER. Choose another harness only when the goal explicitly names one.
+When the goal explicitly names a model for a task, set that task's "model" field. Otherwise omit "model" so Baton applies the role default for the default worker provider; a task on another harness uses its config default.
+When the goal explicitly names a reasoning effort, set that task's "effort" field. Use a lowercase value such as low, medium, high, xhigh, or max. Only codex and claude support effort. Otherwise omit "effort" so Baton applies the role default for the default worker provider; another harness uses its default.
+Reviewer execution is not active in this request. Do not wait for a reviewer verdict; return only the plan.
 Every worker starts in its own worktree, so each prompt must refer to the current working directory, never to the source checkout path.
 Return ONLY a JSON object, with no markdown fences or commentary:
-{"summary":"one sentence","tasks":[{"title":"short task name","provider":"codex","prompt":"complete self-contained instructions for the worker"}]}
-Goal: GOAL
-Source repository: CWD"#;
-    template
+{"summary":"one sentence","tasks":[{"title":"short task name","provider":"DEFAULT_WORKER","prompt":"complete self-contained instructions for the worker"}]}"#;
+    let prompt = template
         .replace("MAX", &max_tasks.to_string())
         .replace("PROVIDERS", &providers)
-        .replace("COORDINATOR", coordinator.as_str())
-        .replace("GOAL", goal)
-        .replace("CWD", &cwd.display().to_string())
+        .replace("DEFAULT_WORKER", default_worker.as_str());
+    format!(
+        "{role_context}\n\nApply the role context above within the coordinator contract below. The output format and safety rules below take precedence if they conflict.\n\n{prompt}\nGoal: {goal}\nSource repository: {}",
+        cwd.display()
+    )
+}
+
+fn normalize_plan_for_role(plan: &mut Plan, role: &RoleSpec) {
+    for task in &mut plan.tasks {
+        if task.provider.trim() != role.provider.as_str() {
+            continue;
+        }
+        if task.model.is_none() {
+            task.model = Some(role.model.clone());
+        }
+        if task.effort.is_none() {
+            task.effort = role.effort.clone();
+        }
+    }
+}
+
+fn fallback_plan_from_role(goal: &str, role: &RoleSpec) -> Plan {
+    fallback_plan_with_values(
+        goal,
+        role.provider,
+        Some(role.model.as_str()),
+        role.effort.as_deref(),
+    )
+}
+
+fn fallback_plan_with_values(
+    goal: &str,
+    provider: ProviderId,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Plan {
+    let mut plan = fallback_plan(goal, provider);
+    if let Some(task) = plan.tasks.first_mut() {
+        task.model = model.map(str::to_string);
+        task.effort = effort.map(str::to_string);
+    }
+    plan
+}
+
+fn planner_failure_plan(goal: &str, available: &[ProviderId], roles: &RoleRegistry) -> Plan {
+    let implementor = roles.get(RoleId::Implementor);
+    if available.contains(&implementor.provider) {
+        fallback_plan_from_role(goal, implementor)
+    } else {
+        fallback_plan_from_role(goal, roles.get(RoleId::Planner))
+    }
 }
 
 fn validate_plan_providers(plan: &Plan, available: &[ProviderId]) -> Result<()> {
@@ -343,6 +412,9 @@ fn validate_plan_providers(plan: &Plan, available: &[ProviderId]) -> Result<()> 
 }
 
 const WORKER_PREAMBLE: &str = "You are a worker in an isolated git worktree. Treat the current working directory as the repository root. Do not read or write the source checkout outside this worktree. If you cannot finish without a user decision or information only the user can provide, stop and end your reply with exactly one line formatted as `BATON_QUESTION: <question>`. Do not guess. Otherwise finish the task.";
+
+const MAX_TASK_PROMPT_BYTES: usize = 12 * 1024;
+const MAX_ORCHESTRATION_GOAL_BYTES: usize = 6 * 1024;
 
 pub const QUESTION_PREFIX: &str = "BATON_QUESTION:";
 
@@ -388,17 +460,29 @@ pub fn parse_plan(text: &str, max_tasks: usize) -> Result<Plan> {
     if plan.tasks.is_empty() {
         anyhow::bail!("planner returned no tasks");
     }
-    if plan.tasks.len() > max_tasks {
-        plan.tasks.truncate(max_tasks);
+    let limit = max_tasks.min(MAX_TASKS);
+    if limit == 0 {
+        anyhow::bail!("max tasks must be at least 1");
+    }
+    if plan.tasks.len() > limit {
+        plan.tasks.truncate(limit);
     }
     for task in &mut plan.tasks {
         if task.title.trim().is_empty() {
             anyhow::bail!("planner returned a task without a title");
         }
         let model = task.model.take();
-        task.model = model
-            .map(|model| model.trim().to_string())
-            .filter(|model| !model.is_empty());
+        task.model = match model {
+            Some(model) if model.trim().is_empty() => None,
+            Some(model) => {
+                let model = model.trim().to_string();
+                if !crate::roles::safe_model_token(&model) {
+                    anyhow::bail!("planner returned an invalid model");
+                }
+                Some(model)
+            }
+            None => None,
+        };
         let effort = task.effort.take();
         task.effort = match effort {
             Some(effort)
@@ -414,6 +498,11 @@ pub fn parse_plan(text: &str, max_tasks: usize) -> Result<Plan> {
         };
         if task.prompt.trim().is_empty() {
             anyhow::bail!("planner returned a task without a prompt");
+        }
+        if task.prompt.len() > MAX_TASK_PROMPT_BYTES {
+            anyhow::bail!(
+                "planner returned a task prompt larger than {MAX_TASK_PROMPT_BYTES} bytes"
+            );
         }
         if ProviderId::parse(task.provider.trim()).is_none() {
             anyhow::bail!("planner returned unknown provider {}", task.provider);
@@ -436,17 +525,14 @@ fn parse_exec_output(stdout: &[u8], stderr: &[u8]) -> (Option<String>, Option<St
     (None, None, (!stderr.is_empty()).then_some(stderr), None)
 }
 
-fn run_coordinator(
-    prompt: &str,
+fn coordinator_command(
+    binary: &Path,
     cwd: &Path,
     provider: ProviderId,
     model: &str,
+    effort: Option<&str>,
     permission_mode: PermissionMode,
-    cancel: Option<&AtomicBool>,
-) -> Result<String> {
-    let temp_home = std::env::temp_dir().join(format!("baton-planner-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&temp_home)?;
-    let binary = std::env::current_exe()?;
+) -> Command {
     let mut command = Command::new(binary);
     command
         .arg("-C")
@@ -457,7 +543,27 @@ fn run_coordinator(
         .arg("-m")
         .arg(model)
         .arg("--json");
+    if let Some(effort) = effort {
+        command.arg("--effort").arg(effort);
+    }
     apply_permission_args(&mut command, permission_mode);
+    command.env("BATON_DISABLE_SKILL_DISPATCH", "1");
+    command
+}
+
+fn run_coordinator(
+    prompt: &str,
+    cwd: &Path,
+    provider: ProviderId,
+    model: &str,
+    effort: Option<&str>,
+    permission_mode: PermissionMode,
+    cancel: Option<&AtomicBool>,
+) -> Result<String> {
+    let temp_home = std::env::temp_dir().join(format!("baton-planner-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&temp_home)?;
+    let binary = std::env::current_exe()?;
+    let mut command = coordinator_command(&binary, cwd, provider, model, effort, permission_mode);
     command.arg(prompt).env("BATON_HOME", &temp_home);
     let output = run_command_cancellable(command, cancel);
     let _ = std::fs::remove_dir_all(&temp_home);
@@ -498,6 +604,14 @@ pub fn is_conversational_greeting(text: &str) -> bool {
     )
 }
 
+pub fn coordinator_role_for(goal: &str, plan_path: Option<&Path>) -> RoleId {
+    if plan_path.is_none() && is_conversational_greeting(goal) {
+        RoleId::Orchestrator
+    } else {
+        RoleId::Planner
+    }
+}
+
 fn run_planner(
     goal: &str,
     cwd: &Path,
@@ -507,8 +621,12 @@ fn run_planner(
     permission_mode: PermissionMode,
     cancel: Option<&AtomicBool>,
     available: &[ProviderId],
+    roles: &RoleRegistry,
+    effort: Option<&str>,
+    default_worker: ProviderId,
 ) -> Result<Plan> {
-    let base_prompt = planner_prompt(goal, cwd, max_tasks, available, provider);
+    let base_prompt = planner_prompt(goal, cwd, max_tasks, available, roles, default_worker);
+    let fallback = planner_failure_plan(goal, available, roles);
     let mut last_error: Option<anyhow::Error> = None;
     for attempt in 0..2 {
         let prompt = if attempt == 0 {
@@ -527,6 +645,7 @@ fn run_planner(
             cwd,
             provider,
             model,
+            effort,
             permission_mode,
             cancel,
         ) {
@@ -546,7 +665,7 @@ fn run_planner(
             Ok(plan) => return Ok(plan),
             Err(error) => {
                 if plan_is_empty(&error) {
-                    return plan_after_planner_failure(goal, provider, &error);
+                    return plan_after_planner_failure(&fallback, &error);
                 }
                 last_error = Some(error);
             }
@@ -556,7 +675,7 @@ fn run_planner(
     if std::env::var_os("BATON_ORCHESTRATE_DEBUG").is_some() {
         eprintln!("[orchestrate] planner failed; using one direct worker: {error}");
     }
-    plan_after_planner_failure(goal, provider, &error)
+    plan_after_planner_failure(&fallback, &error)
 }
 
 fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
@@ -597,15 +716,19 @@ fn plan_is_empty(error: &anyhow::Error) -> bool {
 
 /// A planner that cannot produce a usable plan must not strand the user's
 /// work. Cancellation is the one exception: the user asked to stop.
-fn plan_after_planner_failure(
-    goal: &str,
-    provider: ProviderId,
-    error: &anyhow::Error,
-) -> Result<Plan> {
+fn plan_after_planner_failure(fallback: &Plan, error: &anyhow::Error) -> Result<Plan> {
     if error.to_string() == CANCELLED_ERROR {
         anyhow::bail!(CANCELLED_ERROR);
     }
-    Ok(fallback_plan(goal, provider))
+    Ok(fallback.clone())
+}
+
+fn worker_prompt(implementor_prompt: &str, task_prompt: &str) -> String {
+    format!(
+        "{WORKER_PREAMBLE}\n\n{}\n\n{}",
+        implementor_prompt.trim(),
+        task_prompt
+    )
 }
 
 fn load_plan(path: &Path, max_tasks: usize) -> Result<Plan> {
@@ -657,6 +780,7 @@ fn run_worker(
     repo_root: Option<&Path>,
     repo_snapshot: Option<&worktree::RepoSnapshot>,
     worker_bin: Option<&Path>,
+    implementor_prompt: &str,
     progress: Option<&ProgressFn<'_>>,
     cancel: Option<&AtomicBool>,
     permission_mode: PermissionMode,
@@ -670,6 +794,7 @@ fn run_worker(
         repo_root,
         repo_snapshot,
         worker_bin,
+        implementor_prompt,
         progress,
         cancel,
         permission_mode,
@@ -703,6 +828,7 @@ fn run_worker_inner(
     repo_root: Option<&Path>,
     repo_snapshot: Option<&worktree::RepoSnapshot>,
     worker_bin: Option<&Path>,
+    implementor_prompt: &str,
     progress: Option<&ProgressFn<'_>>,
     cancel: Option<&AtomicBool>,
     permission_mode: PermissionMode,
@@ -846,7 +972,7 @@ fn run_worker_inner(
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_exe().ok())
         .unwrap_or_else(|| PathBuf::from("baton"));
-    let effective_prompt = format!("{WORKER_PREAMBLE}\n\n{}", task.prompt);
+    let effective_prompt = worker_prompt(implementor_prompt, &task.prompt);
     emit(
         progress,
         OrchestrationProgress::WorkerStarted {
@@ -871,7 +997,10 @@ fn run_worker_inner(
         command.arg("--effort").arg(effort);
     }
     apply_permission_args(&mut command, permission_mode);
-    command.arg(&effective_prompt).env("BATON_HOME", home);
+    command
+        .arg(&effective_prompt)
+        .env("BATON_HOME", home)
+        .env("BATON_DISABLE_SKILL_DISPATCH", "1");
     let output = run_command_cancellable(command, cancel);
     let (thread_id, text, error, _phase, cancelled) = match output {
         Ok(result) => {
@@ -1678,6 +1807,7 @@ pub fn integrate_to_json(report: &IntegrateReport) -> serde_json::Value {
 pub fn plan(
     goal: &str,
     cwd: &Path,
+    home: &Path,
     coordinator_provider: ProviderId,
     coordinator_model: &str,
     max_tasks: usize,
@@ -1688,28 +1818,51 @@ pub fn plan(
     if max_tasks == 0 {
         anyhow::bail!("max tasks must be at least 1");
     }
+    if max_tasks > MAX_TASKS {
+        anyhow::bail!("max tasks must be at most {MAX_TASKS}");
+    }
+    if goal.len() > MAX_ORCHESTRATION_GOAL_BYTES {
+        anyhow::bail!(
+            "orchestration goal exceeds {MAX_ORCHESTRATION_GOAL_BYTES} bytes"
+        );
+    }
     if is_cancelled(cancel) {
         anyhow::bail!(CANCELLED_ERROR);
     }
-    match plan_path {
-        Some(path) => load_plan(path, max_tasks),
-        None if is_conversational_greeting(goal) => {
-            Ok(fallback_plan(goal, coordinator_provider))
-        }
-        None => {
-            let available = available_providers(coordinator_provider);
-            run_planner(
-                goal,
-                cwd,
-                coordinator_provider,
-                coordinator_model,
-                max_tasks,
-                permission_mode,
-                cancel,
-                &available,
-            )
-        }
+    let registry = crate::roles::load(home)?;
+    let orchestrator = registry.get(RoleId::Orchestrator);
+    let planner = registry.get(RoleId::Planner);
+    let implementor = registry.get(RoleId::Implementor);
+    let available = available_providers(coordinator_provider);
+    let default_worker =
+        default_worker_provider(&available, coordinator_provider, implementor.provider);
+    let normalization_role = if available.contains(&implementor.provider) {
+        implementor
+    } else {
+        planner
+    };
+    let greeting = coordinator_role_for(goal, plan_path) == RoleId::Orchestrator;
+    let mut plan = match plan_path {
+        Some(path) => load_plan(path, max_tasks)?,
+        None if greeting => fallback_plan_from_role(goal, orchestrator),
+        None => run_planner(
+            goal,
+            cwd,
+            coordinator_provider,
+            coordinator_model,
+            max_tasks,
+            permission_mode,
+            cancel,
+            &available,
+            &registry,
+            planner.effort.as_deref(),
+            default_worker,
+        )?,
+    };
+    if !greeting {
+        normalize_plan_for_role(&mut plan, normalization_role);
     }
+    Ok(plan)
 }
 
 pub fn run(
@@ -1819,10 +1972,14 @@ fn run_with_worker_bin_and_progress(
     if is_cancelled(cancel) {
         anyhow::bail!(CANCELLED_ERROR);
     }
-    let repo_root = worktree::repo_root(cwd).ok();
+    let registry = crate::roles::load(home)?;
+    let implementor = registry.get(RoleId::Implementor);
+    let implementor_prompt = implementor.prompt.clone();
+    let repo_root = worktree::repo_root(cwd).context("orchestrate requires a git repository")?;
     let plan = plan(
         goal,
         cwd,
+        home,
         coordinator_provider,
         coordinator_model,
         max_tasks,
@@ -1831,13 +1988,11 @@ fn run_with_worker_bin_and_progress(
         cancel,
     )?;
     // Capture the source after planning so workers see the latest dirty state.
-    let dirty_source = repo_root
-        .as_ref()
-        .and_then(|root| worktree::is_dirty(root).ok())
-        .unwrap_or(false);
-    let repo_snapshot = match repo_root.as_ref() {
-        Some(root) if dirty_source => worktree::snapshot(root)?,
-        _ => None,
+    let dirty_source = worktree::is_dirty(&repo_root).unwrap_or(false);
+    let repo_snapshot = if dirty_source {
+        worktree::snapshot(&repo_root)?
+    } else {
+        None
     };
     let run_id = uuid::Uuid::new_v4().to_string();
     let summary = plan.summary.clone();
@@ -1882,6 +2037,7 @@ fn run_with_worker_bin_and_progress(
                 let cwd = cwd.to_path_buf();
                 let repo_root = repo_root.clone();
                 let worker_bin = worker_bin.map(Path::to_path_buf);
+                let implementor_prompt = implementor_prompt.clone();
                 let worker_snapshot = repo_snapshot.as_ref();
                 let handle = scope.spawn(move || {
                     run_worker(
@@ -1890,9 +2046,10 @@ fn run_with_worker_bin_and_progress(
                         &run_id,
                         &home,
                         &cwd,
-                        repo_root.as_deref(),
+                        Some(repo_root.as_path()),
                         worker_snapshot,
                         worker_bin.as_deref(),
+                        &implementor_prompt,
                         progress,
                         cancel,
                         permission_mode,
@@ -1970,7 +2127,7 @@ fn run_with_worker_bin_and_progress(
         coordinator_model: coordinator_model.to_string(),
         summary,
         plan,
-        repo_root,
+        repo_root: Some(repo_root),
         dirty_source,
         status: status.to_string(),
         archived_at: None,
@@ -2411,22 +2568,20 @@ mod tests {
 
     #[test]
     fn planner_failures_fall_back_unless_the_user_cancelled() {
-        let plan = plan_after_planner_failure(
-            "fix the test",
-            ProviderId::Codex,
-            &anyhow::anyhow!("planner returned no tasks"),
-        )
-        .unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let registry = crate::roles::load(home.path()).unwrap();
+        let implementor = registry.get(RoleId::Implementor);
+        let fallback = fallback_plan_from_role("fix the test", implementor);
+        let plan =
+            plan_after_planner_failure(&fallback, &anyhow::anyhow!("planner returned no tasks"))
+                .unwrap();
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].provider, "codex");
+        assert_eq!(plan.tasks[0].model.as_deref(), Some("gpt-6.2-sol"));
         assert_eq!(plan.tasks[0].prompt, "fix the test");
 
-        let cancelled = plan_after_planner_failure(
-            "fix the test",
-            ProviderId::Codex,
-            &anyhow::anyhow!(CANCELLED_ERROR),
-        )
-        .unwrap_err();
+        let cancelled =
+            plan_after_planner_failure(&fallback, &anyhow::anyhow!(CANCELLED_ERROR)).unwrap_err();
         assert_eq!(cancelled.to_string(), CANCELLED_ERROR);
     }
 
@@ -2440,6 +2595,113 @@ mod tests {
     }
 
     #[test]
+    fn greeting_uses_the_orchestrator_role_without_implementor_normalization() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::roles::config_path(home.path()),
+            r#"{"roles":{"orchestrator":{"provider":"codex","model":"orch-model"},"implementor":{"provider":"codex","model":"impl-model","effort":"high"}}}"#,
+        )
+        .unwrap();
+        let first_plan = plan(
+            "hi",
+            home.path(),
+            home.path(),
+            ProviderId::Claude,
+            "planner-model",
+            4,
+            None,
+            PermissionMode::Default,
+            None,
+        )
+        .unwrap();
+        assert_eq!(first_plan.tasks[0].provider, "codex");
+        assert_eq!(first_plan.tasks[0].model.as_deref(), Some("orch-model"));
+        assert!(first_plan.tasks[0].effort.is_none());
+
+        std::fs::write(
+            crate::roles::config_path(home.path()),
+            r#"{"roles":{"orchestrator":{"provider":"codex","model":"orch-model","effort":"low"},"implementor":{"provider":"codex","model":"impl-model","effort":"high"}}}"#,
+        )
+        .unwrap();
+        let second_plan = plan(
+            "hi",
+            home.path(),
+            home.path(),
+            ProviderId::Claude,
+            "planner-model",
+            4,
+            None,
+            PermissionMode::Default,
+            None,
+        )
+        .unwrap();
+        assert_eq!(second_plan.tasks[0].effort.as_deref(), Some("low"));
+        let worker = worker_prompt("implementor prompt", &second_plan.tasks[0].prompt);
+        assert!(worker.contains("implementor prompt"), "{worker}");
+    }
+
+    #[test]
+    fn default_worker_uses_the_implementor_only_when_it_is_installed() {
+        assert_eq!(
+            default_worker_provider(
+                &[ProviderId::Claude, ProviderId::Codex],
+                ProviderId::Claude,
+                ProviderId::Codex,
+            ),
+            ProviderId::Codex
+        );
+        assert_eq!(
+            default_worker_provider(&[ProviderId::Claude], ProviderId::Claude, ProviderId::Codex),
+            ProviderId::Claude
+        );
+
+        let home = tempfile::tempdir().unwrap();
+        let registry = crate::roles::load(home.path()).unwrap();
+        let coordinator_only = planner_failure_plan("fix it", &[ProviderId::Claude], &registry);
+        assert_eq!(coordinator_only.tasks[0].provider, "claude");
+        assert_eq!(
+            coordinator_only.tasks[0].model.as_deref(),
+            Some("claude-opus-5-5")
+        );
+        let with_implementor = planner_failure_plan(
+            "fix it",
+            &[ProviderId::Claude, ProviderId::Codex],
+            &registry,
+        );
+        assert_eq!(with_implementor.tasks[0].provider, "codex");
+        assert_eq!(
+            with_implementor.tasks[0].model.as_deref(),
+            Some("gpt-6.2-sol")
+        );
+    }
+
+    #[test]
+    fn coordinator_command_forwards_the_planner_effort() {
+        let command = coordinator_command(
+            Path::new("baton"),
+            Path::new("/repo"),
+            ProviderId::Codex,
+            "planner-model",
+            Some("high"),
+            PermissionMode::Default,
+        );
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--effort" && pair[1] == "high"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "-m" && pair[1] == "planner-model"));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "BATON_DISABLE_SKILL_DISPATCH"
+                && value.map(|value| value.to_string_lossy() == "1").unwrap_or(false)
+        }));
+    }
+
+    #[test]
     fn plan_only_resolves_files_and_greetings_without_running_workers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("plan.json");
@@ -2450,6 +2712,7 @@ mod tests {
         .unwrap();
         let file_plan = plan(
             "preview goal",
+            dir.path(),
             dir.path(),
             ProviderId::Codex,
             "coordinator-model",
@@ -2466,6 +2729,7 @@ mod tests {
         let greeting = plan(
             "hi",
             dir.path(),
+            dir.path(),
             ProviderId::Claude,
             "coordinator-model",
             4,
@@ -2476,9 +2740,11 @@ mod tests {
         .unwrap();
         assert_eq!(greeting.tasks.len(), 1);
         assert_eq!(greeting.tasks[0].provider, "claude");
+        assert_eq!(greeting.tasks[0].model.as_deref(), Some("claude-opus-5-5"));
 
         assert!(plan(
             "goal",
+            dir.path(),
             dir.path(),
             ProviderId::Codex,
             "coordinator-model",
@@ -2488,25 +2754,143 @@ mod tests {
             None,
         )
         .is_err());
+
+        assert!(plan(
+            &"x".repeat(MAX_ORCHESTRATION_GOAL_BYTES + 1),
+            dir.path(),
+            dir.path(),
+            ProviderId::Codex,
+            "coordinator-model",
+            4,
+            Some(&path),
+            PermissionMode::Default,
+            None,
+        )
+        .is_err());
+
+        assert!(plan(
+            "goal",
+            dir.path(),
+            dir.path(),
+            ProviderId::Codex,
+            "coordinator-model",
+            MAX_TASKS + 1,
+            Some(&path),
+            PermissionMode::Default,
+            None,
+        )
+        .is_err());
     }
 
     #[test]
     fn planner_prompt_asks_for_the_smallest_plan_and_lists_available_harnesses() {
+        let home = tempfile::tempdir().unwrap();
+        let registry = crate::roles::load(home.path()).unwrap();
         let prompt = planner_prompt(
             "fix the bug",
             Path::new("/repo"),
             4,
             &[ProviderId::Codex, ProviderId::Claude],
+            &registry,
             ProviderId::Codex,
         );
         assert!(prompt.contains("smallest number of tasks"), "{prompt}");
         assert!(prompt.contains("exactly one task"), "{prompt}");
         assert!(prompt.contains("codex, claude"), "{prompt}");
-        assert!(prompt.contains("Prefer codex"), "{prompt}");
+        assert!(prompt.contains("Default every task to codex"), "{prompt}");
+        assert!(prompt.contains("You are Baton's orchestrator"), "{prompt}");
+        assert!(prompt.contains("You are Baton's planner"), "{prompt}");
+        assert!(prompt.contains("take precedence if they conflict"), "{prompt}");
         assert!(prompt.contains("Never ask a worker to coordinate"), "{prompt}");
         assert!(prompt.contains("explicitly names a model"), "{prompt}");
+        assert!(prompt.contains("role default for the default worker provider"), "{prompt}");
         assert!(prompt.contains("explicitly names a reasoning effort"), "{prompt}");
         assert!(prompt.contains("Only codex and claude support effort"), "{prompt}");
+        assert!(prompt.contains("Reviewer execution is not active"), "{prompt}");
+    }
+
+    #[test]
+    fn implementor_role_defaults_fill_matching_tasks_without_overriding_explicit_values() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::roles::config_path(home.path()),
+            r#"{"roles":{"implementor":{"provider":"codex","model":"custom-impl","effort":"xhigh"}}}"#,
+        )
+        .unwrap();
+        let path = home.path().join("plan.json");
+        std::fs::write(
+            &path,
+            r#"{"summary":"roles","tasks":[
+                {"title":"inherits","provider":"codex","prompt":"one"},
+                {"title":"explicit","provider":"codex","model":"explicit","effort":"low","prompt":"two"},
+                {"title":"other","provider":"claude","prompt":"three"}
+            ]}"#,
+        )
+        .unwrap();
+        let plan = plan(
+            "goal",
+            home.path(),
+            home.path(),
+            ProviderId::Codex,
+            "coordinator-model",
+            4,
+            Some(&path),
+            PermissionMode::Default,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(plan.tasks[0].model.as_deref(), Some("custom-impl"));
+        assert_eq!(plan.tasks[0].effort.as_deref(), Some("xhigh"));
+        assert_eq!(plan.tasks[1].model.as_deref(), Some("explicit"));
+        assert_eq!(plan.tasks[1].effort.as_deref(), Some("low"));
+        assert!(plan.tasks[2].model.is_none());
+        assert!(plan.tasks[2].effort.is_none());
+    }
+
+    #[test]
+    fn worker_prompt_keeps_the_preamble_before_the_role_and_task() {
+        let prompt = worker_prompt("implementor role", "task body");
+        let preamble = prompt.find(WORKER_PREAMBLE).unwrap();
+        let role = prompt.find("implementor role").unwrap();
+        let task = prompt.find("task body").unwrap();
+        assert!(preamble < role && role < task, "{prompt}");
+        assert!(prompt.starts_with(WORKER_PREAMBLE), "{prompt}");
+    }
+
+    #[test]
+    fn planner_prompt_does_not_rewrite_placeholders_inside_user_role_text() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("roles")).unwrap();
+        std::fs::write(
+            crate::roles::prompt_path(home.path(), RoleId::Orchestrator),
+            "orchestrator MAX GOAL CWD",
+        )
+        .unwrap();
+        std::fs::write(
+            crate::roles::prompt_path(home.path(), RoleId::Planner),
+            "planner PROVIDERS IMPLEMENTOR_PROVIDER",
+        )
+        .unwrap();
+        let registry = crate::roles::load(home.path()).unwrap();
+        let prompt = planner_prompt(
+            "fix CWD with MAX PROVIDERS",
+            Path::new("/repo"),
+            4,
+            &[ProviderId::Codex],
+            &registry,
+            ProviderId::Codex,
+        );
+        assert!(prompt.contains("orchestrator MAX GOAL CWD"), "{prompt}");
+        assert!(
+            prompt.contains("planner PROVIDERS IMPLEMENTOR_PROVIDER"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Goal: fix CWD with MAX PROVIDERS"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("Source repository: /repo"), "{prompt}");
     }
 
     #[test]
@@ -2531,6 +2915,15 @@ mod tests {
         assert_eq!(plan.summary.as_deref(), Some("split"));
         assert_eq!(plan.tasks.len(), 1);
         assert_eq!(plan.tasks[0].provider, "codex");
+
+        let oversized = format!(
+            r#"{{"tasks":[{{"title":"huge","provider":"codex","prompt":"{}"}}]}}"#,
+            "x".repeat(MAX_TASK_PROMPT_BYTES + 1)
+        );
+        assert!(parse_plan(&oversized, 4)
+            .unwrap_err()
+            .to_string()
+            .contains("larger than"));
     }
 
     #[test]
@@ -2551,6 +2944,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(invalid.to_string().contains("invalid reasoning effort"));
+
+        let unsafe_model = parse_plan(
+            r#"{"tasks":[{"title":"bad","provider":"codex","model":"bad model\n--foo","prompt":"do it"}]}"#,
+            4,
+        )
+        .unwrap_err();
+        assert!(unsafe_model.to_string().contains("invalid model"));
     }
 
     #[test]
@@ -2564,13 +2964,19 @@ mod tests {
         let plan = r#"{"summary":"model override","tasks":[{"title":"worker","provider":"codex","model":"custom-worker-model","effort":"high","prompt":"do it"}]}"#;
         let (_repo, _home, store, report) = run_fixture(
             plan,
-            "printf '%s\n' \"$@\" > worker-args.txt",
+            "printf '%s\n' \"$@\" > worker-args.txt\nprintf '%s\n' \"$BATON_DISABLE_SKILL_DISPATCH\" > worker-env.txt",
         );
         assert_eq!(report.status, "completed");
         assert_eq!(report.tasks[0].model, "custom-worker-model");
         assert_eq!(report.tasks[0].effort.as_deref(), Some("high"));
         let worktree = report.tasks[0].worktree.as_ref().unwrap();
         let args = std::fs::read_to_string(worktree.path.join("worker-args.txt")).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worktree.path.join("worker-env.txt"))
+                .unwrap()
+                .trim(),
+            "1"
+        );
         let lines: Vec<&str> = args.lines().collect();
         let model_index = lines
             .iter()
@@ -3736,7 +4142,10 @@ printf 'worker\n' > worker.txt",
         )
         .unwrap();
         assert_eq!(report.status, "completed");
+        assert_eq!(report.coordinator_provider, ProviderId::Codex);
+        assert_eq!(report.coordinator_model, "test-model");
         assert_eq!(report.tasks.len(), 1);
+        assert_eq!(report.tasks[0].model, "gpt-6.2-sol");
         assert_eq!(report.tasks[0].text.as_deref(), Some("FAKE_OK"));
         assert!(report.tasks[0].worktree.as_ref().unwrap().path.is_dir());
         assert_eq!(store.list_orchestration_runs(10).unwrap().len(), 1);

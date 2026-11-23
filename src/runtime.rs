@@ -462,7 +462,11 @@ pub async fn run_engine(
                 let turn = claim.turn;
                 let sender = engine_event_sender.clone();
                 let store = store.clone();
-                let steer_text = crate::skill_dispatch::prompt_for_provider(provider, &text);
+                let steer_text = if skill_dispatch_enabled() {
+                    crate::skill_dispatch::prompt_for_provider(provider, &text)
+                } else {
+                    text.clone()
+                };
                 tokio::spawn(async move {
                     let outcome = handle(SteerRequest {
                         thread_id: thread_id.clone(),
@@ -879,11 +883,13 @@ async fn execute_turn(
             intro,
         );
     }
-    prompt = crate::skill_dispatch::prompt_for_provider_from(
-        provider,
-        &prompt,
-        Some(crate::skill_dispatch::current_message(&prompt_text)),
-    );
+    if skill_dispatch_enabled() {
+        prompt = crate::skill_dispatch::prompt_for_provider_from(
+            provider,
+            &prompt,
+            Some(crate::skill_dispatch::current_message(&prompt_text)),
+        );
+    }
 
     let cwd_for_checkpoint = cwd.clone();
     let input = TurnStartInput {
@@ -1113,6 +1119,10 @@ async fn execute_turn(
         rollout_path: outcome.rollout_path,
     }));
     Ok(())
+}
+
+fn skill_dispatch_enabled() -> bool {
+    std::env::var_os("BATON_DISABLE_SKILL_DISPATCH").is_none()
 }
 
 /// Keeps stored diffs bounded: the first 400 lines plus a truncation marker.

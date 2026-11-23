@@ -14,6 +14,8 @@ pub const HOOK_EVENTS: &[&str] = &[
     "after_review",
 ];
 
+pub const MAX_ROLE_PROMPT_BYTES: usize = 6 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RoleId {
@@ -85,6 +87,15 @@ pub struct RoleRegistry {
     pub roles: Vec<RoleSpec>,
     pub hooks: BTreeMap<String, Vec<HookSpec>>,
     pub config_path: PathBuf,
+}
+
+impl RoleRegistry {
+    pub fn get(&self, id: RoleId) -> &RoleSpec {
+        self.roles
+            .iter()
+            .find(|role| role.id == id)
+            .unwrap_or_else(|| panic!("role registry missing {}", id.as_str()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -159,12 +170,23 @@ pub fn prompt_path(home: &Path, id: RoleId) -> PathBuf {
 
 fn read_config(home: &Path) -> Result<RolesFile> {
     let path = config_path(home);
-    if !path.is_file() {
+    if !regular_file_or_absent(&path)? {
         return Ok(RolesFile::default());
     }
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("cannot parse {}", path.display()))
+}
+
+fn regular_file_or_absent(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) if !path.is_file() => {
+            anyhow::bail!("{} is not a regular file", path.display());
+        }
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error).with_context(|| format!("cannot inspect {}", path.display())),
+    }
 }
 
 fn validate_hooks(hooks: &BTreeMap<String, Vec<HookSpec>>) -> Result<()> {
@@ -184,7 +206,7 @@ fn validate_hooks(hooks: &BTreeMap<String, Vec<HookSpec>>) -> Result<()> {
     Ok(())
 }
 
-fn safe_model_token(value: &str) -> bool {
+pub(crate) fn safe_model_token(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty()
         && value.len() <= 200
@@ -235,7 +257,7 @@ pub fn load(home: &Path) -> Result<RoleRegistry> {
             );
         }
         let path = prompt_path(home, id);
-        let (prompt, prompt_source) = if path.is_file() {
+        let (prompt, prompt_source) = if regular_file_or_absent(&path)? {
             (
                 std::fs::read_to_string(&path)
                     .with_context(|| format!("cannot read {}", path.display()))?,
@@ -246,6 +268,13 @@ pub fn load(home: &Path) -> Result<RoleRegistry> {
         };
         if prompt.trim().is_empty() {
             anyhow::bail!("role {} has an empty prompt", id.as_str());
+        }
+        if prompt.len() > MAX_ROLE_PROMPT_BYTES {
+            anyhow::bail!(
+                "role {} prompt exceeds {} bytes",
+                id.as_str(),
+                MAX_ROLE_PROMPT_BYTES
+            );
         }
         roles.push(RoleSpec {
             id,
@@ -368,5 +397,31 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("empty prompt"));
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(config_path(home.path())).unwrap();
+        assert!(load(home.path())
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(prompt_path(home.path(), RoleId::Planner)).unwrap();
+        assert!(load(home.path())
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("roles")).unwrap();
+        std::fs::write(
+            prompt_path(home.path(), RoleId::Planner),
+            "x".repeat(MAX_ROLE_PROMPT_BYTES + 1),
+        )
+        .unwrap();
+        assert!(load(home.path())
+            .unwrap_err()
+            .to_string()
+            .contains("prompt exceeds"));
     }
 }

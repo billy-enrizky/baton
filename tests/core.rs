@@ -51,7 +51,7 @@ fn roles_json_reports_overrides_and_hook_declarations() {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(
         home.path().join("roles.json"),
-        r#"{"roles":{"orchestrator":{"provider":"codex","model":"rits/deepseek-v4.1-flash"},"planner":{"provider":"codex","model":"rits/deepseek-v4.1-flash"},"implementor":{"provider":"codex","model":"rits/deepseek-v4.1-flash","effort":"high"},"reviewer":{"provider":"codex","model":"rits/deepseek-v4.1-flash"}},"hooks":{"before_plan":[{"argv":["true"],"timeout_secs":5}]}}"#,
+        r#"{"roles":{"orchestrator":{"provider":"codex","model":"rits/deepseek-ai/DeepSeek-V4.1-Flash-1017"},"planner":{"provider":"codex","model":"rits/deepseek-ai/DeepSeek-V4.1-Flash-1017"},"implementor":{"provider":"codex","model":"rits/deepseek-ai/DeepSeek-V4.1-Flash-1017","effort":"high"},"reviewer":{"provider":"codex","model":"rits/deepseek-ai/DeepSeek-V4.1-Flash-1017"}},"hooks":{"before_plan":[{"argv":["true"],"timeout_secs":5}]}}"#,
     )
     .unwrap();
 
@@ -68,11 +68,91 @@ fn roles_json_reports_overrides_and_hook_declarations() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["roles"].as_array().unwrap().len(), 4);
     assert_eq!(value["roles"][0]["provider"], "codex");
-    assert_eq!(value["roles"][0]["model"], "rits/deepseek-v4.1-flash");
+    assert_eq!(
+        value["roles"][0]["model"],
+        "rits/deepseek-ai/DeepSeek-V4.1-Flash-1017"
+    );
     assert_eq!(value["roles"][0]["config_source"], "user");
+    assert_eq!(value["roles"][0]["prompt_source"], "default");
+    assert!(value["roles"][0]["prompt_path"]
+        .as_str()
+        .unwrap()
+        .ends_with("/roles/orchestrator.md"));
     assert_eq!(value["roles"][2]["effort"], "high");
     assert_eq!(value["hooks"]["before_plan"][0]["argv"][0], "true");
     assert_eq!(value["hooks"]["before_plan"][0]["timeout_secs"], 5);
+}
+
+#[test]
+fn orchestrate_plan_only_uses_the_orchestrator_role_for_greetings() {
+    let home = tempfile::tempdir().unwrap();
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("roles.json"),
+        r#"{"roles":{"orchestrator":{"provider":"codex","model":"orch-model"},"planner":{"provider":"claude","model":"plan-model"}}}"#,
+    )
+    .unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "-C",
+            repo.path().to_str().unwrap(),
+            "orchestrate",
+            "--plan-only",
+            "--json",
+            "hi",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["coordinator"]["provider"], "codex");
+    assert_eq!(value["coordinator"]["model"], "orch-model");
+    assert_eq!(value["tasks"][0]["provider"], "codex");
+    assert_eq!(value["tasks"][0]["model"], "orch-model");
+    assert_eq!(value["tasks"][0]["prompt"], "hi");
+
+    let rejected = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "-C",
+            repo.path().to_str().unwrap(),
+            "--provider",
+            "codex",
+            "orchestrate",
+            "--plan-only",
+            "--json",
+            "hi",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("uses role settings"));
+
+    let plan_path = repo.path().join("plan.json");
+    std::fs::write(
+        &plan_path,
+        r#"{"tasks":[{"title":"one","provider":"codex","prompt":"do it"}]}"#,
+    )
+    .unwrap();
+    let non_git = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "-C",
+            repo.path().to_str().unwrap(),
+            "orchestrate",
+            "--plan-file",
+            plan_path.to_str().unwrap(),
+            "do it",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!non_git.status.success());
+    assert!(String::from_utf8_lossy(&non_git.stderr).contains("requires a git repository"));
 }
 
 #[test]

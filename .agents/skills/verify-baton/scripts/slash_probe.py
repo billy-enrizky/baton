@@ -202,6 +202,8 @@ def main() -> int:
             "esc close",
         ]
         missing.extend(value for value in roles_required if value not in roles_picker)
+        if "config:" in roles_picker or "prompt:" in roles_picker:
+            missing.append("roles detail fields leaked into picker rows")
         (evidence / "roles-picker-screen.txt").write_text(roles_picker + "\n")
         os.write(master, b"\x1b[B")
         pump(master, 0.2, transcript)

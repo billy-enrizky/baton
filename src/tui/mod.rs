@@ -1850,7 +1850,7 @@ fn parse_orchestrate_args(args: &[String]) -> std::result::Result<OrchestrateArg
                 let Ok(value) = value.parse::<usize>() else {
                     return Err(format!("--max-tasks must be a number, got \"{value}\""));
                 };
-                max_tasks = value.clamp(1, 16);
+                max_tasks = value.clamp(1, orchestrate::MAX_TASKS);
                 index += 2;
             }
             "--plan-file" => {
@@ -1865,6 +1865,22 @@ fn parse_orchestrate_args(args: &[String]) -> std::result::Result<OrchestrateArg
                 index += 1;
             }
             "--help" | "-h" => return Err(ORCHESTRATE_USAGE.to_string()),
+            "--provider" | "--model" | "--effort" => {
+                return Err(
+                    "orchestrate uses role settings; edit roles.json instead of --provider, --model, or --effort"
+                        .to_string(),
+                );
+            }
+            other
+                if other.starts_with("--provider=")
+                    || other.starts_with("--model=")
+                    || other.starts_with("--effort=") =>
+            {
+                return Err(
+                    "orchestrate uses role settings; edit roles.json instead of --provider, --model, or --effort"
+                        .to_string(),
+                );
+            }
             other => {
                 goal_parts.push(other.to_string());
                 index += 1;
@@ -1997,6 +2013,17 @@ fn effective_orchestration_goal(goal: &str, plan_path: Option<&std::path::Path>)
     }
 }
 
+fn load_orchestration_coordinator(
+    home: &std::path::Path,
+    goal: &str,
+    plan_path: Option<&std::path::Path>,
+) -> anyhow::Result<crate::roles::RoleSpec> {
+    let registry = crate::roles::load(home)?;
+    Ok(registry
+        .get(orchestrate::coordinator_role_for(goal, plan_path))
+        .clone())
+}
+
 fn request_orchestration_preview(
     state: &mut TuiState,
     goal: String,
@@ -2022,16 +2049,19 @@ fn start_orchestration_preview(
 ) {
     let cwd = state.thread.cwd.clone();
     let home = state.home.clone();
-    let provider = state.thread.current_provider;
-    let model = state.thread.current_model.clone().unwrap_or_else(|| {
-        resolve_config(&home, std::path::Path::new(&cwd))
-            .for_provider(provider)
-            .model
-            .clone()
-    });
-    let permission_mode = state.permission_mode;
     let plan_path = resolve_plan_path(&cwd, plan_file);
     let effective_goal = effective_orchestration_goal(&goal, plan_path.as_deref());
+    let planner = match load_orchestration_coordinator(&home, &effective_goal, plan_path.as_deref())
+    {
+        Ok(role) => role,
+        Err(error) => {
+            state.notice = Some(format!("cannot load roles: {error}"));
+            return;
+        }
+    };
+    let provider = planner.provider;
+    let model = planner.model.clone();
+    let permission_mode = state.permission_mode;
     let dirty_source = crate::worktree::repo_root(std::path::Path::new(&cwd))
         .ok()
         .and_then(|root| crate::worktree::is_dirty(&root).ok())
@@ -2046,6 +2076,7 @@ fn start_orchestration_preview(
         let result = orchestrate::plan(
             &effective_goal,
             std::path::Path::new(&cwd),
+            &home,
             provider,
             &model,
             max_tasks,
@@ -2087,11 +2118,14 @@ fn start_previewed_orchestration(state: &mut TuiState, preview: OrchestrationPre
         }
     };
     state.overlay = Overlay::None;
+    let coordinator = preview.coordinator;
+    let coordinator_model = preview.coordinator_model.clone();
     start_orchestration(
         state,
         preview.goal,
         preview.plan.tasks.len().max(1),
         Some(path.to_string_lossy().to_string()),
+        Some((coordinator, coordinator_model)),
     );
 }
 
@@ -2122,7 +2156,7 @@ fn request_orchestration(
         state.notice = None;
         return;
     }
-    start_orchestration(state, goal, max_tasks, plan_file);
+    start_orchestration(state, goal, max_tasks, plan_file, None);
 }
 
 fn start_orchestration(
@@ -2130,6 +2164,7 @@ fn start_orchestration(
     goal: String,
     max_tasks: usize,
     plan_file: Option<String>,
+    coordinator: Option<(ProviderId, String)>,
 ) {
     if state.orchestration_pending {
         state.notice = Some("an orchestration is already running".into());
@@ -2141,16 +2176,23 @@ fn start_orchestration(
     }
     let cwd = state.thread.cwd.clone();
     let home = state.home.clone();
-    let provider = state.thread.current_provider;
-    let model = state.thread.current_model.clone().unwrap_or_else(|| {
-        resolve_config(&home, std::path::Path::new(&cwd))
-            .for_provider(provider)
-            .model
-            .clone()
-    });
     let permission_mode = state.permission_mode;
     let plan_path = resolve_plan_path(&cwd, plan_file);
     let effective_goal = effective_orchestration_goal(&goal, plan_path.as_deref());
+    let (provider, model) = match coordinator {
+        Some(coordinator) => coordinator,
+        None => {
+            let planner =
+                match load_orchestration_coordinator(&home, &effective_goal, plan_path.as_deref()) {
+                    Ok(role) => role,
+                    Err(error) => {
+                        state.notice = Some(format!("cannot load roles: {error}"));
+                        return;
+                    }
+                };
+            (planner.provider, planner.model)
+        }
+    };
     let result = {
         let guard = state.store.lock().unwrap();
         ensure_persisted(&guard, &mut state.thread)
@@ -4469,7 +4511,7 @@ fn handle_key(
             max_tasks,
             plan_file,
         } => match key.code {
-            KeyCode::Enter => start_orchestration(state, goal, max_tasks, plan_file),
+            KeyCode::Enter => start_orchestration(state, goal, max_tasks, plan_file, None),
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 if goal.trim().is_empty() {
                     state.overlay = Overlay::DirtyConfirm {
@@ -10921,7 +10963,7 @@ impl TuiState {
                 ),
                 Span::styled(
                     if self.thread.session_mode == SessionMode::Orchestrate {
-                        " · coordinator "
+                        " · thread "
                     } else {
                         " · "
                     },
@@ -20132,8 +20174,26 @@ mod tests {
         assert!(text.contains(">_ baton v"), "{text}");
         assert!(text.contains("permissions: YOLO mode"), "{text}");
         assert!(text.contains("orchestrate"), "{text}");
-        assert!(text.contains("coordinator"), "{text}");
+        assert!(text.contains("thread"), "{text}");
         assert!(text.contains(&state.thread.cwd), "{text}");
+    }
+
+    #[test]
+    fn orchestrate_banner_labels_the_visible_model_as_thread_harness() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::roles::config_path(home.path()),
+            r#"{"roles":{"planner":{"provider":"codex","model":"plan-model"}}}"#,
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.session_mode = SessionMode::Orchestrate;
+        state.thread.current_provider = ProviderId::Claude;
+        state.thread.current_model = Some("thread-model".to_string());
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("orchestrate · thread claude/thread-model"), "{text}");
+        assert!(!text.contains("coordinator claude/thread-model"), "{text}");
     }
 
     #[test]
@@ -20383,6 +20443,27 @@ mod tests {
     }
 
     #[test]
+    fn orchestration_coordinator_role_matches_the_goal_and_plan_source() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::roles::config_path(home.path()),
+            r#"{"roles":{"orchestrator":{"provider":"claude","model":"orch-model"},"planner":{"provider":"codex","model":"plan-model"}}}"#,
+        )
+        .unwrap();
+        let plan_path = home.path().join("plan.json");
+        let planner = load_orchestration_coordinator(home.path(), "fix it", None).unwrap();
+        assert_eq!(planner.provider, ProviderId::Codex);
+        assert_eq!(planner.model, "plan-model");
+        let greeting = load_orchestration_coordinator(home.path(), "hi", None).unwrap();
+        assert_eq!(greeting.provider, ProviderId::Claude);
+        assert_eq!(greeting.model, "orch-model");
+        let explicit_plan =
+            load_orchestration_coordinator(home.path(), "hi", Some(&plan_path)).unwrap();
+        assert_eq!(explicit_plan.provider, ProviderId::Codex);
+        assert_eq!(explicit_plan.model, "plan-model");
+    }
+
+    #[test]
     fn ctrl_c_cancels_orchestration_without_exiting() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -20528,6 +20609,15 @@ mod tests {
             parse_orchestrate_args(&["--plan-file".to_string(), "plan.json".to_string()]).is_ok(),
             "a plan file alone is a valid run"
         );
+        for flag in ["--provider", "--model", "--effort"] {
+            let error = parse_orchestrate_args(&[
+                flag.to_string(),
+                "value".to_string(),
+                "goal".to_string(),
+            ])
+            .unwrap_err();
+            assert!(error.contains("uses role settings"), "{error}");
+        }
     }
 
     #[test]

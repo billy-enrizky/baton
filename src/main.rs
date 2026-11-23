@@ -922,6 +922,11 @@ fn main_result(started: Instant) -> Result<()> {
                     "--stream-json applies to starting a run; use --json for inspection commands"
                 );
             }
+            if cli.provider.is_some() || cli.model.is_some() || cli.effort.is_some() {
+                anyhow::bail!(
+                    "orchestrate uses role settings; set provider, model, and effort in roles.json instead of --provider, --model, or --effort"
+                );
+            }
             let store = BatonStore::open(&paths::baton_db_path())?;
             if list {
                 let runs = orchestrate::run_rows(&store, 20)?
@@ -1077,21 +1082,17 @@ fn main_result(started: Instant) -> Result<()> {
                     "usage: baton orchestrate [--plan-only] <goal> | --list [--all] | --run <id> | --archive <run-id> | --integrate <run-id> | --open-prs <run-id>"
                 );
             }
-            let provider = cli
-                .provider
-                .as_deref()
-                .and_then(ProviderId::parse)
-                .unwrap_or_else(|| default_provider_from_configs(&home, &cwd));
             let resolved = resolve_config(&home, &cwd);
-            let model = cli
-                .model
-                .clone()
-                .unwrap_or_else(|| resolved.for_provider(provider).model.clone());
             let plan_path = plan_file.map(PathBuf::from);
+            let coordinator_role = orchestrate::coordinator_role_for(&goal, plan_path.as_deref());
+            let planner = roles::load(&home)?.get(coordinator_role).clone();
+            let provider = planner.provider;
+            let model = planner.model.clone();
             if plan_only {
                 let plan = orchestrate::plan(
                     &goal,
                     &cwd,
+                    &home,
                     provider,
                     &model,
                     max_tasks,

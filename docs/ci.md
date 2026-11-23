@@ -38,7 +38,7 @@ The false-green goal is scoped to the workflow and aggregator. A test process wi
 
 Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every required command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command. The post-build `--version` smoke check runs outside the budget because the build it checks is already budgeted.
 
-Phase 2 is in progress from recorded runs. The historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds. The historical median is 63.5 seconds. The critical-path change in this slice moves path classification to a shallow two-commit fetch and moves every trusted guard into `Selection`; a branch dispatch with a forced Rust rebuild then completed in 52 seconds, with `Changes` at 6 seconds and `Test` at 38 seconds. That is a provisional warm-path result, not yet a PR p50: the first post-merge PR sample is still required. A free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
+Phase 2 is in progress from recorded runs. The historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds. The historical median is 63.5 seconds. The critical-path change in this slice moves path classification to a shallow two-commit fetch and moves every trusted guard into `Selection`; the final branch dispatch with a forced Rust rebuild completed in 51 seconds, with `Changes` at 6 seconds and `Test` at 35 seconds. That is a provisional warm-path result, not yet a PR p50: the first post-merge PR sample is still required. A free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. All p50 and p95 rows remain provisional until 100 runs or four weeks exist. The acceptance record names the runs, the job breakdown, and every rejected experiment.
 
 Budget rule, applied at every phase: Phase 1 uses three times a conservative cold estimate. Phase 2 sets each budget to the measured Linux p95 plus 20 percent. That reset is the only allowed increase. After it, a budget may only shrink. Widening a budget needs a recorded regression explanation in `ci-acceptance.md`, not a code change.
 
@@ -72,7 +72,7 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
-| Warm Rust rebuild after this slice | 52 seconds; `Changes` 6, `Test` 38, `Verify` 3 | Branch dispatch 45111528561 |
+| Warm Rust rebuild after this slice | 51 seconds; `Changes` 6, `Test` 35, `Verify` 5 | Branch dispatch 45114396442 |
 | Toolchain-cache removal | Not adopted; setup without the cache was slower than restore plus setup | Runs 45108914603, 45109176611, 45109045484, 45109314728 |
 
 The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 509 floor is a lower bound, not a per-test lock; Linux executes one additional non-UTF-8 test. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff. The Cargo cache key includes `Cargo.toml` as well as `Cargo.lock` and `rust-toolchain.toml`, so a test-profile change cannot restore incompatible compiler artifacts.
@@ -85,7 +85,7 @@ The free `ubuntu-24.04-arm` runner is not adopted for Test. A temporary ARM job 
 
 Replacing the x64 Test job would move Linux x64 runtime tests after merge, and official merge queue is unavailable for this repository. A runtime-only x64 regression could then land without a pre-merge test. That violates the rule that no phase removes a passing check. Test stays on `ubuntu-24.04`. The option is closed unless a future proposal is additive, not a replacement, keeps an independent required x64 pre-merge Test job, and provides a matched rerun with identical steps, event shape, cache policy, and command under the 100-run or four-week policy. A merge queue alone is insufficient if it runs the same ARM job.
 
-The experiment is recorded in [ci-acceptance.md](ci-acceptance.md#rejected-arm-runner-experiment) with its runs, timings, cache sizes, and CI013 failure. The historical Rust median remains 63.5 seconds; this slice's provisional warm result is 52 seconds.
+The experiment is recorded in [ci-acceptance.md](ci-acceptance.md#rejected-arm-runner-experiment) with its runs, timings, cache sizes, and CI013 failure. The historical Rust median remains 63.5 seconds; this slice's provisional warm result is 51 seconds.
 
 ## What the gate enforces
 

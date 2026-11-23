@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-Status on 2026-11-23: the historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds, with a 63.5-second median. The new fast classifier plus line-table test profile measured 52 seconds on a branch dispatch with a forced Rust rebuild: `Changes` completed at 6 seconds and `Test` at 38 seconds. This is a provisional critical-path result, not yet a PR p50; the first post-merge PR sample is still required. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
+Status on 2026-11-23: the historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds, with a 63.5-second median. The new fast classifier plus line-table test profile measured 51 seconds on a branch dispatch with a forced Rust rebuild: `Changes` completed at 6 seconds and `Test` at 35 seconds. This is a provisional critical-path result, not yet a PR p50; the first post-merge PR sample is still required. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
 
 This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 
@@ -8,7 +8,7 @@ This file records the runs that changed a decision. It is not a complete archive
 
 | Target | Current evidence | Status |
 |---|---|---|
-| Rust PR feedback p50 under 60 seconds | Historical 16 warm Rust PRs: 52 to 74 seconds, median 63.5. New branch dispatch with a forced Rust rebuild: 52 seconds | Provisional; the new critical path is under 60 on the branch, but a post-merge PR sample is required before acceptance |
+| Rust PR feedback p50 under 60 seconds | Historical 16 warm Rust PRs: 52 to 74 seconds, median 63.5. Final branch dispatch with a forced Rust rebuild: 51 seconds | Provisional; the new critical path is under 60 on the branch, but a post-merge PR sample is required before acceptance |
 | Rust PR feedback p95 under 120 seconds | Sixteen Rust samples, n=16, max 74 seconds | Provisional |
 | Docs-only PR feedback p50 under 45 seconds | n=2: 44 seconds historical, 38 seconds in run 45077008165; median 41 seconds, max 44 seconds | Provisional met |
 | Queue p50 under 10 seconds | n=26 non-retry attempts, median 0 seconds, max 0 seconds; the one manual retry is excluded | Provisional met |
@@ -63,7 +63,8 @@ The test profile now keeps line tables and drops full debuginfo. The Cargo cache
 
 | Run | Event | State | Create to Verify | Changes complete | Test job | Notes |
 |---|---|---|---|---|---|---|
-| [45111528561](https://github.com/billy-enrizky/baton/actions/runs/45111528561) | workflow_dispatch | warm cache, forced Rust rebuild | 52 seconds | 6 seconds | 38 seconds | Realistic Rust source rebuild; 14.13-second compile, 509 tests |
+| [45114396442](https://github.com/billy-enrizky/baton/actions/runs/45114396442) | workflow_dispatch | warm cache, forced Rust rebuild | 51 seconds | 6 seconds | 35 seconds | Final classifier branch; realistic Rust source rebuild, 509 tests |
+| [45111528561](https://github.com/billy-enrizky/baton/actions/runs/45111528561) | workflow_dispatch | warm cache, forced Rust rebuild | 52 seconds | 6 seconds | 38 seconds | Earlier combined branch; kept as a corroborating sample |
 | [45111377033](https://github.com/billy-enrizky/baton/actions/runs/45111377033) | workflow_dispatch | warm cache, unchanged Rust source | 51 seconds | 5 seconds | 32 seconds | Test step reused the Baton artifacts; descriptive only |
 | [45111201206](https://github.com/billy-enrizky/baton/actions/runs/45111201206) | pull_request | cold after profile change | 85 seconds | 5 seconds | 71 seconds | Pull-request cache did not inherit the branch cache; Selection failed at the expected CI013 workflow comparison |
 
@@ -123,7 +124,9 @@ The two PR samples around that work were 51 seconds for the ARM rejection docs (
 | [45064707055](https://github.com/billy-enrizky/baton/actions/runs/45064707055) | pull_request | 74 seconds | Content search; 486 tests, Test 48 seconds |
 | [45064863755](https://github.com/billy-enrizky/baton/actions/runs/45064863755) | push | 69 seconds | Content-search main push; 486 tests, Test 52 seconds |
 | [45111201206](https://github.com/billy-enrizky/baton/actions/runs/45111201206) | pull_request | 85 seconds, cold | Fast classifier; PR cache did not inherit the seeded branch cache |
-| [45111528561](https://github.com/billy-enrizky/baton/actions/runs/45111528561) | workflow_dispatch | 52 seconds, warm | Fast classifier plus line-table test profile; forced Rust rebuild |
+| [45114396442](https://github.com/billy-enrizky/baton/actions/runs/45114396442) | workflow_dispatch | 51 seconds, warm | Final classifier plus line-table test profile; forced Rust rebuild |
+| [45113871281](https://github.com/billy-enrizky/baton/actions/runs/45113871281) | pull_request | 97 seconds, cold | Profile prerequisite PR; old cache key, 75-second Test, then merged as `b854a27` |
+| [45114063161](https://github.com/billy-enrizky/baton/actions/runs/45114063161) | push | 102 seconds, cold | Profile main push; same old cache key, 82-second Test; new-key seed follows the classifier PR |
 
 The 30-second long pole was `orchestrate::tests::cancellation_stops_the_worker_group_and_marks_the_run_cancelled`. On Linux, `kill -TERM -PGID` was accepted but did not signal the process group. The shell leader died, its `sleep` child kept the output pipe open, and the reader threads waited the full 30 seconds. Adding `--` before the negative group operand fixed the signal. `group_alive` then used `ps` to ignore the unreaped leader zombie instead of spending another 2.5 seconds on `kill -0`.
 
@@ -230,7 +233,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Formal gates | All 15 suites under `local_docs/verification/*/run.sh` | Passed 2026-11-22 |
 | CI admission model | `ci/formal/ci-admission/run.sh` | Passed locally |
 | Branch protection | `main` requires `Verify`, requires an up-to-date branch, blocks direct and force pushes, and has admin enforcement off for the documented `ci-repair` override | Configured 2026-11-23; branch-protection API response recorded |
-| Fast classifier warm path | Branch dispatch 45111528561 with a forced Rust rebuild: 52 seconds, Changes complete at 6 seconds, Test 38 seconds | Passed 2026-11-23; post-merge PR sample pending |
+| Fast classifier warm path | Branch dispatch 45114396442 with a forced Rust rebuild: 51 seconds, Changes complete at 6 seconds, Test 35 seconds | Passed 2026-11-23; post-merge PR sample pending |
 
 ## v0.4.0 release assets
 

@@ -116,6 +116,8 @@ impl ClaudeAdapter {
         let pid = child
             .id()
             .ok_or_else(|| anyhow::anyhow!("claude did not expose a process id"))?;
+        // Guard the child before the durable record, so a crash cannot orphan a recorded process.
+        process::spawn_parent_watchdog(pid)?;
         let command_line = process::command_line(pid).unwrap_or_default();
         let process_start = process::process_start(pid);
         recorder.record(

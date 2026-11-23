@@ -510,11 +510,11 @@ jobs:
       - name: Format debt
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/fmt-debt.sh" . "$GITHUB_WORKSPACE/base/ci/fmt-baseline.txt"
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/fmt-debt.sh" . "$RUNNER_TEMP/trusted-ci/fmt-baseline.txt"
       - name: Clippy debt
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 300 "$RUNNER_TEMP/trusted-ci/clippy-debt.sh" . "$GITHUB_WORKSPACE/base/ci/clippy-baseline.txt"
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 300 "$RUNNER_TEMP/trusted-ci/clippy-debt.sh" . "$RUNNER_TEMP/trusted-ci/clippy-baseline.txt"
       - name: Verify trusted tools are unchanged
         run: |
           set -euo pipefail

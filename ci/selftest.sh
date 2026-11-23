@@ -56,6 +56,10 @@ valid="$root/fixtures/check-ci/valid.yml"
 bash "$root/check-ci.sh" --bootstrap "$valid" >/dev/null
 if [[ -f "$repo_root/.github/workflows/ci.yml" ]]; then
   bash "$root/check-ci.sh" --bootstrap "$repo_root/.github/workflows/ci.yml" >/dev/null
+  if grep -q 'GITHUB_WORKSPACE/base/ci/\(fmt\|clippy\)-baseline.txt' "$repo_root/.github/workflows/ci.yml"; then
+    echo "debt ratchet reads a writable baseline from the base checkout" >&2
+    exit 1
+  fi
 fi
 
 if [[ "$quick" == true ]]; then

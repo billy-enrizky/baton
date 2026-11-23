@@ -67,6 +67,7 @@ The test profile now keeps line tables and drops full debuginfo. The Cargo cache
 | [45111528561](https://github.com/billy-enrizky/baton/actions/runs/45111528561) | workflow_dispatch | warm cache, forced Rust rebuild | 52 seconds | 6 seconds | 38 seconds | Earlier combined branch; kept as a corroborating sample |
 | [45111377033](https://github.com/billy-enrizky/baton/actions/runs/45111377033) | workflow_dispatch | warm cache, unchanged Rust source | 51 seconds | 5 seconds | 32 seconds | Test step reused the Baton artifacts; descriptive only |
 | [45115234795](https://github.com/billy-enrizky/baton/actions/runs/45115234795) | workflow_dispatch | warm cache, head tools | 53 seconds | 6 seconds | 33 seconds | Post-merge proof path; merged self-test, workflow guard, required commands, and budgets all passed |
+| [45117405274](https://github.com/billy-enrizky/baton/actions/runs/45117405274) | workflow_dispatch | warm cache, head tools | 62 seconds | 7 seconds | 48 seconds | Slower runner repeat; 5-second setup, 5-second checkout, 8-second toolchain restore, 7-second Cargo restore; all checks passed |
 | [45111201206](https://github.com/billy-enrizky/baton/actions/runs/45111201206) | pull_request | cold after profile change | 85 seconds | 5 seconds | 71 seconds | Pull-request cache did not inherit the branch cache; Selection failed at the expected CI013 workflow comparison |
 
 The 51-second run is the critical-path proof for this slice. It is not counted as a PR p50 sample because it is a dispatch. The 53-second head-tools branch dispatch proves the merged scripts and required-command enforcement on a branch; the first main push and the first post-merge pull request are still the acceptance samples.
@@ -236,6 +237,7 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Branch protection | `main` requires `Verify`, requires an up-to-date branch, blocks force pushes and deletions, and has admin enforcement off. User push restrictions are not available on a user-owned repository | Configured 2026-11-23; direct owner push remains a documented residual risk |
 | Fast classifier warm path | Branch dispatch 45114396442 with a forced Rust rebuild: 51 seconds, Changes complete at 6 seconds, Test 35 seconds | Passed 2026-11-23; post-merge PR sample pending |
 | Head-tools branch proof | Branch dispatch 45115234795: 53 seconds, Selection 12 seconds, merged self-test and workflow guard passed | Passed 2026-11-23; main-push proof pending |
+| Head-tools repeat | Branch dispatch 45117405274: 62 seconds, no skipped checks, slower setup and cache steps | Passed 2026-11-23; recorded without exclusion |
 
 ## v0.4.0 release assets
 

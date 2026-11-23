@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -65,6 +65,55 @@ fn main_result(started: Instant) -> Result<()> {
     let permission_mode = permission_override.unwrap_or(PermissionMode::Default);
 
     match command {
+        cli::Commands::Roles { json } => {
+            let registry = roles::load(&home)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "config_path": registry.config_path.display().to_string(),
+                        "roles": registry.roles.iter().map(|role| serde_json::json!({
+                            "name": role.id.as_str(),
+                            "provider": role.provider.as_str(),
+                            "model": role.model,
+                            "effort": role.effort,
+                            "hook_events": role.hook_events,
+                            "config_source": role.config_source.as_str(),
+                            "prompt_source": role.prompt_source.as_str(),
+                            "prompt_path": role.prompt_path.display().to_string(),
+                        })).collect::<Vec<_>>(),
+                        "hooks": registry.hooks,
+                    }))?
+                );
+            } else {
+                println!("role          provider/model                       config   prompt");
+                for role in &registry.roles {
+                    let model = format!("{}/{}", role.provider, role.model);
+                    let model = sanitize::sanitize_terminal_text(&model);
+                    println!(
+                        "{:<13} {:<38} {:<8} {}",
+                        role.id.as_str(),
+                        model,
+                        role.config_source.as_str(),
+                        role.prompt_source.as_str()
+                    );
+                }
+                let config_path = registry.config_path.display().to_string();
+                let config_path = sanitize::sanitize_terminal_text(&config_path);
+                println!("config: {config_path}");
+                let hook_events = registry.hooks.keys().cloned().collect::<Vec<_>>();
+                println!(
+                    "hooks: {}",
+                    if hook_events.is_empty() {
+                        "none".to_string()
+                    } else {
+                        hook_events.join(", ")
+                    }
+                );
+            }
+            return Ok(());
+        }
         cli::Commands::Exec { prompt, json, stream_json } => {
             if cli.mode.is_some() {
                 anyhow::bail!(

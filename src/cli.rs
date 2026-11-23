@@ -9,6 +9,7 @@ Start here:
   baton exec \"summarize this repo\"    one non-interactive turn
   baton orchestrate \"split this task\" workers in isolated worktrees
   baton spawn \"fix the failing test\"   one isolated worker in a worktree
+  baton roles                        inspect orchestrator and subagent roles
   baton doctor                       check installed harnesses and config
 
 Inside the workspace, type what you want to do, or /help for common paths.";
@@ -239,6 +240,12 @@ pub enum Commands {
     /// Show token usage and cache hit rates
     Usage {
         thread_id: Option<String>,
+    },
+    /// Inspect orchestrator, planner, implementor, and reviewer roles
+    Roles {
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Show or change a provider billing mode
     Auth {
@@ -572,6 +579,15 @@ mod tests {
                 assert!(!json);
             }
             _ => panic!("expected the exec command"),
+        }
+    }
+
+    #[test]
+    fn roles_accepts_json() {
+        let cli = Cli::try_parse_from(["baton", "roles", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Roles { json: true }) => {}
+            _ => panic!("expected roles --json"),
         }
     }
 }

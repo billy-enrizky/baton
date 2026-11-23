@@ -67,6 +67,20 @@ def main() -> int:
     (codex_config / "skills" / "codex-demo" / "SKILL.md").write_text(
         "---\nname: codex-demo\n---\n"
     )
+    (Path(home) / "roles.json").write_text(
+        json.dumps(
+            {
+                "roles": {
+                    role: {
+                        "provider": "codex",
+                        "model": "rits/deepseek-v4.1-flash",
+                    }
+                    for role in ["orchestrator", "planner", "implementor", "reviewer"]
+                }
+            }
+        )
+        + "\n"
+    )
     evidence = Path(args.evidence_dir) / f"slash-probe-{int(time.time())}"
     evidence.mkdir(parents=True, exist_ok=True)
     pid, master = pty.fork()
@@ -172,6 +186,38 @@ def main() -> int:
         ):
             missing.append("codex skill in composer")
         (evidence / "skills-result-screen.txt").write_text(skills_result + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/roles\r")
+        pump(master, 0.8, transcript)
+        roles_picker = screen_text(transcript, args.width, args.height)
+        roles_required = [
+            "roles (4)",
+            "orchestrator · codex/rits/deepseek-v4.1-flash · config user",
+            "planner · codex/rits/deepseek-v4.1-flash",
+            "implementor · codex/rits/deepseek-v4.1-flash",
+            "reviewer · codex/rits/deepseek-v4.1-flash",
+            "enter details",
+            "esc close",
+        ]
+        missing.extend(value for value in roles_required if value not in roles_picker)
+        (evidence / "roles-picker-screen.txt").write_text(roles_picker + "\n")
+        os.write(master, b"\x1b[B")
+        pump(master, 0.2, transcript)
+        os.write(master, b"\x1b[B")
+        pump(master, 0.2, transcript)
+        os.write(master, b"\r")
+        pump(master, 0.5, transcript)
+        roles_detail = screen_text(transcript, args.width, args.height)
+        for value in [
+            "implementor · codex/rits/deepseek-v4.1-flash",
+            "config:",
+            "prompt:",
+        ]:
+            if value not in roles_detail:
+                missing.append(f"roles detail: {value}")
+        (evidence / "roles-detail-screen.txt").write_text(roles_detail + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 

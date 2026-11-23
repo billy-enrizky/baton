@@ -3,7 +3,14 @@ use crate::types::ProviderId;
 pub fn catalog(provider: ProviderId) -> &'static [&'static str] {
     match provider {
         ProviderId::Claude => &["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"],
-        ProviderId::Codex => &["gpt-6.1-sol", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-6-astra"],
+        ProviderId::Codex => &[
+            "gpt-6.1-sol",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-5.6-luna",
+            "gpt-5.6-terra",
+            "gpt-6-astra",
+        ],
         ProviderId::Cursor => &["composer-2.5"],
         ProviderId::Grok => &["grok-build", "grok-4.6", "grok-4.5"],
         ProviderId::OpenCode => &["anthropic/claude-sonnet-4-5", "openai/gpt-6.1-sol"],
@@ -78,5 +85,12 @@ mod tests {
         assert!(capabilities(ProviderId::Antigravity).custom_base_url);
         assert!(base_url_envs(ProviderId::Cursor).is_empty());
         assert!(base_url_envs(ProviderId::Grok).contains(&"GROK_XAI_API_BASE_URL"));
+    }
+
+    #[test]
+    fn codex_catalog_includes_the_default_role_models() {
+        let catalog = catalog(ProviderId::Codex);
+        assert!(catalog.contains(&"gpt-6.2-sol"));
+        assert!(catalog.contains(&"gpt-6.2-astra"));
     }
 }

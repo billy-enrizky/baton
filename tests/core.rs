@@ -47,6 +47,35 @@ fn default_session_mode_is_orchestrate_and_config_can_opt_out() {
 }
 
 #[test]
+fn roles_json_reports_overrides_and_hook_declarations() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(
+        home.path().join("roles.json"),
+        r#"{"roles":{"orchestrator":{"provider":"codex","model":"rits/deepseek-v4.1-flash"},"planner":{"provider":"codex","model":"rits/deepseek-v4.1-flash"},"implementor":{"provider":"codex","model":"rits/deepseek-v4.1-flash","effort":"high"},"reviewer":{"provider":"codex","model":"rits/deepseek-v4.1-flash"}},"hooks":{"before_plan":[{"argv":["true"],"timeout_secs":5}]}}"#,
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["roles", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["roles"].as_array().unwrap().len(), 4);
+    assert_eq!(value["roles"][0]["provider"], "codex");
+    assert_eq!(value["roles"][0]["model"], "rits/deepseek-v4.1-flash");
+    assert_eq!(value["roles"][0]["config_source"], "user");
+    assert_eq!(value["roles"][2]["effort"], "high");
+    assert_eq!(value["hooks"]["before_plan"][0]["argv"][0], "true");
+    assert_eq!(value["hooks"]["before_plan"][0]["timeout_secs"], 5);
+}
+
+#[test]
 fn shipped_worktree_branches_are_only_the_ones_with_pr_urls() {
     let store = BatonStore::memory().unwrap();
     store

@@ -65,10 +65,10 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 | Warm Rust PR feedback | 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds; n=16, median 63.5 seconds, max 74 seconds | Runs 45035044248, 45055995298, 45004705055, 45009466461, 45021604178, 45060299027, 45011836996, 45010710576, 45037001045, 45046974039, 45051808580, 45064707055, 45069517940, 45075059836, 45075683884, and 45080151770 |
 | Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
 | Warm Test job | 33 to 52 seconds; n=16 | Runs 45035044248, 45055995298, 45004705055, 45009466461, 45021604178, 45060299027, 45011836996, 45010710576, 45037001045, 45046974039, 45051808580, 45064707055, 45069517940, 45075059836, 45075683884, and 45080151770 |
-| `cargo test --lib` | 1.67 to 3.70 seconds, 331 tests at the cited runs | Runs 45009466461 and 45011836996; the suite now has 444 lib tests |
-| Integration tests | 0.40 to 0.75 seconds, 75 tests across seven binaries at the cited runs | Runs 45009466461 and 45011836996; the suite now has 99 integration tests across nine binaries, plus one Linux-only non-UTF-8 case |
-| Executed test count (`ci/test-inventory.sh`) | 543 macOS, 544 Linux | Current local suite plus one Linux-only non-UTF-8 test |
-| `ci/test-inventory-floor.txt` | 543 | Current macOS count and floor |
+| `cargo test --lib` | 1.67 to 3.70 seconds, 331 tests at the cited runs | Runs 45009466461 and 45011836996; the suite now has 452 lib tests |
+| Integration tests | 0.40 to 0.75 seconds, 75 tests across seven binaries at the cited runs | Runs 45009466461 and 45011836996; the suite now has 100 integration tests across nine binaries, plus one Linux-only non-UTF-8 case |
+| Executed test count (`ci/test-inventory.sh`) | 552 macOS, 553 Linux | Current local suite plus one Linux-only non-UTF-8 test |
+| `ci/test-inventory-floor.txt` | 552 | Current macOS count and floor |
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
@@ -78,7 +78,7 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 | First post-merge meta PR | 52 seconds; `Changes` 6, `Test` 35 | Pull request 45119777637 |
 | Toolchain-cache removal | Not adopted; setup without the cache was slower than restore plus setup | Runs 45108914603, 45109176611, 45109045484, 45109314728 |
 
-The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 543 floor is a lower bound, not a per-test lock; Linux executes one additional non-UTF-8 test. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff. The Cargo cache key includes `Cargo.toml` as well as `Cargo.lock` and `rust-toolchain.toml`, so a test-profile change cannot restore incompatible compiler artifacts.
+The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 552 floor is a lower bound, not a per-test lock; Linux executes one additional non-UTF-8 test. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff. The Cargo cache key includes `Cargo.toml` as well as `Cargo.lock` and `rust-toolchain.toml`, so a test-profile change cannot restore incompatible compiler artifacts.
 
 Older local macOS measurements are historical and are not acceptance evidence. The acceptance record contains the Linux run-level data and the rejected experiments.
 

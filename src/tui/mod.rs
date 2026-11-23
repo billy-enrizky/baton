@@ -90,6 +90,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "permission mode: default|acceptEdits|bypassPermissions|plan",
     ),
     ("/auth", "billing mode: /auth <provider> <subscription|api>"),
+    (
+        "/roles",
+        "inspect orchestrator, planner, implementor, and reviewer roles",
+    ),
     ("/new", "start a new thread"),
     ("/fork", "branch this conversation into a new thread"),
     (
@@ -497,6 +501,10 @@ enum Overlay {
     },
     AuthPicker {
         selected: usize,
+    },
+    RolesPicker {
+        selected: usize,
+        roles: Vec<crate::roles::RoleSpec>,
     },
     ThreadPicker {
         selected: usize,
@@ -3919,6 +3927,61 @@ fn handle_key(
                 state.overlay = Overlay::ModePicker { selected };
             }
         },
+        Overlay::RolesPicker {
+            mut selected,
+            roles,
+        } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = (selected + roles.len() - 1) % roles.len();
+                state.overlay = Overlay::RolesPicker { selected, roles };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % roles.len();
+                state.overlay = Overlay::RolesPicker { selected, roles };
+            }
+            KeyCode::Enter => {
+                if let Some(role) = roles.get(selected) {
+                    let preview: String = role
+                        .prompt
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(160)
+                        .collect();
+                    let preview = crate::sanitize::sanitize_terminal_text(&preview);
+                    let prompt_path = role.prompt_path.display().to_string();
+                    let prompt_path = crate::sanitize::sanitize_terminal_text(&prompt_path);
+                    let config_path = role.config_path.display().to_string();
+                    let config_path = crate::sanitize::sanitize_terminal_text(&config_path);
+                    let effort = role
+                        .effort
+                        .as_deref()
+                        .map(|effort| format!("@{effort}"))
+                        .unwrap_or_default();
+                    let hooks = if role.hook_events.is_empty() {
+                        "none".to_string()
+                    } else {
+                        role.hook_events.join(", ")
+                    };
+                    state.notice = Some(format!(
+                        "{} · {}/{}{effort}\nhooks: {hooks}\nconfig: {} ({})\nprompt: {} ({})\n{preview}",
+                        role.id.as_str(),
+                        role.provider,
+                        role.model,
+                        config_path,
+                        role.config_source.as_str(),
+                        prompt_path,
+                        role.prompt_source.as_str(),
+                    ));
+                }
+                state.overlay = Overlay::RolesPicker { selected, roles };
+            }
+            _ => {
+                state.overlay = Overlay::RolesPicker { selected, roles };
+            }
+        },
         Overlay::AuthPicker { mut selected } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
@@ -6687,6 +6750,15 @@ fn handle_command(
                 }
             }
         }
+        "/roles" => match crate::roles::load(&state.home) {
+            Ok(registry) => {
+                state.overlay = Overlay::RolesPicker {
+                    selected: 0,
+                    roles: registry.roles,
+                };
+            }
+            Err(error) => state.notice = Some(format!("cannot load roles: {error}")),
+        },
         "/settings" => {
             let categories = settings_categories(state);
             let value_index = categories
@@ -8338,6 +8410,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::SettingsPicker { categories, .. } => categories.len().min(5) + 5,
             Overlay::McpPicker { .. } => 8,
             Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
+            Overlay::RolesPicker { roles, .. } => roles.len() + 6,
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
             Overlay::ModePicker { .. } => 7,
@@ -8426,6 +8499,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 *value_index,
             ),
             Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[1], *selected),
+            Overlay::RolesPicker { selected, roles } => {
+                draw_roles_picker(frame, chunks[1], roles, *selected)
+            }
             Overlay::CopyPicker { selected, replies } => {
                 draw_copy_picker(frame, chunks[1], replies, *selected)
             }
@@ -8984,6 +9060,59 @@ fn draw_mcp_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("❯ {action}"), style));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_roles_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    roles: &[crate::roles::RoleSpec],
+    selected: usize,
+) {
+    let selected_role = roles.get(selected);
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!(
+            "roles ({}) · ↑↓ select · enter details · esc close",
+            roles.len()
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, role) in roles.iter().enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let effort = role
+            .effort
+            .as_deref()
+            .map(|effort| format!("@{effort}"))
+            .unwrap_or_default();
+        lines.push(Line::styled(
+            format!(
+                "❯ {} · {}/{}{effort} · config {} · prompt {}",
+                role.id.as_str(),
+                role.provider,
+                role.model,
+                role.config_source.as_str(),
+                role.prompt_source.as_str()
+            ),
+            style,
+        ));
+    }
+    if let Some(role) = selected_role {
+        let config_path = role.config_path.display().to_string();
+        let config_path = crate::sanitize::sanitize_terminal_text(&config_path);
+        lines.push(Line::styled(
+            format!("config file: {}", config_path),
+            Style::default().fg(COLORS.muted),
+        ));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -20967,5 +21096,74 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("usage: /queue move"));
+    }
+
+    #[test]
+    fn roles_picker_shows_user_overrides_and_role_details() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::roles::config_path(home.path()),
+            r#"{"roles":{"orchestrator":{"provider":"codex","model":"rits/deepseek-v4.1-flash"},"planner":{"provider":"codex","model":"rits/deepseek-v4.1-flash"},"implementor":{"provider":"codex","model":"rits/deepseek-v4.1-flash"},"reviewer":{"provider":"codex","model":"rits/deepseek-v4.1-flash"}}}"#,
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/roles");
+        let screen = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(screen.contains("roles (4)"), "{screen}");
+        assert!(
+            screen.contains("orchestrator · codex/rits/deepseek-v4.1-flash · config user"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("implementor · codex/rits/deepseek-v4.1-flash"),
+            "{screen}"
+        );
+        assert!(screen.contains("enter details"), "{screen}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("implementor · codex/rits/deepseek-v4.1-flash"));
+        assert!(matches!(state.overlay, Overlay::RolesPicker { .. }));
+    }
+
+    #[test]
+    fn roles_command_reports_a_malformed_role_config() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(crate::roles::config_path(home.path()), "not json").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/roles");
+
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("cannot load roles"));
+        assert!(matches!(state.overlay, Overlay::None));
     }
 }

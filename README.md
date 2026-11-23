@@ -95,6 +95,16 @@ Grok uses the same override shape with the OpenAI-compatible `/v1` base. Baton s
 
 Cursor is installed as `cursor-agent` and baton spawns `cursor-agent acp`. Cursor validates its own API keys, so the ICA key is rejected; run `cursor-agent login` and use subscription auth instead. Cursor cannot use the ICA endpoint.
 
+OpenCode can use an OpenAI-compatible ICA provider through its own `opencode.json`; Baton does not map a custom OpenCode base URL. Keep harness CLIs current with `grok update`, `cursor-agent update`, and `opencode upgrade`. To verify every advertised harness and record either a live turn or an explicit account block, run the harness matrix probe from a source checkout:
+
+```
+.agents/skills/verify-baton/scripts/harness_matrix_probe.py \
+  --binary target/debug/baton \
+  --evidence-dir local_docs/verification/evidence
+```
+
+The default run skips a live Claude turn and checks Cursor's capability only. Add `--include-claude` only when you approve a live Claude subscription turn.
+
 ## Start here
 
 Run `baton` with no arguments. The workspace opens in orchestrate mode. Type what you want to do in plain language and press Enter. Baton picks a harness or splits the work. `/help` shows the common paths, `/help all` lists every command, and `baton doctor` checks what is installed.

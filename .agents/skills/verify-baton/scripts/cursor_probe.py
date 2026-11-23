@@ -18,8 +18,11 @@ def main() -> int:
     if shutil.which("cursor-agent") is None:
         print(json.dumps({"passed": False, "error": "cursor-agent is not installed"}))
         return 2
-    version = subprocess.run(["cursor-agent", "--version"], capture_output=True, text=True).stdout.strip()
-    status = subprocess.run(["cursor-agent", "status"], capture_output=True, text=True).stdout.strip()
+    key = os.environ.get("CODEX_ICA_API_KEY")
+    def safe(value: str) -> str:
+        return value.replace(key, "[redacted]") if key and value else value
+    version = safe(subprocess.run(["cursor-agent", "--version"], capture_output=True, text=True).stdout.strip())
+    status = safe(subprocess.run(["cursor-agent", "status"], capture_output=True, text=True).stdout.strip())
     evidence = Path(args.evidence_dir) / f"cursor-probe-{int(time.time())}"
     evidence.mkdir(parents=True, exist_ok=True)
     home = Path(tempfile.mkdtemp(prefix="baton-cursor-home-")); cwd = Path(tempfile.mkdtemp(prefix="baton-cursor-cwd-"))
@@ -41,11 +44,11 @@ def main() -> int:
             "cursor_version": version,
             "cursor_status": status,
             "subscription_exit": subscription.returncode,
-            "subscription_stdout": subscription.stdout[:500],
-            "subscription_stderr": subscription.stderr[-500:],
+            "subscription_stdout": safe(subscription.stdout[:500]),
+            "subscription_stderr": safe(subscription.stderr[-500:]),
             "login_hint_ok": login_hint_ok,
             "custom_endpoint_exit": custom.returncode,
-            "custom_endpoint_stderr": custom.stderr[-500:],
+            "custom_endpoint_stderr": safe(custom.stderr[-500:]),
             "custom_endpoint_rejected": custom_rejected,
         }
         result["passed"] = login_hint_ok and custom_rejected

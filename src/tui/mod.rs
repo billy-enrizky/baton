@@ -2269,24 +2269,7 @@ fn model_filter_indices(models: &[String], filter: &str) -> Vec<usize> {
 }
 
 fn split_line_target(query: &str) -> (String, Option<u32>) {
-    let query = query.trim();
-    if let Some((path, digits)) = query.rsplit_once(':') {
-        if path.ends_with('\\') {
-            return (query.replace("\\:", ":"), None);
-        }
-        let digits = digits.trim();
-        if !path.trim().is_empty()
-            && !digits.is_empty()
-            && digits.bytes().all(|byte| byte.is_ascii_digit())
-        {
-            if let Ok(line) = digits.parse::<u32>() {
-                if line > 0 {
-                    return (path.trim().replace("\\:", ":"), Some(line));
-                }
-            }
-        }
-    }
-    (query.replace("\\:", ":"), None)
+    crate::files::split_line_target(query)
 }
 
 fn grep_filter_indices(matches: &[crate::grep::ContentMatch], query: &str) -> Vec<usize> {

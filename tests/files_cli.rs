@@ -184,6 +184,89 @@ fn open_prefers_visual_over_editor_in_a_real_process() {
     assert_eq!(printed, format!("nvim -f {}\n", target.display()));
 }
 
+#[cfg(unix)]
+#[test]
+fn open_print_passes_line_targets_to_common_editors() {
+    let project = init_project();
+    let home = tempfile::tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_baton");
+    let target = project.path().join("src/parser.rs").canonicalize().unwrap();
+
+    for (visual, expected) in [
+        (
+            "code --wait",
+            format!("code --wait --goto {}:12\n", target.display()),
+        ),
+        ("vim -f", format!("vim -f +12 {}\n", target.display())),
+        (
+            "hx --vsplit",
+            format!("hx --vsplit {}:12\n", target.display()),
+        ),
+    ] {
+        let output = Command::new(binary)
+            .args([
+                "-C",
+                project.path().to_str().unwrap(),
+                "open",
+                "src/parser.rs:12",
+                "--print",
+            ])
+            .env("BATON_HOME", home.path())
+            .env("VISUAL", visual)
+            .env_remove("EDITOR")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn open_runs_a_known_editor_with_the_line_argument() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let project = init_project();
+    let home = tempfile::tempdir().unwrap();
+    let tools = tempfile::tempdir().unwrap();
+    let log = tools.path().join("argv.txt");
+    let code = tools.path().join("code");
+    std::fs::write(
+        &code,
+        format!("#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\n", log.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&code, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let binary = env!("CARGO_BIN_EXE_baton");
+
+    let output = Command::new(binary)
+        .args([
+            "-C",
+            project.path().to_str().unwrap(),
+            "open",
+            "src/parser.rs:12",
+        ])
+        .env("BATON_HOME", home.path())
+        .env("VISUAL", format!("{} --wait", code.display()))
+        .env_remove("EDITOR")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let target = project.path().join("src/parser.rs").canonicalize().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&log).unwrap(),
+        format!("--wait\n--goto\n{}:12\n", target.display())
+    );
+}
+
 #[test]
 fn files_scope_to_the_current_directory() {
     let project = init_project();

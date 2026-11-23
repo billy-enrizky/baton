@@ -1857,6 +1857,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Open { path, print } => {
+            let (path, line) = files::split_line_target(&path);
             let target = files::resolve_project_file(&cwd, Path::new(&path))?;
             let root = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
             if let Ok(relative) = target.strip_prefix(&root) {
@@ -1871,7 +1872,7 @@ fn main_result(started: Instant) -> Result<()> {
                     "no editor configured; set VISUAL or EDITOR, for example `EDITOR=vim baton open {path}`"
                 )
             })?;
-            let command = files::build_open_command(&editor, &target)?;
+            let command = files::build_open_command_at_line(&editor, &target, line)?;
             if print {
                 print_file_paths(&[command.shell_line()])?;
             } else {

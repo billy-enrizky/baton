@@ -155,16 +155,74 @@ pub fn editor_from_env() -> Option<String> {
 }
 
 pub fn build_open_command(editor: &str, path: &Path) -> Result<EditorCommand> {
+    build_open_command_at_line(editor, path, None)
+}
+
+pub fn build_open_command_at_line(
+    editor: &str,
+    path: &Path,
+    line: Option<u32>,
+) -> Result<EditorCommand> {
     let mut words = split_command_line(editor)?;
     if words.is_empty() {
         anyhow::bail!("VISUAL or EDITOR is empty");
     }
     let program = words.remove(0);
-    words.push(path.to_string_lossy().into_owned());
+    if let Some(line) = line {
+        match editor_program_name(&program).as_str() {
+            "code" | "code-insiders" | "codium" | "cursor" | "windsurf" => {
+                words.push("--goto".into());
+                words.push(format!("{}:{line}", path.to_string_lossy()));
+            }
+            "vim" | "vi" | "view" | "gvim" | "mvim" | "nvim" | "emacs" | "emacsclient" | "nano" => {
+                words.push(format!("+{line}"));
+                words.push(path.to_string_lossy().into_owned());
+            }
+            _ => words.push(format!("{}:{line}", path.to_string_lossy())),
+        }
+    } else {
+        words.push(path.to_string_lossy().into_owned());
+    }
     Ok(EditorCommand {
         program,
         args: words,
     })
+}
+
+fn editor_program_name(program: &str) -> String {
+    let name = program
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(program)
+        .to_ascii_lowercase();
+    for suffix in [".exe", ".cmd", ".bat"] {
+        if let Some(stripped) = name.strip_suffix(suffix) {
+            return stripped.to_string();
+        }
+    }
+    name
+}
+
+/// Split a trailing `:<line>` from a quick-open path. A literal colon is escaped as `\:`.
+pub fn split_line_target(query: &str) -> (String, Option<u32>) {
+    let query = query.trim();
+    if let Some((path, digits)) = query.rsplit_once(':') {
+        if path.ends_with('\\') {
+            return (query.replace("\\:", ":"), None);
+        }
+        let digits = digits.trim();
+        if !path.trim().is_empty()
+            && !digits.is_empty()
+            && digits.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            if let Ok(line) = digits.parse::<u32>() {
+                if line > 0 {
+                    return (path.trim().replace("\\:", ":"), Some(line));
+                }
+            }
+        }
+    }
+    (query.replace("\\:", ":"), None)
 }
 
 pub fn split_command_line(input: &str) -> Result<Vec<String>> {
@@ -864,6 +922,51 @@ mod tests {
         assert_eq!(open.program, "vim");
         assert_eq!(open.args, vec!["-f", "/tmp/it's here.rs"]);
         assert_eq!(open.shell_line(), "vim -f '/tmp/it'\\''s here.rs'");
+    }
+
+    #[test]
+    fn open_commands_apply_editor_specific_line_syntax() {
+        let path = Path::new("/tmp/file.rs");
+        let code = build_open_command_at_line("code --wait", path, Some(12)).unwrap();
+        assert_eq!(code.program, "code");
+        assert_eq!(code.args, vec!["--wait", "--goto", "/tmp/file.rs:12"]);
+
+        let vim = build_open_command_at_line("vim -f", path, Some(12)).unwrap();
+        assert_eq!(vim.args, vec!["-f", "+12", "/tmp/file.rs"]);
+
+        let emacs = build_open_command_at_line("emacsclient -a \"\"", path, Some(7)).unwrap();
+        assert_eq!(emacs.args, vec!["-a", "", "+7", "/tmp/file.rs"]);
+
+        let nano = build_open_command_at_line("nano", path, Some(9)).unwrap();
+        assert_eq!(nano.args, vec!["+9", "/tmp/file.rs"]);
+
+        let helix = build_open_command_at_line("hx --vsplit", path, Some(3)).unwrap();
+        assert_eq!(helix.args, vec!["--vsplit", "/tmp/file.rs:3"]);
+
+        let unknown = build_open_command_at_line("my-editor --flag", path, Some(4)).unwrap();
+        assert_eq!(unknown.args, vec!["--flag", "/tmp/file.rs:4"]);
+
+        for editor in ["code-insiders", "codium", "cursor", "windsurf"] {
+            let command = build_open_command_at_line(editor, path, Some(5)).unwrap();
+            assert_eq!(command.args, vec!["--goto", "/tmp/file.rs:5"]);
+        }
+
+        let unscoped = build_open_command_at_line("code --wait", path, None).unwrap();
+        assert_eq!(unscoped.args, vec!["--wait", "/tmp/file.rs"]);
+        assert_eq!(
+            editor_program_name("C:\\Program Files\\Code\\code.exe"),
+            "code"
+        );
+        assert_eq!(editor_program_name("code.cmd"), "code");
+        assert_eq!(editor_program_name("Code.BAT"), "code");
+    }
+
+    #[test]
+    fn split_line_targets_are_shared_by_the_cli_and_picker() {
+        assert_eq!(split_line_target("parser:42").1, Some(42));
+        assert_eq!(split_line_target("parser:42").0, "parser");
+        assert_eq!(split_line_target("app\\:12"), ("app:12".into(), None));
+        assert_eq!(split_line_target("parser:0"), ("parser:0".into(), None));
     }
 
     #[test]

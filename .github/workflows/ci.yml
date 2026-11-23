@@ -229,22 +229,10 @@ jobs:
           cp -R base/ci "$dest"
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
-      - name: Restore Rust toolchain cache
-        id: rustup-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: rustup-1.100.0-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
-      - name: Save Rust toolchain cache
-        if: github.ref == 'refs/heads/main' && steps.rustup-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
@@ -300,22 +288,10 @@ jobs:
           cp -R base/ci "$dest"
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
-      - name: Restore Rust toolchain cache
-        id: rustup-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: rustup-1.100.0-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
-      - name: Save Rust toolchain cache
-        if: github.ref == 'refs/heads/main' && steps.rustup-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
@@ -374,22 +350,10 @@ jobs:
           cp -R base/ci "$dest"
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
-      - name: Restore Rust toolchain cache
-        id: rustup-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: rustup-1.100.0-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
-      - name: Save Rust toolchain cache
-        if: github.ref == 'refs/heads/main' && steps.rustup-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
@@ -468,23 +432,11 @@ jobs:
           cp -R base/ci "$dest"
           chmod -R a-w "$dest"
           (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
-      - name: Restore Rust toolchain cache
-        id: rustup-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: rustup-1.100.0-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
           components: rustfmt, clippy
-      - name: Save Rust toolchain cache
-        if: github.ref == 'refs/heads/main' && steps.rustup-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: ~/.rustup
-          key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:

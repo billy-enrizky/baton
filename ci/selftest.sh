@@ -25,6 +25,33 @@ for fixture in "$root"/fixtures/paths/*.txt; do
   fi
 done
 
+stale_root=$(mktemp -d)
+git -C "$stale_root" init --quiet -b main
+git -C "$stale_root" config user.email ci@example.invalid
+git -C "$stale_root" config user.name ci
+printf 'base\n' > "$stale_root/base.txt"
+git -C "$stale_root" add base.txt
+git -C "$stale_root" commit --quiet -m base
+git -C "$stale_root" switch --quiet -c pr
+printf 'pr\n' > "$stale_root/pr.txt"
+git -C "$stale_root" add pr.txt
+git -C "$stale_root" commit --quiet -m pr
+git -C "$stale_root" switch --quiet main
+printf 'base side\n' > "$stale_root/base-side.txt"
+git -C "$stale_root" add base-side.txt
+git -C "$stale_root" commit --quiet -m base-side
+stable_base=$(git -C "$stale_root" rev-parse main)
+git -C "$stale_root" merge --quiet --no-ff pr -m merge
+merge_commit=$(git -C "$stale_root" rev-parse HEAD)
+git -C "$stale_root" diff --name-only "$stable_base" pr > "$stale_root/head.diff"
+git -C "$stale_root" diff --name-only "$stable_base" "$merge_commit" > "$stale_root/merge.diff"
+grep -qx 'base-side.txt' "$stale_root/head.diff"
+if grep -qx 'base-side.txt' "$stale_root/merge.diff"; then
+  echo "stale-base fixture: merge diff included a base-side change" >&2
+  exit 1
+fi
+grep -qx 'pr.txt' "$stale_root/merge.diff"
+
 valid="$root/fixtures/check-ci/valid.yml"
 bash "$root/check-ci.sh" --bootstrap "$valid" >/dev/null
 if [[ -f "$repo_root/.github/workflows/ci.yml" ]]; then
@@ -63,6 +90,24 @@ if [[ $code -eq 0 ]]; then
   exit 1
 fi
 bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/changed-test-command.yml" --allow-change >/dev/null
+
+set +e
+output=$(bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/invalid-allow-change-missing-command.yml" --allow-change 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q 'CI014' <<< "$output"; then
+  echo "--allow-change skipped a missing required command" >&2
+  exit 1
+fi
+
+set +e
+output=$(bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/invalid-unbudgeted-command.yml" --allow-change 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q 'CI017' <<< "$output"; then
+  echo "--allow-change skipped a missing budget" >&2
+  exit 1
+fi
 
 set +e
 bash "$root/budget.sh" 1 sleep 2

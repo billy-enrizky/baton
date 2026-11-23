@@ -47,7 +47,7 @@ Budget rule, applied at every phase: Phase 1 uses three times a conservative col
 | Alternative | Why it was not adopted |
 |---|---|
 | Keep the full head and base checkout in `Changes` | The fast path replaced a 16-second checkout and guard sequence with a shallow two-commit fetch and a base-owned classifier. The guards still run in `Selection`, so no check is removed. |
-| List changed files through the GitHub pull request API | The API returns merge-base changes, while the existing classifier compares the base tip with the head. That mismatch would make `Selection` fail. A shallow fetch of the base and `refs/pull/<number>/head` uses the same two-commit diff as the classifier and takes about one to two seconds. |
+| List changed files through the GitHub pull request API | The API returns merge-base changes, while `Selection` classifies the checked-out pull request merge ref against the base tip. A shallow fetch of the base and `refs/pull/<number>/merge` uses the exact same two commits as `Selection` and takes about one to two seconds. A stale base therefore cannot change the selection between jobs. |
 | Move classification into every gate job | Each job would repeat GitHub API or git work and would still need a trusted cross-check. One fast `Changes` job plus a `Selection` recomputation gives one shared result and one place to fail closed. |
 | Remove the Rust toolchain cache | Measured against a retained cache, Setup Rust took about 9 seconds instead of about 6 seconds of restore plus 1 second of activation. The removed-cache runs were 57 and 69 seconds against 69 and 71 seconds retained. No gain was proven. |
 | Keep full debuginfo in the test profile | Line tables keep readable backtraces and cut the warm compile from 18.94 to 14.13 seconds on the measured run. The cache key includes `Cargo.toml`, so the profile change cannot silently reuse incompatible artifacts. |
@@ -144,21 +144,21 @@ Gate-integrity rules:
 | A profile or dependency change reuses incompatible Cargo artifacts | The cache key includes `Cargo.lock`, `Cargo.toml`, and `rust-toolchain.toml`; the first main run after a profile change is a cold seed | One cache-miss run is slower and must be recorded separately from warm samples |
 | Diff-aware test selection is mistaken for full-suite coverage | This slice only classifies which gates run. Every code or meta PR still runs the full Rust suite; docs-only is the only fast path | The Phase 3 selector is not shipped and its union proof is still required |
 | A direct push or owner bypass skips `Verify` | `main` now requires the `Verify` status check and an up-to-date branch, blocks direct and force pushes, and disables admin enforcement only for the documented `ci-repair` override | The bypass is an owner capability and must remain visible in the merge record |
-| The 52-second warm result is mistaken for a PR p50 | Acceptance keeps the historical 16-sample distribution and labels the new result provisional until a post-merge PR sample exists | A future regression still needs 100 runs or four weeks before the percentile is acceptance-bearing |
+| The 51-second warm result is mistaken for a PR p50 | Acceptance keeps the historical 16-sample distribution and labels the new result provisional until a post-merge PR sample exists | A future regression still needs 100 runs or four weeks before the percentile is acceptance-bearing |
 | Paid runner or merge-queue capacity is assumed | Costs table and owner actions state that no paid capacity is approved and merge queue is blocked on ownership | The target may require an owner decision if the free runner cannot meet p95 |
 
 ## Trust model
 
-The base supplies every pass/fail script on every event. The head supplies only the measured source.
+Pull requests and merge groups use base-owned pass/fail scripts. Main pushes and owner-controlled dispatches use the checked-out head scripts, so the first push after a CI change proves the merged tools rather than the previous tools.
 
 - `pull_request` uses `github.event.pull_request.base.sha`.
 - `merge_group` uses `github.event.merge_group.base_sha`.
 - `push` uses `github.event.before`, falling back to `HEAD~1` for a first push or a zero SHA.
 - `workflow_dispatch` uses `github.event.before`, falling back to `HEAD~1`.
 
-`changes` is the fast path. It does not check out the worktree. For a pull request it initializes a temporary repository, fetches only the base and `refs/pull/<number>/head` at depth one, exports the base-owned `budget.sh` and `classify-paths.sh` from the base commit, and classifies the two-commit diff. A failed fetch or classification selects every gate. The job deliberately carries no pass/fail guards, so the Rust jobs can start before the trusted tools finish staging.
+`changes` is the fast path. It does not check out the worktree. For a pull request it initializes a temporary repository, fetches only the base and `refs/pull/<number>/merge` at depth one, exports the base-owned `budget.sh` and `classify-paths.sh` from the base commit, and classifies the base-to-merge diff. The merge ref is the same tree `Selection` checks out, so an advancing base cannot produce different selections. A failed fetch or classification selects every gate. The job deliberately carries no pass/fail guards, so the Rust jobs can start before the trusted tools finish staging.
 
-`selection` is the trust gate. It sparse-checks out the base copy with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`, copies `base/ci` to `$RUNNER_TEMP/trusted-ci`, marks it read-only, records a SHA-256 manifest, and executes only from that copy. It runs gate integrity, the full tool self-test, and the baseline ratchets, then recomputes classification with the base classifier and compares every output with `changes`. It also compares `rust-toolchain.toml` and runs the workflow guard. The `test` job reads the inventory floor and timing script from its own trusted copy, treats the captured test log as untrusted input, and re-verifies the manifest after the test gates. Moving the guards into `selection` is safe because `verify` still requires both `changes` and `selection` to succeed.
+`selection` is the trust gate. It sparse-checks out the base copy with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`. On pull requests and merge groups it stages `base/ci`; on main pushes and dispatches it stages the checked-out head `ci/`, because branch protection has already admitted that tree on main and a dispatch is owner-controlled. It marks the staged copy read-only, records a SHA-256 manifest, and executes only from that copy. It runs gate integrity, the full tool self-test, and the baseline ratchets, then recomputes classification and compares every output with `changes`. It also compares `rust-toolchain.toml` and runs the workflow guard. The `test` job reads the inventory floor and timing script from its own trusted copy, treats the captured test log as untrusted input, and re-verifies the manifest after the test gates. Moving the guards into `selection` is safe because `verify` still requires both `changes` and `selection` to succeed.
 
 That staging is a detection boundary, not a sandbox. `cargo test` runs arbitrary repository code with write access to the runner's filesystem, so a determined change can still tamper with the process. What staging buys is that tampering after the first gate step is visible as a manifest mismatch instead of silently changing the harness. A real sandbox needs a separate container or a read-only mount, which is a Phase 3 decision.
 
@@ -166,7 +166,7 @@ Head-controlled process configuration is rejected rather than compared. A workfl
 
 `rust-toolchain.toml` is compared byte for byte with the base copy in the `selection` job. There is no `RUSTUP_TOOLCHAIN` environment override anywhere in the workflow.
 
-On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run outside a pull request. Job-list equality is still enforced, and `workflow_dispatch` can target a feature branch, so it is owner-controlled rather than a substitute for the PR gate.
+On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run outside a pull request. `--allow-change` permits only the base-to-head command and step comparison. Required commands and `CI017` budget enforcement are unconditional, so the override cannot remove a gate or run it outside `ci/budget.sh`. Job-list equality is still enforced, and `workflow_dispatch` can target a feature branch, so it is owner-controlled rather than a substitute for the PR gate.
 
 Changing a gate command is not a PR-level decision. There is no `ci-change` label. The workflow passes `--allow-change` on `push`, `merge_group`, and `workflow_dispatch`. Push and merge-group commits are protected; `workflow_dispatch` is owner-controlled and can target a feature branch. A job-list change is rejected on every event. A PR that changes a command, `needs`, `if`, timeout, runner, output, or strategy fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
 
@@ -174,9 +174,9 @@ The single escape hatch is `ci-repair`, and it is a human action rather than a w
 
 1. The repository owner opens a PR that touches only `ci/**`, `.github/**`, or `docs/ci*.md`.
 2. The PR is expected to fail `verify` at the base comparison. That failure is the record of the change.
-3. Before merging, the owner runs `ci/selftest.sh`, `ci/check-ci.sh --base <base workflow> <head workflow> --allow-change`, `actionlint`, and a full local `cargo test --locked` on the same commit.
+3. Before merging, the owner runs `ci/selftest.sh`, `ci/check-ci.sh --base <base workflow> <head workflow> --allow-change`, `actionlint`, and a full local `cargo test --locked` on the same commit. The guard still enforces every required command and budget; `--allow-change` only permits the reviewed command and step changes.
 4. The owner merges with an admin override, quoting the local results in the PR.
-5. The `push` run on `main` is the proof: it runs the new tools against the full suite with all gates selected.
+5. The `push` run on `main` is the proof: it stages the merged head `ci/` tools, runs the full self-test and workflow guard against them, selects every gate, and executes the full suite. The same proof is available on a branch through `workflow_dispatch`, which is owner-controlled.
 
 This is visible in the PR, the merge API, and the next main run. It is not silent, and it cannot be triggered by an outside contributor.
 

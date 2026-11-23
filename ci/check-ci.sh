@@ -170,35 +170,32 @@ end
   fail!("CI010", "#{job_name} must read changes.outputs.#{output}") unless condition.include?(output)
 end
 
-unless allow_change
-  required_commands = {
-    "changes" => ["classify-paths.sh"],
-    "selection" => ["classify-paths.sh", "check-ci.sh", "--base", "selftest.sh", "gate-integrity.sh"],
-    "check" => ["cargo check --locked"],
-    "build" => ["cargo build --locked"],
-    "test" => ["cargo test --locked"],
-    "debt" => ["fmt-debt.sh", "clippy-debt.sh"],
-    "verify" => ["check_gate"],
-  }
-  job_text = {}
-  required_commands.each do |job_name, commands|
-    job = jobs[job_name]
-    fail!("CI014", "missing #{job_name} job") unless job.is_a?(Hash)
-    text = Array(job["steps"]).map { |step| step["run"].to_s }.join("\n")
-    job_text[job_name] = text
-    commands.each do |command|
-      fail!("CI014", "#{job_name} is missing required command #{command}") unless text.include?(command)
-    end
+required_commands = {
+  "changes" => ["classify-paths.sh"],
+  "selection" => ["classify-paths.sh", "check-ci.sh", "--base", "selftest.sh", "gate-integrity.sh"],
+  "check" => ["cargo check --locked"],
+  "build" => ["cargo build --locked"],
+  "test" => ["cargo test --locked"],
+  "debt" => ["fmt-debt.sh", "clippy-debt.sh"],
+  "verify" => ["check_gate"],
+}
+job_text = {}
+required_commands.each do |job_name, commands|
+  job = jobs[job_name]
+  fail!("CI014", "missing #{job_name} job") unless job.is_a?(Hash)
+  text = Array(job["steps"]).map { |step| step["run"].to_s }.join("\n")
+  job_text[job_name] = text
+  commands.each do |command|
+    fail!("CI014", "#{job_name} is missing required command #{command}") unless text.include?(command)
   end
-  required_commands.each do |job_name, commands|
-    text = job_text[job_name]
-    commands.each do |command|
-      next if command == "check_gate" || command.start_with?("--")
-      budgeted = Regexp.new("budget\\.sh\"?\\s+\\d+\\s+\\S*" + Regexp.escape(command))
-      fail!("CI017", "#{job_name} runs #{command} outside ci/budget.sh") unless text.match?(budgeted)
-    end
+end
+required_commands.each do |job_name, commands|
+  text = job_text[job_name]
+  commands.each do |command|
+    next if command == "check_gate" || command.start_with?("--")
+    budgeted = Regexp.new("budget\\.sh\"?\\s+\\d+\\s+\\S*" + Regexp.escape(command))
+    fail!("CI017", "#{job_name} runs #{command} outside ci/budget.sh") unless text.match?(budgeted)
   end
-
 end
 
 if base_path.to_s.empty? || !File.file?(base_path)

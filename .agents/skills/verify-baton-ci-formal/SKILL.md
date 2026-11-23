@@ -7,7 +7,7 @@ description: "Model-check Baton's CI admission rules. Use when changing ci/class
 
 The CI gate is a state machine: a path classifier selects gates, each selected gate either runs or is skipped, the workflow guard checks command identity, and `verify` decides whether the run is green. A bug here can merge a broken change while every job reports success.
 
-In the workflow, `changes` is an untrusted fast path that only classifies, and `selection` owns the trusted guard and the recomputation check. The model's gate names and admission rules are unchanged; `selection` is the gate that must succeed for the workflow guard to count.
+In the workflow, `changes` is an untrusted fast path that only classifies, and `selection` owns the trusted guard and the recomputation check. Pull requests and merge groups stage base tools; main pushes and dispatches stage head tools as a post-merge proof. The model's gate names and admission rules are unchanged; `selection` is the gate that must succeed for the workflow guard to count.
 
 The model is committed at `ci/formal/ci-admission/`.
 

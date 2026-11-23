@@ -153,7 +153,7 @@ pub enum Commands {
     Orchestrate {
         /// Goal for the coordinator to split
         goal: Vec<String>,
-        /// Maximum number of worker tasks
+        /// Maximum number of worker tasks (1-16)
         #[arg(long, default_value_t = 4)]
         max_tasks: usize,
         /// Read a plan JSON file instead of asking the coordinator

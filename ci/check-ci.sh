@@ -58,7 +58,7 @@ def canonical_steps(job)
   end
 end
 
-def canonical_job(job)
+def canonical_job_shell(job)
   {
     "needs" => job["needs"],
     "if" => job["if"],
@@ -68,8 +68,11 @@ def canonical_job(job)
     "outputs" => job["outputs"],
     "with" => job["with"],
     "secrets" => job["secrets"],
-    "steps" => canonical_steps(job),
   }
+end
+
+def canonical_job(job)
+  canonical_job_shell(job).merge("steps" => canonical_steps(job))
 end
 
 head_path, base_path, allow_change, bootstrap = ARGV
@@ -186,7 +189,7 @@ required_commands = {
   "check" => ["cargo check --locked"],
   "build" => ["cargo build --locked"],
   "test" => ["cargo test --locked"],
-  "debt" => ["fmt-debt.sh", "clippy-debt.sh"],
+  "debt" => ["fmt-debt.sh", "clippy-debt.sh", "debt-selftest.sh"],
   "verify" => ["check_gate"],
 }
 job_text = {}
@@ -222,6 +225,9 @@ elsif File.file?(base_path)
 
   changed = []
   head_jobs.each do |name|
+    unless canonical_job_shell(jobs[name]) == canonical_job_shell(base_jobs[name])
+      fail!("CI013", "job #{name} wiring changed; job wiring is never allowed to drift")
+    end
     next if canonical_job(jobs[name]) == canonical_job(base_jobs[name])
     changed << name
   end

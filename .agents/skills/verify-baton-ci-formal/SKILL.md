@@ -54,4 +54,4 @@ Read every failing trace with the pstack `/statechart` skill. It presents the sh
 
 Update the model and this skill together when a gate name, selection output, `verify` rule, or command-identity rule changes. A failing invariant is a finding, not a reason to weaken the model.
 
-The model does not need a new configuration for the fast path: moving the guard from `changes` to `selection` preserves the `NoFalseGreen` requirement that both gate jobs succeed before `verify` can be green.
+The model does not need a new configuration for the fast path: moving the guard from `changes` to `selection` preserves the `NoFalseGreen` requirement that both gate jobs succeed before `verify` can be green. Job-level wiring and Git typechanges are enforced by `CI013` fixtures and the self-test, not by the admission model.

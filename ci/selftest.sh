@@ -52,6 +52,28 @@ if grep -qx 'base-side.txt' "$stale_root/merge.diff"; then
 fi
 grep -qx 'pr.txt' "$stale_root/merge.diff"
 
+type_root=$(mktemp -d)
+git -C "$type_root" init --quiet -b main
+git -C "$type_root" config user.email ci@example.invalid
+git -C "$type_root" config user.name ci
+mkdir -p "$type_root/src"
+printf 'pub fn f() {}\n' > "$type_root/src/lib.rs"
+printf 'docs\n' > "$type_root/README.md"
+git -C "$type_root" add -A
+git -C "$type_root" commit --quiet -m base
+rm "$type_root/src/lib.rs"
+ln -s ../README.md "$type_root/src/lib.rs"
+git -C "$type_root" add -A
+git -C "$type_root" commit --quiet -m typechange
+git -C "$type_root" diff --name-only --no-renames --diff-filter=ACDMRT HEAD~1 HEAD > "$type_root/type.diff"
+grep -qx 'src/lib.rs' "$type_root/type.diff"
+printf 'src/lib.rs\nREADME.md\n' > "$type_root/type-files.txt"
+type_selection=$(bash "$root/classify-paths.sh" --files "$type_root/type-files.txt" . .)
+if ! grep -q '^full_suite_reason=code$' <<< "$type_selection"; then
+  echo "typechange fixture: a .rs typechange did not select code" >&2
+  exit 1
+fi
+
 valid="$root/fixtures/check-ci/valid.yml"
 bash "$root/check-ci.sh" --bootstrap "$valid" >/dev/null
 if [[ -f "$repo_root/.github/workflows/ci.yml" ]]; then
@@ -86,14 +108,23 @@ for invalid in "$root"/fixtures/check-ci/invalid-*.yml; do
 done
 
 set +e
-bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/changed-test-command.yml" >/dev/null 2>&1
+output=$(bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/changed-test-command.yml" 2>&1)
 code=$?
 set -e
-if [[ $code -eq 0 ]]; then
-  echo "changed test command passed without --allow-change" >&2
+if [[ $code -eq 0 ]] || ! grep -q 'ERROR: CI013 ' <<< "$output"; then
+  echo "changed test command did not fail with CI013 without --allow-change" >&2
   exit 1
 fi
 bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/changed-test-command.yml" --allow-change >/dev/null
+
+set +e
+output=$(bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/changed-job-wiring.yml" --allow-change 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q 'ERROR: CI013 job check wiring changed' <<< "$output"; then
+  echo "--allow-change admitted a job-level wiring change" >&2
+  exit 1
+fi
 
 set +e
 output=$(bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/invalid-allow-change-missing-command.yml" --allow-change 2>&1)

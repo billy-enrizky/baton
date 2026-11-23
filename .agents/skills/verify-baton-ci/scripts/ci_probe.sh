@@ -22,6 +22,7 @@ evidence="$evidence_root/ci-probe-$stamp"
 mkdir -p "$evidence"
 
 bash ci/selftest.sh > "$evidence/selftest.log" 2>&1
+bash ci/debt-selftest.sh > "$evidence/debt-selftest.log" 2>&1
 bash ci/check-ci.sh --bootstrap ci/fixtures/check-ci/valid.yml > "$evidence/guard-valid.log" 2>&1
 bash ci/check-ci.sh --bootstrap .github/workflows/ci.yml > "$evidence/guard-workflow.log" 2>&1
 if bash ci/check-ci.sh --base ci/fixtures/check-ci/valid.yml ci/fixtures/check-ci/changed-test-command.yml > "$evidence/guard-change-rejected.log" 2>&1; then
@@ -45,6 +46,7 @@ cat > "$evidence/summary.json" <<JSON
   "passed": true,
   "evidence": "$evidence",
   "selftest": "passed",
+  "debt_selftest": "passed",
   "workflow_guard": "passed",
   "real_workflow": "passed",
   "command_change": "rejected-without-override",

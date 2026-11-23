@@ -66,6 +66,7 @@ jobs:
       - run: |
           base/ci/budget.sh 30 base/ci/fmt-debt.sh . base/ci/fmt-baseline.txt
           base/ci/budget.sh 180 base/ci/clippy-debt.sh . base/ci/clippy-baseline.txt
+          base/ci/budget.sh 60 base/ci/debt-selftest.sh
   verify:
     if: always()
     needs: [changes, selection, check, build, test, debt]

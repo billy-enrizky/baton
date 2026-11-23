@@ -89,7 +89,7 @@ The experiment is recorded in [ci-acceptance.md](ci-acceptance.md#rejected-arm-r
 
 ## What the gate enforces
 
-Every check below is a real command in `ci/`, and `ci/selftest.sh` proves at least one failing fixture per rule.
+Every check below is a real command in `ci/`. `ci/selftest.sh` proves the workflow rules, and `ci/debt-selftest.sh` runs the negative format and Clippy ratchet fixtures in the debt job.
 
 | Area | File | Enforcement |
 |---|---|---|
@@ -100,7 +100,8 @@ Every check below is a real command in `ci/`, and `ci/selftest.sh` proves at lea
 | Test inventory | `ci/test-inventory.sh` | Rules TI001 to TI005. Run mode compares announced and executed totals; list mode counts discovered tests |
 | Format debt | `ci/fmt-debt.sh` | Count of `Diff in ` lines must not exceed the baseline |
 | Clippy debt | `ci/clippy-debt.sh` | Count of `error:` lines must not exceed the baseline |
-| Self-test | `ci/selftest.sh` | Runs every fixture, the budget negative test, and the inventory floor, short-execution, and missing-total cases |
+| Self-test | `ci/selftest.sh` | Runs every workflow fixture, stale-base and Git typechange fixtures, the budget negative test, and the inventory floor, short-execution, and missing-total cases |
+| Debt self-test | `ci/debt-selftest.sh` | Runs in the debt job and proves a format diff and a Clippy lint over a zero baseline both fail |
 
 Workflow invariants:
 
@@ -166,9 +167,9 @@ Head-controlled process configuration is rejected rather than compared. A workfl
 
 `rust-toolchain.toml` is compared byte for byte with the base copy in the `selection` job. There is no `RUSTUP_TOOLCHAIN` environment override anywhere in the workflow.
 
-On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run outside a pull request. `--allow-change` permits only the base-to-head command and step comparison. Required commands and `CI017` budget enforcement are unconditional, so the override cannot remove a gate or run it outside `ci/budget.sh`. Job-list equality is still enforced, and `workflow_dispatch` can target a feature branch, so it is owner-controlled rather than a substitute for the PR gate.
+On `push`, `merge_group`, and `workflow_dispatch` the guard runs with `--allow-change`, because a merged CI change must be able to run outside a pull request. `--allow-change` permits only the base-to-head step comparison. Required commands and `CI017` budget enforcement are unconditional, so the override cannot remove a gate or run it outside `ci/budget.sh`. Job-list equality and job-level wiring (`needs`, `if`, timeout, runner, outputs, strategy, `with`, and secrets) are always enforced. `workflow_dispatch` can target a feature branch, so it is owner-controlled rather than a substitute for the PR gate.
 
-Changing a gate command is not a PR-level decision. There is no `ci-change` label. The workflow passes `--allow-change` on `push`, `merge_group`, and `workflow_dispatch`. Push and merge-group commits are protected; `workflow_dispatch` is owner-controlled and can target a feature branch. A job-list change is rejected on every event. A PR that changes a command, `needs`, `if`, timeout, runner, output, or strategy fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
+Changing a gate command is not a PR-level decision. There is no `ci-change` label. The workflow passes `--allow-change` on `push`, `merge_group`, and `workflow_dispatch`. Push and merge-group commits are protected; `workflow_dispatch` is owner-controlled and can target a feature branch. A job-list or job-wiring change is rejected on every event. A PR that changes a command, `needs`, `if`, timeout, runner, output, or strategy fails `verify` against the base workflow, by design. Step-level `working-directory`, `shell`, and every `continue-on-error` other than literal `false` are rejected too, because any of them can redirect a trusted tool or swallow a failure.
 
 The single escape hatch is `ci-repair`, and it is a human action rather than a workflow branch:
 
@@ -301,6 +302,7 @@ What it does not prove: test inventory completeness, shard union coverage, or th
 | Test inventory | 120 seconds | 60 seconds |
 | Format ratchet | 60 seconds | 30 seconds |
 | Clippy ratchet | 300 seconds | 300 seconds |
+| Debt self-test | 60 seconds | 60 seconds |
 
 Phase 1 values are three times a conservative local cold estimate. They are caps, not targets: a command that exceeds one fails the job. Phase 2 replaces each value with the measured Linux p95 plus 20 percent. That replacement is the only allowed increase; after it, no value may increase. Clippy is a separate debt ratchet, not a build or test command; its 300-second ceiling is recorded here so the 90-second warm build/test goal is not misread as a Clippy ceiling.
 

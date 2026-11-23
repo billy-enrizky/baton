@@ -206,6 +206,8 @@ fn main_result(started: Instant) -> Result<()> {
                 text: prompt,
                 permission_mode,
                 skip_handoff: false,
+                expected_provider: None,
+                retry: false,
             });
 
             let mut stream = exec_events::TurnStreamState::default();

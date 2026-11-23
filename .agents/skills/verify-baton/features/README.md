@@ -20,6 +20,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Native rewind | CLI | `baton rewind --native` truncates Codex or OpenCode history and keeps the session |
 | Review | TUI | `/review` shows the turn diff, saves a line note, and leaves it unsent |
 | TUI native rewind | TUI | `/rewind --native` truncates the provider and store history and prefills the message |
+| Retry | TUI | `/retry` lists failed or unverified turns and submits the chosen prompt as a new turn |
 | Greeting | TUI | `hi` in default orchestrate mode answers directly, with no planner run |
 | MCP stdio | CLI | `baton mcp` handshakes, lists 14 tools, and answers status, turns, threads, and doctor |
 | Antigravity | CLI | `agy acp` completes one turn with the ICA key and custom base URL |

@@ -20,6 +20,8 @@ pub enum EngineCommand {
         text: String,
         permission_mode: PermissionMode,
         skip_handoff: bool,
+        expected_provider: Option<ProviderId>,
+        retry: bool,
     },
     Steer {
         thread_id: String,
@@ -49,7 +51,12 @@ pub enum EngineEvent {
         models: Vec<String>,
         error: Option<String>,
     },
-    TurnRejected { thread_id: String, text: String, reason: String },
+    TurnRejected {
+        thread_id: String,
+        text: String,
+        reason: String,
+        retry: bool,
+    },
     TurnFinished { thread_id: String, ok: bool, error: Option<String>, phase: TurnPhase },
 }
 
@@ -558,13 +565,58 @@ pub async fn run_engine(
                 text,
                 permission_mode,
                 skip_handoff,
+                expected_provider,
+                retry,
             } => {
+                if let Some(expected_provider) = expected_provider {
+                    let current = store
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get_thread(&thread_id);
+                    match current {
+                        Ok(Some(thread)) if thread.current_provider == expected_provider => {}
+                        Ok(Some(thread)) => {
+                            let _ = engine_event_sender.send(EngineEvent::TurnRejected {
+                                thread_id,
+                                text,
+                                reason: format!(
+                                    "the thread harness changed to {} while retry was confirming",
+                                    thread.current_provider
+                                ),
+                                retry,
+                            });
+                            continue;
+                        }
+                        Ok(None) => {
+                            let _ = engine_event_sender.send(EngineEvent::TurnRejected {
+                                thread_id,
+                                text,
+                                reason: "the thread no longer exists while retry was confirming"
+                                    .into(),
+                                retry,
+                            });
+                            continue;
+                        }
+                        Err(error) => {
+                            let _ = engine_event_sender.send(EngineEvent::TurnRejected {
+                                thread_id,
+                                text,
+                                reason: format!(
+                                    "cannot read the thread for retry admission: {error}"
+                                ),
+                                retry,
+                            });
+                            continue;
+                        }
+                    }
+                }
                 let accepted = active_threads.lock().unwrap().insert(thread_id.clone());
                 if !accepted {
                     let _ = engine_event_sender.send(EngineEvent::TurnRejected {
                         thread_id,
                         text,
                         reason: "a turn is already running for this thread".into(),
+                        retry,
                     });
                     continue;
                 }
@@ -585,6 +637,7 @@ pub async fn run_engine(
                     text,
                     permission_mode,
                     skip_handoff,
+                    expected_provider,
                     engine_event_sender.clone(),
                     turn_event_sender.clone(),
                     active_threads.clone(),
@@ -607,6 +660,7 @@ async fn run_turn(
     text: String,
     permission_mode: PermissionMode,
     skip_handoff: bool,
+    expected_provider: Option<ProviderId>,
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: ThreadTurnEventSender,
     active_threads: Arc<Mutex<HashSet<String>>>,
@@ -635,6 +689,7 @@ async fn run_turn(
         &text,
         permission_mode,
         skip_handoff,
+        expected_provider,
         &engine_event_sender,
         &turn_event_sender,
     )
@@ -716,6 +771,7 @@ async fn execute_turn(
     text: &str,
     permission_mode: PermissionMode,
     skip_handoff: bool,
+    expected_provider: Option<ProviderId>,
     engine_event_sender: &std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: &ThreadTurnEventSender,
 ) -> Result<()> {
@@ -724,6 +780,9 @@ async fn execute_turn(
         let thread = store
             .get_thread(thread_id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+        if expected_provider.is_some_and(|expected| thread.current_provider != expected) {
+            anyhow::bail!("the thread harness changed before the turn started");
+        }
         (
             thread.current_provider,
             thread.cwd,
@@ -749,6 +808,13 @@ async fn execute_turn(
 
     let (prior_messages, turn, session) = {
         let store = store.lock().unwrap();
+        let current = store
+            .get_thread(thread_id)?
+            .ok_or_else(|| anyhow::anyhow!("thread not found: {thread_id}"))?;
+        if expected_provider.is_some_and(|expected| current.current_provider != expected) {
+            anyhow::bail!("the thread harness changed before the turn started");
+        }
+        let provider = current.current_provider;
         let prior = store.list_messages(thread_id)?;
         let turn = store.next_turn_number(thread_id)?;
         store.add_message(thread_id, turn, "user", Some(provider.as_str()), Some(&model), text)?;
@@ -1214,6 +1280,7 @@ mod tests {
             "hello",
             PermissionMode::Default,
             false,
+            None,
             &engine_sender,
             &turn_sender,
         )
@@ -1310,6 +1377,7 @@ mod tests {
             "hello $memories",
             PermissionMode::Default,
             false,
+            None,
             &engine_sender,
             &turn_sender,
         )
@@ -1385,6 +1453,7 @@ mod tests {
             "next",
             PermissionMode::Default,
             false,
+            None,
             &engine_sender,
             &turn_sender,
         )
@@ -1467,6 +1536,7 @@ mod tests {
             "next",
             PermissionMode::Default,
             true,
+            None,
             &engine_sender,
             &turn_sender,
         )
@@ -1537,6 +1607,7 @@ mod tests {
             "next",
             PermissionMode::Default,
             false,
+            None,
             &engine_sender,
             &turn_sender,
         )
@@ -1607,6 +1678,7 @@ mod tests {
             "next",
             PermissionMode::Default,
             false,
+            None,
             &engine_sender,
             &turn_sender,
         )
@@ -1786,6 +1858,8 @@ mod tests {
                 text: "hello".into(),
                 permission_mode: PermissionMode::Default,
                 skip_handoff: false,
+                expected_provider: None,
+                retry: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started).await, thread.id);
@@ -1845,6 +1919,8 @@ mod tests {
                 text: "hello".into(),
                 permission_mode: PermissionMode::Default,
                 skip_handoff: false,
+                expected_provider: None,
+                retry: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started).await, thread.id);
@@ -1935,6 +2011,8 @@ mod tests {
                 text: "hello".into(),
                 permission_mode: PermissionMode::Default,
                 skip_handoff: false,
+                expected_provider: None,
+                retry: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, claude_thread.id);
@@ -2005,6 +2083,8 @@ mod tests {
                 text: "first prompt".into(),
                 permission_mode: PermissionMode::Default,
                 skip_handoff: false,
+                expected_provider: None,
+                retry: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, first.id);
@@ -2015,6 +2095,8 @@ mod tests {
                 text: "second prompt".into(),
                 permission_mode: PermissionMode::Default,
                 skip_handoff: false,
+                expected_provider: None,
+                retry: false,
             })
             .unwrap();
         wait_engine_event(&event_receiver, |event| {
@@ -2136,6 +2218,8 @@ mod tests {
                 text: "first prompt".into(),
                 permission_mode: PermissionMode::Default,
                 skip_handoff: false,
+                expected_provider: None,
+                retry: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, first.id);
@@ -2145,6 +2229,8 @@ mod tests {
                 text: "second prompt".into(),
                 permission_mode: PermissionMode::Default,
                 skip_handoff: false,
+                expected_provider: None,
+                retry: false,
             })
             .unwrap();
         wait_engine_event(&event_receiver, |event| {
@@ -2244,6 +2330,8 @@ mod tests {
                 text: "hello".into(),
                 permission_mode: PermissionMode::Default,
                 skip_handoff: false,
+                expected_provider: None,
+                retry: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, thread.id);
@@ -2352,6 +2440,8 @@ mod tests {
                     text: "hello".into(),
                     permission_mode: PermissionMode::Default,
                     skip_handoff: false,
+                    expected_provider: None,
+                    retry: false,
                 })
                 .unwrap();
         }
@@ -2475,6 +2565,8 @@ mod tests {
                     text: text.into(),
                     permission_mode: PermissionMode::Default,
                     skip_handoff: false,
+                    expected_provider: None,
+                    retry: false,
                 })
                 .unwrap();
         }
@@ -2497,6 +2589,80 @@ mod tests {
             finished, 1,
             "only the accepted turn finishes (rejected: {rejected:?})"
         );
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+    }
+
+    #[tokio::test]
+    async fn retry_admission_rejects_a_changed_provider_before_starting() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "retry".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (started_sender, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let adapters = vec![gate_shared(ProviderId::Claude, &started_sender, &release)];
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store.clone(),
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        command_sender
+            .send(EngineCommand::Submit {
+                thread_id: thread.id.clone(),
+                text: "retry seed".into(),
+                permission_mode: PermissionMode::Default,
+                skip_handoff: true,
+                expected_provider: Some(ProviderId::Claude),
+                retry: true,
+            })
+            .unwrap();
+
+        let event = wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnRejected { retry: true, .. })
+        })
+        .await;
+        match event {
+            EngineEvent::TurnRejected {
+                text,
+                reason,
+                retry,
+                ..
+            } => {
+                assert_eq!(text, "retry seed");
+                assert!(retry);
+                assert!(reason.contains("harness changed"), "{reason}");
+            }
+            _ => panic!("expected a retry rejection"),
+        }
+        assert!(store
+            .lock()
+            .unwrap()
+            .get_turn_record(&thread.id, 1)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_messages(&thread.id)
+            .unwrap()
+            .is_empty());
+        assert!(started_receiver.try_recv().is_err());
         command_sender.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
     }
@@ -2557,6 +2723,8 @@ mod tests {
                     text: text.into(),
                     permission_mode: PermissionMode::Default,
                     skip_handoff: false,
+                    expected_provider: None,
+                    retry: false,
                 })
                 .unwrap();
             let event = wait_engine_event(&event_receiver, |event| {

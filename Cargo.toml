@@ -34,3 +34,7 @@ tempfile = "3"
 
 [profile.release]
 lto = true
+
+# Keep line tables for backtraces without paying for full test debuginfo.
+[profile.test]
+debug = 1

@@ -231,6 +231,7 @@ def main() -> int:
         grep_required = [
             'grep "parse"',
             "src/parser/mod.rs:1",
+            "ctrl+o open",
             "enter insert",
             "esc close",
         ]
@@ -249,6 +250,30 @@ def main() -> int:
         (evidence / "grep-result-screen.txt").write_text(grep_result + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
+
+        if editor_fail.exists():
+            editor_fail.unlink()
+        os.write(master, b"/grep parse\r")
+        pump(master, 1.5, transcript)
+        os.write(master, b"\x0f")
+        if not wait_for(master, "opened src/parser/mod.rs:1", 3.0, transcript):
+            missing.append("grep ctrl+o opened notice")
+        pump(master, 0.5, transcript)
+        grep_open_result = screen_text(transcript, args.width, args.height)
+        (evidence / "grep-open-screen.txt").write_text(grep_open_result + "\n")
+        if not editor_capture.is_file():
+            missing.append("grep ctrl+o editor process")
+        else:
+            editor_args = editor_capture.read_text().splitlines()
+            (evidence / "grep-open-args.txt").write_text(
+                json.dumps(editor_args, indent=2) + "\n"
+            )
+            if "--goto" not in editor_args:
+                missing.append("grep ctrl+o --goto")
+            if not editor_args or not editor_args[-1].endswith(
+                "src/parser/mod.rs:1"
+            ):
+                missing.append("grep ctrl+o line target")
 
         os.write(master, b"/pin\r")
         pump(master, 1.5, transcript)

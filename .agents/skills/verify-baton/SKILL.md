@@ -95,6 +95,7 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 | MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, uses the OpenCode 401 seed |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |
 | Slash argument choices and completion | `scripts/slash_probe.py` | zero |
+| All advertised harnesses with ICA or an explicit account block | `scripts/harness_matrix_probe.py` | four small ICA turns; the live Claude turn is opt-in and Cursor is capability-only |
 
 Every probe accepts `--binary` (default `~/.cargo/bin/baton`) and `--evidence-dir`. To run it against a change before merge, pass `--binary target/debug/baton`.
 

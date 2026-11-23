@@ -10,11 +10,36 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
+
+
+def run_baton(args, env, timeout):
+    process = subprocess.Popen(
+        args,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            stdout, stderr = process.communicate()
+        note = f"command timed out after {timeout}s"
+        stderr = f"{stderr}\n{note}" if stderr else note
+        return subprocess.CompletedProcess(args, 124, stdout, stderr)
 
 
 def run(binary: str, key_env: str, base_url: str, model: str, evidence: Path) -> dict:
@@ -37,23 +62,26 @@ def run(binary: str, key_env: str, base_url: str, model: str, evidence: Path) ->
     env["BATON_HOME"] = str(home)
     try:
         started = time.time()
-        run_turn = subprocess.run(
+        run_turn = run_baton(
             [binary, "-C", str(cwd), "exec", "-p", "antigravity", "--json", "Reply with exactly AGY_OK"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=180,
+            env,
+            180,
         )
         seconds = round(time.time() - started, 1)
         try:
             payload = json.loads(run_turn.stdout)
         except json.JSONDecodeError:
             payload = {}
+        def safe(value):
+            return value.replace(key, "[redacted]") if value else value
         ps = subprocess.run(
             [binary, "ps", "--json"], env=env, capture_output=True, text=True, timeout=30
         )
         try:
-            processes = json.loads(ps.stdout).get("processes", [])
+            process_payload = json.loads(ps.stdout)
+            processes = process_payload.get("processes") if ps.returncode == 0 and isinstance(process_payload, dict) else ["unparseable"]
+            if not isinstance(processes, list):
+                processes = ["unparseable"]
         except json.JSONDecodeError:
             processes = ["unparseable"]
         result = {
@@ -61,10 +89,10 @@ def run(binary: str, key_env: str, base_url: str, model: str, evidence: Path) ->
             "seconds": seconds,
             "ok": payload.get("ok"),
             "phase": payload.get("phase"),
-            "text": payload.get("text"),
-            "error": payload.get("error"),
+            "text": safe(payload.get("text")),
+            "error": safe(payload.get("error")),
             "thread_id": payload.get("thread_id"),
-            "stderr": run_turn.stderr[-400:],
+            "stderr": safe(run_turn.stderr[-400:]),
             "processes": processes,
         }
         passed = (
@@ -77,7 +105,7 @@ def run(binary: str, key_env: str, base_url: str, model: str, evidence: Path) ->
         )
         result["passed"] = passed
         (evidence / "summary.json").write_text(json.dumps(result, indent=2) + "\n")
-        (evidence / "stdout.json").write_text(run_turn.stdout)
+        (evidence / "stdout.json").write_text(safe(run_turn.stdout))
         return result
     finally:
         shutil.rmtree(home, ignore_errors=True)

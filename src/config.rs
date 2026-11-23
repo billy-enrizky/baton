@@ -1,6 +1,7 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::harness_config::read_harness_config;
@@ -19,6 +20,8 @@ pub struct ProviderAuthFile {
     /// Endpoint root for harnesses that accept a custom base URL.
     #[serde(default, alias = "apiBaseUrl", alias = "api_base_url")]
     pub api_base_url: Option<String>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -26,6 +29,8 @@ pub struct NotificationsConfig {
     /// Ring the terminal on turn end. Off unless the user turns it on.
     #[serde(default)]
     pub bell: bool,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -86,6 +91,20 @@ pub fn load_config_file(home: &Path) -> Option<BatonConfigFile> {
     serde_json::from_str(&contents).ok()
 }
 
+/// Reads config for a writer. A malformed file is an error, not an empty config
+/// to overwrite, because it may contain hand-edited provider keys.
+pub fn load_config_file_strict(home: &Path) -> Result<Option<BatonConfigFile>> {
+    let path = config_path(home);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let file = serde_json::from_str(&contents)
+        .with_context(|| format!("cannot parse {}", path.display()))?;
+    Ok(Some(file))
+}
+
 /// Rejects provider overrides the harness cannot honor before a turn starts.
 pub fn validate_provider_overrides(home: &Path) -> Result<()> {
     let Some(file) = load_config_file(home) else {
@@ -111,9 +130,38 @@ pub fn validate_provider_overrides(home: &Path) -> Result<()> {
 }
 
 pub fn save_config_file(home: &Path, file: &BatonConfigFile) -> Result<()> {
-    std::fs::create_dir_all(home)?;
-    std::fs::write(config_path(home), format!("{}\n", serde_json::to_string_pretty(file)?))?;
-    Ok(())
+    std::fs::create_dir_all(home)
+        .with_context(|| format!("cannot create {}", home.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(home, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = config_path(home);
+    let temp = home.join(format!(".config.json.{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut handle = options
+            .open(&temp)
+            .with_context(|| format!("cannot write {}", temp.display()))?;
+        handle.write_all(format!("{}\n", serde_json::to_string_pretty(file)?).as_bytes())?;
+        handle.sync_all()?;
+        std::fs::rename(&temp, &path)
+            .with_context(|| format!("cannot replace {}", path.display()))?;
+        #[cfg(unix)]
+        std::fs::File::open(home)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 pub fn resolve_provider_config(
@@ -313,6 +361,42 @@ pub fn describe_auth(auth: &EffectiveProviderConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn save_preserves_extra_fields_and_private_permissions() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            config_path(home.path()),
+            r#"{"notifications":{"bell":false,"desktop":true},"defaultModels":{"claude":"custom"},"claude":{"apiKeyEnv":"KEY_A","api_key":"secret","future":7}}"#,
+        )
+        .unwrap();
+
+        let mut file = load_config_file_strict(home.path()).unwrap().unwrap();
+        file.notifications.bell = true;
+        save_config_file(home.path(), &file).unwrap();
+
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(config_path(home.path())).unwrap())
+                .unwrap();
+        assert_eq!(value["notifications"]["desktop"], true);
+        assert_eq!(value["notifications"]["bell"], true);
+        assert_eq!(value["claude"]["future"], 7);
+        assert_eq!(value["claude"]["api_key"], "secret");
+        assert_eq!(value["defaultModels"]["claude"], "custom");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let file_mode = std::fs::metadata(config_path(home.path()))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            let home_mode = std::fs::metadata(home.path()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(file_mode, 0o600);
+            assert_eq!(home_mode, 0o700);
+        }
+    }
 
     #[test]
     fn explicit_default_wins_even_when_missing() {

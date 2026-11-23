@@ -223,7 +223,13 @@ fn resolve_config_precedence() {
     let mut providers = std::collections::BTreeMap::new();
     providers.insert(
         "claude".to_string(),
-        baton::config::ProviderAuthFile { mode: Some(AuthMode::Api), api_key: Some("sk-ant-file".into()), api_key_env: None, api_base_url: None },
+        baton::config::ProviderAuthFile {
+            mode: Some(AuthMode::Api),
+            api_key: Some("sk-ant-file".into()),
+            api_key_env: None,
+            api_base_url: None,
+            ..Default::default()
+        },
     );
     save_config_file(
         home.path(),

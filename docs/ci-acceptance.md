@@ -167,6 +167,15 @@ The nextest experiment is not evidence for sharding. It showed that a count part
 
 The per-repository worktree lock in PR #132 did not change CI wall time. It is kept because one process-wide lock made unrelated repositories wait on each other; it is a scope fix, not a speed claim.
 
+## Latest feature samples
+
+| Run | Event | Create to Verify | Test | Notes |
+|---|---|---|---|---|
+| [45147067545](https://github.com/billy-enrizky/baton/actions/runs/45147067545) | pull_request | 62 seconds | 44 seconds | Claude watchdog fix; 518 tests |
+| [45147281203](https://github.com/billy-enrizky/baton/actions/runs/45147281203) | push | 64 seconds | not recorded | Claude watchdog main push |
+| [45158239304](https://github.com/billy-enrizky/baton/actions/runs/45158239304) | pull_request | 53 seconds | 32 seconds | `/grep` editor launch; 522 tests |
+| [45158698921](https://github.com/billy-enrizky/baton/actions/runs/45158698921) | push | 59 seconds | not recorded | `/grep` editor launch main push |
+
 ## Cited run log
 
 The Test column is the Test job start to complete. Skipped means the gate did not run. Retry attempts are separate rows. The 8,138-second gap from attempt 1 `createdAt` (01:01:41Z) to attempt 2 `createdAt` (03:17:19Z) is not counted as queue for the normal runs.

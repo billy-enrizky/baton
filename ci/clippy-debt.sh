@@ -7,7 +7,7 @@ baseline_file=${2:-$script_dir/clippy-baseline.txt}
 baseline=$(tr -d '[:space:]' < "$baseline_file")
 
 set +e
-output=$(cd "$root" && cargo clippy --locked --all-targets -- -D warnings 2>&1)
+output=$(cd "$root" && CARGO_TERM_COLOR=never cargo clippy --locked --all-targets -- -D warnings 2>&1)
 code=$?
 set -e
 

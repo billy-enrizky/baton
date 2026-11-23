@@ -13,7 +13,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Recent thread hint | TUI | a new session points at existing threads in the folder |
 | Attention inbox | TUI | `/inbox` lists failed, unverified, interrupted, needs-input, and queued work and opens the selected thread |
 | Thread pins | TUI; CLI read | `/pin` toggles a durable pin, Ctrl+Up/Ctrl+Down or `/pin move` orders pinned threads, pinned rows sort first, and `baton threads --json` exposes `pinned` and `pin_order_key` |
-| File navigation | TUI; CLI | `/files` inserts a selected project path or `path:line`; Ctrl+O launches that target or a selected `/grep` match in `VISUAL` or `EDITOR`; `/grep` and `baton grep` search file contents with sorted previews; `baton files` ranks project paths with ripgrep or git; and `baton open` launches the editor with `-C`-directory containment |
+| File navigation | TUI; CLI | `/files [--ignored]` inserts a selected project path or `path:line` and warns when ignored files are included; Ctrl+O launches that target or a selected `/grep` match in `VISUAL` or `EDITOR`; `/grep` and `baton grep` search file contents with sorted previews; `baton files` ranks project paths with ripgrep or git; and `baton open` launches the editor with `-C`-directory containment |
 | Shell completions | CLI | `baton completions <shell>` generates from the clap command graph and handles a broken pipe |
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |

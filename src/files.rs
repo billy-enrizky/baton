@@ -1061,6 +1061,31 @@ mod tests {
     }
 
     #[test]
+    fn ignored_substring_can_take_a_cap_slot_from_a_primary_fuzzy_match() {
+        let primary = CandidateSet {
+            items: (0..MAX_FILES)
+                .map(|index| format!("src/primary{index}.rs"))
+                .collect(),
+            truncated: false,
+        };
+        let ignored = CandidateSet {
+            items: vec!["src/needle.rs".into()],
+            truncated: false,
+        };
+        let merged = merge_ignored(primary, ignored, &["needle"]);
+        assert_eq!(
+            merged.items.first().map(String::as_str),
+            Some("src/needle.rs")
+        );
+        assert_eq!(merged.items.len(), MAX_FILES);
+        assert!(merged.truncated);
+        assert!(!merged
+            .items
+            .iter()
+            .any(|path| path == "src/primary20000.rs"));
+    }
+
+    #[test]
     fn null_output_is_normalized_and_deduplicated() {
         let candidates = parse_null_paths(
             b"./src/main.rs\0src/main.rs\0../escape\0.git/config\0docs/read me.md\0",

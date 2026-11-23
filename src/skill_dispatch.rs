@@ -112,6 +112,13 @@ pub fn prompt_for_provider(provider: ProviderId, prompt: &str) -> String {
     prompt_for_provider_from(provider, prompt, None)
 }
 
+pub fn current_message(prompt: &str) -> &str {
+    prompt
+        .strip_prefix("[goal: ")
+        .and_then(|rest| rest.split_once('\n').map(|(_, message)| message))
+        .unwrap_or(prompt)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -167,6 +174,17 @@ mod tests {
         assert_eq!(
             rewrite_claude_prompt_from(prompt, &known, current_start),
             "/new history $old\ncurrent"
+        );
+    }
+
+    #[test]
+    fn goal_text_mentions_are_not_current_message_mentions() {
+        let prompt = "[goal: use $review when ready]\ncontinue";
+        assert_eq!(current_message(prompt), "continue");
+        let current_start = prompt.find(current_message(prompt)).unwrap();
+        assert_eq!(
+            rewrite_claude_prompt_from(prompt, &["review".to_string()], current_start),
+            prompt
         );
     }
 

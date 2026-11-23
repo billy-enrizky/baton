@@ -42,6 +42,18 @@ def main() -> int:
     (Path(workdir) / "src" / "parser").mkdir(parents=True)
     (Path(workdir) / "src" / "parser" / "mod.rs").write_text("pub fn parse() {}\n")
     (Path(workdir) / "README.md").write_text("# readme\n")
+    editor_bin = Path(home) / "bin"
+    editor_bin.mkdir()
+    editor_capture = Path(home) / "editor-args.txt"
+    editor_fail = Path(home) / "editor-fail"
+    editor = editor_bin / "code"
+    editor.write_text(
+        "#!/bin/sh\n"
+        "printf '%s\\n' \"$@\" > \"$BATON_EDITOR_CAPTURE\"\n"
+        "if [ -f \"$BATON_EDITOR_FAIL\" ]; then exit 7; fi\n"
+        "exit 0\n"
+    )
+    editor.chmod(0o755)
     subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
     evidence = Path(args.evidence_dir) / f"slash-probe-{int(time.time())}"
     evidence.mkdir(parents=True, exist_ok=True)
@@ -51,6 +63,11 @@ def main() -> int:
         env = os.environ.copy()
         env["BATON_HOME"] = home
         env["TERM"] = "xterm-256color"
+        env["BATON_EDITOR_CAPTURE"] = str(editor_capture)
+        env["BATON_EDITOR_FAIL"] = str(editor_fail)
+        env["EDITOR"] = "code --wait"
+        env["PATH"] = f"{editor_bin}{os.pathsep}{env.get('PATH', '')}"
+        env.pop("VISUAL", None)
         os.execvpe(str(binary), [str(binary)], env)
 
     transcript = bytearray()
@@ -133,6 +150,7 @@ def main() -> int:
             "line 12",
             "src/parser/mod.rs",
             "enter insert",
+            "ctrl+o open",
             "esc close",
         ]
         missing.extend(value for value in files_required if value not in files_picker)
@@ -147,6 +165,44 @@ def main() -> int:
         (evidence / "files-result-screen.txt").write_text(files_result + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
+
+        os.write(master, b"/files pmod rs:12\r")
+        pump(master, 1.5, transcript)
+        os.write(master, b"\x0f")
+        if not wait_for(master, "opened src/parser/mod.rs:12", 3.0, transcript):
+            missing.append("files ctrl+o opened notice")
+        pump(master, 0.5, transcript)
+        editor_result = screen_text(transcript, args.width, args.height)
+        (evidence / "files-open-screen.txt").write_text(editor_result + "\n")
+        if not editor_capture.is_file():
+            missing.append("files ctrl+o editor process")
+        else:
+            editor_args = editor_capture.read_text().splitlines()
+            (evidence / "files-open-args.txt").write_text(
+                json.dumps(editor_args, indent=2) + "\n"
+            )
+            if "--goto" not in editor_args:
+                missing.append("files ctrl+o --goto")
+            if not editor_args or not editor_args[-1].endswith(
+                "src/parser/mod.rs:12"
+            ):
+                missing.append("files ctrl+o line target")
+
+        editor_fail.write_text("fail\n")
+        os.write(master, b"/files pmod rs:12\r")
+        pump(master, 1.5, transcript)
+        os.write(master, b"\x0f")
+        if not wait_for(master, "editor failed:", 3.0, transcript):
+            missing.append("files ctrl+o editor failure notice")
+        pump(master, 0.5, transcript)
+        os.write(master, b"/status\r")
+        pump(master, 1.0, transcript)
+        after_failure = screen_text(transcript, args.width, args.height)
+        if "adapters:" not in after_failure:
+            missing.append("TUI accepted input after editor failure")
+        (evidence / "files-open-failure-screen.txt").write_text(
+            after_failure + "\n"
+        )
 
         os.write(master, b"/files \r")
         pump(master, 1.5, transcript)

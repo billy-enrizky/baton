@@ -1,11 +1,13 @@
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::{execute, terminal};
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Terminal;
+use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -563,6 +565,11 @@ struct HandoffPrompt {
     provider: ProviderId,
 }
 
+struct PendingEditorOpen {
+    command: crate::files::EditorCommand,
+    label: String,
+}
+
 const FILES_PICKER_LIMIT: usize = crate::files::MAX_FILES;
 const GREP_PICKER_LIMIT: usize = 200;
 
@@ -642,6 +649,7 @@ pub struct TuiState {
     files_picker_sender: std::sync::mpsc::Sender<FilesPickerEvent>,
     files_picker_receiver: std::sync::mpsc::Receiver<FilesPickerEvent>,
     files_picker_request: u64,
+    pending_editor_open: Option<PendingEditorOpen>,
     grep_picker_sender: std::sync::mpsc::Sender<GrepPickerEvent>,
     grep_picker_receiver: std::sync::mpsc::Receiver<GrepPickerEvent>,
     grep_picker_request: u64,
@@ -753,6 +761,7 @@ pub fn run_tui(
         files_picker_sender,
         files_picker_receiver,
         files_picker_request: 0,
+        pending_editor_open: None,
         grep_picker_sender,
         grep_picker_receiver,
         grep_picker_request: 0,
@@ -858,6 +867,31 @@ pub fn run_tui(
         for event in grep_events {
             apply_grep_picker_event(&mut state, event);
         }
+        if let Some(open) = state.pending_editor_open.take() {
+            let cwd = std::path::PathBuf::from(&state.thread.cwd);
+            match suspend_tui(&mut terminal) {
+                Ok(()) => {
+                    let run_result = open.command.run(&cwd);
+                    resume_tui(&mut terminal)?;
+                    state.notice = Some(match run_result {
+                        Ok(()) => format!("opened {}", open.label),
+                        Err(error) => crate::sanitize::sanitize_terminal_text(&format!(
+                            "editor failed: {error}"
+                        ))
+                        .into_owned(),
+                    });
+                }
+                Err(error) => {
+                    let _ = resume_tui(&mut terminal);
+                    state.notice = Some(
+                        crate::sanitize::sanitize_terminal_text(&format!(
+                            "editor launch failed: {error}"
+                        ))
+                        .into_owned(),
+                    );
+                }
+            }
+        }
         if crossterm::event::poll(Duration::from_millis(32))? {
             match crossterm::event::read()? {
                 Event::Key(key) => {
@@ -890,6 +924,43 @@ pub fn run_tui(
         crossterm::event::DisableBracketedPaste
     )?;
     let _ = engine_command_sender.send(EngineCommand::Quit);
+    Ok(())
+}
+
+fn suspend_tui<W: std::io::Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> Result<()> {
+    terminal::disable_raw_mode()?;
+    let _ = execute!(
+        terminal.backend_mut(),
+        crossterm::event::PopKeyboardEnhancementFlags
+    );
+    execute!(
+        terminal.backend_mut(),
+        crossterm::cursor::Show,
+        terminal::LeaveAlternateScreen,
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
+    )?;
+    terminal.backend_mut().flush()?;
+    Ok(())
+}
+
+fn resume_tui<W: std::io::Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> Result<()> {
+    terminal::enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        terminal::EnterAlternateScreen,
+        crossterm::cursor::Hide,
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
+    )?;
+    let _ = execute!(
+        terminal.backend_mut(),
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    );
+    let size = terminal.size()?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))?;
     Ok(())
 }
 
@@ -3055,6 +3126,33 @@ fn reorder_selected_pin(
     }
 }
 
+fn prepare_editor_open(
+    cwd: &str,
+    path: &str,
+    line: Option<u32>,
+) -> Result<PendingEditorOpen, String> {
+    let editor = crate::files::editor_from_env().ok_or_else(|| {
+        "no editor configured; set VISUAL or EDITOR before launching from /files".to_string()
+    })?;
+    let target =
+        crate::files::resolve_project_file(std::path::Path::new(cwd), std::path::Path::new(path))
+            .map_err(|error| error.to_string())?;
+    let command = crate::files::build_open_command_at_line(&editor, &target, line)
+        .map_err(|error| error.to_string())?;
+    if crate::doctor::find_executable(&command.program).is_none() {
+        return Err(format!(
+            "editor {} is not on PATH; set VISUAL or EDITOR to an installed editor",
+            command.program
+        ));
+    }
+    let label = match line {
+        Some(line) => format!("{path}:{line}"),
+        None => path.to_string(),
+    };
+    let label = crate::sanitize::sanitize_terminal_text(&label).into_owned();
+    Ok(PendingEditorOpen { command, label })
+}
+
 fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread_id: &str) {
     let found = {
         let guard = store.lock().unwrap();
@@ -3972,6 +4070,36 @@ fn handle_key(
                     line = typed_line.or(command_line);
                     filtered = files_filter_indices(&entries, &filter, &recent);
                 }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if loading {
+                        state.notice =
+                            Some("files: wait for the scan to finish, then ctrl+o".into());
+                    } else if let Some(path) = filtered
+                        .get(selected)
+                        .and_then(|index| entries.get(*index))
+                        .cloned()
+                    {
+                        match prepare_editor_open(&state.thread.cwd, &path, line) {
+                            Ok(open) => {
+                                let project = crate::files::recent_project_key(&state.thread.cwd);
+                                let _ = store.lock().unwrap().record_recent_file(&project, &path);
+                                state.notice = Some(format!("opening {}", open.label));
+                                state.pending_editor_open = Some(open);
+                                return;
+                            }
+                            Err(error) => {
+                                state.notice = Some(
+                                    crate::sanitize::sanitize_terminal_text(&format!(
+                                        "files: {error}"
+                                    ))
+                                    .into_owned(),
+                                )
+                            }
+                        }
+                    } else {
+                        state.notice = Some("files: no matches".into());
+                    }
+                }
                 KeyCode::Char(character)
                     if !key
                         .modifiers
@@ -4008,6 +4136,8 @@ fn handle_key(
                                 Some(line) => format!("{path}:{line}"),
                                 None => path.clone(),
                             };
+                            let target =
+                                crate::sanitize::sanitize_terminal_text(&target).into_owned();
                             state.insert_input_str(&format!("{target} "));
                             state.notice = Some(format!("inserted {target}"));
                             return;
@@ -9121,9 +9251,9 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
         filtered.len().to_string()
     };
     let action = if filter.is_empty() {
-        "enter insert · esc close"
+        "enter insert · ctrl+o open · esc close"
     } else {
-        "enter insert · esc clears"
+        "enter insert · ctrl+o open · esc clears"
     };
     let line_label = line
         .map(|line| format!(" · line {line}"))
@@ -9156,7 +9286,8 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
                 Style::default().fg(COLORS.muted)
             };
             let cursor = if position == selected { "❯" } else { " " };
-            lines.push(file_row(cursor, &entries[*index], highlight, style));
+            let path = crate::sanitize::sanitize_terminal_text(&entries[*index]).into_owned();
+            lines.push(file_row(cursor, &path, highlight, style));
         }
     }
     let hint = if truncated {
@@ -10463,6 +10594,8 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    static EDITOR_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     fn render_state(state: &TuiState, width: u16, height: u16) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, state, 0)).unwrap();
@@ -10494,10 +10627,15 @@ mod tests {
                 std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             }
+            let editor = root.join("fake-editor");
+            std::fs::write(&editor, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&editor, std::fs::Permissions::from_mode(0o755)).unwrap();
             let path = std::env::var_os("PATH").unwrap_or_default();
             let mut dirs = vec![root];
             dirs.extend(std::env::split_paths(&path));
             std::env::set_var("PATH", std::env::join_paths(dirs).unwrap());
+            std::env::set_var("VISUAL", editor);
+            std::env::remove_var("EDITOR");
             // A runner has no clipboard, and the product's fallback is a
             // platform command. Pin it for the whole binary so copy assertions
             // test this code rather than the host.
@@ -10594,6 +10732,7 @@ mod tests {
             files_picker_sender,
             files_picker_receiver,
             files_picker_request: 0,
+            pending_editor_open: None,
             grep_picker_sender,
             grep_picker_receiver,
             grep_picker_request: 0,
@@ -16068,6 +16207,403 @@ mod tests {
     }
 
     #[test]
+    fn files_picker_ctrl_o_prepares_editor_launch() {
+        let _editor_env = EDITOR_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[("src/parser.rs", "fn parse() {}\n")]);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let project_key = crate::files::recent_project_key(project.path().to_str().unwrap());
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/files parser:42",
+        );
+        finish_files_picker_load(&mut state);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+
+        let open = state
+            .pending_editor_open
+            .as_ref()
+            .expect("prepared editor launch");
+        assert_eq!(open.label, "src/parser.rs:42");
+        assert_eq!(
+            std::path::Path::new(&open.command.program)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some("fake-editor")
+        );
+        let target = std::fs::canonicalize(project.path().join("src/parser.rs")).unwrap();
+        let target = format!("{}:42", target.display());
+        assert_eq!(
+            open.command.args.last().map(String::as_str),
+            Some(target.as_str())
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.notice.as_deref(), Some("opening src/parser.rs:42"));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_recent_files(&project_key, 10)
+                .unwrap(),
+            vec!["src/parser.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn files_picker_ctrl_o_keeps_the_picker_when_setup_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[("src/parser.rs", "fn parse() {}\n")]);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        let _editor_env = EDITOR_ENV_LOCK.lock().unwrap();
+        let visual = std::env::var_os("VISUAL");
+        let editor = std::env::var_os("EDITOR");
+
+        std::env::remove_var("VISUAL");
+        std::env::remove_var("EDITOR");
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/parser.rs".into()],
+            filtered: vec![0],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        let no_editor_notice = state.notice.clone().unwrap_or_default();
+
+        std::env::set_var("VISUAL", "vim 'unterminated");
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/parser.rs".into()],
+            filtered: vec![0],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        let malformed_notice = state.notice.clone().unwrap_or_default();
+
+        std::env::set_var("VISUAL", "/definitely/missing/baton-editor");
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/parser.rs".into()],
+            filtered: vec![0],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        let missing_editor_notice = state.notice.clone().unwrap_or_default();
+
+        if let Some(visual) = visual.as_ref() {
+            std::env::set_var("VISUAL", visual);
+        } else {
+            std::env::set_var("VISUAL", "vim");
+        }
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec!["src/missing.rs".into()],
+            filtered: vec![0],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        let missing_file_notice = state.notice.clone().unwrap_or_default();
+
+        let outside = home.path().join("outside.rs");
+        std::fs::write(&outside, "fn outside() {}\n").unwrap();
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec![outside.to_string_lossy().to_string()],
+            filtered: vec![0],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        let outside_notice = state.notice.clone().unwrap_or_default();
+
+        if let Some(visual) = visual {
+            std::env::set_var("VISUAL", visual);
+        } else {
+            std::env::remove_var("VISUAL");
+        }
+        if let Some(editor) = editor {
+            std::env::set_var("EDITOR", editor);
+        } else {
+            std::env::remove_var("EDITOR");
+        }
+
+        assert!(matches!(state.overlay, Overlay::FilesPicker { .. }));
+        assert!(state.pending_editor_open.is_none());
+        assert!(
+            no_editor_notice.contains("no editor configured"),
+            "{no_editor_notice}"
+        );
+        assert!(
+            malformed_notice.contains("unclosed quote"),
+            "{malformed_notice}"
+        );
+        assert!(
+            missing_editor_notice.contains("is not on PATH"),
+            "{missing_editor_notice}"
+        );
+        assert!(
+            missing_file_notice.contains("does not exist"),
+            "{missing_file_notice}"
+        );
+        assert!(
+            outside_notice.contains("outside the -C directory"),
+            "{outside_notice}"
+        );
+    }
+
+    #[test]
+    fn files_picker_ctrl_o_uses_a_typed_line_target() {
+        let _editor_env = EDITOR_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[("src/parser.rs", "fn parse() {}\n")]);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/files parser");
+        finish_files_picker_load(&mut state);
+        for character in "parser:7".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+
+        let open = state
+            .pending_editor_open
+            .as_ref()
+            .expect("prepared editor launch");
+        assert_eq!(open.label, "src/parser.rs:7");
+        let target = std::fs::canonicalize(project.path().join("src/parser.rs")).unwrap();
+        let target = format!("{}:7", target.display());
+        assert_eq!(
+            open.command.args.last().map(String::as_str),
+            Some(target.as_str())
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn files_picker_sanitizes_paths_insertion_and_launch_notices() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let malicious = "src/evil\u{1b}]0;spoof\u{7}.rs";
+        let target = state.thread.cwd.clone();
+        std::fs::create_dir_all(std::path::Path::new(&target).join("src")).unwrap();
+        std::fs::write(
+            std::path::Path::new(&target).join(malicious),
+            "fn evil() {}\n",
+        )
+        .unwrap();
+        let _editor_env = EDITOR_ENV_LOCK.lock().unwrap();
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec![malicious.into()],
+            filtered: vec![0],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(!text.contains('\u{7}'), "{text}");
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(state.input.contains('\u{fffd}'), "{:?}", state.input);
+        assert!(!state.input.contains('\u{1b}'), "{:?}", state.input);
+        assert!(!state.input.contains('\u{7}'), "{:?}", state.input);
+
+        state.set_input(String::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec![malicious.into()],
+            filtered: vec![0],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        let open = state
+            .pending_editor_open
+            .as_ref()
+            .expect("sanitized editor launch");
+        assert!(!open.label.contains('\u{1b}'), "{:?}", open.label);
+        assert!(!open.label.contains('\u{7}'), "{:?}", open.label);
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(!notice.contains('\u{1b}'), "{notice:?}");
+        assert!(!notice.contains('\u{7}'), "{notice:?}");
+
+        state.pending_editor_open = None;
+        let missing = "src/missing\u{1b}]0;spoof\u{7}.rs";
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: vec![missing.into()],
+            filtered: vec![0],
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(matches!(state.overlay, Overlay::FilesPicker { .. }));
+        assert!(!notice.contains('\u{1b}'), "{notice:?}");
+        assert!(!notice.contains('\u{7}'), "{notice:?}");
+    }
+
+    #[test]
+    fn files_picker_ctrl_o_waits_for_the_scan() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::FilesPicker {
+            selected: 0,
+            query: String::new(),
+            entries: Vec::new(),
+            filtered: Vec::new(),
+            base_query: String::new(),
+            line: None,
+            command_line: None,
+            recent: Vec::new(),
+            truncated: false,
+            loading: true,
+            request: 0,
+        };
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            state.overlay,
+            Overlay::FilesPicker { loading: true, .. }
+        ));
+        assert!(state.pending_editor_open.is_none());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("files: wait for the scan to finish, then ctrl+o")
+        );
+    }
+
+    #[test]
     fn files_picker_filters_typed_text_and_escape_resets() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -16499,7 +17035,7 @@ mod tests {
         assert_eq!(text.matches('❯').count(), 1, "{text}");
         assert!(text.contains("❯ src/file9.rs"), "{text}");
         assert!(
-            text.contains("files · 10 · enter insert · esc close"),
+            text.contains("files · 10 · enter insert · ctrl+o open · esc close"),
             "{text}"
         );
     }

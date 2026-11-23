@@ -161,7 +161,7 @@ pub fn build_open_command(editor: &str, path: &Path) -> Result<EditorCommand> {
 pub fn build_open_command_at_line(
     editor: &str,
     path: &Path,
-    line: Option<u32>,
+    line: Option<u64>,
 ) -> Result<EditorCommand> {
     let mut words = split_command_line(editor)?;
     if words.is_empty() {
@@ -204,7 +204,7 @@ fn editor_program_name(program: &str) -> String {
 }
 
 /// Split a trailing `:<line>` from a quick-open path. A literal colon is escaped as `\:`.
-pub fn split_line_target(query: &str) -> (String, Option<u32>) {
+pub fn split_line_target(query: &str) -> (String, Option<u64>) {
     let query = query.trim();
     if let Some((path, digits)) = query.rsplit_once(':') {
         if path.ends_with('\\') {
@@ -215,7 +215,7 @@ pub fn split_line_target(query: &str) -> (String, Option<u32>) {
             && !digits.is_empty()
             && digits.bytes().all(|byte| byte.is_ascii_digit())
         {
-            if let Ok(line) = digits.parse::<u32>() {
+            if let Ok(line) = digits.parse::<u64>() {
                 if line > 0 {
                     return (path.trim().replace("\\:", ":"), Some(line));
                 }

@@ -524,9 +524,9 @@ enum Overlay {
         /// Query used to load `entries`, shown in the heading.
         base_query: String,
         /// Optional 1-based line appended to the inserted path.
-        line: Option<u32>,
+        line: Option<u64>,
         /// Line supplied on the `/files` command, restored when the live filter clears.
-        command_line: Option<u32>,
+        command_line: Option<u64>,
         /// Recently picked paths, newest first.
         recent: Vec<String>,
         truncated: bool,
@@ -2339,7 +2339,7 @@ fn model_filter_indices(models: &[String], filter: &str) -> Vec<usize> {
         .collect()
 }
 
-fn split_line_target(query: &str) -> (String, Option<u32>) {
+fn split_line_target(query: &str) -> (String, Option<u64>) {
     crate::files::split_line_target(query)
 }
 
@@ -3129,10 +3129,10 @@ fn reorder_selected_pin(
 fn prepare_editor_open(
     cwd: &str,
     path: &str,
-    line: Option<u32>,
+    line: Option<u64>,
 ) -> Result<PendingEditorOpen, String> {
     let editor = crate::files::editor_from_env().ok_or_else(|| {
-        "no editor configured; set VISUAL or EDITOR before launching from /files".to_string()
+        "no editor configured; set VISUAL or EDITOR before launching from a picker".to_string()
     })?;
     let target =
         crate::files::resolve_project_file(std::path::Path::new(cwd), std::path::Path::new(path))
@@ -3151,6 +3151,31 @@ fn prepare_editor_open(
     };
     let label = crate::sanitize::sanitize_terminal_text(&label).into_owned();
     Ok(PendingEditorOpen { command, label })
+}
+
+fn launch_picker_editor(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    surface: &str,
+    path: &str,
+    line: Option<u64>,
+) -> bool {
+    match prepare_editor_open(&state.thread.cwd, path, line) {
+        Ok(open) => {
+            let project = crate::files::recent_project_key(&state.thread.cwd);
+            let _ = store.lock().unwrap().record_recent_file(&project, path);
+            state.notice = Some(format!("opening {}", open.label));
+            state.pending_editor_open = Some(open);
+            true
+        }
+        Err(error) => {
+            state.notice = Some(
+                crate::sanitize::sanitize_terminal_text(&format!("{surface}: {error}"))
+                    .into_owned(),
+            );
+            false
+        }
+    }
 }
 
 fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread_id: &str) {
@@ -4003,6 +4028,28 @@ fn handle_key(
                         selected = (selected + 10).min(filtered.len() - 1);
                     }
                 }
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if loading {
+                        state.notice =
+                            Some("grep: wait for the search to finish, then ctrl+o".into());
+                    } else if let Some(found) = filtered
+                        .get(selected)
+                        .and_then(|index| matches.get(*index))
+                        .cloned()
+                    {
+                        if launch_picker_editor(
+                            state,
+                            store,
+                            "grep",
+                            &found.path,
+                            Some(found.line),
+                        ) {
+                            return;
+                        }
+                    } else {
+                        state.notice = Some("grep: no matches".into());
+                    }
+                }
                 KeyCode::Enter => {
                     if let Some(index) = filtered.get(selected) {
                         if let Some(found) = matches.get(*index) {
@@ -4079,22 +4126,8 @@ fn handle_key(
                         .and_then(|index| entries.get(*index))
                         .cloned()
                     {
-                        match prepare_editor_open(&state.thread.cwd, &path, line) {
-                            Ok(open) => {
-                                let project = crate::files::recent_project_key(&state.thread.cwd);
-                                let _ = store.lock().unwrap().record_recent_file(&project, &path);
-                                state.notice = Some(format!("opening {}", open.label));
-                                state.pending_editor_open = Some(open);
-                                return;
-                            }
-                            Err(error) => {
-                                state.notice = Some(
-                                    crate::sanitize::sanitize_terminal_text(&format!(
-                                        "files: {error}"
-                                    ))
-                                    .into_owned(),
-                                )
-                            }
+                        if launch_picker_editor(state, store, "files", &path, line) {
+                            return;
                         }
                     } else {
                         state.notice = Some("files: no matches".into());
@@ -9093,7 +9126,10 @@ fn draw_grep_picker(frame: &mut ratatui::Frame, area: Rect, view: GrepPickerView
         loading,
         spinner,
     } = view;
-    let filter = query.trim();
+    let base_query = crate::sanitize::sanitize_terminal_text(base_query);
+    let base_query = base_query.as_ref();
+    let filter = crate::sanitize::sanitize_terminal_text(query.trim());
+    let filter = filter.as_ref();
     let options = grep_options_label(case_sensitive, word, regex);
     let filter_label = if filter.is_empty() {
         String::new()
@@ -9119,14 +9155,18 @@ fn draw_grep_picker(frame: &mut ratatui::Frame, area: Rect, view: GrepPickerView
         return;
     }
     let count = if filtered.is_empty() && !filter.is_empty() {
-        "no matches".to_string()
+        if truncated {
+            "0 loaded".to_string()
+        } else {
+            "no matches".to_string()
+        }
     } else {
         filtered.len().to_string()
     };
     let action = if filter.is_empty() {
-        "enter insert · esc close"
+        "ctrl+o open · enter insert · esc close"
     } else {
-        "enter insert · esc clears"
+        "ctrl+o open · enter insert · esc clears"
     };
     let heading = format!("grep \"{base_query}\"{options}{filter_label} · {count} · {action}");
     let mut lines: Vec<Line> = vec![Line::styled(heading, Style::default().fg(COLORS.muted))];
@@ -9168,7 +9208,7 @@ fn draw_grep_picker(frame: &mut ratatui::Frame, area: Rect, view: GrepPickerView
         }
     }
     let hint = if truncated {
-        format!("first {GREP_PICKER_LIMIT} matches · esc, then rerun /grep <query>")
+        format!("first {GREP_PICKER_LIMIT} matches · close the picker to rerun /grep <query>")
     } else if filter.is_empty() {
         "type to narrow · esc close".to_string()
     } else {
@@ -9187,7 +9227,7 @@ struct FilesPickerView<'a> {
     selected: usize,
     query: &'a str,
     base_query: &'a str,
-    line: Option<u32>,
+    line: Option<u64>,
     truncated: bool,
     loading: bool,
     spinner: usize,
@@ -9205,8 +9245,11 @@ fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerVi
         loading,
         spinner,
     } = view;
+    let base_query = crate::sanitize::sanitize_terminal_text(base_query);
+    let base_query = base_query.as_ref();
     let (filter, _) = split_line_target(query);
-    let filter = filter.as_str();
+    let filter = crate::sanitize::sanitize_terminal_text(&filter);
+    let filter = filter.as_ref();
     let highlight = if filter.is_empty() {
         base_query.trim()
     } else {
@@ -15816,6 +15859,7 @@ mod tests {
         let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
         assert!(text.contains("grep \"hello\""), "{text}");
         assert!(text.contains("src/main.rs:2"), "{text}");
+        assert!(text.contains("ctrl+o open"), "{text}");
         handle_key(
             &mut state,
             &store,
@@ -15830,6 +15874,7 @@ mod tests {
         );
         assert_eq!(state.input, "src/main.rs:2 ");
         assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.notice.as_deref(), Some("inserted src/main.rs:2"));
         assert_eq!(
             store
                 .lock()
@@ -15837,6 +15882,169 @@ mod tests {
                 .list_recent_files(&project_key, 10)
                 .unwrap(),
             vec!["src/main.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn grep_picker_ctrl_o_prepares_editor_launch() {
+        let _editor_env = EDITOR_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let project = files_project(&[
+            ("src/parser.rs", "fn parse() {}\n"),
+            ("README.md", "# readme\n"),
+        ]);
+        let project_key = crate::files::recent_project_key(project.path().to_str().unwrap());
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/grep parse");
+        finish_grep_picker_load(&mut state);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+
+        let open = state
+            .pending_editor_open
+            .as_ref()
+            .expect("prepared editor launch");
+        assert_eq!(open.label, "src/parser.rs:1");
+        let target = std::fs::canonicalize(project.path().join("src/parser.rs")).unwrap();
+        let target = format!("{}:1", target.display());
+        assert_eq!(
+            open.command.args.last().map(String::as_str),
+            Some(target.as_str())
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.notice.as_deref(), Some("opening src/parser.rs:1"));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_recent_files(&project_key, 10)
+                .unwrap(),
+            vec!["src/parser.rs".to_string()]
+        );
+    }
+
+    #[test]
+    fn grep_picker_ctrl_o_keeps_the_picker_when_setup_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        let _editor_env = EDITOR_ENV_LOCK.lock().unwrap();
+        let visual = std::env::var_os("VISUAL");
+        let editor = std::env::var_os("EDITOR");
+
+        std::env::remove_var("VISUAL");
+        std::env::remove_var("EDITOR");
+        state.overlay = Overlay::GrepPicker {
+            selected: 0,
+            query: String::new(),
+            matches: vec![crate::grep::ContentMatch {
+                path: "src/parser.rs".into(),
+                line: 3,
+                text: "fn parse() {}".into(),
+            }],
+            filtered: vec![0],
+            base_query: "parse".into(),
+            case_sensitive: false,
+            word: false,
+            regex: false,
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        let no_editor_notice = state.notice.clone().unwrap_or_default();
+
+        state.overlay = Overlay::GrepPicker {
+            selected: 0,
+            query: String::new(),
+            matches: Vec::new(),
+            filtered: Vec::new(),
+            base_query: "absent".into(),
+            case_sensitive: false,
+            word: false,
+            regex: false,
+            truncated: false,
+            loading: false,
+            request: 0,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        let no_match_notice = state.notice.clone().unwrap_or_default();
+
+        if let Some(visual) = visual {
+            std::env::set_var("VISUAL", visual);
+        } else {
+            std::env::remove_var("VISUAL");
+        }
+        if let Some(editor) = editor {
+            std::env::set_var("EDITOR", editor);
+        } else {
+            std::env::remove_var("EDITOR");
+        }
+
+        assert!(matches!(state.overlay, Overlay::GrepPicker { .. }));
+        assert!(state.pending_editor_open.is_none());
+        assert!(
+            no_editor_notice.contains("grep: no editor configured"),
+            "{no_editor_notice}"
+        );
+        assert_eq!(no_match_notice, "grep: no matches");
+    }
+
+    #[test]
+    fn grep_picker_ctrl_o_waits_for_the_search() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::GrepPicker {
+            selected: 0,
+            query: String::new(),
+            matches: Vec::new(),
+            filtered: Vec::new(),
+            base_query: "parse".into(),
+            case_sensitive: false,
+            word: false,
+            regex: false,
+            truncated: false,
+            loading: true,
+            request: 0,
+        };
+        let (engine_command_sender, _engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(
+            state.overlay,
+            Overlay::GrepPicker { loading: true, .. }
+        ));
+        assert!(state.pending_editor_open.is_none());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("grep: wait for the search to finish, then ctrl+o")
         );
     }
 
@@ -16085,20 +16293,48 @@ mod tests {
     }
 
     #[test]
+    fn grep_picker_marks_a_truncated_empty_filter_as_loaded_only() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::GrepPicker {
+            selected: 0,
+            query: "absent".into(),
+            matches: vec![crate::grep::ContentMatch {
+                path: "src/main.rs".into(),
+                line: 2,
+                text: "needle".into(),
+            }],
+            filtered: Vec::new(),
+            base_query: "needle".into(),
+            case_sensitive: false,
+            word: false,
+            regex: false,
+            truncated: true,
+            loading: false,
+            request: 0,
+        };
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(text.contains("0 loaded"), "{text}");
+        assert!(text.contains("no matches in the loaded results"), "{text}");
+        assert!(!text.contains("· no matches ·"), "{text}");
+    }
+
+    #[test]
     fn grep_picker_sanitizes_match_text_and_insertion() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
         state.overlay = Overlay::GrepPicker {
             selected: 0,
-            query: String::new(),
+            query: "\u{1b}]0;filter\u{7}".into(),
             matches: vec![crate::grep::ContentMatch {
                 path: "src/evil\u{1b}]0;spoof\u{7}.rs".into(),
                 line: 3,
                 text: "needle \u{1b}[2J".into(),
             }],
             filtered: vec![0],
-            base_query: "needle".into(),
+            base_query: "nee\u{1b}[2Jdle".into(),
             case_sensitive: false,
             word: false,
             regex: false,
@@ -16483,10 +16719,10 @@ mod tests {
         let _editor_env = EDITOR_ENV_LOCK.lock().unwrap();
         state.overlay = Overlay::FilesPicker {
             selected: 0,
-            query: String::new(),
+            query: "\u{1b}]0;filter\u{7}".into(),
             entries: vec![malicious.into()],
             filtered: vec![0],
-            base_query: String::new(),
+            base_query: malicious.into(),
             line: None,
             command_line: None,
             recent: Vec::new(),

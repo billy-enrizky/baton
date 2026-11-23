@@ -509,7 +509,7 @@ fn main_result(started: Instant) -> Result<()> {
             let plan = orchestrate::single_task_plan(
                 &prompt,
                 provider,
-                cli.model.clone(),
+                model.clone(),
                 requested_effort.clone(),
             );
             std::fs::create_dir_all(&home)?;

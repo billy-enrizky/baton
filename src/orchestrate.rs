@@ -116,6 +116,11 @@ pub struct Plan {
     #[serde(default)]
     pub summary: Option<String>,
     pub tasks: Vec<PlanTask>,
+    /// Provider, model, and effort defaults were already resolved into these
+    /// tasks. A saved plan keeps this marker so a preview and its run use the
+    /// same settings instead of applying another role after reload.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub role_defaults_applied: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -380,6 +385,7 @@ fn fallback_plan_with_values(
         task.model = model.map(str::to_string);
         task.effort = effort.map(str::to_string);
     }
+    plan.role_defaults_applied = true;
     plan
 }
 
@@ -681,6 +687,7 @@ fn run_planner(
 fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
     Plan {
         summary: Some("direct task".to_string()),
+        role_defaults_applied: false,
         tasks: vec![PlanTask {
             title: "answer".to_string(),
             provider: provider.as_str().to_string(),
@@ -695,15 +702,16 @@ fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
 pub fn single_task_plan(
     prompt: &str,
     provider: ProviderId,
-    model: Option<String>,
+    model: String,
     effort: Option<String>,
 ) -> Plan {
     Plan {
         summary: Some("single subagent".to_string()),
+        role_defaults_applied: true,
         tasks: vec![PlanTask {
             title: crate::handoff::derive_title(prompt),
             provider: provider.as_str().to_string(),
-            model,
+            model: Some(model),
             effort,
             prompt: prompt.to_string(),
         }],
@@ -1859,8 +1867,16 @@ pub fn plan(
             default_worker,
         )?,
     };
-    if !greeting {
-        normalize_plan_for_role(&mut plan, normalization_role);
+    if plan_path.is_none() && !greeting {
+        // Planner output is untrusted metadata. Baton always applies the role
+        // defaults itself, even when the model copied this marker into JSON.
+        plan.role_defaults_applied = false;
+    }
+    if !plan.role_defaults_applied {
+        if !greeting {
+            normalize_plan_for_role(&mut plan, normalization_role);
+        }
+        plan.role_defaults_applied = true;
     }
     Ok(plan)
 }
@@ -2374,6 +2390,7 @@ pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<
         .ok_or_else(|| anyhow::anyhow!("no orchestration run matches {run_id}"))?;
     let plan: Plan = serde_json::from_str(&run.plan_json).unwrap_or_else(|_| Plan {
         summary: run.summary.clone(),
+        role_defaults_applied: false,
         tasks: Vec::new(),
     });
     let repo_root = worktree::repo_root(cwd).ok();
@@ -2545,7 +2562,7 @@ mod tests {
         let plan = single_task_plan(
             "fix the login test",
             ProviderId::OpenCode,
-            Some("provider/model".into()),
+            "provider/model".into(),
             Some("high".into()),
         );
         assert_eq!(plan.summary.as_deref(), Some("single subagent"));
@@ -2554,6 +2571,7 @@ mod tests {
         assert_eq!(plan.tasks[0].model.as_deref(), Some("provider/model"));
         assert_eq!(plan.tasks[0].effort.as_deref(), Some("high"));
         assert_eq!(plan.tasks[0].prompt, "fix the login test");
+        assert!(plan.role_defaults_applied);
     }
 
     #[test]
@@ -2780,6 +2798,48 @@ mod tests {
             None,
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_saved_greeting_preview_keeps_its_orchestrator_defaults() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::roles::config_path(home.path()),
+            r#"{"roles":{"orchestrator":{"provider":"codex","model":"orch-model"},"implementor":{"provider":"codex","model":"impl-model","effort":"high"}}}"#,
+        )
+        .unwrap();
+        let greeting = plan(
+            "hi",
+            home.path(),
+            home.path(),
+            ProviderId::Codex,
+            "coordinator-model",
+            4,
+            None,
+            PermissionMode::Default,
+            None,
+        )
+        .unwrap();
+        assert_eq!(greeting.tasks[0].model.as_deref(), Some("orch-model"));
+        assert_eq!(greeting.tasks[0].effort, None);
+        assert!(greeting.role_defaults_applied);
+
+        let path = home.path().join("preview.json");
+        std::fs::write(&path, serde_json::to_string(&greeting).unwrap()).unwrap();
+        let reloaded = plan(
+            "hi",
+            home.path(),
+            home.path(),
+            ProviderId::Codex,
+            "coordinator-model",
+            4,
+            Some(&path),
+            PermissionMode::Default,
+            None,
+        )
+        .unwrap();
+        assert_eq!(reloaded.tasks[0].model.as_deref(), Some("orch-model"));
+        assert_eq!(reloaded.tasks[0].effort, None);
     }
 
     #[test]

@@ -69,7 +69,7 @@ The test profile now keeps line tables and drops full debuginfo. The Cargo cache
 | [45115234795](https://github.com/billy-enrizky/baton/actions/runs/45115234795) | workflow_dispatch | warm cache, head tools | 53 seconds | 6 seconds | 33 seconds | Post-merge proof path; merged self-test, workflow guard, required commands, and budgets all passed |
 | [45111201206](https://github.com/billy-enrizky/baton/actions/runs/45111201206) | pull_request | cold after profile change | 85 seconds | 5 seconds | 71 seconds | Pull-request cache did not inherit the branch cache; Selection failed at the expected CI013 workflow comparison |
 
-The 51-second run is the critical-path proof for this slice. It is not counted as a PR p50 sample because it is a dispatch. The 53-second head-tools run proves the merged scripts and required-command enforcement; the first post-merge pull request will be the acceptance sample.
+The 51-second run is the critical-path proof for this slice. It is not counted as a PR p50 sample because it is a dispatch. The 53-second head-tools branch dispatch proves the merged scripts and required-command enforcement on a branch; the first main push and the first post-merge pull request are still the acceptance samples.
 
 The toolchain-cache removal experiment was rejected. Removing the 391 MB `~/.rustup` restore made Setup Rust take about 9 seconds instead of about 6 seconds of restore plus 1 second of activation. Matched samples were 57 and 69 seconds with the cache removed, against 69 and 71 seconds with the cache retained; the difference was noise, not a gain. Runs 45108914603, 45109176611, 45109045484, and 45109314728 are recorded for that decision.
 
@@ -233,9 +233,9 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Installed feature smoke | PTY slash probe passed against the curl and Homebrew binaries; summaries in gitignored `v0.4.0-release/curl/summary.json` and `v0.4.0-release/brew/summary.json` | Passed 2026-11-22 |
 | Formal gates | All 15 suites under `local_docs/verification/*/run.sh` | Passed 2026-11-22 |
 | CI admission model | `ci/formal/ci-admission/run.sh` | Passed locally |
-| Branch protection | `main` requires `Verify`, requires an up-to-date branch, blocks direct and force pushes, and has admin enforcement off for the documented `ci-repair` override | Configured 2026-11-23; branch-protection API response recorded |
+| Branch protection | `main` requires `Verify`, requires an up-to-date branch, blocks force pushes and deletions, and has admin enforcement off. User push restrictions are not available on a user-owned repository | Configured 2026-11-23; direct owner push remains a documented residual risk |
 | Fast classifier warm path | Branch dispatch 45114396442 with a forced Rust rebuild: 51 seconds, Changes complete at 6 seconds, Test 35 seconds | Passed 2026-11-23; post-merge PR sample pending |
-| Head-tools post-merge proof | Branch dispatch 45115234795: 53 seconds, Selection 12 seconds, merged self-test and workflow guard passed | Passed 2026-11-23 |
+| Head-tools branch proof | Branch dispatch 45115234795: 53 seconds, Selection 12 seconds, merged self-test and workflow guard passed | Passed 2026-11-23; main-push proof pending |
 
 ## v0.4.0 release assets
 
@@ -265,7 +265,7 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 - The repository is public. Standard GitHub-hosted runners are free. No paid-runner cost is approved or required by the current measurements.
 - A paid 8-core runner remains an unmeasured option. It is not recommended until both Rust-target metrics miss across at least 100 runs or four weeks.
 - Official merge queue requires organization ownership; private organization repositories additionally require GitHub Enterprise Cloud. Until then, the PR `verify` run plus the following `main` push are the merge proof.
-- Branch protection on `main` was configured on 2026-11-23: required `Verify`, strict up-to-date, no direct pushes, no force pushes, and admin enforcement off for the documented `ci-repair` override. The proof is the branch-protection API response for `main`.
+- Branch protection on `main` was configured on 2026-11-23: required `Verify`, strict up-to-date, no force pushes, no deletions, and admin enforcement off for the documented `ci-repair` override. GitHub rejected user push restrictions on this user-owned repository, so direct owner pushes remain a visible residual risk. The branch-protection API response is the proof.
 
 ## Collection commands
 

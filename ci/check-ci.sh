@@ -87,6 +87,16 @@ on = head["on"] || head[true]
 push = on.is_a?(Hash) ? on["push"] : nil
 branches = push.is_a?(Hash) ? Array(push["branches"]).map(&:to_s) : []
 fail!("CI001", "push trigger must target main") unless branches.include?("main")
+if on.is_a?(Hash)
+  %w[pull_request push merge_group].each do |event|
+    config = on[event]
+    next unless config.is_a?(Hash)
+    %w[paths paths-ignore].each do |filter|
+      fail!("CI001", "#{event} must not use #{filter}; a filtered trigger can skip the required run") if config.key?(filter)
+    end
+    fail!("CI001", "#{event} must not use branches-ignore; a filtered trigger can skip the required run") if config.key?("branches-ignore")
+  end
+end
 
 fail!("CI015", "top-level env is not allowed; a head-controlled env can shadow cargo on PATH") if head.key?("env")
 fail!("CI015", "top-level defaults is not allowed") if head.key?("defaults")

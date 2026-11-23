@@ -143,10 +143,11 @@ Warm Test cache in PR 45004705055:
 
 | Cache | Key | Size | Match | Restore time |
 |---|---|---|---|---|
-| Rust toolchain | `rustup-1.100.0-Linux-X64-test` | 409,824,536 bytes | exact key hit | 4 seconds |
-| Cargo target and registry | `v0-rust-baton-v2-Linux-X64-test-Linux-x64-2fd77104-bc9f7da2` | 253,171,713 bytes | `full match: true` | 3 seconds |
+| Rust toolchain, slim minimum | `rustup-min-1.100.0-Linux-X64` | 190 MB | exact key hit | 2 to 5 seconds on fast runners; 8 seconds on the slowest sampled runner |
+| Rust toolchain, slim lint | `rustup-lint-1.100.0-Linux-X64` | 199 MB | exact key hit | 2 to 5 seconds on fast runners |
+| Cargo target and registry | `v0-rust-baton-v2-Linux-X64-test-Linux-x64-2fd77104-fda39e8f` | 330 MB | `full match: true` | 5 to 10 seconds |
 
-Saves are restricted to `main`. A PR cannot write the cache that another PR restores.
+The old full rustup cache was about 390 MB per job. The slim minimum and lint caches are shared across Check, Build, Test, and Debt instead of keyed per job. Test saves the minimum cache and Debt saves the lint cache on `main` or an owner-dispatched run. Check and Build only restore. A workflow dispatch requires write access, so a normal PR cannot write the cache.
 
 ## Rejected experiments
 
@@ -159,6 +160,8 @@ Saves are restricted to `main`. A PR cannot write the cache that another PR rest
 | Install the pinned toolchain instead of restoring 391 MB | [45004219154](https://github.com/billy-enrizky/baton/actions/runs/45004219154), [45004357746](https://github.com/billy-enrizky/baton/actions/runs/45004357746) | Test 40 and 43 seconds against a 44 to 45 second baseline | Rejected; no consistent gain |
 | Remove the rustup cache again on the current workflow | [45108914603](https://github.com/billy-enrizky/baton/actions/runs/45108914603), [45109176611](https://github.com/billy-enrizky/baton/actions/runs/45109176611), [45109045484](https://github.com/billy-enrizky/baton/actions/runs/45109045484), [45109314728](https://github.com/billy-enrizky/baton/actions/runs/45109314728) | Removed-cache runs 57 and 69 seconds; retained-cache runs 69 and 71 seconds; Setup Rust about 9 seconds without cache versus 6 restore plus 1 activation | Rejected; no proven gain and a slower Test setup path |
 | Temporary ARM Test job evaluated as a replacement | [45012384561](https://github.com/billy-enrizky/baton/actions/runs/45012384561), [45012538857](https://github.com/billy-enrizky/baton/actions/runs/45012538857) | Cold 85-second and warm 33-second ARM jobs; 406 tests each | Rejected; would remove x64 runtime from the pre-merge gate while merge queue is unavailable |
+| Skip `dtolnay/rust-toolchain` when the slim toolchain cache hits | [45142952375](https://github.com/billy-enrizky/baton/actions/runs/45142952375) | All Rust jobs succeeded but the run took 85 seconds; Test and Build were 68 seconds | Rejected; skipping the setup action left Cargo on a slower path even though the toolchain directory existed |
+| Share a slim 190 MB toolchain cache instead of four full 390 MB job caches | [45142327957](https://github.com/billy-enrizky/baton/actions/runs/45142327957) cold seed; [45142584909](https://github.com/billy-enrizky/baton/actions/runs/45142584909), [45143262549](https://github.com/billy-enrizky/baton/actions/runs/45143262549), [45143495137](https://github.com/billy-enrizky/baton/actions/runs/45143495137), [45143668852](https://github.com/billy-enrizky/baton/actions/runs/45143668852) warm | Toolchain restore fell from 9 seconds to 2 to 5 seconds on fast runs and the archive halved; total warm samples were 62, 64, 47, and 62 seconds; Test jobs were 46, 48, 33, and 43 seconds | Kept; the step improved and archive size fell, but total p50 remains dominated by Cargo restore and hosted-runner variance |
 
 The nextest experiment is not evidence for sharding. It showed that a count partition can put one 30-second test into a 61-second shard. After the cancellation fix the whole lib binary takes 1.73 seconds, so sharding is no longer on the critical path.
 

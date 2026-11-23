@@ -462,11 +462,12 @@ pub async fn run_engine(
                 let turn = claim.turn;
                 let sender = engine_event_sender.clone();
                 let store = store.clone();
+                let steer_text = crate::skill_dispatch::prompt_for_provider(provider, &text);
                 tokio::spawn(async move {
                     let outcome = handle(SteerRequest {
                         thread_id: thread_id.clone(),
                         turn,
-                        text: text.clone(),
+                        text: steer_text,
                     })
                     .await;
                     if outcome == SteerOutcome::Delivered {
@@ -878,6 +879,7 @@ async fn execute_turn(
             intro,
         );
     }
+    prompt = crate::skill_dispatch::prompt_for_provider_from(provider, &prompt, Some(&prompt_text));
 
     let cwd_for_checkpoint = cwd.clone();
     let input = TurnStartInput {
@@ -1289,6 +1291,7 @@ mod tests {
     }
 
     struct CapturingAdapter {
+        provider: ProviderId,
         prompt: Arc<Mutex<Option<String>>>,
         session_id: Option<String>,
     }
@@ -1296,7 +1299,7 @@ mod tests {
     #[async_trait::async_trait]
     impl BatonAdapter for CapturingAdapter {
         fn id(&self) -> ProviderId {
-            ProviderId::Codex
+            self.provider
         }
 
         fn interrupt_handle(&self) -> Arc<dyn Fn() + Send + Sync> {
@@ -1355,12 +1358,14 @@ mod tests {
             .add_memory("global", &project, "Answer briefly")
             .unwrap();
         let captured = Arc::new(Mutex::new(None));
-        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
-            Box::new(CapturingAdapter {
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
+            CapturingAdapter {
+                provider: ProviderId::Codex,
                 prompt: captured.clone(),
                 session_id: None,
-            }) as Box<dyn BatonAdapter>,
-        ))];
+            },
+        )
+            as Box<dyn BatonAdapter>))];
         let adapter_indices = HashMap::from([(ProviderId::Codex, 0)]);
         let provider_claims: ProviderClaims = Arc::new(Mutex::new(HashMap::new()));
         let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
@@ -1393,6 +1398,79 @@ mod tests {
             messages.iter().any(|message| message.role == "user" && message.text == "hello $memories"),
             "the transcript keeps the raw prompt"
         );
+    }
+
+    #[tokio::test]
+    async fn claude_payload_uses_native_skill_syntax_and_keeps_the_transcript_token() {
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+                    None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+                }
+            }
+        }
+
+        let claude_root = tempfile::tempdir().unwrap();
+        let skill_dir = claude_root.path().join("skills").join("review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(skill_dir.join("SKILL.md"), "---\nname: review\n---\n").unwrap();
+        let _restore = RestoreEnv(std::env::var_os("CLAUDE_CONFIG_DIR"));
+        std::env::set_var("CLAUDE_CONFIG_DIR", claude_root.path());
+
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let cwd = home.path().to_string_lossy().to_string();
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "skills".into(),
+                cwd: cwd.clone(),
+                current_provider: ProviderId::Claude,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
+            CapturingAdapter {
+                provider: ProviderId::Claude,
+                prompt: captured.clone(),
+                session_id: None,
+            },
+        )
+            as Box<dyn BatonAdapter>))];
+        let adapter_indices = HashMap::from([(ProviderId::Claude, 0)]);
+        let provider_claims: ProviderClaims = Arc::new(Mutex::new(HashMap::new()));
+        let (_cancel_sender, cancel_receiver) = tokio::sync::watch::channel(false);
+        let (engine_sender, _engine_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let result = execute_turn(
+            &store,
+            &home.path().to_path_buf(),
+            &adapters,
+            &adapter_indices,
+            &provider_claims,
+            cancel_receiver,
+            &thread.id,
+            "$review this change",
+            PermissionMode::Default,
+            false,
+            None,
+            &engine_sender,
+            &turn_sender,
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(
+            captured.lock().unwrap().as_deref(),
+            Some("/review this change")
+        );
+        let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
+        assert!(messages
+            .iter()
+            .any(|message| message.role == "user" && message.text == "$review this change"));
     }
 
     #[tokio::test]
@@ -1433,6 +1511,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
             CapturingAdapter {
+                provider: ProviderId::Codex,
                 prompt: captured.clone(),
                 session_id: Some("s1".into()),
             },
@@ -1516,6 +1595,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
             CapturingAdapter {
+                provider: ProviderId::Codex,
                 prompt: captured.clone(),
                 session_id: Some("s1".into()),
             },
@@ -1587,6 +1667,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
             Box::new(CapturingAdapter {
+                provider: ProviderId::Codex,
                 prompt: captured.clone(),
                 session_id: None,
             }) as Box<dyn BatonAdapter>,
@@ -1658,6 +1739,7 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
             CapturingAdapter {
+                provider: ProviderId::Codex,
                 prompt: captured.clone(),
                 session_id: Some("s1".into()),
             },

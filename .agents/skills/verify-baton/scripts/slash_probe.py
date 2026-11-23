@@ -57,6 +57,16 @@ def main() -> int:
     subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
     (Path(workdir) / ".git" / "info" / "exclude").write_text(".env\n")
     (Path(workdir) / ".env").write_text("IGNORED_MARKER=present\n")
+    claude_config = Path(home) / "claude-config"
+    codex_config = Path(home) / "codex-config"
+    (claude_config / "skills" / "claude-demo").mkdir(parents=True)
+    (claude_config / "skills" / "claude-demo" / "SKILL.md").write_text(
+        "---\nname: claude-demo\n---\n"
+    )
+    (codex_config / "skills" / "codex-demo").mkdir(parents=True)
+    (codex_config / "skills" / "codex-demo" / "SKILL.md").write_text(
+        "---\nname: codex-demo\n---\n"
+    )
     evidence = Path(args.evidence_dir) / f"slash-probe-{int(time.time())}"
     evidence.mkdir(parents=True, exist_ok=True)
     pid, master = pty.fork()
@@ -69,6 +79,8 @@ def main() -> int:
         env["BATON_EDITOR_FAIL"] = str(editor_fail)
         env["EDITOR"] = "code --wait"
         env["PATH"] = f"{editor_bin}{os.pathsep}{env.get('PATH', '')}"
+        env["CLAUDE_CONFIG_DIR"] = str(claude_config)
+        env["CODEX_HOME"] = str(codex_config)
         env.pop("VISUAL", None)
         os.execvpe(str(binary), [str(binary)], env)
 
@@ -126,12 +138,38 @@ def main() -> int:
             r"[a-z-]+ models · (\d+)/(\d+) · type to filter · enter · esc",
             model_picker,
         )
-        if model_header is None or int(model_header.group(1)) < 2:
+        if model_header is None or int(model_header.group(2)) < 2:
             missing.append("model picker count is at least 2")
         model_rows = re.findall(r"❯\s+(?:●\s+)?\S+", model_picker)
         if len(model_rows) < 2:
             missing.append("model picker has at least 2 option rows")
         (evidence / "model-picker-screen.txt").write_text(model_picker + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/skills\r")
+        pump(master, 0.8, transcript)
+        skills_picker = screen_text(transcript, args.width, args.height)
+        skills_required = ["skills (2)", "enter insert", "claude-demo (claude)"]
+        missing.extend(value for value in skills_required if value not in skills_picker)
+        if "codex-demo (codex)" not in skills_picker:
+            missing.append("codex skill row")
+        (evidence / "skills-picker-screen.txt").write_text(skills_picker + "\n")
+        os.write(master, b"\x1b[B")
+        pump(master, 0.2, transcript)
+        os.write(master, b"\r")
+        pump(master, 0.8, transcript)
+        skills_result = screen_text(transcript, args.width, args.height)
+        if "inserted $codex-demo (codex)" not in skills_result:
+            missing.append("codex skill insertion notice")
+        if "/orchestrate off before sending" not in skills_result:
+            missing.append("skills orchestrate warning")
+        if not any(
+            line.strip().startswith("│$codex-demo ")
+            for line in skills_result.splitlines()
+        ):
+            missing.append("codex skill in composer")
+        (evidence / "skills-result-screen.txt").write_text(skills_result + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 

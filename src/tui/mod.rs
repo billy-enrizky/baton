@@ -3823,6 +3823,15 @@ fn handle_key(
                     };
                 }
             }
+            KeyCode::Enter => {
+                let inserted = skills
+                    .get(selected)
+                    .map(|(name, source)| insert_skill(state, name, source))
+                    .unwrap_or(false);
+                if !inserted {
+                    state.overlay = Overlay::SkillsPicker { selected, skills };
+                }
+            }
             _ => {
                 state.overlay = Overlay::SkillsPicker { selected, skills };
             }
@@ -5558,6 +5567,11 @@ fn handoff_preview(
         None,
         intro,
     );
+    let payload = crate::skill_dispatch::prompt_for_provider_from(
+        state.thread.current_provider,
+        &payload,
+        Some(text),
+    );
     Some(HandoffPrompt {
         prompt: text.to_string(),
         payload,
@@ -6584,8 +6598,9 @@ fn handle_command(
                 .map(|skill| (skill.name, skill.source))
                 .collect();
             if skills.is_empty() {
-                state.notice =
-                    Some("no skills found in ~/.claude/skills or ~/.codex/skills".into());
+                state.notice = Some(
+                    "no skills found in the configured Claude or Codex skill directories".into(),
+                );
             } else {
                 state.overlay = Overlay::SkillsPicker {
                     selected: 0,
@@ -8886,17 +8901,102 @@ fn draw_copy_picker(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn is_insertable_skill_name(name: &str) -> bool {
+    let mut characters = name.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphanumeric() {
+        return false;
+    }
+    let mut has_letter = first.is_ascii_alphabetic();
+    let valid = characters.all(|character| {
+        has_letter |= character.is_ascii_alphabetic();
+        character.is_ascii_alphanumeric() || matches!(character, ':' | '_' | '-')
+    });
+    valid && has_letter
+}
+
+fn skill_label(value: &str, max_chars: usize) -> String {
+    let sanitized = crate::sanitize::sanitize_terminal_text(value);
+    let mut label = sanitized
+        .chars()
+        .take(max_chars)
+        .map(|character| match character {
+            '\n' | '\t' => crate::sanitize::REPLACEMENT,
+            other => other,
+        })
+        .collect::<String>();
+    if sanitized.chars().count() > max_chars {
+        label.push('…');
+    }
+    label
+}
+
+fn insert_skill(state: &mut TuiState, name: &str, source: &str) -> bool {
+    if name.eq_ignore_ascii_case("memories") {
+        state.notice = Some("skill name $memories is reserved".into());
+        return false;
+    }
+    if !is_insertable_skill_name(name) {
+        state.notice = Some("skill name cannot be inserted".into());
+        return false;
+    }
+    if !matches!(source, "claude" | "codex") {
+        state.notice = Some("skill source cannot be inserted".into());
+        return false;
+    }
+    let byte = char_to_byte(&state.input, state.input_cursor);
+    let needs_separator = state.input[..byte]
+        .chars()
+        .next_back()
+        .is_some_and(|character| !character.is_whitespace());
+    let invocation = if needs_separator {
+        format!(" ${name} ")
+    } else {
+        format!("${name} ")
+    };
+    state.insert_input_str(&invocation);
+    state.overlay = Overlay::None;
+    let mut notice = format!("inserted ${name} ({source})");
+    if source != state.thread.current_provider.as_str() {
+        notice = format!("{notice} · switch to {source} before sending");
+    }
+    if state.thread.session_mode == SessionMode::Orchestrate {
+        notice = format!("{notice} · /orchestrate off before sending");
+    }
+    state.notice = Some(notice);
+    true
+}
+
 fn draw_skills_picker(
     frame: &mut ratatui::Frame,
     area: Rect,
     skills: &[(String, String)],
     selected: usize,
 ) {
+    let visible = 8;
+    let selected = selected.min(skills.len().saturating_sub(1));
+    let start = if skills.len() <= visible {
+        0
+    } else {
+        selected
+            .saturating_sub(visible - 1)
+            .min(skills.len() - visible)
+    };
+    let position = if skills.len() > visible {
+        format!(" · {}/{}", selected + 1, skills.len())
+    } else {
+        String::new()
+    };
     let mut lines: Vec<Line> = vec![Line::styled(
-        format!("skills ({}) · esc close", skills.len()),
+        format!(
+            "skills ({}){position} · ↑↓ select · enter insert · esc close",
+            skills.len()
+        ),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, (name, source)) in skills.iter().take(8).enumerate() {
+    for (index, (name, source)) in skills.iter().enumerate().skip(start).take(visible) {
         let style = if index == selected {
             Style::default()
                 .fg(COLORS.accent)
@@ -8904,13 +9004,10 @@ fn draw_skills_picker(
         } else {
             Style::default().fg(COLORS.muted)
         };
-        lines.push(Line::styled(format!("❯ {name} ({source})"), style));
-    }
-    if skills.len() > 8 {
-        lines.push(Line::styled(
-            format!("... and {} more", skills.len() - 8),
-            Style::default().fg(COLORS.muted),
-        ));
+        let cursor = if index == selected { "❯" } else { " " };
+        let name = skill_label(name, 64);
+        let source = skill_label(source, 16);
+        lines.push(Line::styled(format!("{cursor} {name} ({source})"), style));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -14319,6 +14416,208 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("no assistant reply at position 3"));
+    }
+
+    #[test]
+    fn skills_picker_inserts_skill_tokens_at_token_boundaries() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        state.thread.session_mode = SessionMode::Single;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        state.input = "summarize".into();
+        state.input_cursor = state.input.chars().count();
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![("review".into(), "codex".into())],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "summarize $review ");
+        assert_eq!(state.input_cursor, state.input.chars().count());
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.notice.as_deref(), Some("inserted $review (codex)"));
+
+        state.thread.current_provider = ProviderId::Claude;
+        state.set_input("explain this".into());
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![("brainstorm".into(), "claude".into())],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(state.input, "explain this $brainstorm ");
+        assert_eq!(state.input_cursor, state.input.chars().count());
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("inserted $brainstorm (claude)")
+        );
+    }
+
+    #[test]
+    fn skills_picker_warns_when_source_or_mode_needs_switching() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        state.thread.session_mode = SessionMode::Single;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![("brainstorm".into(), "claude".into())],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("switch to claude before sending"));
+
+        state.set_input(String::new());
+        state.thread.session_mode = SessionMode::Orchestrate;
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![("review".into(), "codex".into())],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("/orchestrate off before sending"));
+    }
+
+    #[test]
+    fn skills_picker_rejects_reserved_and_unsafe_names_and_keeps_the_picker_open() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        state.thread.session_mode = SessionMode::Single;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![("memories".into(), "codex".into())],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::SkillsPicker { .. }));
+        assert!(state.input.is_empty());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("skill name $memories is reserved")
+        );
+
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![("bad\n\u{1b}]0;spoof".into(), "codex".into())],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::SkillsPicker { .. }));
+        assert!(state.input.is_empty());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("skill name cannot be inserted")
+        );
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert_eq!(text.lines().filter(|line| line.contains("bad")).count(), 1);
+        assert!(text.contains("bad\u{fffd}\u{fffd}]0;spoof"), "{text}");
+    }
+
+    #[test]
+    fn skills_picker_window_follows_selection_past_eight() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::SkillsPicker {
+            selected: 9,
+            skills: (0..10)
+                .map(|index| (format!("skill-{index}"), "codex".into()))
+                .collect(),
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("skills (10) · 10/10"), "{text}");
+        assert!(text.contains("❯ skill-9 (codex)"), "{text}");
+        assert_eq!(text.lines().filter(|line| line.contains('❯')).count(), 1);
+        assert!(!text.contains("skill-0 (codex)"), "{text}");
+        assert!(text.contains("enter insert"), "{text}");
+
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        );
+        match state.overlay {
+            Overlay::SkillsPicker { selected, .. } => assert_eq!(selected, 0),
+            _ => panic!("expected skills picker"),
+        }
+    }
+
+    #[test]
+    fn skill_tokens_submit_as_messages_instead_of_slash_commands() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Claude;
+        state.thread.session_mode = SessionMode::Single;
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        state.set_input("$review this change".into());
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        match engine_command_receiver
+            .try_recv()
+            .expect("skill prompt submits")
+        {
+            EngineCommand::Submit { text, .. } => assert_eq!(text, "$review this change"),
+            _ => panic!("expected submit"),
+        }
+        assert!(
+            !state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown command"),
+            "{:?}",
+            state.notice
+        );
     }
 
     #[test]

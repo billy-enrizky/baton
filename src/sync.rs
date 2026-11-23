@@ -174,42 +174,66 @@ pub struct DiscoveredSkill {
     pub source: String,
 }
 
-pub fn scan_skills() -> Vec<DiscoveredSkill> {
-    let mut skills = Vec::new();
-    let claude_skills = crate::paths::claude_global_settings_dir().join("skills");
-    if let Ok(entries) = std::fs::read_dir(&claude_skills) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                    skills.push(DiscoveredSkill {
-                        name: name.to_string(),
-                        path: path.clone(),
-                        source: "claude".to_string(),
-                    });
-                }
-            }
+fn is_skill_dir(path: &Path) -> bool {
+    path.join("SKILL.md").is_file() || path.join("skill.md").is_file()
+}
+
+fn collect_skill_dirs(path: &Path, source: &str, depth: usize, skills: &mut Vec<DiscoveredSkill>) {
+    if !path.is_dir() {
+        return;
+    }
+    if is_skill_dir(path) {
+        if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+            skills.push(DiscoveredSkill {
+                name: name.to_string(),
+                path: path.to_path_buf(),
+                source: source.to_string(),
+            });
+        }
+        return;
+    }
+    if depth > 0 {
+        return;
+    }
+    if let Ok(children) = std::fs::read_dir(path) {
+        for child in children.flatten() {
+            collect_skill_dirs(&child.path(), source, depth + 1, skills);
         }
     }
-    let codex_skills = crate::paths::codex_global_home().join("skills");
-    if let Ok(entries) = std::fs::read_dir(&codex_skills) {
+}
+
+fn scan_skill_root(root: &Path, source: &str) -> Vec<DiscoveredSkill> {
+    let mut skills = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(root) {
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
-                    if !skills.iter().any(|skill| skill.name == name) {
-                        skills.push(DiscoveredSkill {
-                            name: name.to_string(),
-                            path: path.clone(),
-                            source: "codex".to_string(),
-                        });
-                    }
-                }
-            }
+            collect_skill_dirs(&entry.path(), source, 0, &mut skills);
+        }
+    }
+    skills.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    skills.dedup_by(|left, right| left.name == right.name);
+    skills
+}
+
+pub fn scan_skill_roots(claude_root: &Path, codex_root: &Path) -> Vec<DiscoveredSkill> {
+    let mut skills = scan_skill_root(claude_root, "claude");
+    for skill in scan_skill_root(codex_root, "codex") {
+        if !skills.iter().any(|existing| existing.name == skill.name) {
+            skills.push(skill);
         }
     }
     skills.sort_by(|a, b| a.name.cmp(&b.name));
     skills
+}
+
+pub fn scan_skills() -> Vec<DiscoveredSkill> {
+    scan_skill_roots(
+        &crate::paths::claude_global_settings_dir().join("skills"),
+        &crate::paths::codex_global_home().join("skills"),
+    )
 }
 
 pub fn settings_for_provider(provider: ProviderId) -> Vec<(&'static str, Vec<&'static str>)> {
@@ -239,5 +263,75 @@ pub fn settings_for_provider(provider: ProviderId) -> Vec<(&'static str, Vec<&'s
             ("mode", vec!["default", "auto_edit", "yolo"]),
             ("api key", vec!["GEMINI_API_KEY"]),
         ],
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skill(root: &Path, name: &str, file: &str) {
+        let path = root.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join(file), "---\nname: test\n---\n").unwrap();
+    }
+
+    #[test]
+    fn skill_roots_scan_flat_and_container_directories() {
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        skill(claude.path(), "flat", "SKILL.md");
+        skill(claude.path(), "lower", "skill.md");
+        skill(&claude.path().join(".system"), "nested", "SKILL.md");
+        std::fs::create_dir_all(claude.path().join("empty")).unwrap();
+        std::fs::create_dir_all(claude.path().join("container").join("deep")).unwrap();
+        std::fs::write(
+            claude
+                .path()
+                .join("container")
+                .join("deep")
+                .join("SKILL.md"),
+            "---\nname: deep\n---\n",
+        )
+        .unwrap();
+
+        let skills = scan_skill_roots(claude.path(), codex.path());
+        let names = skills
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill.source.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("deep", "claude"),
+                ("flat", "claude"),
+                ("lower", "claude"),
+                ("nested", "claude"),
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_skills_win_duplicate_names_and_codex_adds_the_rest() {
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        skill(claude.path(), "shared", "SKILL.md");
+        skill(codex.path(), "shared", "SKILL.md");
+        skill(codex.path(), "codex-only", "SKILL.md");
+        skill(&codex.path().join(".system"), "built-in", "SKILL.md");
+
+        let skills = scan_skill_roots(claude.path(), codex.path());
+        let names = skills
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill.source.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("built-in", "codex"),
+                ("codex-only", "codex"),
+                ("shared", "claude"),
+            ]
+        );
     }
 }

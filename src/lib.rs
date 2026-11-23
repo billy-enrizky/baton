@@ -25,6 +25,7 @@ pub mod resume;
 pub mod runtime;
 pub mod sanitize;
 pub mod scanner;
+pub mod skill_dispatch;
 pub mod status;
 pub mod store;
 pub mod sync;

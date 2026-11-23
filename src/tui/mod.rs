@@ -5618,6 +5618,7 @@ fn parse_multi_args(args: &[String]) -> std::result::Result<MultiArgs, String> {
 fn multi_worktree_plan(providers: &[ProviderId], prompt: &str) -> orchestrate::Plan {
     orchestrate::Plan {
         summary: Some("multi fan-out across isolated worktrees".to_string()),
+        role_defaults_applied: false,
         tasks: providers
             .iter()
             .map(|provider| orchestrate::PlanTask {
@@ -7158,6 +7159,7 @@ fn handle_command(
                 .unwrap_or_else(|| resolved.for_provider(source_provider).model.clone());
             let plan = orchestrate::Plan {
                 summary: Some(format!("thread worktree from {short_thread}")),
+                role_defaults_applied: false,
                 tasks: vec![orchestrate::PlanTask {
                     title: "thread worktree".to_string(),
                     provider: source_provider.as_str().to_string(),
@@ -19813,6 +19815,7 @@ mod tests {
             summary: Some("two independent workers".to_string()),
             plan: crate::orchestrate::Plan {
                 summary: Some("two independent workers".to_string()),
+                role_defaults_applied: false,
                 tasks: vec![
                     crate::orchestrate::PlanTask {
                         title: "worker one".to_string(),

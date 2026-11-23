@@ -175,6 +175,70 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
+        os.write(master, b"/settings\r")
+        pump(master, 0.8, transcript)
+        settings_picker = screen_text(transcript, args.width, args.height)
+        settings_required = [
+            "claude + global",
+            "default session mode: orchestrate",
+            "notifications bell: off",
+            "options: [orchestrate] · single",
+            "permission mode · read-only",
+            "enter apply",
+            "esc",
+        ]
+        missing.extend(
+            value for value in settings_required if value not in settings_picker
+        )
+        (evidence / "settings-picker-screen.txt").write_text(settings_picker + "\n")
+
+        os.write(master, b"\x1b[C")
+        pump(master, 0.2, transcript)
+        os.write(master, b"\r")
+        pump(master, 0.5, transcript)
+        settings_mode = screen_text(transcript, args.width, args.height)
+        if "default session mode set to single" not in settings_mode:
+            missing.append("settings default mode notice")
+
+        os.write(master, b"\x1b[B")
+        pump(master, 0.2, transcript)
+        settings_bell = screen_text(transcript, args.width, args.height)
+        if "options: [off] · on" not in settings_bell:
+            missing.append("settings bell option row")
+        os.write(master, b"\x1b[C")
+        pump(master, 0.2, transcript)
+        os.write(master, b"\r")
+        pump(master, 0.5, transcript)
+        settings_result = screen_text(transcript, args.width, args.height)
+        if "notifications bell on" not in settings_result:
+            missing.append("settings bell notice")
+        (evidence / "settings-result-screen.txt").write_text(settings_result + "\n")
+
+        os.write(master, b"\x1b[B")
+        pump(master, 0.2, transcript)
+        settings_harness = screen_text(transcript, args.width, args.height)
+        if "options: [default] · acceptEdits · bypassPermissions · plan" not in settings_harness:
+            missing.append("settings harness option row")
+        if "permission mode · read-only" not in settings_harness:
+            missing.append("settings harness read-only row")
+        (evidence / "settings-harness-options-screen.txt").write_text(
+            settings_harness + "\n"
+        )
+        config_path = Path(home) / "config.json"
+        if not config_path.is_file():
+            missing.append("settings config file")
+        else:
+            config = json.loads(config_path.read_text())
+            (evidence / "settings-config.json").write_text(
+                json.dumps(config, indent=2) + "\n"
+            )
+            if config.get("defaultMode") != "single":
+                missing.append("settings persisted default mode")
+            if config.get("notifications", {}).get("bell") is not True:
+                missing.append("settings persisted bell")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
         os.write(master, b"/files ")
         pump(master, 0.5, transcript)
         files_hint = screen_text(transcript, args.width, args.height)

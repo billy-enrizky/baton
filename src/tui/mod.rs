@@ -17,7 +17,7 @@ use crate::handoff::git_branch_label;
 use crate::inbox::{self, InboxItem};
 use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
-use crate::store::{BatonStore, MessageRow, NewThread, PinMoveOutcome, ThreadRow};
+use crate::store::{BatonStore, MessageRow, NewThread, PinMoveOutcome, ThreadOpenWork, ThreadRow};
 use crate::sync;
 use crate::types::{
     normalize_reasoning_effort, ApprovalDecision, PermissionMode, ProviderId, SessionMode,
@@ -106,6 +106,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/review", "review the latest turn diff with line notes"),
     ("/diff", "diff a checkpoint against the working tree"),
     ("/rewind", "rewind to a previous message"),
+    ("/retry", "retry a failed or unverified turn as a new turn"),
     ("/goal", "set a multi-turn objective the agent works toward"),
     ("/memories", "list, add, remove, or clear governed memories"),
     ("/find", "search the conversation"),
@@ -177,6 +178,7 @@ Common
   /runs                       orchestration history
   /review                     line notes on the latest diff
   /rewind                     go back to a previous message
+  /retry                      retry a failed or unverified turn
   /quit                       exit
 
 /help all  every command · shift+enter newline · up/down history";
@@ -191,6 +193,26 @@ struct ReplyChoice {
     /// Position from the end, so 1 is the newest reply.
     position: usize,
     text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RetryChoice {
+    turn: i64,
+    phase: TurnPhase,
+    provider: crate::types::ProviderKey,
+    model: Option<String>,
+    error_preview: Option<String>,
+    message_id: i64,
+    prompt_preview: String,
+    prompt_len: usize,
+    same_provider: bool,
+    current_provider: crate::types::ProviderKey,
+    current_provider_id: ProviderId,
+    current_model: Option<String>,
+    effective_model: String,
+    permission_mode: PermissionMode,
+    native_session_id: Option<String>,
+    session_covered_turn: Option<i64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -421,6 +443,10 @@ enum Overlay {
     RewindPicker {
         selected: usize,
         native: bool,
+    },
+    RetryPicker {
+        selected: usize,
+        choices: Vec<RetryChoice>,
     },
     CodeConfirm {
         turn: i64,
@@ -1235,6 +1261,7 @@ fn apply_engine_event(
             if thread_id != state.thread.id {
                 return;
             }
+            state.suggestion_cache.borrow_mut().take();
             if state
                 .bell
                 .fire(state.bell_enabled, std::time::Instant::now())
@@ -1368,6 +1395,7 @@ fn apply_engine_event(
             thread_id,
             text,
             reason,
+            retry,
         } => {
             if let Some(child) = state.multi.as_mut().and_then(|multi| {
                 multi
@@ -1379,11 +1407,15 @@ fn apply_engine_event(
                 child.error = Some(reason.clone());
             }
             if thread_id == state.thread.id {
-                enqueue_message(state, store, text);
-                state.notice = Some(format!(
-                    "{reason}; queued ({} waiting)",
-                    state.queued_messages.len()
-                ));
+                if retry {
+                    state.notice = Some(format!("{reason}; retry not queued"));
+                } else {
+                    enqueue_message(state, store, text);
+                    state.notice = Some(format!(
+                        "{reason}; queued ({} waiting)",
+                        state.queued_messages.len()
+                    ));
+                }
             }
         }
         EngineEvent::SteerRejected {
@@ -2332,7 +2364,17 @@ fn compute_suggestions(state: &TuiState) -> Vec<CommandSuggestion> {
         let mut suggestions = argument_suggestions(state, command);
         suggestions.retain(|suggestion| suggestion.insert.starts_with(prefix));
         if prefix != command {
-            suggestions.retain(|suggestion| suggestion.insert != prefix);
+            if command == "/retry" {
+                if let Some(index) = suggestions
+                    .iter()
+                    .position(|suggestion| suggestion.insert == prefix)
+                {
+                    let exact = suggestions.remove(index);
+                    suggestions.insert(0, exact);
+                }
+            } else {
+                suggestions.retain(|suggestion| suggestion.insert != prefix);
+            }
         }
         return suggestions;
     }
@@ -2374,6 +2416,85 @@ fn turn_choices(state: &TuiState, role: Option<&str>, limit: usize) -> Vec<i64> 
     turns
 }
 
+fn retry_choices(
+    state: &TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+) -> std::result::Result<Vec<RetryChoice>, String> {
+    let (current_provider, current_model, cwd, session, turns) = {
+        let guard = store.lock().unwrap();
+        let thread = guard
+            .get_thread(&state.thread.id)
+            .map_err(|error| format!("cannot read retry thread: {error}"))?
+            .ok_or_else(|| "the current thread no longer exists".to_string())?;
+        let current_provider = thread.current_provider;
+        let session = guard
+            .get_provider_session(&state.thread.id, current_provider)
+            .map_err(|error| format!("cannot read retry session: {error}"))?;
+        let turns = guard
+            .list_retryable_turns(&state.thread.id)
+            .map_err(|error| format!("cannot read retry history: {error}"))?;
+        (
+            current_provider,
+            thread.current_model,
+            thread.cwd,
+            session,
+            turns,
+        )
+    };
+    let effective_model = current_model.clone().unwrap_or_else(|| {
+        resolve_config(&state.home, std::path::Path::new(&cwd))
+            .for_provider(current_provider)
+            .model
+            .clone()
+    });
+    Ok(turns
+        .into_iter()
+        .map(|turn| {
+            let same_provider = turn.provider == current_provider.into();
+            RetryChoice {
+                turn: turn.turn,
+                phase: turn.phase,
+                provider: turn.provider,
+                model: turn.model,
+                error_preview: turn.error_preview,
+                message_id: turn.message_id,
+                prompt_preview: turn.prompt_preview,
+                prompt_len: turn.prompt_len,
+                same_provider,
+                current_provider: current_provider.into(),
+                current_provider_id: current_provider,
+                current_model: current_model.clone(),
+                effective_model: effective_model.clone(),
+                permission_mode: state.permission_mode,
+                native_session_id: same_provider
+                    .then(|| session.as_ref().map(|row| row.native_session_id.clone()))
+                    .flatten(),
+                session_covered_turn: same_provider
+                    .then(|| session.as_ref().map(|row| row.covered_turn))
+                    .flatten(),
+            }
+        })
+        .collect())
+}
+
+fn retry_preview(input: &str, limit: usize) -> String {
+    crate::sanitize::sanitize_terminal_text(input)
+        .chars()
+        .map(|character| match character {
+            '\n' | '\t' => ' ',
+            character => character,
+        })
+        .take(limit)
+        .collect()
+}
+
+fn is_exact_retry_turn(input: &str) -> bool {
+    let Some(turn) = input.trim().strip_prefix("/retry ") else {
+        return false;
+    };
+    !turn.is_empty() && !turn.contains(char::is_whitespace) && turn.parse::<i64>().is_ok()
+}
+
 fn assistant_reply_count(state: &TuiState) -> usize {
     state
         .history
@@ -2405,6 +2526,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/review", _) => Some("review [turn]"),
         ("/diff", _) => Some("diff [turn]"),
         ("/rewind", _) => Some("rewind [--native]"),
+        ("/retry", _) => Some("retry <turn>"),
         ("/goal", _) => Some("goal pause|resume|clear|<done criteria>"),
         ("/memories", "add") => Some("memories add [--global] <text>"),
         ("/memories", "remove") => Some("memories remove <id>"),
@@ -2699,6 +2821,17 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 "--native",
                 "use native provider rewind",
             );
+        }
+        "/retry" => {
+            for choice in retry_choices(state, &state.store).unwrap_or_default() {
+                let preview = retry_preview(&choice.prompt_preview, 60);
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &choice.turn.to_string(),
+                    format!("{} · {preview}", choice.phase.as_str()),
+                );
+            }
         }
         "/help" => {
             push_suggestion(&mut suggestions, command, "all", "show every command");
@@ -3125,6 +3258,35 @@ fn handle_key(
                 _ => {
                     state.overlay = Overlay::RewindPicker { selected, native };
                 }
+            }
+        }
+        Overlay::RetryPicker {
+            mut selected,
+            choices,
+        } => {
+            let mut keep = true;
+            match key.code {
+                KeyCode::Esc => keep = false,
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if !choices.is_empty() {
+                        selected = (selected + choices.len() - 1) % choices.len();
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if !choices.is_empty() {
+                        selected = (selected + 1) % choices.len();
+                    }
+                }
+                KeyCode::Enter => {
+                    keep = false;
+                    if let Some(choice) = choices.get(selected).cloned() {
+                        retry_turn(state, store, engine_command_sender, choice);
+                    }
+                }
+                _ => {}
+            }
+            if keep {
+                state.overlay = Overlay::RetryPicker { selected, choices };
             }
         }
         Overlay::CommandList {
@@ -3963,6 +4125,8 @@ fn handle_key(
                     engine_command_sender,
                     pending.prompt.clone(),
                     false,
+                    None,
+                    false,
                 );
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -3974,6 +4138,8 @@ fn handle_key(
                     engine_command_sender,
                     pending.prompt.clone(),
                     true,
+                    None,
+                    false,
                 );
             }
             KeyCode::Esc => {
@@ -4852,6 +5018,13 @@ fn handle_composer_key(
         return;
     }
 
+    let typed = state.input.trim().to_string();
+    if key.code == KeyCode::Enter && is_exact_retry_turn(&typed) {
+        state.set_input(String::new());
+        handle_command(state, store, engine_command_sender, &typed);
+        return;
+    }
+
     if !suggestions.is_empty() {
         match key.code {
             KeyCode::Up => {
@@ -4874,7 +5047,6 @@ fn handle_composer_key(
                 return;
             }
             KeyCode::Enter => {
-                let typed = state.input.trim().to_string();
                 if suggestions
                     .iter()
                     .any(|suggestion| suggestion.insert == typed)
@@ -5126,7 +5298,15 @@ fn submit(
         state.set_input(String::new());
         return;
     }
-    dispatch_submit(state, store, engine_command_sender, text, false);
+    dispatch_submit(
+        state,
+        store,
+        engine_command_sender,
+        text,
+        false,
+        None,
+        false,
+    );
 }
 
 /// Builds the payload another provider would receive, so the user can see it
@@ -5201,6 +5381,8 @@ fn dispatch_submit(
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     text: String,
     skip_handoff: bool,
+    expected_provider: Option<ProviderId>,
+    retry: bool,
 ) {
     remember_prompt(state, store, &text);
     let result = {
@@ -5219,7 +5401,190 @@ fn dispatch_submit(
         text,
         permission_mode,
         skip_handoff,
+        expected_provider,
+        retry,
     });
+}
+
+fn retry_blocked_reason(
+    state: &TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+) -> std::result::Result<Option<String>, String> {
+    if state.running {
+        return Ok(Some(
+            "wait for the current work to finish before retrying".into(),
+        ));
+    }
+    if state.orchestration_pending {
+        return Ok(Some(
+            "wait for the current orchestration to finish before retrying".into(),
+        ));
+    }
+    if state.native_rewind_running {
+        return Ok(Some(
+            "wait for the native rewind to finish before retrying".into(),
+        ));
+    }
+    if !state.queued_messages.is_empty() {
+        return Ok(Some(format!(
+            "send or clear the {} queued message(s) before retrying",
+            state.queued_messages.len()
+        )));
+    }
+    let open = {
+        let guard = store.lock().unwrap();
+        let mut open = guard
+            .thread_open_work(&state.thread.id)
+            .map_err(|error| format!("cannot check turn ownership: {error}"))?;
+        if open == Some(ThreadOpenWork::Orchestration) {
+            orchestrate::reconcile_abandoned_runs(&guard)
+                .map_err(|error| format!("cannot reconcile orchestration: {error}"))?;
+            open = guard
+                .thread_open_work(&state.thread.id)
+                .map_err(|error| format!("cannot check turn ownership: {error}"))?;
+        }
+        open
+    };
+    match open {
+        Some(ThreadOpenWork::Turn) => {
+            return Ok(Some(
+                "this thread still has an open turn; wait for settlement before retrying".into(),
+            ));
+        }
+        Some(ThreadOpenWork::Queue) => {
+            return Ok(Some(
+                "this thread still has queued messages; send or clear them before retrying".into(),
+            ));
+        }
+        Some(ThreadOpenWork::NativeRewind) => {
+            return Ok(Some(
+                "a provider-native rewind is still pending; finish that rewind before retrying"
+                    .into(),
+            ));
+        }
+        Some(ThreadOpenWork::Orchestration) => {
+            return Ok(Some(
+                "this thread is part of a running orchestration; inspect /runs and wait for it to finish before retrying"
+                    .into(),
+            ));
+        }
+        None => {}
+    }
+    Ok(None)
+}
+
+fn retry_turn_state_notice(store: &Arc<Mutex<BatonStore>>, thread_id: &str, turn: i64) -> String {
+    let guard = store.lock().unwrap();
+    match guard.get_turn_record(thread_id, turn) {
+        Ok(Some(record)) if matches!(record.phase, TurnPhase::Failed | TurnPhase::Unverified) => {
+            match guard.turn_has_user_message(thread_id, turn) {
+                Ok(true) => format!("turn {turn} changed; run /retry again"),
+                Ok(false) => {
+                    format!("turn {turn} has no stored user prompt; it cannot be retried")
+                }
+                Err(error) => format!("cannot read turn {turn} prompt: {error}"),
+            }
+        }
+        Ok(Some(record)) => format!(
+            "turn {turn} is {}; only failed and unverified turns can be retried",
+            record.phase.as_str()
+        ),
+        Ok(None) => format!("turn {turn} does not exist; /retry lists retryable turns"),
+        Err(error) => format!("cannot read turn {turn}: {error}"),
+    }
+}
+
+fn retry_turn(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    choice: RetryChoice,
+) {
+    let snapshot = choice;
+    let turn = snapshot.turn;
+    let fresh = match retry_choices(state, store) {
+        Ok(choices) => choices,
+        Err(error) => {
+            state.notice = Some(error);
+            return;
+        }
+    };
+    let Some(choice) = fresh.into_iter().find(|choice| choice.turn == turn) else {
+        state.notice = Some(retry_turn_state_notice(store, &state.thread.id, turn));
+        return;
+    };
+    if choice != snapshot {
+        state.notice = Some(format!(
+            "turn {turn} changed while the picker was open; run /retry again"
+        ));
+        return;
+    }
+    match retry_blocked_reason(state, store) {
+        Ok(Some(reason)) | Err(reason) => {
+            state.notice = Some(reason);
+            return;
+        }
+        Ok(None) => {}
+    }
+    if !choice.same_provider {
+        state.notice = Some(format!(
+            "turn {} used {}; switch back to {} before retrying",
+            choice.turn, choice.provider, choice.provider
+        ));
+        return;
+    }
+    if let Some(covered) = choice.session_covered_turn {
+        if covered > choice.turn {
+            state.notice = Some(format!(
+                "the native session already covers turn {covered}; retrying turn {} would run against later context",
+                choice.turn
+            ));
+            return;
+        }
+    }
+    let prompt =
+        match store
+            .lock()
+            .unwrap()
+            .retry_prompt(&state.thread.id, choice.turn, choice.message_id)
+        {
+            Ok(Some(prompt)) => prompt,
+            Ok(None) => {
+                state.notice = Some(format!(
+                    "turn {} changed while the picker was open; run /retry again",
+                    choice.turn
+                ));
+                return;
+            }
+            Err(error) => {
+                state.notice = Some(format!("cannot read turn {} prompt: {error}", choice.turn));
+                return;
+            }
+        };
+    state.overlay = Overlay::None;
+    let session_note = match choice.session_covered_turn {
+        Some(covered) => format!("resuming the native session through turn {covered}"),
+        None => "no native session; sending the stored prompt only".to_string(),
+    };
+    state.notice = Some(format!(
+        "retrying turn {} as one turn on {}/{} · {} · mode {}",
+        choice.turn,
+        choice.current_provider,
+        choice.effective_model,
+        session_note,
+        choice.permission_mode
+    ));
+    // A retry stays on the same provider. A cross-provider retry would need the
+    // redacted handoff preview, so this slice refuses it instead of bypassing it.
+    dispatch_submit(
+        state,
+        store,
+        engine_command_sender,
+        prompt,
+        true,
+        Some(choice.current_provider_id),
+        true,
+    );
 }
 
 fn handle_command(
@@ -5565,6 +5930,8 @@ fn handle_command(
                     text: prompt.clone(),
                     permission_mode: state.permission_mode,
                     skip_handoff: false,
+                    expected_provider: None,
+                    retry: false,
                 });
             }
             state.multi = Some(MultiView {
@@ -6821,6 +7188,47 @@ fn handle_command(
                 state.notice = Some("nothing to rewind to yet".into());
             }
         }
+        "/retry" => {
+            match retry_blocked_reason(state, store) {
+                Ok(Some(reason)) | Err(reason) => {
+                    state.notice = Some(reason);
+                    return;
+                }
+                Ok(None) => {}
+            }
+            let choices = match retry_choices(state, store) {
+                Ok(choices) => choices,
+                Err(error) => {
+                    state.notice = Some(error);
+                    return;
+                }
+            };
+            if let Some(value) = args.first() {
+                if args.len() > 1 {
+                    state.notice = Some("usage: /retry <turn>".into());
+                    return;
+                }
+                let Ok(turn) = value.parse::<i64>() else {
+                    state.notice = Some("usage: /retry <turn>".into());
+                    return;
+                };
+                match choices.iter().position(|choice| choice.turn == turn) {
+                    Some(selected) => {
+                        state.overlay = Overlay::RetryPicker { selected, choices };
+                    }
+                    None => {
+                        state.notice = Some(retry_turn_state_notice(store, &state.thread.id, turn));
+                    }
+                }
+            } else if choices.is_empty() {
+                state.notice = Some("retry: no failed or unverified turns".into());
+            } else {
+                state.overlay = Overlay::RetryPicker {
+                    selected: 0,
+                    choices,
+                };
+            }
+        }
         other => {
             if let Some((_, template)) =
                 state.custom_commands.iter().find(|(name, _)| name == other)
@@ -7587,6 +7995,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                     .min(8)
                     + 4
             }
+            Overlay::RetryPicker { choices, .. } => choices.len().min(6) + 9,
             Overlay::CodeConfirm { .. } => 4,
             Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
             Overlay::ModelPicker { models, filter, .. } => {
@@ -7664,6 +8073,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         match &state.overlay {
             Overlay::RewindPicker { selected, native } => {
                 draw_rewind_picker(frame, chunks[1], state, *selected, *native)
+            }
+            Overlay::RetryPicker { selected, choices } => {
+                draw_retry_picker(frame, chunks[1], state, choices, *selected)
             }
             Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[1], *turn),
             Overlay::SwitchPicker { selected } => {
@@ -9295,6 +9707,94 @@ fn draw_rewind_picker(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn draw_retry_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    choices: &[RetryChoice],
+    selected: usize,
+) {
+    let window_start = if choices.len() <= 6 {
+        0
+    } else {
+        selected
+            .saturating_sub(5)
+            .min(choices.len().saturating_sub(6))
+    };
+    let current_provider = choices
+        .first()
+        .map(|choice| choice.current_provider.as_str().to_string())
+        .unwrap_or_else(|| state.thread.current_provider.to_string());
+    let current_model = choices
+        .first()
+        .map(|choice| choice.effective_model.clone())
+        .unwrap_or_else(|| "harness default".to_string());
+    let permission_mode = choices
+        .first()
+        .map(|choice| choice.permission_mode)
+        .unwrap_or(state.permission_mode);
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "retry one turn · enter confirms · {}/{} · esc cancel",
+                selected.saturating_add(1).min(choices.len()),
+                choices.len()
+            ),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            format!("current mode {permission_mode} · {current_provider}/{current_model}"),
+            Style::default().fg(COLORS.muted),
+        ),
+    ];
+    for (index, choice) in choices.iter().enumerate().skip(window_start).take(6) {
+        let preview = retry_preview(&choice.prompt_preview, 72);
+        let context = if !choice.same_provider {
+            format!("switch to {} to retry", choice.provider)
+        } else if let Some(covered) = choice.session_covered_turn {
+            format!("session through turn {covered}")
+        } else {
+            "no session; prompt only".to_string()
+        };
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(
+            format!(
+                "❯ turn {} {} · {}/{} · {context} · {preview}",
+                choice.turn,
+                choice.phase.as_str(),
+                choice.provider,
+                choice.model.as_deref().unwrap_or("harness default")
+            ),
+            style,
+        ));
+    }
+    if let Some(choice) = choices.get(selected) {
+        let prompt = retry_preview(&choice.prompt_preview, 240);
+        lines.push(Line::from(""));
+        lines.push(Line::styled(
+            format!("selected prompt ({} chars): {prompt}", choice.prompt_len),
+            Style::default().fg(COLORS.text),
+        ));
+        if let Some(error) = choice.error_preview.as_deref() {
+            let error = retry_preview(error, 160);
+            lines.push(Line::styled(
+                format!("error: {error}"),
+                Style::default().fg(COLORS.warning),
+            ));
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_handoff_preview(frame: &mut ratatui::Frame, area: Rect, pending: &HandoffPrompt) {
     let mut lines = vec![
         Line::styled(
@@ -10215,6 +10715,7 @@ mod tests {
             "/review",
             "/diff",
             "/rewind",
+            "/retry",
             "/goal",
             "/memories",
             "/find",
@@ -10324,6 +10825,1163 @@ mod tests {
                 .unwrap();
         }
         state
+    }
+
+    fn seed_terminal_turn(
+        store: &Arc<Mutex<BatonStore>>,
+        thread_id: &str,
+        turn: i64,
+        prompt: &str,
+        phase: TurnPhase,
+        error: Option<&str>,
+    ) {
+        seed_terminal_turn_for(
+            store,
+            thread_id,
+            turn,
+            prompt,
+            phase,
+            error,
+            ProviderId::Claude,
+        );
+    }
+
+    fn seed_terminal_turn_for(
+        store: &Arc<Mutex<BatonStore>>,
+        thread_id: &str,
+        turn: i64,
+        prompt: &str,
+        phase: TurnPhase,
+        error: Option<&str>,
+        provider: ProviderId,
+    ) {
+        let guard = store.lock().unwrap();
+        guard
+            .add_message(
+                thread_id,
+                turn,
+                "user",
+                Some(provider.as_str()),
+                None,
+                prompt,
+            )
+            .unwrap();
+        guard
+            .start_turn_record(thread_id, turn, provider, None)
+            .unwrap();
+        guard
+            .finish_turn_record(thread_id, turn, phase, error)
+            .unwrap();
+    }
+
+    fn seed_session(store: &Arc<Mutex<BatonStore>>, thread_id: &str, provider: ProviderId) {
+        store
+            .lock()
+            .unwrap()
+            .upsert_provider_session(
+                thread_id,
+                provider,
+                &format!("{provider}-session"),
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    fn seed_running_task(
+        store: &Arc<Mutex<BatonStore>>,
+        run_id: &str,
+        thread_id: &str,
+        owner_pid: Option<u32>,
+    ) {
+        let guard = store.lock().unwrap();
+        guard
+            .create_orchestration_run_owned(
+                run_id,
+                "goal",
+                ProviderId::Claude,
+                "m",
+                None,
+                "{}",
+                false,
+                owner_pid,
+                None,
+            )
+            .unwrap();
+        guard
+            .add_orchestration_task(
+                &format!("{run_id}-task"),
+                run_id,
+                1,
+                "title",
+                ProviderId::Claude,
+                "m",
+                "prompt",
+                None,
+                None,
+                None,
+                Some(thread_id),
+                "queued",
+                None,
+                None,
+                "now",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn retry_picker_lists_retryable_turns_and_submits_the_selected_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        seed_terminal_turn(
+            &store,
+            &thread_id,
+            1,
+            "first prompt",
+            TurnPhase::Failed,
+            Some("provider died"),
+        );
+        seed_terminal_turn(
+            &store,
+            &thread_id,
+            2,
+            "completed prompt",
+            TurnPhase::Completed,
+            None,
+        );
+        seed_terminal_turn(
+            &store,
+            &thread_id,
+            3,
+            "unverified prompt",
+            TurnPhase::Unverified,
+            Some("baton exited before the turn settled"),
+        );
+        seed_session(&store, &thread_id, ProviderId::Claude);
+        state.permission_mode = PermissionMode::AcceptEdits;
+        state.thread.session_mode = SessionMode::Orchestrate;
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+
+        let Overlay::RetryPicker { selected, choices } = &state.overlay else {
+            panic!("expected the retry picker");
+        };
+        assert_eq!(*selected, 0);
+        assert_eq!(
+            choices.iter().map(|choice| choice.turn).collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        assert!(choices
+            .iter()
+            .all(|choice| choice.prompt_preview != "completed prompt"));
+        let screen = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(screen.contains("retry one turn"), "{screen}");
+        assert!(screen.contains("unverified prompt"), "{screen}");
+        assert!(screen.contains("session through turn 0"), "{screen}");
+        assert!(screen.contains("current mode acceptEdits"), "{screen}");
+        assert!(screen.contains("retry one turn"), "{screen}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+
+        match engine_command_receiver.try_recv().expect("retry submit") {
+            EngineCommand::Submit {
+                thread_id: submitted_thread,
+                text,
+                permission_mode,
+                skip_handoff,
+                expected_provider,
+                retry,
+            } => {
+                assert_eq!(submitted_thread, thread_id);
+                assert_eq!(text, "unverified prompt");
+                assert_eq!(permission_mode, PermissionMode::AcceptEdits);
+                assert!(skip_handoff, "a retry on the same harness skips handoff");
+                assert_eq!(expected_provider, Some(ProviderId::Claude));
+                assert!(retry);
+            }
+            _ => panic!("expected a submit"),
+        }
+        let original = store
+            .lock()
+            .unwrap()
+            .get_turn_record(&thread_id, 3)
+            .unwrap()
+            .expect("failed row remains");
+        assert_eq!(original.phase, TurnPhase::Unverified);
+        assert_eq!(
+            original.error.as_deref(),
+            Some("baton exited before the turn settled")
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("as one turn"));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("resuming the native session through turn 0"));
+    }
+
+    #[test]
+    fn retry_completion_and_direct_turn_use_the_same_eligible_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        seed_terminal_turn(
+            &store,
+            &thread_id,
+            1,
+            "failed prompt",
+            TurnPhase::Failed,
+            Some("provider died"),
+        );
+        seed_terminal_turn(
+            &store,
+            &thread_id,
+            2,
+            "completed prompt",
+            TurnPhase::Completed,
+            None,
+        );
+        seed_session(&store, &thread_id, ProviderId::Claude);
+        store
+            .lock()
+            .unwrap()
+            .start_turn_record(&thread_id, 4, ProviderId::Claude, None)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .finish_turn_record(&thread_id, 4, TurnPhase::Failed, Some("no prompt"))
+            .unwrap();
+        state.goal = Some("current goal".into());
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        state.input = "/retry ".to_string();
+        assert_eq!(
+            suggestions_for(&state)
+                .into_iter()
+                .map(|suggestion| suggestion.insert)
+                .collect::<Vec<_>>(),
+            vec!["/retry 1".to_string()]
+        );
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry 1");
+        assert!(engine_command_receiver.try_recv().is_err());
+        let Overlay::RetryPicker { selected, .. } = &state.overlay else {
+            panic!("direct retry must open the preview picker");
+        };
+        assert_eq!(*selected, 0);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        match engine_command_receiver.try_recv().expect("retry submit") {
+            EngineCommand::Submit {
+                thread_id: submitted_thread,
+                text,
+                permission_mode,
+                skip_handoff,
+                expected_provider,
+                retry,
+            } => {
+                assert_eq!(submitted_thread, thread_id);
+                assert_eq!(text, "failed prompt");
+                assert_eq!(permission_mode, PermissionMode::Default);
+                assert!(skip_handoff);
+                assert_eq!(expected_provider, Some(ProviderId::Claude));
+                assert!(retry);
+            }
+            _ => panic!("expected a submit"),
+        }
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry 2");
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("turn 2 is completed"));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry 99");
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("turn 99 does not exist"));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry 4");
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("turn 4 has no stored user prompt"));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry 1 extra");
+        assert_eq!(state.notice.as_deref(), Some("usage: /retry <turn>"));
+    }
+
+    #[test]
+    fn retry_composer_prefers_an_exact_turn_over_a_longer_completion() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        for turn in [1, 10] {
+            seed_terminal_turn(
+                &store,
+                &thread_id,
+                turn,
+                &format!("failed prompt {turn}"),
+                TurnPhase::Failed,
+                Some("provider died"),
+            );
+        }
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        for input in ["/retry 1", "/retry 10", "/retry 1 "] {
+            state.overlay = Overlay::None;
+            state.input = input.to_string();
+            assert_eq!(
+                suggestions_for(&state)
+                    .first()
+                    .map(|suggestion| suggestion.insert.as_str()),
+                Some(input.trim_end()),
+                "{input} must keep its exact choice first"
+            );
+            handle_composer_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Enter),
+            );
+            assert_eq!(state.input, "", "{input}");
+            assert!(engine_command_receiver.try_recv().is_err(), "{input}");
+            let Overlay::RetryPicker { selected, choices } = &state.overlay else {
+                panic!("{input} must open the retry picker");
+            };
+            assert_eq!(
+                choices[*selected].turn,
+                input
+                    .trim_end()
+                    .trim_start_matches("/retry ")
+                    .parse::<i64>()
+                    .unwrap(),
+                "{input}"
+            );
+        }
+
+        state.overlay = Overlay::None;
+        state.input = "/retry ".to_string();
+        state.suggestion_index = 0;
+        handle_composer_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(state.input, "/retry 10 ");
+        handle_composer_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let Overlay::RetryPicker { selected, choices } = &state.overlay else {
+            panic!("the selected completion must open the retry picker");
+        };
+        assert_eq!(choices[*selected].turn, 10);
+
+        let only_ten_home = tempfile::tempdir().unwrap();
+        let only_ten_store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut only_ten = test_state(only_ten_home.path(), &only_ten_store, Vec::new());
+        seed_terminal_turn(
+            &only_ten_store,
+            &only_ten.thread.id.clone(),
+            10,
+            "failed prompt 10",
+            TurnPhase::Failed,
+            Some("provider died"),
+        );
+        let (only_ten_sender, mut only_ten_receiver) = tokio::sync::mpsc::unbounded_channel();
+        only_ten.input = "/retry 1".to_string();
+        handle_composer_key(
+            &mut only_ten,
+            &only_ten_store,
+            &only_ten_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(only_ten_receiver.try_recv().is_err());
+        assert!(matches!(only_ten.overlay, Overlay::None));
+        assert!(only_ten
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("turn 1 does not exist"));
+    }
+
+    #[test]
+    fn retry_picker_revalidates_the_selected_turn_before_submitting() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        seed_terminal_turn(
+            &store,
+            &thread_id,
+            1,
+            "failed prompt",
+            TurnPhase::Failed,
+            Some("provider died"),
+        );
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        assert!(matches!(state.overlay, Overlay::RetryPicker { .. }));
+        store
+            .lock()
+            .unwrap()
+            .finish_turn_record(&thread_id, 1, TurnPhase::Completed, None)
+            .unwrap();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("turn 1 is completed"));
+
+        store
+            .lock()
+            .unwrap()
+            .finish_turn_record(&thread_id, 1, TurnPhase::Failed, Some("first error"))
+            .unwrap();
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        assert!(matches!(state.overlay, Overlay::RetryPicker { .. }));
+        store
+            .lock()
+            .unwrap()
+            .finish_turn_record(&thread_id, 1, TurnPhase::Failed, Some("changed error"))
+            .unwrap();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("changed while the picker was open"));
+
+        seed_session(&store, &thread_id, ProviderId::Claude);
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        store
+            .lock()
+            .unwrap()
+            .upsert_provider_session(
+                &thread_id,
+                ProviderId::Claude,
+                "changed-session",
+                None,
+                None,
+            )
+            .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("changed while the picker was open"));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        store
+            .lock()
+            .unwrap()
+            .set_thread_model(&thread_id, "changed-model")
+            .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("changed while the picker was open"));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        state.permission_mode = PermissionMode::BypassPermissions;
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("changed while the picker was open"));
+
+        store
+            .lock()
+            .unwrap()
+            .mark_provider_session_covered(&thread_id, ProviderId::Claude, 5)
+            .unwrap();
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("already covers turn 5"));
+
+        store
+            .lock()
+            .unwrap()
+            .set_thread_provider(&thread_id, ProviderId::Claude, None)
+            .unwrap();
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        store
+            .lock()
+            .unwrap()
+            .set_thread_provider(&thread_id, ProviderId::Codex, None)
+            .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("changed while the picker was open"));
+
+        store
+            .lock()
+            .unwrap()
+            .set_thread_provider(&thread_id, ProviderId::Claude, None)
+            .unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"defaultModels":{"claude":"model-a"}}"#,
+        )
+        .unwrap();
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"defaultModels":{"claude":"model-b"}}"#,
+        )
+        .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("changed while the picker was open"));
+    }
+
+    #[test]
+    fn retry_refuses_to_overlap_running_queued_or_open_work() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        seed_terminal_turn(
+            &store,
+            &thread_id,
+            1,
+            "failed prompt",
+            TurnPhase::Failed,
+            Some("provider died"),
+        );
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+        for (setup, expected) in [
+            (
+                "running",
+                "wait for the current work to finish before retrying",
+            ),
+            (
+                "orchestration",
+                "wait for the current orchestration to finish before retrying",
+            ),
+            (
+                "rewind",
+                "wait for the native rewind to finish before retrying",
+            ),
+            (
+                "queue",
+                "send or clear the 1 queued message(s) before retrying",
+            ),
+            (
+                "open",
+                "this thread still has an open turn; wait for settlement before retrying",
+            ),
+        ] {
+            state.running = false;
+            state.orchestration_pending = false;
+            state.native_rewind_running = false;
+            state.queued_messages.clear();
+            if setup == "running" {
+                state.running = true;
+            } else if setup == "orchestration" {
+                state.orchestration_pending = true;
+            } else if setup == "rewind" {
+                state.native_rewind_running = true;
+            } else if setup == "queue" {
+                state.queued_messages.push("queued".into());
+            } else {
+                store
+                    .lock()
+                    .unwrap()
+                    .add_message(&thread_id, 2, "user", Some("claude"), None, "open")
+                    .unwrap();
+                store
+                    .lock()
+                    .unwrap()
+                    .start_turn_record(&thread_id, 2, ProviderId::Claude, None)
+                    .unwrap();
+            }
+            handle_command(&mut state, &store, &engine_command_sender, "/retry 1");
+            assert!(engine_command_receiver.try_recv().is_err(), "{setup}");
+            assert_eq!(state.notice.as_deref(), Some(expected), "{setup}");
+        }
+    }
+
+    #[test]
+    fn retry_rechecks_guards_after_the_picker_opens() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        seed_terminal_turn(
+            &store,
+            &thread_id,
+            1,
+            "failed prompt",
+            TurnPhase::Failed,
+            Some("provider died"),
+        );
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        state.running = true;
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("wait for the current work to finish before retrying")
+        );
+        state.running = false;
+        state.overlay = Overlay::None;
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        state.orchestration_pending = true;
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("wait for the current orchestration to finish before retrying")
+        );
+        state.orchestration_pending = false;
+        state.overlay = Overlay::None;
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        state.native_rewind_running = true;
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("wait for the native rewind to finish before retrying")
+        );
+        state.native_rewind_running = false;
+        state.overlay = Overlay::None;
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        state.queued_messages.push("queued".into());
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("send or clear the 1 queued message(s) before retrying")
+        );
+        state.queued_messages.clear();
+        state.overlay = Overlay::None;
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&thread_id, "durable queue")
+            .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("this thread still has queued messages; send or clear them before retrying")
+        );
+        store
+            .lock()
+            .unwrap()
+            .clear_queued_messages(&thread_id)
+            .unwrap();
+        state.overlay = Overlay::None;
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        store
+            .lock()
+            .unwrap()
+            .add_message(&thread_id, 2, "user", Some("claude"), None, "open")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .start_turn_record(&thread_id, 2, ProviderId::Claude, None)
+            .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("this thread still has an open turn; wait for settlement before retrying")
+        );
+        store
+            .lock()
+            .unwrap()
+            .finish_turn_record(&thread_id, 2, TurnPhase::Completed, None)
+            .unwrap();
+        state.overlay = Overlay::None;
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        store
+            .lock()
+            .unwrap()
+            .set_native_rewind_pending(&thread_id, ProviderId::Claude, 2)
+            .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("a provider-native rewind is still pending; finish that rewind before retrying")
+        );
+        store
+            .lock()
+            .unwrap()
+            .clear_native_rewind_pending(&thread_id)
+            .unwrap();
+        state.overlay = Overlay::None;
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        seed_running_task(&store, "ownerless-after-picker", &thread_id, None);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("this thread is part of a running orchestration; inspect /runs and wait for it to finish before retrying")
+        );
+    }
+
+    #[test]
+    fn retry_reconciles_a_dead_owner_and_keeps_an_ownerless_run_blocked() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        seed_terminal_turn(
+            &store,
+            &thread_id,
+            1,
+            "failed prompt",
+            TurnPhase::Failed,
+            Some("provider died"),
+        );
+        seed_running_task(&store, "dead-owner", &thread_id, Some(0));
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry 1");
+        assert!(matches!(state.overlay, Overlay::RetryPicker { .. }));
+        assert!(engine_command_receiver.try_recv().is_err());
+        {
+            let guard = store.lock().unwrap();
+            let run = guard
+                .find_orchestration_runs("dead-owner")
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let task = guard.list_orchestration_tasks("dead-owner").unwrap();
+            assert_ne!(run.status, "running");
+            assert_eq!(task[0].status, "failed");
+        }
+
+        state.overlay = Overlay::None;
+        seed_running_task(&store, "ownerless", &thread_id, None);
+        handle_command(&mut state, &store, &engine_command_sender, "/retry 1");
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("this thread is part of a running orchestration; inspect /runs and wait for it to finish before retrying")
+        );
+    }
+
+    #[test]
+    fn retry_refuses_a_turn_from_another_harness() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        seed_terminal_turn_for(
+            &store,
+            &thread_id,
+            1,
+            "codex prompt",
+            TurnPhase::Failed,
+            Some("provider died"),
+            ProviderId::Codex,
+        );
+        store
+            .lock()
+            .unwrap()
+            .set_thread_model(&thread_id, "claude-test-model")
+            .unwrap();
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        let Overlay::RetryPicker { choices, .. } = &state.overlay else {
+            panic!("expected the retry picker");
+        };
+        assert_eq!(choices.len(), 1);
+        assert!(!choices[0].same_provider);
+        let screen = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(screen.contains("current mode default"), "{screen}");
+        assert!(screen.contains("claude/claude-test-model"), "{screen}");
+        assert!(screen.contains("switch to codex to retry"), "{screen}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("switch back to codex before retrying"));
+    }
+
+    #[test]
+    fn retry_completion_lists_every_eligible_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        for turn in 1..=10 {
+            let prompt = if turn == 10 {
+                "x".repeat(500)
+            } else {
+                format!("prompt {turn}")
+            };
+            seed_terminal_turn(
+                &store,
+                &thread_id,
+                turn,
+                &prompt,
+                TurnPhase::Failed,
+                Some("provider died"),
+            );
+        }
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"defaultModels":{"claude":"configured-model"}}"#,
+        )
+        .unwrap();
+
+        state.input = "/retry ".to_string();
+        let choices = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .collect::<Vec<_>>();
+        assert_eq!(choices.len(), 10, "{choices:?}");
+        assert!(choices.contains(&"/retry 1".to_string()));
+        assert!(choices.contains(&"/retry 10".to_string()));
+
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/retry");
+        let Overlay::RetryPicker {
+            selected, choices, ..
+        } = &state.overlay
+        else {
+            panic!("expected the retry picker");
+        };
+        assert_eq!(*selected, 0);
+        assert_eq!(choices.len(), 10);
+        assert_eq!(choices[0].prompt_len, 500);
+        assert_eq!(choices[0].prompt_preview.chars().count(), 240);
+        let screen = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(screen.contains("no session; prompt only"), "{screen}");
+        assert!(screen.contains("turn 10 failed"), "{screen}");
+        assert!(screen.contains("claude/configured-model"), "{screen}");
+    }
+
+    #[test]
+    fn retry_picker_window_follows_the_selected_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::RetryPicker {
+            selected: 9,
+            choices: (1..=10)
+                .rev()
+                .map(|turn| RetryChoice {
+                    turn,
+                    phase: TurnPhase::Failed,
+                    provider: ProviderId::Claude.into(),
+                    model: None,
+                    error_preview: Some("provider died".into()),
+                    message_id: turn,
+                    prompt_preview: format!("prompt {turn}"),
+                    prompt_len: format!("prompt {turn}").chars().count(),
+                    same_provider: true,
+                    current_provider: ProviderId::Claude.into(),
+                    current_provider_id: ProviderId::Claude,
+                    current_model: None,
+                    effective_model: "claude-test-model".into(),
+                    permission_mode: PermissionMode::Default,
+                    native_session_id: None,
+                    session_covered_turn: None,
+                })
+                .collect(),
+        };
+
+        let screen = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(screen.contains("turn 1 failed"), "selected row: {screen}");
+        assert!(!screen.contains("turn 10 "), "oldest row hidden: {screen}");
+        assert!(screen.contains("10/10"), "position: {screen}");
+    }
+
+    #[test]
+    fn retry_completion_refreshes_when_a_running_turn_fails() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        store
+            .lock()
+            .unwrap()
+            .add_message(
+                &thread_id,
+                1,
+                "user",
+                Some("claude"),
+                None,
+                "running prompt",
+            )
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .start_turn_record(&thread_id, 1, ProviderId::Claude, None)
+            .unwrap();
+        state.history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        state.input = "/retry ".to_string();
+        assert!(suggestions_for(&state).is_empty());
+
+        store
+            .lock()
+            .unwrap()
+            .finish_turn_record(&thread_id, 1, TurnPhase::Failed, Some("provider died"))
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id,
+                ok: false,
+                error: Some("provider died".into()),
+                phase: TurnPhase::Failed,
+            },
+            &engine_command_sender,
+        );
+
+        let choices = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .collect::<Vec<_>>();
+        assert_eq!(choices, vec!["/retry 1".to_string()]);
+    }
+
+    #[test]
+    fn retry_picker_sanitizes_prompt_and_error_previews() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::RetryPicker {
+            selected: 0,
+            choices: vec![RetryChoice {
+                turn: 1,
+                phase: TurnPhase::Failed,
+                provider: ProviderId::Claude.into(),
+                model: None,
+                error_preview: Some("bell\u{7} error".into()),
+                message_id: 1,
+                prompt_preview: "bad\t\u{1b}[31m prompt".into(),
+                prompt_len: 16,
+                same_provider: true,
+                current_provider: ProviderId::Claude.into(),
+                current_provider_id: ProviderId::Claude,
+                current_model: None,
+                effective_model: "claude-test-model".into(),
+                permission_mode: PermissionMode::Default,
+                native_session_id: None,
+                session_covered_turn: None,
+            }],
+        };
+
+        let screen = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(!screen.contains('\u{1b}'), "raw escape: {screen}");
+        assert!(!screen.contains('\u{7}'), "raw bell: {screen}");
+        assert!(!screen.contains('\t'), "raw tab: {screen}");
+        assert!(
+            screen.contains("bad �[31m prompt"),
+            "sanitized prompt: {screen}"
+        );
+        assert!(screen.contains("bell� error"), "sanitized error: {screen}");
+
+        state.overlay = Overlay::RetryPicker {
+            selected: 0,
+            choices: vec![RetryChoice {
+                turn: 1,
+                phase: TurnPhase::Failed,
+                provider: ProviderId::Claude.into(),
+                model: None,
+                error_preview: Some(format!("first\n{}", "e".repeat(159))),
+                message_id: 1,
+                prompt_preview: "p".repeat(240),
+                prompt_len: 1000,
+                same_provider: true,
+                current_provider: ProviderId::Claude.into(),
+                current_provider_id: ProviderId::Claude,
+                current_model: None,
+                effective_model: "claude-test-model".into(),
+                permission_mode: PermissionMode::Default,
+                native_session_id: None,
+                session_covered_turn: None,
+            }],
+        };
+        let narrow = buffer_lines(&render_state(&state, 60, 20)).join("\n");
+        assert!(narrow.contains("selected prompt (1000 chars)"), "{narrow}");
+        assert!(narrow.contains("error: first e"), "{narrow}");
+        assert_eq!(narrow.matches("error:").count(), 1, "{narrow}");
+        let narrow = buffer_lines(&render_state(&state, 80, 24)).join("\n");
+        assert!(narrow.contains("retry one turn"), "{narrow}");
+        assert!(narrow.contains("current mode default"), "{narrow}");
+        assert!(narrow.contains("claude/claude-test-model"), "{narrow}");
+        assert!(narrow.contains("no session; prompt only"), "{narrow}");
     }
 
     #[test]
@@ -13338,9 +14996,10 @@ mod tests {
             &mut state,
             &store,
             EngineEvent::TurnRejected {
-                thread_id,
+                thread_id: thread_id.clone(),
                 text: "second".into(),
                 reason: "a turn is already running for this thread".into(),
+                retry: false,
             },
             &engine_command_sender,
         );
@@ -13358,6 +15017,32 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("already running"));
+
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnRejected {
+                thread_id: thread_id.clone(),
+                text: "retry".into(),
+                reason: "a turn is already running for this thread".into(),
+                retry: true,
+            },
+            &engine_command_sender,
+        );
+        assert_eq!(state.queued_messages, vec!["second".to_string()]);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
+            vec!["second".to_string()]
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("retry not queued"));
     }
 
     #[test]

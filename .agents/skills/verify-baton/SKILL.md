@@ -90,6 +90,7 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 |---|---|---|
 | Review overlay, line note, unsent storage | `scripts/review_probe.py` | one small Codex turn |
 | TUI native rewind (`/rewind --native`) | `scripts/rewind_probe.py` | zero, uses the OpenCode 401 fixture |
+| Retry a failed turn (`/retry`) | `scripts/retry_probe.py` | zero, uses a fake Claude harness |
 | Greeting in default orchestrate mode | `scripts/greeting_probe.py` | one small Codex turn |
 | MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, uses the OpenCode 401 seed |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |

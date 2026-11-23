@@ -50,6 +50,26 @@ pub struct TurnRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct RetryableTurnRow {
+    pub turn: i64,
+    pub provider: crate::types::ProviderKey,
+    pub model: Option<String>,
+    pub phase: TurnPhase,
+    pub error_preview: Option<String>,
+    pub message_id: i64,
+    pub prompt_preview: String,
+    pub prompt_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThreadOpenWork {
+    Turn,
+    Queue,
+    NativeRewind,
+    Orchestration,
+}
+
+#[derive(Debug, Clone)]
 pub struct ProviderSessionRow {
     pub thread_id: String,
     /// The stored name, including a configured agent Baton does not know yet.
@@ -1674,6 +1694,96 @@ impl BatonStore {
         Ok(rows)
     }
 
+    /// Failed and unverified turns with the first user message of each turn.
+    /// The first message is the original prompt; later user messages in the
+    /// same turn are steers and are not part of a retry payload.
+    pub fn list_retryable_turns(&self, thread_id: &str) -> Result<Vec<RetryableTurnRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT t.turn, t.provider, t.model, t.phase,
+                    CASE WHEN t.error IS NULL THEN NULL ELSE SUBSTR(t.error, 1, 160) END,
+                    m.id, SUBSTR(m.text, 1, 240), LENGTH(m.text)
+             FROM turns t
+             JOIN messages m ON m.id = (
+                 SELECT first.id FROM messages first
+                 WHERE first.thread_id = t.thread_id AND first.turn = t.turn AND first.role = 'user'
+                 ORDER BY first.id LIMIT 1
+             )
+             WHERE t.thread_id = ? AND t.phase IN ('failed', 'unverified')
+             ORDER BY t.turn DESC",
+        )?;
+        let rows = statement
+            .query_map(params![thread_id], |row| {
+                let provider: String = row.get(1)?;
+                let phase: String = row.get(3)?;
+                Ok(RetryableTurnRow {
+                    turn: row.get(0)?,
+                    provider: crate::types::ProviderKey::from_stored(&provider),
+                    model: row.get(2)?,
+                    phase: TurnPhase::parse(&phase).unwrap_or(TurnPhase::Unverified),
+                    error_preview: row.get(4)?,
+                    message_id: row.get(5)?,
+                    prompt_preview: row.get(6)?,
+                    prompt_len: row.get::<_, i64>(7)?.max(0) as usize,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// The full first user message for one confirmed retry row.
+    pub fn retry_prompt(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        message_id: i64,
+    ) -> Result<Option<String>> {
+        self.db
+            .query_row(
+                "SELECT text FROM messages WHERE id = ? AND thread_id = ? AND turn = ? AND role = 'user'",
+                params![message_id, thread_id, turn],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn turn_has_user_message(&self, thread_id: &str, turn: i64) -> Result<bool> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE thread_id = ? AND turn = ? AND role = 'user')",
+                params![thread_id, turn],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// The strongest durable reason this thread cannot start another turn.
+    /// This is not a distributed lease; startup and retry reconciliation own
+    /// the decision that an orchestration owner is gone.
+    pub fn thread_open_work(&self, thread_id: &str) -> Result<Option<ThreadOpenWork>> {
+        let (turn, queue, native_rewind, orchestration): (bool, bool, bool, bool) = self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM turns WHERE thread_id = ?1 AND phase IN ('queued', 'running', 'settling')),
+                    EXISTS(SELECT 1 FROM queued_messages WHERE thread_id = ?1),
+                    EXISTS(SELECT 1 FROM native_rewinds WHERE thread_id = ?1),
+                    EXISTS(SELECT 1 FROM orchestration_tasks task
+                           JOIN orchestration_runs run ON run.id = task.run_id
+                           WHERE task.thread_id = ?1 AND run.status = 'running')",
+            params![thread_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+        Ok(if turn {
+            Some(ThreadOpenWork::Turn)
+        } else if queue {
+            Some(ThreadOpenWork::Queue)
+        } else if native_rewind {
+            Some(ThreadOpenWork::NativeRewind)
+        } else if orchestration {
+            Some(ThreadOpenWork::Orchestration)
+        } else {
+            None
+        })
+    }
+
     /// A process that starts after a crash must not show a running turn as
     /// live. Mark unfinished turns in this project as unverified.
     pub fn reconcile_running_turns(&self, cwd: Option<&str>) -> Result<Vec<TurnRow>> {
@@ -2664,5 +2774,161 @@ mod tests {
             next_pin_order_key_from(later, Some(base)),
             "2026-01-02T03:04:05.006002Z"
         );
+    }
+
+    #[test]
+    fn retryable_turns_keep_the_first_prompt_and_exclude_open_or_completed_rows() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "retry".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        let first_prompt = "a".repeat(300);
+        store
+            .add_message(&thread.id, 1, "user", Some("claude"), None, &first_prompt)
+            .unwrap();
+        store
+            .add_message(&thread.id, 1, "user", Some("claude"), None, "steer")
+            .unwrap();
+        let first_error = format!("first\n{}", "e".repeat(220));
+        store
+            .start_turn_record(&thread.id, 1, ProviderId::Claude, None)
+            .unwrap();
+        store
+            .finish_turn_record(&thread.id, 1, TurnPhase::Failed, Some(&first_error))
+            .unwrap();
+        store
+            .add_message(&thread.id, 2, "user", Some("claude"), None, "done")
+            .unwrap();
+        store
+            .start_turn_record(&thread.id, 2, ProviderId::Claude, None)
+            .unwrap();
+        store
+            .finish_turn_record(&thread.id, 2, TurnPhase::Completed, None)
+            .unwrap();
+        store
+            .add_message(&thread.id, 3, "user", Some("claude"), None, "open")
+            .unwrap();
+        store
+            .start_turn_record(&thread.id, 3, ProviderId::Claude, None)
+            .unwrap();
+
+        let rows = store.list_retryable_turns(&thread.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn, 1);
+        assert_eq!(rows[0].provider.as_str(), "claude");
+        assert_eq!(rows[0].phase, TurnPhase::Failed);
+        assert_eq!(rows[0].error_preview.as_ref().unwrap().chars().count(), 160);
+        assert!(rows[0]
+            .error_preview
+            .as_deref()
+            .unwrap()
+            .starts_with("first\n"));
+        assert_eq!(rows[0].prompt_preview.chars().count(), 240);
+        assert_eq!(rows[0].prompt_len, 300);
+        assert_eq!(
+            store
+                .retry_prompt(&thread.id, 1, rows[0].message_id)
+                .unwrap()
+                .as_deref(),
+            Some(first_prompt.as_str())
+        );
+        assert!(store
+            .retry_prompt(&thread.id, 2, rows[0].message_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            store.thread_open_work(&thread.id).unwrap(),
+            Some(ThreadOpenWork::Turn)
+        );
+        store
+            .set_turn_phase(&thread.id, 3, TurnPhase::Queued)
+            .unwrap();
+        assert_eq!(
+            store.thread_open_work(&thread.id).unwrap(),
+            Some(ThreadOpenWork::Turn)
+        );
+        store
+            .set_turn_phase(&thread.id, 3, TurnPhase::Settling)
+            .unwrap();
+        assert_eq!(
+            store.thread_open_work(&thread.id).unwrap(),
+            Some(ThreadOpenWork::Turn)
+        );
+
+        store
+            .finish_turn_record(&thread.id, 3, TurnPhase::Completed, None)
+            .unwrap();
+        assert_eq!(store.thread_open_work(&thread.id).unwrap(), None);
+
+        store
+            .start_turn_record(&thread.id, 4, ProviderId::Claude, None)
+            .unwrap();
+        store
+            .finish_turn_record(&thread.id, 4, TurnPhase::Failed, Some("no prompt"))
+            .unwrap();
+        store
+            .add_message(&thread.id, 5, "user", Some("claude"), None, "stopped")
+            .unwrap();
+        store
+            .start_turn_record(&thread.id, 5, ProviderId::Claude, None)
+            .unwrap();
+        store
+            .finish_turn_record(&thread.id, 5, TurnPhase::Interrupted, None)
+            .unwrap();
+        assert!(!store.turn_has_user_message(&thread.id, 4).unwrap());
+        assert!(store.turn_has_user_message(&thread.id, 5).unwrap());
+        let rows = store.list_retryable_turns(&thread.id).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].turn, 1);
+
+        store.enqueue_message(&thread.id, "queued").unwrap();
+        assert_eq!(
+            store.thread_open_work(&thread.id).unwrap(),
+            Some(ThreadOpenWork::Queue)
+        );
+        store.clear_queued_messages(&thread.id).unwrap();
+        assert_eq!(store.thread_open_work(&thread.id).unwrap(), None);
+
+        store
+            .set_native_rewind_pending(&thread.id, ProviderId::Codex, 2)
+            .unwrap();
+        assert_eq!(
+            store.thread_open_work(&thread.id).unwrap(),
+            Some(ThreadOpenWork::NativeRewind)
+        );
+        store.clear_native_rewind_pending(&thread.id).unwrap();
+        assert_eq!(store.thread_open_work(&thread.id).unwrap(), None);
+
+        store
+            .db
+            .execute(
+                "INSERT INTO orchestration_runs (id, goal, coordinator_provider, coordinator_model, plan_json, status, created_at) VALUES ('run', 'goal', 'claude', 'm', '{}', 'running', 'now')",
+                [],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO orchestration_tasks (id, run_id, title, provider, model, prompt, thread_id, status, created_at) VALUES ('task', 'run', 'title', 'claude', 'm', 'prompt', ?, 'queued', 'now')",
+                params![thread.id],
+            )
+            .unwrap();
+        assert_eq!(
+            store.thread_open_work(&thread.id).unwrap(),
+            Some(ThreadOpenWork::Orchestration)
+        );
+        store
+            .db
+            .execute(
+                "UPDATE orchestration_runs SET status = 'completed' WHERE id = 'run'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(store.thread_open_work(&thread.id).unwrap(), None);
     }
 }

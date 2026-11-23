@@ -19,6 +19,11 @@ Open the TUI and type `/mode `, `/model`, `/switch `, `/effort `, `/auth `, `/me
 
 The probe types `/find ` and requires its argument syntax, then types `/mode `, requires all four permission choices and the completion hint, presses Tab to accept `default`, presses Enter, and requires the resulting `permission mode: default` notice. It then types `/model`, requires the model picker header, filter hint, and Enter/Escape affordances, requires a model count of at least two and at least two model option rows, and closes it with Escape. It types `/files ` and requires the `files [query]` argument syntax, runs `/files pmod rs:12`, requires the `files matching "pmod rs"` heading, the `line 12` target, the `src/parser/mod.rs` row found by two independent subsequence tokens, and the `enter insert` and `esc close` affordances, presses Enter, and requires the `inserted src/parser/mod.rs:12` notice. It reopens `/files ` and requires the picked file as the first recent row. It runs `/grep parse`, requires the `grep "parse"` heading, the `src/parser/mod.rs:1` row, and the `enter insert` and `esc close` affordances, presses Enter, and requires the `inserted src/parser/mod.rs:1` notice. It opens `/pin`, toggles a pinned row, closes that picker, creates and pins a second thread, then runs a real `/pin move <second-id> down`. It requires the moved notice, refreshed picker, and swapped row order, closes the picker, runs the same move again, requires the last-position boundary notice, reopens the picker, sends Ctrl+Down, requires the moved notice and refreshed row order while the picker stays open, and requires a clean `/quit`.
 
+The retry probe owns `/retry ` completion because it needs failed turns. It
+requires `/retry 1` and `/retry 10` with their failed-turn descriptions, then
+types the exact `/retry 1` form to prove it wins over the longer completion
+prefix, opens the picker, and completes the retry through the fake harness.
+
 Installed-binary proof: the same slash probe passed against the v0.4.0 default curl install and the v0.4.0 Homebrew binary. The stable summaries live in the gitignored `v0.4.0-release/curl/summary.json` and `v0.4.0-release/brew/summary.json` evidence directories.
 
 ## Gotchas

@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-Status on 2026-11-23: the historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds, with a 63.5-second median. The new fast classifier plus line-table test profile measured 51 seconds on a branch dispatch with a forced Rust rebuild: `Changes` completed at 6 seconds and `Test` at 35 seconds. This is a provisional critical-path result, not yet a PR p50; the first post-merge PR sample is still required. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
+Status on 2026-11-23: the historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds, with a 63.5-second median. The new fast classifier plus line-table test profile measured 51 seconds on a branch dispatch with a forced Rust rebuild, 48 seconds on the final head-tools dispatch, and 59 seconds on the first post-merge main push (Test 43 seconds). This is a provisional critical-path result, not yet a PR p50; the first post-merge PR sample is still required. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
 
 This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 
@@ -69,9 +69,10 @@ The test profile now keeps line tables and drops full debuginfo. The Cargo cache
 | [45115234795](https://github.com/billy-enrizky/baton/actions/runs/45115234795) | workflow_dispatch | warm cache, head tools | 53 seconds | 6 seconds | 33 seconds | Post-merge proof path; merged self-test, workflow guard, required commands, and budgets all passed |
 | [45117405274](https://github.com/billy-enrizky/baton/actions/runs/45117405274) | workflow_dispatch | warm cache, head tools | 62 seconds | 7 seconds | 48 seconds | Slower runner repeat; 5-second setup, 5-second checkout, 8-second toolchain restore, 7-second Cargo restore; all checks passed |
 | [45119247835](https://github.com/billy-enrizky/baton/actions/runs/45119247835) | workflow_dispatch | warm cache, head tools | 48 seconds | 5 seconds | 32 seconds | Final head-tools run; debt self-test passed, Clippy debt 61 <= 61, all gates green |
+| [45119477704](https://github.com/billy-enrizky/baton/actions/runs/45119477704) | push | main, warm cache | 59 seconds | 6 seconds | 43 seconds | First post-merge main push; merged tools, debt self-test, Clippy 61 <= 61, cache seed |
 | [45111201206](https://github.com/billy-enrizky/baton/actions/runs/45111201206) | pull_request | cold after profile change | 85 seconds | 5 seconds | 71 seconds | Pull-request cache did not inherit the branch cache; Selection failed at the expected CI013 workflow comparison |
 
-The 51-second run is the critical-path proof for this slice. It is not counted as a PR p50 sample because it is a dispatch. The 53-second head-tools branch dispatch proves the merged scripts and required-command enforcement on a branch; the first main push and the first post-merge pull request are still the acceptance samples.
+The 51-second run is the critical-path proof for this slice. It is not counted as a PR p50 sample because it is a dispatch. The 48-second head-tools dispatch and the 59-second main push prove the merged scripts, required-command enforcement, and the cache seed. The first post-merge pull request is still the PR acceptance sample.
 
 The toolchain-cache removal experiment was rejected. Removing the 391 MB `~/.rustup` restore made Setup Rust take about 9 seconds instead of about 6 seconds of restore plus 1 second of activation. Matched samples were 57 and 69 seconds with the cache removed, against 69 and 71 seconds with the cache retained; the difference was noise, not a gain. Runs 45108914603, 45109176611, 45109045484, and 45109314728 are recorded for that decision.
 
@@ -237,10 +238,11 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | CI admission model | `ci/formal/ci-admission/run.sh` | Passed locally |
 | Branch protection | `main` requires `Verify`, requires an up-to-date branch, blocks force pushes and deletions, and has admin enforcement off. User push restrictions are not available on a user-owned repository | Configured 2026-11-23; direct owner push remains a documented residual risk |
 | Fast classifier warm path | Branch dispatch 45114396442 with a forced Rust rebuild: 51 seconds, Changes complete at 6 seconds, Test 35 seconds | Passed 2026-11-23; post-merge PR sample pending |
-| Head-tools branch proof | Branch dispatch 45115234795: 53 seconds, Selection 12 seconds, merged self-test and workflow guard passed | Passed 2026-11-23; main-push proof pending |
+| Head-tools branch proof | Branch dispatch 45115234795: 53 seconds, Selection 12 seconds, merged self-test and workflow guard passed | Passed 2026-11-23; followed by main push 45119477704 |
 | Head-tools repeat | Branch dispatch 45117405274: 62 seconds, no skipped checks, slower setup and cache steps | Passed 2026-11-23; recorded without exclusion |
 | Head-tools final dispatch | Branch dispatch 45119247835: 48 seconds, Debt ratchet 32 seconds, debt self-test passed, Clippy debt 61 <= 61 | Passed 2026-11-23 |
 | Clippy ratchet color and count | `CARGO_TERM_COLOR=never` in the ratchet; compiler summary lines excluded; one-lint fixture passes a one-entry baseline | Passed locally and in 45119247835 |
+| First post-merge main push | Push 45119477704: 59 seconds, Test 43, head tools, debt self-test, Clippy 61 <= 61 | Passed 2026-11-23 |
 
 ## v0.4.0 release assets
 
@@ -263,7 +265,7 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 
 ## Open gaps
 
-- The current workflow has sixteen warm samples. The Rust median is 63.5 seconds and the maximum is 74 seconds. All p50 and p95 rows remain provisional until 100 runs or four weeks exist; the under-60 target is not met.
+- The historical sixteen-sample Rust median is 63.5 seconds. The new warm samples are 48, 51, 52, 53, 59, and 62 seconds, with the first main push at 59 seconds. A post-merge PR sample is still required, and all p50 and p95 rows remain provisional until 100 runs or four weeks exist.
 - The free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. A future proposal must be additive, not a replacement, keep an independent required x64 pre-merge Test job, and provide a matched rerun under the 100-run or four-week measurement policy. A merge queue alone is insufficient if it runs the same ARM job.
 - The docs-only samples are 44 seconds (historical) and 38 seconds (run 45077008165); n=2, median 41 seconds, max 44 seconds.
 - Queue p50 is 0 seconds on cited non-retry runs. Queue p95, setup p95, and cache hit rate are not established; setup has one 16-second sample against a 15-second target.

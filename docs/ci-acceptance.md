@@ -1,6 +1,6 @@
 # Baton CI acceptance record
 
-Status on 2026-11-23: the historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds, with a 63.5-second median. The new fast classifier plus line-table test profile measured 51 seconds on a branch dispatch with a forced Rust rebuild, 48 seconds on the final head-tools dispatch, and 59 seconds on the first post-merge main push (Test 43 seconds). The first post-merge PR, a meta CI-docs PR with the full suite selected, completed in 52 seconds. This is a provisional critical-path result, not yet a Rust PR p50; a post-merge Rust PR sample is still required. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
+Status on 2026-11-23: the historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds, with a 63.5-second median. The new fast classifier plus line-table test profile measured 51 seconds on a branch dispatch with a forced Rust rebuild, 48 seconds on the final head-tools dispatch, and 59 seconds on the first post-merge main push (Test 43 seconds). PR #177 was a post-merge feature sample: 55 seconds with Test at 41 seconds; its main push 45173850895 was 51 seconds with Test at 35 seconds. This is a provisional critical-path result, not yet a Rust PR p50; the last two feature PR and main pairs are still too small a sample. A free ARM runner was measured and rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The Rust-specific p50 is not accepted until 100 runs or four weeks exist.
 
 This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 
@@ -8,7 +8,7 @@ This file records the runs that changed a decision. It is not a complete archive
 
 | Target | Current evidence | Status |
 |---|---|---|
-| Rust PR feedback p50 under 60 seconds | Historical 16 warm Rust PRs: 52 to 74 seconds, median 63.5. Final branch dispatch with a forced Rust rebuild: 51 seconds | Provisional; the new critical path is under 60 on the branch, but a post-merge PR sample is required before acceptance |
+| Rust PR feedback p50 under 60 seconds | Historical 16 warm Rust PRs: 52 to 74 seconds, median 63.5. Post-merge feature PR #177: 55 seconds. Main push 45173850895: 51 seconds | Provisional; the recent feature samples are under 60 seconds, but the sample is too small for an accepted p50 |
 | Rust PR feedback p95 under 120 seconds | Sixteen Rust samples, n=16, max 74 seconds | Provisional |
 | Docs-only PR feedback p50 under 45 seconds | n=2: 44 seconds historical, 38 seconds in run 45077008165; median 41 seconds, max 44 seconds | Provisional met |
 | Queue p50 under 10 seconds | n=26 non-retry attempts, median 0 seconds, max 0 seconds; the one manual retry is excluded | Provisional met |
@@ -175,6 +175,8 @@ The per-repository worktree lock in PR #132 did not change CI wall time. It is k
 | [45147281203](https://github.com/billy-enrizky/baton/actions/runs/45147281203) | push | 64 seconds | not recorded | Claude watchdog main push |
 | [45158239304](https://github.com/billy-enrizky/baton/actions/runs/45158239304) | pull_request | 53 seconds | 32 seconds | `/grep` editor launch; 522 tests |
 | [45158698921](https://github.com/billy-enrizky/baton/actions/runs/45158698921) | push | 59 seconds | not recorded | `/grep` editor launch main push |
+| [45172642965](https://github.com/billy-enrizky/baton/actions/runs/45172642965) | pull_request | 55 seconds | 41 seconds | `/files --ignored`; 523 tests |
+| [45173850895](https://github.com/billy-enrizky/baton/actions/runs/45173850895) | push | 51 seconds | 35 seconds | `/files --ignored` main push |
 
 ## Cited run log
 
@@ -279,7 +281,7 @@ The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as 
 
 ## Open gaps
 
-- The historical sixteen-sample Rust median is 63.5 seconds. The new warm samples are 48, 51, 52, 53, 59, and 62 seconds, with the first main push at 59 seconds. A post-merge PR sample is still required, and all p50 and p95 rows remain provisional until 100 runs or four weeks exist.
+- The historical sixteen-sample Rust median is 63.5 seconds. The new warm samples include 48, 51, 52, 53, 55, 59, and 62 seconds, with feature main pushes at 51 and 59 seconds. The post-merge feature sample now exists, but all p50 and p95 rows remain provisional until 100 runs or four weeks exist.
 - The free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. A future proposal must be additive, not a replacement, keep an independent required x64 pre-merge Test job, and provide a matched rerun under the 100-run or four-week measurement policy. A merge queue alone is insufficient if it runs the same ARM job.
 - The docs-only samples are 44 seconds (historical) and 38 seconds (run 45077008165); n=2, median 41 seconds, max 44 seconds.
 - Queue p50 is 0 seconds on cited non-retry runs. Queue p95, setup p95, and cache hit rate are not established; setup has one 16-second sample against a 15-second target.

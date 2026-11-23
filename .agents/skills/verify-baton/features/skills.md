@@ -58,7 +58,7 @@ The first Enter opens the picker. Down selects the next source row. The second E
   --evidence-dir local_docs/verification/evidence
 ```
 
-The probe creates isolated `CLAUDE_CONFIG_DIR` and `CODEX_HOME` trees with one skill each and a real `SKILL.md`. It requires `skills (2)`, `enter insert`, both source rows, selects the Codex row with Down, presses Enter, requires the insertion notice and orchestrate warning, and checks the composer line itself for `$codex-demo `.
+The probe creates isolated `CLAUDE_CONFIG_DIR` and `CODEX_HOME` trees with one skill each and a real `SKILL.md`. It requires `skills (2)`, `enter insert`, both source rows, selects the Codex row with Down, presses Enter, requires the insertion notice plus the source and orchestrate warnings, and checks the composer line itself for `$codex-demo `.
 
 ### Unit proof
 

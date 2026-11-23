@@ -22,6 +22,7 @@ pub mod process;
 pub mod provider_runtime;
 pub mod redact;
 pub mod resume;
+pub mod roles;
 pub mod runtime;
 pub mod sanitize;
 pub mod scanner;

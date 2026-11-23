@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 
 use crate::adapters::{AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
-use crate::config::{describe_auth, load_config_file, resolve_config, save_config_file};
+use crate::config::{
+    describe_auth, load_config_file, load_config_file_strict, resolve_config, save_config_file,
+};
 use crate::handoff::git_branch_label;
 use crate::inbox::{self, InboxItem};
 use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
@@ -139,7 +141,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),
     ("/export", "export the conversation"),
-    ("/settings", "configure the current harness's settings"),
+    (
+        "/settings",
+        "configure global preferences and inspect harness settings",
+    ),
     ("/mcp", "manage MCP servers and sync across harnesses"),
     ("/skills", "list skills across harnesses"),
     ("/copy", "copy the latest assistant reply to the clipboard"),
@@ -468,7 +473,7 @@ enum Overlay {
     },
     SettingsPicker {
         provider: ProviderId,
-        categories: Vec<(String, Vec<String>)>,
+        categories: Vec<SettingsCategory>,
         category_index: usize,
         value_index: usize,
     },
@@ -556,6 +561,21 @@ enum Overlay {
     HandoffPreview {
         pending: Box<HandoffPrompt>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingsAction {
+    DefaultMode,
+    Bell,
+    ReadOnly,
+}
+
+#[derive(Debug, Clone)]
+struct SettingsCategory {
+    label: String,
+    values: Vec<String>,
+    current: usize,
+    action: SettingsAction,
 }
 
 struct HandoffPrompt {
@@ -3605,18 +3625,32 @@ fn handle_key(
         }
         Overlay::SettingsPicker {
             provider,
-            categories,
+            mut categories,
             mut category_index,
             mut value_index,
         } => match key.code {
             KeyCode::Esc => {}
-            KeyCode::Left => {
-                state.overlay = Overlay::SwitchPicker { selected: 0 };
+            KeyCode::Left | KeyCode::BackTab => {
+                if let Some(category) = categories.get(category_index) {
+                    if !category.values.is_empty() {
+                        value_index =
+                            (value_index + category.values.len() - 1) % category.values.len();
+                    }
+                }
+                state.overlay = Overlay::SettingsPicker {
+                    provider,
+                    categories,
+                    category_index,
+                    value_index,
+                };
             }
             KeyCode::Up => {
                 if !categories.is_empty() {
                     category_index = (category_index + categories.len() - 1) % categories.len();
-                    value_index = 0;
+                    value_index = categories
+                        .get(category_index)
+                        .map(|category| category.current)
+                        .unwrap_or(0);
                 }
                 state.overlay = Overlay::SettingsPicker {
                     provider,
@@ -3628,7 +3662,10 @@ fn handle_key(
             KeyCode::Down => {
                 if !categories.is_empty() {
                     category_index = (category_index + 1) % categories.len();
-                    value_index = 0;
+                    value_index = categories
+                        .get(category_index)
+                        .map(|category| category.current)
+                        .unwrap_or(0);
                 }
                 state.overlay = Overlay::SettingsPicker {
                     provider,
@@ -3638,9 +3675,9 @@ fn handle_key(
                 };
             }
             KeyCode::Right | KeyCode::Tab => {
-                if let Some((_, values)) = categories.get(category_index) {
-                    if !values.is_empty() {
-                        value_index = (value_index + 1) % values.len();
+                if let Some(category) = categories.get(category_index) {
+                    if !category.values.is_empty() {
+                        value_index = (value_index + 1) % category.values.len();
                     }
                 }
                 state.overlay = Overlay::SettingsPicker {
@@ -3651,11 +3688,31 @@ fn handle_key(
                 };
             }
             KeyCode::Enter => {
-                if let Some((label, values)) = categories.get(category_index) {
-                    if let Some(value) = values.get(value_index) {
-                        state.notice = Some(format!("{provider} {label}: {value}"));
+                if let Some(category) = categories.get_mut(category_index) {
+                    if let Some(value) = category.values.get(value_index).cloned() {
+                        match category.action {
+                            SettingsAction::ReadOnly => {
+                                state.notice = Some(format!(
+                                    "{provider} {} option: {value} · read-only; edit the harness settings directly",
+                                    category.label
+                                ));
+                            }
+                            action => match write_global_setting(state, action, &value) {
+                                Ok(notice) => {
+                                    category.current = value_index;
+                                    state.notice = Some(notice);
+                                }
+                                Err(error) => state.notice = Some(error),
+                            },
+                        }
                     }
                 }
+                state.overlay = Overlay::SettingsPicker {
+                    provider,
+                    categories,
+                    category_index,
+                    value_index,
+                };
             }
             _ => {
                 state.overlay = Overlay::SettingsPicker {
@@ -5792,6 +5849,69 @@ fn retry_turn(
     );
 }
 
+fn settings_categories(state: &TuiState) -> Vec<SettingsCategory> {
+    let mode_values = ["orchestrate", "single"];
+    let default_mode = crate::config::get_default_session_mode(&state.home);
+    let bell = crate::config::notifications(&state.home).bell;
+    let mut categories = vec![
+        SettingsCategory {
+            label: "default session mode".to_string(),
+            values: mode_values.iter().map(|value| value.to_string()).collect(),
+            current: mode_values
+                .iter()
+                .position(|value| *value == default_mode.as_str())
+                .unwrap_or(0),
+            action: SettingsAction::DefaultMode,
+        },
+        SettingsCategory {
+            label: "notifications bell".to_string(),
+            values: vec!["off".to_string(), "on".to_string()],
+            current: usize::from(bell),
+            action: SettingsAction::Bell,
+        },
+    ];
+    categories.extend(
+        sync::settings_for_provider(state.thread.current_provider)
+            .into_iter()
+            .map(|(label, values)| SettingsCategory {
+                label: label.to_string(),
+                values: values.into_iter().map(str::to_string).collect(),
+                current: 0,
+                action: SettingsAction::ReadOnly,
+            }),
+    );
+    categories
+}
+
+fn write_global_setting(
+    state: &mut TuiState,
+    action: SettingsAction,
+    value: &str,
+) -> std::result::Result<String, String> {
+    let mut file = load_config_file_strict(&state.home)
+        .map_err(|error| format!("cannot save config: {error}"))?
+        .unwrap_or_default();
+    let notice = match action {
+        SettingsAction::DefaultMode => {
+            let mode = SessionMode::parse(value)
+                .ok_or_else(|| "invalid session mode choice".to_string())?;
+            file.default_mode = Some(mode.as_str().to_string());
+            format!("default session mode set to {mode}; applies to new sessions")
+        }
+        SettingsAction::Bell => {
+            let enabled = value == "on";
+            file.notifications.bell = enabled;
+            format!("notifications bell {}", if enabled { "on" } else { "off" })
+        }
+        SettingsAction::ReadOnly => return Err("setting is read-only".to_string()),
+    };
+    save_config_file(&state.home, &file).map_err(|error| format!("cannot save config: {error}"))?;
+    if action == SettingsAction::Bell {
+        state.bell_enabled = value == "on";
+    }
+    Ok(notice)
+}
+
 fn handle_command(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -6568,21 +6688,16 @@ fn handle_command(
             }
         }
         "/settings" => {
-            let categories: Vec<(String, Vec<String>)> =
-                sync::settings_for_provider(state.thread.current_provider)
-                    .into_iter()
-                    .map(|(label, values)| {
-                        (
-                            label.to_string(),
-                            values.into_iter().map(str::to_string).collect(),
-                        )
-                    })
-                    .collect();
+            let categories = settings_categories(state);
+            let value_index = categories
+                .first()
+                .map(|category| category.current)
+                .unwrap_or(0);
             state.overlay = Overlay::SettingsPicker {
                 provider: state.thread.current_provider,
                 categories,
                 category_index: 0,
-                value_index: 0,
+                value_index,
             };
         }
         "/mcp" => {
@@ -8220,19 +8335,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::ModelPicker { models, filter, .. } => {
                 model_filter_indices(models, filter).len().min(8) + 4
             }
-            Overlay::SettingsPicker {
-                categories,
-                category_index,
-                ..
-            } => {
-                categories
-                    .get(*category_index)
-                    .map(|(_, values): &(String, Vec<String>)| values.len())
-                    .unwrap_or(0)
-                    .min(6)
-                    + categories.len().min(4)
-                    + 4
-            }
+            Overlay::SettingsPicker { categories, .. } => categories.len().min(5) + 5,
             Overlay::McpPicker { .. } => 8,
             Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
@@ -8785,15 +8888,22 @@ fn draw_settings_picker(
     frame: &mut ratatui::Frame,
     area: Rect,
     provider: ProviderId,
-    categories: &[(String, Vec<String>)],
+    categories: &[SettingsCategory],
     category_index: usize,
     value_index: usize,
 ) {
     let mut lines: Vec<Line> = vec![Line::styled(
-        format!("{provider} settings · ←back · ↑↓ category · →/tab value · enter apply"),
+        format!("{provider} + global · ↑↓ categories · ←→ values · enter apply · esc"),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, (label, values)) in categories.iter().enumerate() {
+    let visible = categories.len().min(5);
+    let start = if category_index < visible {
+        0
+    } else {
+        (category_index + 1 - visible).min(categories.len().saturating_sub(visible))
+    };
+    for (offset, category) in categories[start..start + visible].iter().enumerate() {
+        let index = start + offset;
         let style = if index == category_index {
             Style::default()
                 .fg(COLORS.accent)
@@ -8801,11 +8911,52 @@ fn draw_settings_picker(
         } else {
             Style::default().fg(COLORS.muted)
         };
-        let current_value = values
-            .get(value_index)
-            .map(|value| value.as_str())
-            .unwrap_or("?");
-        lines.push(Line::styled(format!("❯ {label}: {current_value}"), style));
+        if category.action == SettingsAction::ReadOnly {
+            lines.push(Line::styled(
+                format!("❯ {} · read-only", category.label),
+                style,
+            ));
+        } else {
+            let shown_index = if index == category_index {
+                value_index
+            } else {
+                category.current
+            };
+            let shown_value = category
+                .values
+                .get(shown_index)
+                .map(|value| value.as_str())
+                .unwrap_or("?");
+            let mut suffix = String::new();
+            if index == category_index && shown_index != category.current {
+                if let Some(current) = category.values.get(category.current) {
+                    suffix.push_str(&format!(" · current {current}"));
+                }
+            }
+            lines.push(Line::styled(
+                format!("❯ {}: {shown_value}{suffix}", category.label),
+                style,
+            ));
+        }
+    }
+    if let Some(category) = categories.get(category_index) {
+        let options = category
+            .values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| {
+                if index == value_index {
+                    format!("[{value}]")
+                } else {
+                    value.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        lines.push(Line::styled(
+            format!("options: {options}"),
+            Style::default().fg(COLORS.muted),
+        ));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -12471,6 +12622,169 @@ mod tests {
         .unwrap();
         state = test_state(home.path(), &store, Vec::new());
         assert!(state.bell_enabled);
+    }
+
+    #[test]
+    fn settings_picker_shows_global_and_read_only_harness_options() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::config::config_path(home.path()),
+            r#"{"defaultMode":"single","notifications":{"bell":true}}"#,
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/settings");
+
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("claude + global"), "{text}");
+        assert!(text.contains("default session mode: single"), "{text}");
+        assert!(text.contains("notifications bell: on"), "{text}");
+        assert!(text.contains("options: orchestrate · [single]"), "{text}");
+        assert!(text.contains("permission mode · read-only"), "{text}");
+        assert!(
+            text.contains("api key · read-only"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn settings_picker_writes_global_values_and_preserves_other_config() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            crate::config::config_path(home.path()),
+            r#"{"defaultModels":{"claude":"custom-model"}}"#,
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.session_mode = SessionMode::Orchestrate;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/settings");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Right),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+
+        assert_eq!(
+            crate::config::get_default_session_mode(home.path()),
+            SessionMode::Single
+        );
+        assert_eq!(state.thread.session_mode, SessionMode::Orchestrate);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("applies to new sessions"));
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Tab),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+
+        assert!(state.bell_enabled);
+        assert!(crate::config::notifications(home.path()).bell);
+        assert_eq!(state.notice.as_deref(), Some("notifications bell on"));
+        let config: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(crate::config::config_path(home.path())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config["defaultModels"]["claude"], "custom-model");
+        assert_eq!(config["defaultMode"], "single");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/new");
+        assert_eq!(state.thread.session_mode, SessionMode::Single);
+    }
+
+    #[test]
+    fn settings_picker_keeps_provider_rows_read_only() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/settings");
+
+        for _ in 0..2 {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Down),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Right),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+
+        assert!(matches!(state.overlay, Overlay::SettingsPicker { .. }));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("claude permission mode option: acceptEdits · read-only"));
+        assert!(!crate::config::config_path(home.path()).exists());
+    }
+
+    #[test]
+    fn settings_picker_refuses_to_overwrite_malformed_config() {
+        let home = tempfile::tempdir().unwrap();
+        let malformed = r#"{"providers":{"claude":{"api_key":"keep-me"},"#;
+        std::fs::write(crate::config::config_path(home.path()), malformed).unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/settings");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("cannot save config"));
+        assert_eq!(
+            std::fs::read_to_string(crate::config::config_path(home.path())).unwrap(),
+            malformed
+        );
     }
 
     #[test]

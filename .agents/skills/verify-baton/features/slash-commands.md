@@ -21,7 +21,7 @@ The probe types `/find ` and requires its argument syntax, then types `/mode `, 
 
 The probe filters `/auth antigravity ` and requires both billing choices. It opens `/auth`, requires the `1/12` position, the key row, the missing-key row, and the apply hint, wraps to `12/12`, applies `codex api`, checks the persisted mode, selects `grok api` without a key, and requires the picker to stay open with `no API key for grok` before Escape.
 
-The probe opens `/git`, selects Checks against a fake `gh`, requires the PR header and pass/pending rows, then creates and pushes `feat/pr`, runs `/git pr`, requires the confirmation with `feat/pr -> origin/main`, the generated title and body row, presses Enter, and requires the `opened pull request #43` notice with the fake URL.
+The probe opens `/git`, selects Checks against a fake `gh`, requires the PR header and pass/pending rows, then creates and pushes `feat/pr`, runs `/git pr`, requires the confirmation with `example/repo`, `feat/pr -> origin/main`, the generated title and body row, presses Enter, and requires the `opened pull request #43` notice with the fake URL. The fake `gh` rejects a pull request lookup or creation that omits the repository binding.
 
 The full sweep runs every command in one isolated session and requires each
 command's stable surface, no panic or unknown-command text, and a clean `/exit`:
@@ -48,4 +48,4 @@ Installed-binary proof: the same slash probe passed against the v0.4.0 default c
 - Turn-number choices for `/review`, `/commands`, and `/fork --turn` come from the current thread history.
 - `/mcp remove`, `/runs`, and `/copy` choices come from the MCP registry, current store, and conversation.
 - `/pin move ` offers both directions only for pinned threads in the current project. The probe enters the full ID from the picker row because the move notice, refreshed order, and boundary result are part of the proof.
-- `/git` completes status, commit, commit --staged, push, checks, and pr. The probe commits the isolated repository, checks the real git subject and exact file list, pushes to a local bare remote, checks its head, opens Checks against a fake `gh`, and requires the PR header and the pass/pending rows. It then pushes `feat/pr`; `/git pr` requires the base, title, body, and HEAD preview, and Enter requires the created PR notice and URL.
+- `/git` completes status, commit, commit --staged, push, checks, and pr. The unit tests execute both the picker Checks row and exact `/git checks`. The probe commits the isolated repository, checks the real git subject and exact file list, pushes to a local bare remote, checks its head, opens Checks against a fake `gh`, and requires the PR header and the pass/pending rows. It then pushes `feat/pr`; `/git pr` requires the repository, base, title, body, and HEAD preview, and Enter requires the created PR notice and URL.

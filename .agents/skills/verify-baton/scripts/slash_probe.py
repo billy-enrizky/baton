@@ -95,7 +95,7 @@ def main() -> int:
         "#!/bin/sh\n"
         "set -eu\n"
         "if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then\n"
-        "  printf '%s\\n' '{\"defaultBranchRef\":{\"name\":\"main\"}}'\n"
+        "  printf '%s\\n' '{\"defaultBranchRef\":{\"name\":\"main\"},\"nameWithOwner\":\"example/repo\"}'\n"
         "  exit 0\n"
         "fi\n"
         "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n"
@@ -104,6 +104,10 @@ def main() -> int:
         '{"number":42,"title":"Add checks","url":"https://github.com/example/repo/pull/42","state":"OPEN","mergeable":"MERGEABLE","headRefName":"feat/checks","isDraft":false}\n'
         "JSON\n"
         "    exit 0\n"
+        "  fi\n"
+        "  if [ \"${4:-}\" != \"--repo\" ] || [ \"${5:-}\" != \"example/repo\" ]; then\n"
+        "    printf 'missing --repo example/repo\\n' >&2\n"
+        "    exit 1\n"
         "  fi\n"
         "  printf 'no pull requests found for branch\\n' >&2\n"
         "  exit 1\n"
@@ -115,6 +119,10 @@ def main() -> int:
         "  exit 0\n"
         "fi\n"
         "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"create\" ]; then\n"
+        "  if [ \"${3:-}\" != \"--repo\" ] || [ \"${4:-}\" != \"example/repo\" ]; then\n"
+        "    printf 'missing --repo example/repo\\n' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
         "  printf 'https://github.com/example/repo/pull/43\\n'\n"
         "  exit 0\n"
         "fi\n"
@@ -696,6 +704,24 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
+        os.write(master, b"/git checks\r")
+        if not wait_for_screen(
+            master,
+            "Git checks · #42",
+            10.0,
+            transcript,
+            args.width,
+            args.height,
+        ):
+            missing.append("direct /git checks command")
+        direct_checks = screen_text(transcript, args.width, args.height)
+        for value in ["Add checks", "Test · SUCCESS"]:
+            if value not in direct_checks:
+                missing.append(f"direct /git checks row: {value}")
+        (evidence / "git-checks-direct-screen.txt").write_text(direct_checks + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
         subprocess.run(
             ["git", "-C", workdir, "checkout", "-q", "-b", "feat/pr"], check=True
         )
@@ -716,7 +742,7 @@ def main() -> int:
         pump(master, 0.2, transcript)
         git_pr = screen_text(transcript, args.width, args.height)
         for value in [
-            "Pull request · feat/pr → origin/main",
+            "Pull request · example/repo · feat/pr → origin/main",
             "title: Add pull request",
             "- Add pull request",
             "enter create",

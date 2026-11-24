@@ -149,7 +149,7 @@ def main() -> int:
         pump(master, 3.0, transcript)
         for index, (command, required) in enumerate(COMMANDS):
             os.write(master, command.encode())
-            pump(master, 0.35, transcript)
+            pump(master, 0.6, transcript)
             os.write(master, b"\r")
             pump(master, 0.9, transcript)
             screen = screen_text(transcript, args.width, args.height)

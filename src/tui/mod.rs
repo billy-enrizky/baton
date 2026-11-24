@@ -664,6 +664,7 @@ pub struct TuiState {
     input_cursor: usize,
     input_layout: std::cell::RefCell<Vec<InputRow>>,
     suggestion_cache: std::cell::RefCell<Option<(SuggestionCacheKey, Vec<CommandSuggestion>)>>,
+    git_pr_scroll_max: std::cell::Cell<usize>,
     running: bool,
     queued_provider: Option<ProviderId>,
     streaming_text: String,
@@ -778,6 +779,7 @@ pub fn run_tui(
         input_cursor: 0,
         input_layout: std::cell::RefCell::new(Vec::new()),
         suggestion_cache: std::cell::RefCell::new(None),
+        git_pr_scroll_max: std::cell::Cell::new(0),
         running: false,
         queued_provider: None,
         streaming_text: String::new(),
@@ -4611,7 +4613,8 @@ fn handle_key(
             }
         }
         Overlay::GitPrConfirm { plan, mut scroll } => {
-            let max = plan.body.lines().count().saturating_sub(1);
+            let max = state.git_pr_scroll_max.get();
+            scroll = scroll.min(max);
             match key.code {
                 KeyCode::Esc => open_git_picker(state, store),
                 KeyCode::Enter => create_git_pr(state, store, *plan),
@@ -7293,6 +7296,7 @@ fn handle_command(
                 open_git_confirm(state, store, mode, message.as_deref());
             }
             Some("push") => open_git_push_picker(state, store),
+            Some("checks") => open_git_checks(state),
             Some("pr") => {
                 let title = if args.len() > 1 {
                     Some(args[1..].join(" "))
@@ -9197,7 +9201,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 draw_git_checks(frame, chunks[1], report, *scroll)
             }
             Overlay::GitPrConfirm { plan, scroll } => {
-                draw_git_pr_confirm(frame, chunks[1], plan, *scroll)
+                draw_git_pr_confirm(frame, chunks[1], state, plan, *scroll)
             }
             Overlay::ModePicker { selected } => {
                 draw_mode_picker(frame, chunks[1], state, *selected)
@@ -10767,25 +10771,18 @@ fn draw_git_checks(
 fn draw_git_pr_confirm(
     frame: &mut ratatui::Frame,
     area: Rect,
+    state: &TuiState,
     plan: &crate::git_workflow::PullRequestPlan,
     scroll: usize,
 ) {
-    let body: Vec<&str> = plan.body.lines().collect();
-    let visible = body.len().min(10);
-    let start = if body.len() <= visible {
-        0
-    } else {
-        scroll.min(body.len() - visible)
-    };
-    let position = if body.len() > visible {
-        format!(" · {}/{}", start + 1, body.len())
-    } else {
-        String::new()
-    };
-    let mut lines = vec![
-        Line::styled(
+    let width = area.width.saturating_sub(2).max(1) as usize;
+    let inner_height = area.height.saturating_sub(2) as usize;
+    let mut header = Vec::new();
+    for (text, style) in [
+        (
             format!(
-                "Pull request · {} → {}/{} · {} commit(s){position} · enter create · esc back",
+                "Pull request · {} · {} → {}/{} · {} commit(s) · enter create · esc back",
+                git_line(&plan.repo),
                 git_line(&plan.branch),
                 git_line(&plan.remote),
                 git_line(&plan.base),
@@ -10793,27 +10790,67 @@ fn draw_git_pr_confirm(
             ),
             Style::default().fg(COLORS.muted),
         ),
-        Line::styled(
+        (
             format!("title: {}", git_line(&plan.title)),
             Style::default()
                 .fg(COLORS.secondary)
                 .add_modifier(Modifier::BOLD),
         ),
-        Line::styled(
+        (
             format!("head: {}", git_line(&plan.head)),
             Style::default().fg(COLORS.muted),
         ),
-    ];
-    for line in body.iter().skip(start).take(visible) {
-        lines.push(Line::styled(
-            git_line(line),
-            Style::default().fg(COLORS.text),
-        ));
+    ] {
+        for row in wrap_text_rows(&text, width) {
+            header.push(Line::styled(row, style));
+        }
     }
+    let body_height = inner_height.saturating_sub(header.len());
+    let mut body = Vec::new();
+    for line in plan.body.lines() {
+        for row in wrap_text_rows(&git_line(line), width) {
+            body.push(row);
+        }
+    }
+    let start = if body.len() <= body_height {
+        0
+    } else {
+        scroll.min(body.len() - body_height)
+    };
+    state
+        .git_pr_scroll_max
+        .set(body.len().saturating_sub(body_height));
+    let mut lines = header;
+    lines.extend(
+        body.into_iter()
+            .skip(start)
+            .take(body_height)
+            .map(|row| Line::styled(row, Style::default().fg(COLORS.text))),
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn wrap_text_rows(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for character in text.chars() {
+        if used == width {
+            rows.push(row);
+            row = String::new();
+            used = 0;
+        }
+        row.push(character);
+        used += 1;
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
+    rows
 }
 
 fn draw_thread_picker(
@@ -12528,6 +12565,7 @@ mod tests {
             input_cursor: 0,
             input_layout: std::cell::RefCell::new(Vec::new()),
             suggestion_cache: std::cell::RefCell::new(None),
+            git_pr_scroll_max: std::cell::Cell::new(0),
             running: false,
             queued_provider: None,
             streaming_text: String::new(),
@@ -21617,8 +21655,6 @@ exit 1
             &engine_command_sender,
             key(KeyCode::Enter),
         );
-        std::env::remove_var("BATON_GH_BIN");
-
         let Overlay::GitChecks { report, .. } = &state.overlay else {
             panic!("expected git checks overlay");
         };
@@ -21636,6 +21672,16 @@ exit 1
             key(KeyCode::Esc),
         );
         assert!(matches!(state.overlay, Overlay::None));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git checks");
+        assert!(matches!(state.overlay, Overlay::GitChecks { .. }));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        std::env::remove_var("BATON_GH_BIN");
     }
 
     #[test]
@@ -21657,12 +21703,8 @@ exit 1
             .output()
             .unwrap();
         let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
-        run_git(&[
-            "remote",
-            "add",
-            "origin",
-            "https://example.invalid/repo.git",
-        ]);
+        let origin = repo.path().to_string_lossy().to_string();
+        run_git(&["remote", "add", "origin", &origin]);
         run_git(&["update-ref", "refs/remotes/origin/main", &base]);
         run_git(&["checkout", "-q", "-b", "feat/pr"]);
         std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
@@ -21682,7 +21724,7 @@ exit 1
             r#"#!/bin/sh
 set -eu
 if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
-  printf '%s\n' '{"defaultBranchRef":{"name":"main"}}'
+  printf '%s\n' '{"defaultBranchRef":{"name":"main"},"nameWithOwner":"example/repo"}'
   exit 0
 fi
 if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
@@ -21729,11 +21771,30 @@ exit 1
         assert!(plan.body.contains("- Add feature"));
         let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
         assert!(
-            text.contains("Pull request · feat/pr → origin/main"),
+            text.contains("Pull request · example/repo · feat/pr → origin/main"),
             "{text}"
         );
         assert!(text.contains("title: Add feature"), "{text}");
         assert!(text.contains("- Add feature"), "{text}");
+
+        let Overlay::GitPrConfirm { plan, .. } = &mut state.overlay else {
+            unreachable!("the confirmation was checked above");
+        };
+        plan.title = format!("{}TITLE_END", "long title ".repeat(8));
+        plan.body = (0..20)
+            .map(|index| format!("body-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = render_state(&state, 80, 24);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::End),
+        );
+        let short = buffer_lines(&render_state(&state, 80, 24)).join("\n");
+        assert!(short.contains("TITLE_END"), "{short}");
+        assert!(short.contains("body-19"), "{short}");
 
         handle_key(
             &mut state,

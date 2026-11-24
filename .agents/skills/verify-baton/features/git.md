@@ -42,7 +42,7 @@ The TUI has three overlays: the picker, a read-only status view, and the confirm
 
 - Shelling out to `git` was chosen over `git2` or `gix`. Hooks, signing, configuration, and exact porcelain behavior come from the user's git; a library would add a dependency and still need to model them.
 - A per-checkout lease was not added. The slice uses the durable open-work check across threads sharing the worktree plus HEAD and tree fingerprint checks at commit time. The residual gap is a writer that changes content after the final fingerprint read; a future lease belongs in the durable store, not the TUI.
-- Per-file selection was deferred. All changes or the staged index covers the common finish path; Orca's staged/unstaged panel is a larger UI.
+- Per-file selection was deferred. All changes or the staged index covers the common finish path; a staged/unstaged panel is a larger UI.
 - `git add -A` plus `git commit` was chosen over `git commit --only -- <paths>`. The latter changes which index entries are committed and interacts poorly with partially staged files; the explicit staging and fingerprint keep the plan exact.
 - A deterministic message was chosen over a model or inline editor. It stays offline and testable; `/git commit <message>` supplies a custom message until an editor exists.
 - `--no-renames` was chosen so every path is deterministic. A rename is shown and committed as a deletion plus an addition.

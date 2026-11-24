@@ -13,7 +13,7 @@ A terminal user can see installed Claude Code and Codex skills, but Baton only l
 
 ## Non-goals
 
-- Installing, updating, or removing skills. Orca owns a separate install workflow; Baton reads existing skill directories.
+- Installing, updating, or removing skills. Baton does not own an install workflow; it reads existing skill directories.
 - A skill marketplace, metadata editor, or per-skill enable switch.
 - Project-level skill roots, skill descriptions, and skill execution inside the orchestration coordinator.
 - Rewriting a Codex-only skill for Claude or a Claude-only skill for Codex.
@@ -35,7 +35,7 @@ A terminal user can see installed Claude Code and Codex skills, but Baton only l
 - The validator requires at least one ASCII letter, permits ASCII letters, digits, `:`, `_`, and `-`, and rejects `memories` because `$memories` is a Baton memory token. A rejected name leaves the picker open.
 - The notice adds `switch to <source> before sending` when the row source differs from the current harness, and `/orchestrate off before sending` in orchestrate mode. It does not silently claim the current harness will use a different harness's skill.
 - Claude receives one native skill command per payload. The last known `$name` mention becomes `/name` at the start; all other text, including a goal prefix or handoff, remains as arguments. Earlier skill mentions stay literal in the arguments.
-- Claude dispatch ignores unknown names, mid-word mentions, punctuation immediately after the name, and names without an ASCII letter. This matches the T3 mention boundary and prevents `$123` from becoming a command.
+- Claude dispatch ignores unknown names, mid-word mentions, punctuation immediately after the name, and names without an ASCII letter. That boundary prevents `$123` from becoming a command.
 - The picker scrolls an eight-row window with Up and Down, wraps at both ends, and marks only the selected row with `❯`. Names are capped at 64 characters and sources at 16, with a trailing ellipsis when truncated.
 - Row labels replace newline, tab, and terminal control characters before rendering. Long labels cannot add visual rows or push the selected row outside the window.
 

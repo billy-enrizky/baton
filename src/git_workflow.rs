@@ -1964,11 +1964,18 @@ exit 1"#,
         );
     }
 
-    fn pr_repo() -> (tempfile::TempDir, tempfile::TempDir) {
+    fn pr_repo() -> tempfile::TempDir {
         let repo = repo();
         let base = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
-        let bare = bare_remote();
-        add_remote(repo.path(), "origin", bare.path());
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://example.invalid/repo.git",
+            ],
+        );
         git(
             repo.path(),
             &["update-ref", "refs/remotes/origin/main", &base],
@@ -1982,7 +1989,7 @@ exit 1"#,
             repo.path(),
             &["update-ref", "refs/remotes/origin/feat/pr", &head],
         );
-        (repo, bare)
+        repo
     }
 
     fn pr_gh(repo: &Path) -> PathBuf {
@@ -2003,7 +2010,7 @@ exit 1"#,
 
     #[test]
     fn plan_pr_builds_the_base_title_and_body() {
-        let (repo, _remote) = pr_repo();
+        let repo = pr_repo();
         let gh = pr_gh(repo.path());
         let plan = plan_pr_with(repo.path(), Some("Custom title"), &gh).unwrap();
         assert_eq!(plan.base, "main");
@@ -2024,7 +2031,7 @@ exit 1"#,
 
     #[test]
     fn plan_pr_refuses_existing_pr_and_unready_remote_states() {
-        let (repo, _remote) = pr_repo();
+        let repo = pr_repo();
         let existing_gh = fake_gh(
             repo.path(),
             "fake-gh-existing-pr",
@@ -2082,7 +2089,7 @@ exit 1"#,
 
     #[test]
     fn create_pr_uses_the_planned_arguments_and_rejects_a_moved_head() {
-        let (repo, _remote) = pr_repo();
+        let repo = pr_repo();
         let log = repo.path().join("gh.log");
         let gh = fake_gh(
             repo.path(),

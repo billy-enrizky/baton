@@ -21657,14 +21657,24 @@ exit 1
             .output()
             .unwrap();
         let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
-        let remote = git_bare_remote();
-        git_add_remote(repo.path(), "origin", remote.path());
+        run_git(&[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ]);
         run_git(&["update-ref", "refs/remotes/origin/main", &base]);
         run_git(&["checkout", "-q", "-b", "feat/pr"]);
         std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
         run_git(&["add", "."]);
         run_git(&["commit", "-q", "-m", "Add feature"]);
-        run_git(&["push", "-q", "origin", "feat/pr"]);
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        run_git(&["update-ref", "refs/remotes/origin/feat/pr", &head]);
 
         let gh = repo.path().join("fake-gh-pr");
         std::fs::write(

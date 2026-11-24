@@ -7,7 +7,7 @@
 - Requires provider and model together in an override; effort is rejected for providers that do not support it.
 - Embeds the orchestrator and planner prompts in the planner request. The planner prompt instructs tasks to default to the implementor provider when it is installed, otherwise to the coordinator provider. Code fills model and effort only when a task already names the selected role provider.
 - Places the implementor prompt after Baton's fixed worker preamble and before the task prompt. The preamble is always first in the request; Baton does not enforce whether the model follows it.
-- Parses and validates JSON hook declarations. Hook execution is still pending.
+- Parses and validates JSON hook declarations, and runs `before_plan`, `after_plan`, `before_implement`, and `after_implement` hooks with their declared timeout. The review hooks wait for the reviewer phase.
 - `/roles` shows the four rows and their detail; `baton roles --json` returns model, effort, prompt source/path, and parsed hook declarations.
 
 ## Problem statement
@@ -18,7 +18,7 @@ Role behavior was implicit in one coordinator prompt and one worker preamble. Us
 
 Goals: one validated role registry, explicit defaults, user prompt and model overrides, role-driven planning and worker execution, a TUI submenu, a machine-readable CLI, and fail-closed malformed configuration.
 
-Still out of scope: executing hooks, reviewer gating, full orchestrator turns for normal conversation, mutating role files from the TUI, and project-scoped roles. A greeting fallback copies only the orchestrator provider, model, and effort.
+Still out of scope: reviewer gating, the review hooks, full orchestrator turns for normal conversation, mutating role files from the TUI, and project-scoped roles. A greeting fallback copies only the orchestrator provider, model, and effort.
 
 ## Approach
 
@@ -106,7 +106,7 @@ The 2026-11-23 acceptance run used `rits/deepseek-ai/DeepSeek-V4.1-Flash-1017` t
 A second live run exercised the real planner path with `planner.effort = high`, no plan file, and no greeting fallback. `orchestrate --plan-only --json` returned one model-written implementation task with a non-fallback summary. The prompt unit test proves role composition and the no-reviewer sentence, and the coordinator command unit test proves effort forwarding.
 
 ## Gotchas
-- The reviewer role is visible and configurable, but reviewer gating and hook execution are not active yet.
+- The reviewer role is visible and configurable, but reviewer gating and the review hooks are not active yet. Plan and implement hooks do run.
 - Hooks are declared globally in `roles.json`; the `/roles` Enter detail and each `baton roles --json` role object repeat the same event names. Picker rows do not show them.
 - `~/.baton/roles.json` is read as strict JSON. A typo fails the command instead of using defaults.
 - A role markdown file overrides only that role's prompt; provider, model, and effort stay in JSON.

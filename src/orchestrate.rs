@@ -631,6 +631,7 @@ fn run_planner(
     effort: Option<&str>,
     default_worker: ProviderId,
 ) -> Result<Plan> {
+    crate::roles::run_hooks_from(roles, "before_plan", cwd)?;
     let base_prompt = planner_prompt(goal, cwd, max_tasks, available, roles, default_worker);
     let fallback = planner_failure_plan(goal, available, roles);
     let mut last_error: Option<anyhow::Error> = None;
@@ -668,10 +669,10 @@ fn run_planner(
         match parse_plan(&text, max_tasks)
             .and_then(|plan| validate_plan_providers(&plan, available).map(|()| plan))
         {
-            Ok(plan) => return Ok(plan),
+            Ok(plan) => return finish_plan(plan, roles, cwd),
             Err(error) => {
                 if plan_is_empty(&error) {
-                    return plan_after_planner_failure(&fallback, &error);
+                    return finish_plan(plan_after_planner_failure(&fallback, &error)?, roles, cwd);
                 }
                 last_error = Some(error);
             }
@@ -681,7 +682,14 @@ fn run_planner(
     if std::env::var_os("BATON_ORCHESTRATE_DEBUG").is_some() {
         eprintln!("[orchestrate] planner failed; using one direct worker: {error}");
     }
-    plan_after_planner_failure(&fallback, &error)
+    finish_plan(plan_after_planner_failure(&fallback, &error)?, roles, cwd)
+}
+
+/// Run the `after_plan` hooks before a plan can launch workers, including a
+/// fallback plan, so a failing project check stops the run.
+fn finish_plan(plan: Plan, roles: &RoleRegistry, cwd: &Path) -> Result<Plan> {
+    crate::roles::run_hooks_from(roles, "after_plan", cwd)?;
+    Ok(plan)
 }
 
 fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
@@ -976,6 +984,31 @@ fn run_worker_inner(
         .as_ref()
         .map(|worktree| worktree.path.clone())
         .unwrap_or_else(|| cwd.to_path_buf());
+    if let Err(error) = crate::roles::run_hooks(home, "before_implement", &worker_cwd) {
+        return (
+            index,
+            WorkerResult {
+                id: uuid::Uuid::new_v4().to_string(),
+                title: task.title.clone(),
+                provider,
+                model,
+                effort,
+                prompt: task.prompt.clone(),
+                worktree,
+                commit: None,
+                thread_id: None,
+                status: "failed".to_string(),
+                text: None,
+                error: Some(format!("before_implement hook failed: {error}")),
+                pr_url: None,
+                merged_at: None,
+                created_at,
+                finished_at: chrono::Utc::now()
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                snapshot: worker_snapshot,
+            },
+        );
+    }
     let binary = worker_bin
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_exe().ok())
@@ -1038,6 +1071,14 @@ fn run_worker_inner(
     };
     let mut error = error;
     let mut commit = None;
+    // A completed worker runs its post hook before the commit, so formatting
+    // and validation changes belong to the same commit.
+    if status == "completed" {
+        if let Err(hook_error) = crate::roles::run_hooks(home, "after_implement", &worker_cwd) {
+            status = "failed";
+            error = Some(format!("after_implement hook failed: {hook_error}"));
+        }
+    }
     if matches!(status, "completed" | "needs_input") {
         if let Some(worktree) = worktree.as_ref() {
             let message = format!("baton worker: {}", task.title);
@@ -2517,6 +2558,188 @@ pub fn task_rows(store: &BatonStore, run_id: &str) -> Result<Vec<OrchestrationTa
 mod tests {
     use super::*;
     use crate::store::BatonStore;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_before_plan_hook_aborts_the_plan() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("roles.json"),
+            r#"{"hooks":{"before_plan":[{"argv":["sh","-c","echo no plan >&2; exit 9"]}]}}"#,
+        )
+        .unwrap();
+        let roles = crate::roles::load(home.path()).unwrap();
+        let error = run_planner(
+            "ship it",
+            home.path(),
+            ProviderId::Codex,
+            "model",
+            4,
+            PermissionMode::Default,
+            None,
+            &[ProviderId::Codex],
+            &roles,
+            None,
+            ProviderId::Codex,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("before_plan"), "{error}");
+        assert!(error.to_string().contains("no plan"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_after_plan_hook_rejects_the_plan() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("roles.json"),
+            r#"{"hooks":{"after_plan":[{"argv":["sh","-c","exit 2"]}]}}"#,
+        )
+        .unwrap();
+        let roles = crate::roles::load(home.path()).unwrap();
+        let error = finish_plan(
+            fallback_plan("goal", ProviderId::Codex),
+            &roles,
+            home.path(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("after_plan"), "{error}");
+
+        let clean = tempfile::tempdir().unwrap();
+        let roles = crate::roles::load(clean.path()).unwrap();
+        let plan = finish_plan(
+            fallback_plan("goal", ProviderId::Codex),
+            &roles,
+            clean.path(),
+        )
+        .expect("no hooks means the plan passes");
+        assert_eq!(plan.tasks.len(), 1);
+    }
+
+    #[cfg(unix)]
+    fn hook_fixture(
+        roles: &str,
+        worker_body: &str,
+    ) -> (tempfile::TempDir, tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("roles.json"), roles).unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "hook@example.com"]);
+        git(&["config", "user.name", "hook"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.path().join("base.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        let worker = home.path().join("fake-worker");
+        std::fs::write(
+            &worker,
+            format!("#!/bin/sh\nset -eu\ncd \"$2\"\n{worker_body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (home, repo, worker)
+    }
+
+    #[cfg(unix)]
+    fn hooked_task() -> PlanTask {
+        PlanTask {
+            title: "hooked task".to_string(),
+            provider: "codex".to_string(),
+            model: None,
+            effort: None,
+            prompt: "do the work".to_string(),
+        }
+    }
+
+    const WORKER_SUCCESS: &str =
+        "printf '%s' '{\"thread_id\":\"t\",\"text\":\"done\",\"error\":null,\"phase\":\"completed\"}'";
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_before_implement_hook_stops_the_worker() {
+        let (home, repo, worker) = hook_fixture(
+            r#"{"hooks":{"before_implement":[{"argv":["sh","-c","echo blocked >&2; exit 4"]}]}}"#,
+            &format!("touch worker-ran.txt\n{WORKER_SUCCESS}"),
+        );
+        let (_, result) = run_worker_inner(
+            &hooked_task(),
+            0,
+            "hook-run-before",
+            home.path(),
+            repo.path(),
+            Some(repo.path()),
+            None,
+            Some(&worker),
+            "implementor",
+            None,
+            None,
+            PermissionMode::Default,
+        );
+        assert_eq!(result.status, "failed");
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("before_implement hook failed"), "{error}");
+        assert!(error.contains("blocked"), "{error}");
+        assert!(
+            !result
+                .worktree
+                .as_ref()
+                .expect("worktree")
+                .path
+                .join("worker-ran.txt")
+                .exists(),
+            "the worker must not start after a failing hook"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_passing_after_implement_hook_runs_before_the_commit() {
+        let (home, repo, worker) = hook_fixture(
+            r#"{"hooks":{"after_implement":[{"argv":["sh","-c","echo stamped > hook.txt"]}]}}"#,
+            &format!("echo made > worker.txt\n{WORKER_SUCCESS}"),
+        );
+        let (_, result) = run_worker_inner(
+            &hooked_task(),
+            0,
+            "hook-run-after",
+            home.path(),
+            repo.path(),
+            Some(repo.path()),
+            None,
+            Some(&worker),
+            "implementor",
+            None,
+            None,
+            PermissionMode::Default,
+        );
+        assert_eq!(result.status, "completed", "{:?}", result.error);
+        let commit = result.commit.expect("a commit with the hook output");
+        let worktree = result.worktree.expect("worktree");
+        let files = Command::new("git")
+            .args(["show", "--name-only", "--format=", &commit])
+            .current_dir(&worktree.path)
+            .output()
+            .unwrap();
+        assert!(files.status.success());
+        let listed = String::from_utf8_lossy(&files.stdout);
+        assert!(listed.contains("hook.txt"), "{listed}");
+        assert!(listed.contains("worker.txt"), "{listed}");
+    }
 
     #[test]
     fn progress_json_covers_each_orchestration_event() {

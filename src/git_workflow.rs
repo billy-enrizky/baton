@@ -233,6 +233,17 @@ pub fn commit(plan: &CommitPlan) -> Result<CommitOutcome> {
             );
         }
     }
+    let before_commit = inspect(&plan.root)?;
+    if before_commit.branch != plan.branch {
+        bail!(
+            "branch changed from {} to {}; review the commit again",
+            plan.branch,
+            before_commit.branch
+        );
+    }
+    if current_head(&plan.root)? != plan.head {
+        bail!("HEAD moved since the confirmation; review the commit again");
+    }
     git_text(
         &plan.root,
         &["commit", "--quiet", "--message", &plan.message],
@@ -248,6 +259,14 @@ pub fn commit(plan: &CommitPlan) -> Result<CommitOutcome> {
         }
     })?;
     let sha = git_text(&plan.root, &["rev-parse", "--short", "HEAD"])?;
+    let committed_tree = git_text(&plan.root, &["rev-parse", "HEAD^{tree}"])?;
+    if committed_tree.trim() != plan.fingerprint {
+        bail!(
+            "hooks changed the committed tree; commit {} has tree {}; review the hook and reset if needed",
+            sha.trim(),
+            committed_tree.trim()
+        );
+    }
     Ok(CommitOutcome {
         sha: sha.trim().to_string(),
         files: plan.files.len(),
@@ -357,9 +376,9 @@ fn repo_root(cwd: &Path) -> Result<PathBuf> {
         bail!("not inside a git repository: {}", cwd.display());
     }
     let output = git_bytes(cwd, &["rev-parse", "--show-toplevel"])?;
-    let root = std::str::from_utf8(&output)
-        .context("git reported a repository root that is not valid UTF-8")?
-        .trim();
+    let text = std::str::from_utf8(&output)
+        .context("git reported a repository root that is not valid UTF-8")?;
+    let root = text.strip_suffix('\n').unwrap_or(text);
     if root.is_empty() {
         bail!("not inside a git repository: {}", cwd.display());
     }
@@ -392,6 +411,7 @@ fn in_progress_operation(root: &Path) -> Result<Option<String>> {
         "REVERT_HEAD",
         "rebase-merge",
         "rebase-apply",
+        "sequencer",
         "BISECT_LOG",
     ] {
         let path = git_text(root, &["rev-parse", "--git-path", name])?;
@@ -407,6 +427,7 @@ fn in_progress_operation(root: &Path) -> Result<Option<String>> {
                 "CHERRY_PICK_HEAD" => "a cherry-pick".to_string(),
                 "REVERT_HEAD" => "a revert".to_string(),
                 "rebase-merge" | "rebase-apply" => "a rebase".to_string(),
+                "sequencer" => "a cherry-pick or revert sequence".to_string(),
                 "BISECT_LOG" => "a bisect".to_string(),
                 _ => name.to_string(),
             }));
@@ -639,6 +660,7 @@ mod tests {
             ("REVERT_HEAD", "revert"),
             ("rebase-merge", "rebase"),
             ("rebase-apply", "rebase"),
+            ("sequencer", "sequence"),
             ("BISECT_LOG", "bisect"),
         ] {
             std::fs::write(repo.path().join(".git").join(marker), "x\n").unwrap();
@@ -828,6 +850,51 @@ mod tests {
         let error = commit(&plan).unwrap_err();
         assert!(error.to_string().contains("all changes are now staged"));
         assert!(!inspect(repo.path()).unwrap().staged_files().is_empty());
+    }
+
+    #[test]
+    fn successful_hook_tree_changes_are_reported() {
+        let repo = repo();
+        std::fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        git(repo.path(), &["config", "core.hooksPath", ".git/hooks"]);
+        let hook = repo.path().join(".git").join("hooks").join("pre-commit");
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\necho hook >> hook.txt\ngit add hook.txt\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let plan = plan_commit(repo.path(), CommitMode::All, None).unwrap();
+        let error = commit(&plan).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("hooks changed the committed tree"),
+            "{error}"
+        );
+        let committed =
+            git_text(repo.path(), &["show", "--name-only", "--format=", "HEAD"]).unwrap();
+        assert!(
+            committed.lines().any(|line| line == "hook.txt"),
+            "{committed}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repository_root_preserves_a_trailing_space() {
+        let base = tempfile::tempdir().unwrap();
+        let root = base.path().join("repo ");
+        std::fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q", "-b", "main"]);
+        assert_eq!(
+            repo_root(&root).unwrap(),
+            std::fs::canonicalize(&root).unwrap()
+        );
     }
 
     #[test]

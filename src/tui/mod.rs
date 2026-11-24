@@ -2514,7 +2514,7 @@ fn compute_suggestions(state: &TuiState) -> Vec<CommandSuggestion> {
         let mut suggestions = argument_suggestions(state, command);
         suggestions.retain(|suggestion| suggestion.insert.starts_with(prefix));
         if prefix != command {
-            if command == "/retry" {
+            if matches!(command, "/retry" | "/git") {
                 if let Some(index) = suggestions
                     .iter()
                     .position(|suggestion| suggestion.insert == prefix)
@@ -3538,12 +3538,11 @@ fn apply_git_picker(
     store: &Arc<Mutex<BatonStore>>,
     selected: usize,
     status: crate::git_workflow::GitStatus,
-    blocked: Option<String>,
 ) {
     match selected {
         0 => open_git_status(state),
         1 | 2 => {
-            if let Some(reason) = blocked.or_else(|| git_open_work(state, store, &status.root)) {
+            if let Some(reason) = git_open_work(state, store, &status.root) {
                 state.notice = Some(git_line(&format!(
                     "git: {reason}; wait for it before committing"
                 )));
@@ -4346,7 +4345,7 @@ fn handle_key(
                     blocked,
                 };
             }
-            KeyCode::Enter => apply_git_picker(state, store, selected, *status, blocked),
+            KeyCode::Enter => apply_git_picker(state, store, selected, *status),
             _ => {
                 state.overlay = Overlay::GitPicker {
                     selected,
@@ -20755,6 +20754,25 @@ mod tests {
         assert!(blocked.as_deref().unwrap_or("").contains("open"));
         let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
         assert!(text.contains("commit blocked"), "{text}");
+
+        store
+            .lock()
+            .unwrap()
+            .finish_turn_record(&other.id, 1, TurnPhase::Completed, None)
+            .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::GitConfirm { .. }));
     }
 
     #[test]
@@ -20891,6 +20909,29 @@ mod tests {
             suggestions.contains(&"/git commit --staged".to_string()),
             "{suggestions:?}"
         );
+    }
+
+    #[test]
+    fn git_exact_commit_completion_runs_all_mode() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        std::fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/git commit".to_string();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(state.input.is_empty());
+        let Overlay::GitConfirm { plan, .. } = &state.overlay else {
+            panic!("exact /git commit should open the confirmation");
+        };
+        assert_eq!(plan.mode, crate::git_workflow::CommitMode::All);
     }
 
     #[test]

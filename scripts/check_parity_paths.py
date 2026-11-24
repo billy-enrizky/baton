@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify the upstream and Baton paths cited by docs/parity.md, and the status vocabulary."""
+"""Verify the upstream and Baton paths cited by .agents/parity.md, and the status vocabulary."""
 
 import argparse
 import logging
@@ -194,7 +194,7 @@ def exists(checkout: Path, commit: str, path: str) -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--document", type=Path, default=Path("docs/parity.md"))
+    parser.add_argument("--document", type=Path, default=Path(".agents/parity.md"))
     parser.add_argument("--repo", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
@@ -217,12 +217,12 @@ def main() -> int:
             LOGGER.info("ok %s %s", label, path)
 
     for line_number, label, path in missing:
-        LOGGER.error("docs/parity.md:%s missing %s path %s", line_number, label, path)
+        LOGGER.error(".agents/parity.md:%s missing %s path %s", line_number, label, path)
 
     unprefixed = list(iter_unprefixed_evidence(args.document))
     for line_number, claim in unprefixed:
         LOGGER.error(
-            "docs/parity.md:%s upstream evidence needs a T3:, Orca:, or Codex: prefix: %s",
+            ".agents/parity.md:%s upstream evidence needs a T3:, Orca:, or Codex: prefix: %s",
             line_number,
             claim,
         )
@@ -230,7 +230,7 @@ def main() -> int:
     bad_upstream = list(iter_bad_upstream_evidence(args.document))
     for line_number, claim, reason in bad_upstream:
         LOGGER.error(
-            "docs/parity.md:%s upstream evidence has %s: %s",
+            ".agents/parity.md:%s upstream evidence has %s: %s",
             line_number,
             reason,
             claim,
@@ -246,7 +246,7 @@ def main() -> int:
             LOGGER.info("ok baton %s", path)
 
     for line_number, path in baton_missing:
-        LOGGER.error("docs/parity.md:%s missing Baton path %s", line_number, path)
+        LOGGER.error(".agents/parity.md:%s missing Baton path %s", line_number, path)
 
     defined = delivery_codes(args.document)
     plan_refs = list(iter_plan_codes(args.document))
@@ -256,7 +256,7 @@ def main() -> int:
             bad_code.append((line_number, code))
 
     for line_number, code in bad_code:
-        LOGGER.error("docs/parity.md:%s Plan references undefined slice %s", line_number, code)
+        LOGGER.error(".agents/parity.md:%s Plan references undefined slice %s", line_number, code)
 
     statuses = list(iter_statuses(args.document))
     bad_status: list[tuple[int, str]] = []
@@ -265,12 +265,12 @@ def main() -> int:
             bad_status.append((line_number, status))
 
     for line_number, status in bad_status:
-        LOGGER.error("docs/parity.md:%s unknown status %s", line_number, status)
+        LOGGER.error(".agents/parity.md:%s unknown status %s", line_number, status)
 
     broken_rows = list(iter_broken_capability_rows(args.document))
     for line_number, cell_count in broken_rows:
         LOGGER.error(
-            "docs/parity.md:%s capability row has %s cells, expected 7",
+            ".agents/parity.md:%s capability row has %s cells, expected 7",
             line_number,
             cell_count,
         )

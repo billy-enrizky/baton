@@ -75,10 +75,10 @@ while IFS= read -r file; do
     *.rs|Cargo.toml|Cargo.lock|rust-toolchain.toml|build.rs)
       code=true
       ;;
-    .github/workflows/*|ci/*|docs/ci.md|docs/parity.md)
+    .github/workflows/*|ci/*|docs/ci.md|.agents/parity.md)
       meta=true
       ;;
-    docs/*|*.md|LICENSE)
+    docs/*|*.md|LICENSE|NOTICE)
       ;;
     *)
       unknown=true

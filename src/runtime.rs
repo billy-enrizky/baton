@@ -991,17 +991,32 @@ async fn execute_turn(
     let _ = engine_event_sender.send(EngineEvent::TurnStarted { thread_id: thread_id.to_string() });
 
     // Snapshot the worktree before the turn so its own edits can be diffed.
-    let start_captured = {
-        let start_path = std::path::PathBuf::from(&cwd_for_checkpoint);
-        start_path.exists() && {
+    // A clean tree is exactly HEAD, so its commit id is the snapshot and the
+    // five git processes a snapshot needs are skipped.
+    let start_path = std::path::PathBuf::from(&cwd_for_checkpoint);
+    let start_state = if start_path.exists() {
+        crate::checkpoints::worktree_state(&start_path).ok()
+    } else {
+        None
+    };
+    let start_clean = start_state
+        .as_ref()
+        .map(|state| state.clean)
+        .unwrap_or(false);
+    let start_head = start_state.as_ref().and_then(|state| state.head.clone());
+    let start_reference = match (start_clean, start_head.clone()) {
+        (true, Some(head)) => Some(head),
+        _ if start_path.exists() => {
             let start_ref = crate::checkpoints::checkpoint_start_ref(thread_id, turn);
             crate::checkpoints::capture_checkpoint_at(
                 &start_path,
                 &start_ref,
                 &format!("baton checkpoint {thread_id} turn {turn} start"),
             )
-            .is_ok()
+            .ok()
+            .map(|()| start_ref)
         }
+        _ => None,
     };
 
     let (event_sender, event_receiver) = std::sync::mpsc::channel::<TurnEvent>();
@@ -1144,23 +1159,25 @@ async fn execute_turn(
         }
         let cwd_path = std::path::PathBuf::from(&cwd_for_checkpoint);
         if cwd_path.exists() {
-            if let Ok(reference) = capture_checkpoint(&cwd_path, thread_id, turn) {
-                store
-                    .lock()
-                    .unwrap()
-                    .add_checkpoint(thread_id, turn, &reference)?;
-                // The turn's own changes, kept in the conversation as a diff.
-                if start_captured {
-                    let start = crate::checkpoints::checkpoint_start_ref(thread_id, turn);
-                    if let Ok(diff) =
-                        crate::checkpoints::diff_checkpoints(&cwd_path, &start, &reference)
-                    {
-                        if !diff.trim().is_empty() {
-                            let capped = cap_diff(&diff);
-                            let _ = store
-                                .lock()
-                                .unwrap()
-                                .add_message(thread_id, turn, "diff", None, None, &capped);
+            let end_state = crate::checkpoints::worktree_state(&cwd_path).ok();
+            if !turn_unchanged(start_clean, start_head.as_deref(), end_state.as_ref()) {
+                if let Ok(reference) = capture_checkpoint(&cwd_path, thread_id, turn) {
+                    store
+                        .lock()
+                        .unwrap()
+                        .add_checkpoint(thread_id, turn, &reference)?;
+                    // The turn's own changes, kept in the conversation as a diff.
+                    if let Some(start) = start_reference.as_deref() {
+                        if let Ok(diff) =
+                            crate::checkpoints::diff_checkpoints(&cwd_path, start, &reference)
+                        {
+                            if !diff.trim().is_empty() {
+                                let capped = cap_diff(&diff);
+                                let _ = store
+                                    .lock()
+                                    .unwrap()
+                                    .add_message(thread_id, turn, "diff", None, None, &capped);
+                            }
                         }
                     }
                 }
@@ -1177,6 +1194,19 @@ async fn execute_turn(
         rollout_path: outcome.rollout_path,
     }));
     Ok(())
+}
+
+/// A turn that neither edits the tree nor moves HEAD has nothing to restore or
+/// show, so it skips the checkpoint write entirely.
+fn turn_unchanged(
+    start_clean: bool,
+    start_head: Option<&str>,
+    end: Option<&crate::checkpoints::WorktreeState>,
+) -> bool {
+    start_clean
+        && end
+            .map(|state| state.clean && state.head.as_deref() == start_head)
+            .unwrap_or(false)
 }
 
 fn skill_dispatch_enabled() -> bool {
@@ -1285,6 +1315,33 @@ mod tests {
         assert!(
             catalog.models.contains(&"grok-4.6".to_string()),
             "the static catalog still appears"
+        );
+    }
+
+    #[test]
+    fn only_an_unchanged_clean_turn_skips_the_checkpoint() {
+        let clean = crate::checkpoints::WorktreeState {
+            clean: true,
+            head: Some("a".to_string()),
+        };
+        assert!(turn_unchanged(true, Some("a"), Some(&clean)));
+        assert!(
+            !turn_unchanged(true, Some("a"), None),
+            "a failed status check falls back to a snapshot"
+        );
+        let dirty = crate::checkpoints::WorktreeState {
+            clean: false,
+            head: Some("a".to_string()),
+        };
+        assert!(!turn_unchanged(true, Some("a"), Some(&dirty)));
+        let committed = crate::checkpoints::WorktreeState {
+            clean: true,
+            head: Some("b".to_string()),
+        };
+        assert!(!turn_unchanged(true, Some("a"), Some(&committed)));
+        assert!(
+            !turn_unchanged(false, Some("a"), Some(&clean)),
+            "a dirty start still needs the end snapshot"
         );
     }
 

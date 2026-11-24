@@ -9444,14 +9444,9 @@ fn draw_memory_picker(
     selected: usize,
 ) {
     let rows = listing.iter();
-    let visible = (area.height.saturating_sub(5) as usize).min(10);
     let count = listing.row_count();
     let selected = selected.min(count.saturating_sub(1));
-    let start = if visible == 0 || count <= visible {
-        0
-    } else {
-        selected.saturating_sub(visible - 1).min(count - visible)
-    };
+    let (start, visible) = memory_picker_window(listing, selected, area.height);
     let position = if count > visible {
         format!(" · {}/{}", selected + 1, count)
     } else {
@@ -9513,6 +9508,40 @@ fn draw_memory_picker(
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.border));
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn memory_picker_window(
+    listing: &crate::memory_files::MemoryListing,
+    selected: usize,
+    height: u16,
+) -> (usize, usize) {
+    let total = listing.row_count();
+    if total == 0 {
+        return (0, 0);
+    }
+    let inner = height.saturating_sub(2) as usize;
+    let titles = listing
+        .iter()
+        .map(|(section, _)| section.title)
+        .collect::<Vec<_>>();
+    let warning_lines = listing.warnings.len().min(3) + usize::from(listing.warnings.len() > 3);
+    let mut visible = total.min(10);
+    loop {
+        let start = if total <= visible {
+            0
+        } else {
+            selected.saturating_sub(visible - 1).min(total - visible)
+        };
+        let headers = 1 + titles[start..start + visible]
+            .windows(2)
+            .filter(|pair| pair[0] != pair[1])
+            .count();
+        let needed = 1 + headers + visible + warning_lines;
+        if needed <= inner || visible <= 1 {
+            return (start, visible);
+        }
+        visible -= 1;
+    }
 }
 
 fn draw_mode_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
@@ -19608,6 +19637,15 @@ mod tests {
             text.contains("Auto-memory  user unset · effective on · default"),
             "{text}"
         );
+        let last = match &state.overlay {
+            Overlay::MemoryPicker { listing, .. } => listing.row_count().saturating_sub(1),
+            _ => 0,
+        };
+        if let Overlay::MemoryPicker { selected, .. } = &mut state.overlay {
+            *selected = last;
+        }
+        let short = buffer_lines(&render_state(&state, 120, 15)).join("\n");
+        assert!(short.contains("Open auto-memory folder"), "{short}");
     }
 
     #[test]

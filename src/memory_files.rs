@@ -413,7 +413,7 @@ fn resolve_auto_memory(
         read_only_reason = Some("fix malformed or non-regular settings first".to_string());
     }
     if let Some(forced) = env.disable_auto_memory {
-        enabled = forced;
+        enabled = !forced;
         enabled_source = "CLAUDE_CODE_DISABLE_AUTO_MEMORY".to_string();
         can_toggle = false;
         read_only_reason = Some(if forced {
@@ -435,24 +435,28 @@ fn resolve_auto_memory(
     }
 
     let (mut directory, mut directory_source) = default_auto_memory_dir(root, env, warnings);
+    let mut cowork_applied = false;
     if let Some(path) = env.cowork_memory_path.as_deref() {
         if let Some(path) = absolute_setting_path(path, &env.home_dir) {
             directory = path;
             directory_source = "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE".to_string();
+            cowork_applied = true;
         } else {
             warnings.push(
                 "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE must be absolute or start with ~/".to_string(),
             );
         }
     }
-    if let Some((value, source)) = setting_string(&settings.user, "user settings") {
-        if let Some(path) = absolute_setting_path(Path::new(&value), &env.home_dir) {
-            directory = path;
-            directory_source = format!("autoMemoryDirectory in {source}");
-        } else {
-            warnings.push(format!(
-                "autoMemoryDirectory in {source} must be absolute or start with ~/"
-            ));
+    if !cowork_applied {
+        if let Some((value, source)) = setting_string(&settings.user, "user settings") {
+            if let Some(path) = absolute_setting_path(Path::new(&value), &env.home_dir) {
+                directory = path;
+                directory_source = format!("autoMemoryDirectory in {source}");
+            } else {
+                warnings.push(format!(
+                    "autoMemoryDirectory in {source} must be absolute or start with ~/"
+                ));
+            }
         }
     }
     for (settings, source) in [
@@ -1145,6 +1149,29 @@ mod tests {
     }
 
     #[test]
+    fn disable_auto_memory_environment_controls_the_effective_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut env = environment(temp.path());
+        env.disable_auto_memory = Some(true);
+        let listing = discover(temp.path(), &env);
+        assert!(!listing.auto_memory.enabled);
+        assert_eq!(
+            listing.auto_memory.enabled_source,
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+        );
+        assert!(!listing.auto_memory.can_toggle);
+
+        env.disable_auto_memory = Some(false);
+        let listing = discover(temp.path(), &env);
+        assert!(listing.auto_memory.enabled);
+        assert_eq!(
+            listing.auto_memory.enabled_source,
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+        );
+        assert!(!listing.auto_memory.can_toggle);
+    }
+
+    #[test]
     fn remote_memory_base_must_be_absolute_and_reports_its_source() {
         let temp = tempfile::tempdir().unwrap();
         let mut env = environment(temp.path());
@@ -1165,6 +1192,27 @@ mod tests {
         let listing = discover(temp.path(), &env);
         assert!(listing.auto_memory.directory.starts_with(&remote));
         assert_eq!(listing.auto_memory.directory_source, "remote memory base");
+    }
+
+    #[test]
+    fn cowork_override_wins_over_user_auto_memory_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut env = environment(temp.path());
+        std::fs::create_dir_all(&env.config_dir).unwrap();
+        std::fs::write(
+            env.config_dir.join("settings.json"),
+            r#"{"autoMemoryDirectory":"~/user-memory"}"#,
+        )
+        .unwrap();
+        let cowork = temp.path().join("cowork-memory");
+        env.cowork_memory_path = Some(cowork.clone());
+
+        let listing = discover(temp.path(), &env);
+        assert_eq!(listing.auto_memory.directory, cowork);
+        assert_eq!(
+            listing.auto_memory.directory_source,
+            "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE"
+        );
     }
 
     #[test]

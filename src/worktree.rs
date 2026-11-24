@@ -198,12 +198,7 @@ pub fn auto_memory_identity_root(cwd: &Path) -> Option<PathBuf> {
     if common.file_name().and_then(|name| name.to_str()) == Some(".git") {
         return common.parent().map(Path::to_path_buf);
     }
-    let is_submodule = common
-        .components()
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|pair| pair[0].as_os_str() == ".git" && pair[1].as_os_str() == "modules");
-    if !is_submodule {
+    if !is_submodule_common_dir(&common) {
         return Some(common);
     }
     if let Ok(worktree) = git_with_git_dir(cwd, &common, &["config", "--get", "core.worktree"]) {
@@ -218,6 +213,19 @@ pub fn auto_memory_identity_root(cwd: &Path) -> Option<PathBuf> {
         }
     }
     repo_root(cwd).ok()
+}
+
+fn is_submodule_common_dir(common: &Path) -> bool {
+    let parts = common
+        .components()
+        .map(|component| component.as_os_str())
+        .collect::<Vec<_>>();
+    let dot_git = std::ffi::OsStr::new(".git");
+    let modules = std::ffi::OsStr::new("modules");
+    let Some(git_index) = parts.iter().rposition(|part| *part == dot_git) else {
+        return false;
+    };
+    parts[git_index + 1..].contains(&modules)
 }
 
 pub fn is_dirty(repo_root: &Path) -> Result<bool> {
@@ -1159,5 +1167,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(auto_memory_identity_root(&worktree), Some(identity));
+    }
+
+    #[test]
+    fn submodule_common_dir_detection_handles_linked_superproject_worktrees() {
+        assert!(is_submodule_common_dir(Path::new(
+            "/repo/.git/modules/deps/sub"
+        )));
+        assert!(is_submodule_common_dir(Path::new(
+            "/repo/.git/worktrees/super-wt/modules/deps/sub"
+        )));
+        assert!(!is_submodule_common_dir(Path::new("/repo/.git")));
+        assert!(!is_submodule_common_dir(Path::new(
+            "/repo/.git/worktrees/super-wt"
+        )));
+        assert!(!is_submodule_common_dir(Path::new(
+            "/repo/modules/deps/sub"
+        )));
     }
 }

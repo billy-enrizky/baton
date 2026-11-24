@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Drive every advertised harness and record a live pass or explicit block."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -11,6 +13,11 @@ import tempfile
 import time
 import uuid
 from pathlib import Path
+
+if sys.version_info < (3, 10):
+    raise SystemExit(
+        "Python 3.10 or newer is required; run with `uv run --no-project python`."
+    )
 
 
 PROMPTS = {

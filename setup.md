@@ -136,12 +136,14 @@ Known events are `before_plan`, `after_plan`, `before_implement`, `after_impleme
 From a source checkout, the harness matrix probe records either a live turn or an explicit account block for each advertised harness:
 
 ```sh
-.agents/skills/verify-baton/scripts/harness_matrix_probe.py \
+uv run --no-project python .agents/skills/verify-baton/scripts/harness_matrix_probe.py \
   --binary target/debug/baton \
   --evidence-dir local_docs/verification/evidence
 ```
 
 The default run skips a live Claude turn and checks Cursor's capability only. Add `--include-claude` only when you approve a live Claude subscription turn.
+
+The probe requires Python 3.10 or newer. `uv run --no-project python` supplies it; a bare `python3` on macOS 3.9 exits with a version message.
 
 ## Troubleshooting
 

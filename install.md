@@ -1,6 +1,6 @@
 # Install Baton
 
-Baton ships as a single binary for macOS and Linux, plus a Windows x64 archive. The harness CLIs you want to drive are separate programs and must be on `PATH`.
+Baton ships as a single binary for macOS and Linux, plus a Windows x64 archive. The harness CLIs you want to drive are separate programs and must be on `PATH`. A harness is the coding agent CLI you already use, such as Codex, Claude Code, Cursor, Grok, OpenCode, or Antigravity.
 
 ## macOS and Linux
 

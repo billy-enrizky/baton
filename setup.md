@@ -1,6 +1,6 @@
 # Set up Baton
 
-Baton drives harness CLIs that you install and authenticate yourself. This guide covers the first run, provider login, API billing, custom endpoints, roles, MCP, skills, memory, and common failures.
+Baton drives harness CLIs that you install and authenticate yourself. A harness is the coding agent CLI you already use, such as Codex, Claude Code, Cursor, Grok, OpenCode, or Antigravity. This guide covers the first run, provider login, API billing, custom endpoints, roles, MCP, skills, memory, and common failures.
 
 ## What Baton needs from you
 
@@ -12,7 +12,7 @@ Optional, only for the features that use them:
 
 | Tool or setting | Needed for |
 |---|---|
-| Authenticated `gh` | `/git checks`, `/git pr`, `/task`, and pull request creation from an orchestration report. The rest of `/git` works without it. |
+| Authenticated `gh` | `/git checks`, `/git pr`, `/git review`, `/git merge`, `/task`, and worker pull requests from an orchestration report. The rest of `/git` works without it. |
 | `rg` | `/files` and `/grep`. Without it Baton falls back to `git grep` inside a repository. |
 | `VISUAL` or `EDITOR` | Opening a file from `/files`, `/grep`, or `/memory`. |
 | An MCP server | Whatever you add with `/mcp`; nothing is configured for you. |

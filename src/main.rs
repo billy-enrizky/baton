@@ -2161,6 +2161,62 @@ fn main_result(started: Instant) -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Agents { json } => {
+            let Some(thread_id) = cli.thread.as_deref() else {
+                anyhow::bail!("agents needs a thread id: baton agents -t <thread-id> [--json]");
+            };
+            let store = BatonStore::open(&paths::baton_db_path())?;
+            let thread = resolve_thread(&store, thread_id)?;
+            let rows = store.list_subagents(&thread.id)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "thread_id": thread.id,
+                        "subagents": rows.iter().map(|row| serde_json::json!({
+                            "id": row.id,
+                            "turn": row.turn,
+                            "provider": row.provider,
+                            "call_id": row.call_id,
+                            "name": row.name,
+                            "detail": row.detail,
+                            "status": row.status,
+                            "started_at": row.started_at,
+                            "finished_at": row.finished_at,
+                        })).collect::<Vec<_>>(),
+                    }))?
+                );
+            } else if rows.is_empty() {
+                println!(
+                    "no subagents recorded for {}",
+                    &thread.id[..8.min(thread.id.len())]
+                );
+            } else {
+                println!(
+                    "{} subagent(s) for {}",
+                    rows.len(),
+                    &thread.id[..8.min(thread.id.len())]
+                );
+                for row in &rows {
+                    println!(
+                        "  turn {:<3} {:<9} {} · {}{}",
+                        row.turn,
+                        row.status,
+                        sanitize::sanitize_terminal_text(&row.name),
+                        row.detail
+                            .as_deref()
+                            .map(|detail| sanitize::sanitize_terminal_text(detail))
+                            .unwrap_or_default(),
+                        row.call_id
+                            .as_deref()
+                            .map(|id| format!(" · {id}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            return Ok(());
+        }
         cli::Commands::Ps { json } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let rows = store.list_provider_processes()?;

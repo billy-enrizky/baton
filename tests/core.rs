@@ -749,6 +749,63 @@ fn threads_json_reports_pinned() {
 }
 
 #[test]
+fn agents_json_reports_subagent_rows_for_a_thread() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+    let thread = store
+        .create_thread(NewThread {
+            title: "agents".to_string(),
+            cwd: work.path().to_string_lossy().to_string(),
+            current_provider: ProviderId::Claude,
+            current_model: None,
+        })
+        .unwrap();
+    store
+        .add_subagent(
+            &thread.id,
+            2,
+            "claude",
+            Some("toolu_1"),
+            "Explore",
+            Some("Find the parser"),
+            "done",
+            "2026-01-01T00:00:00Z",
+            Some("2026-01-01T00:01:00Z"),
+        )
+        .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["-t", &thread.id, "agents", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["thread_id"], thread.id);
+    assert_eq!(value["subagents"][0]["name"], "Explore");
+    assert_eq!(value["subagents"][0]["status"], "done");
+    assert_eq!(value["subagents"][0]["turn"], 2);
+    assert_eq!(value["subagents"][0]["call_id"], "toolu_1");
+
+    let missing = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["agents"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("needs a thread id"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+}
+
+#[test]
 fn thread_pin_survives_store_reopen() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("baton.sqlite");

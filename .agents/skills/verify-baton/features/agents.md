@@ -8,10 +8,11 @@
 - A child from the current turn appears from the live `SubagentStarted`/`SubagentFinished` events and is marked `live`; the live list clears when the turn settles.
 - Enter or `y` copies the selected label. Escape closes.
 - The list is read-only and derived from the primary transcript and live tool list, so it adds no second source of truth.
+- `baton agents -t <thread-id> [--json]` reads the persisted subagent rows for scripts and agents.
 
 ## How to get to it (user POV)
 
-Run a turn that starts a subagent, then type `/agents`. The overlay names the count and every key. A running child appears from the live tool list; a finished child appears from the persisted tool message with its turn.
+Run a turn that starts a subagent, then type `/agents`, or run `baton agents -t <thread-id>` from a shell. The overlay names the count and every key. A running child appears from the live tool list; a finished child appears from the persisted tool message with its turn.
 
 ## Approach
 
@@ -33,4 +34,5 @@ The Claude adapter emits `SubagentStarted`/`SubagentFinished` for `Task` and `Ag
 - `subagent_events_are_persisted_with_the_turn`
 - `claude_adapter_reports_task_subagents`
 - `codex_adapter_reports_collab_and_subagent_activity`
+- `agents_json_reports_subagent_rows_for_a_thread`
 - The 50-command sweep runs `/agents` and requires the empty-state notice.

@@ -604,6 +604,12 @@ enum Overlay {
         provider: ProviderId,
         selected: usize,
     },
+    OrchestratePicker {
+        selected: usize,
+    },
+    GoalPicker {
+        selected: usize,
+    },
     RolesPicker {
         selected: usize,
         roles: Vec<crate::roles::RoleSpec>,
@@ -5023,6 +5029,80 @@ fn handle_key(
                 state.overlay = Overlay::AuthProviderPicker { provider, selected };
             }
         },
+        Overlay::OrchestratePicker { mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = (selected + 3) % 4;
+                state.overlay = Overlay::OrchestratePicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % 4;
+                state.overlay = Overlay::OrchestratePicker { selected };
+            }
+            KeyCode::Enter => match selected {
+                0 => {
+                    state.set_session_mode(store, SessionMode::Orchestrate);
+                    state.notice = Some("orchestrate mode: prompts spawn worker harnesses".into());
+                }
+                1 => {
+                    state.set_session_mode(store, SessionMode::Single);
+                    state.notice =
+                        Some("single harness mode: prompts run on the current provider".into());
+                }
+                2 => {
+                    state.input = "/orchestrate --plan-only ".to_string();
+                    state.overlay = Overlay::None;
+                }
+                _ => open_runs_picker(state, store, false),
+            },
+            _ => {
+                state.overlay = Overlay::OrchestratePicker { selected };
+            }
+        },
+        Overlay::GoalPicker { mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = (selected + 3) % 4;
+                state.overlay = Overlay::GoalPicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % 4;
+                state.overlay = Overlay::GoalPicker { selected };
+            }
+            KeyCode::Enter => match selected {
+                0 => {
+                    state.input = "/goal ".to_string();
+                    state.overlay = Overlay::None;
+                }
+                1 => match state.goal.clone() {
+                    Some(goal) => {
+                        state.set_goal_state(store, Some(goal), true);
+                        state.notice = Some("goal paused (not injected into new turns)".into());
+                    }
+                    None => {
+                        state.notice =
+                            Some("no goal to pause; set one with /goal <criteria>".into())
+                    }
+                },
+                2 => match state.goal.clone() {
+                    Some(goal) => {
+                        state.set_goal_state(store, Some(goal), false);
+                        state.notice = Some("goal resumed".into());
+                    }
+                    None => {
+                        state.notice =
+                            Some("no goal to resume; set one with /goal <criteria>".into())
+                    }
+                },
+                _ => {
+                    state.set_goal_state(store, None, false);
+                    state.notice = Some("goal cleared".into());
+                }
+            },
+            _ => {
+                state.overlay = Overlay::GoalPicker { selected };
+            }
+        },
         Overlay::ThreadPicker {
             selected,
             threads,
@@ -7205,12 +7285,8 @@ fn handle_command(
                         state.notice = Some(format!("goal set: {goal}"));
                     }
                 }
-            } else if let Some(goal) = &state.goal {
-                let suffix = if state.goal_paused { " (paused)" } else { "" };
-                state.notice = Some(format!("current goal{suffix}: {goal}"));
             } else {
-                state.notice =
-                    Some("usage: /goal <done criteria> · /goal pause|resume|clear".into());
+                state.overlay = Overlay::GoalPicker { selected: 0 };
             }
         }
         "/find" => {
@@ -7399,6 +7475,10 @@ fn handle_command(
             ));
         }
         "/orchestrate" => {
+            if args.is_empty() {
+                state.overlay = Overlay::OrchestratePicker { selected: 0 };
+                return;
+            }
             match args.first().map(String::as_str) {
                 Some("on") => {
                     state.set_session_mode(store, SessionMode::Orchestrate);
@@ -7455,44 +7535,7 @@ fn handle_command(
                     Err(error) => state.notice = Some(format!("cannot open run: {error}")),
                 }
             } else {
-                let runs = store
-                    .lock()
-                    .unwrap()
-                    .list_orchestration_runs(10)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|run| include_archived || run.archived_at.is_none())
-                    .collect::<Vec<_>>();
-                if runs.is_empty() {
-                    state.notice = Some(if include_archived {
-                        "no orchestration runs yet".to_string()
-                    } else {
-                        "no active orchestration runs; /runs --all includes archived runs"
-                            .to_string()
-                    });
-                } else {
-                    let choices: Vec<RunChoice> = runs
-                        .iter()
-                        .map(|run| RunChoice {
-                            id: run.id.clone(),
-                            label: format!(
-                                "{}  {:<9}  {}{}",
-                                &run.id[..8.min(run.id.len())],
-                                run.status,
-                                run.summary.as_deref().unwrap_or(&run.goal),
-                                if run.archived_at.is_some() {
-                                    " (archived)"
-                                } else {
-                                    ""
-                                }
-                            ),
-                        })
-                        .collect();
-                    state.overlay = Overlay::RunPicker {
-                        selected: 0,
-                        runs: choices,
-                    };
-                }
+                open_runs_picker(state, store, include_archived);
             }
         }
         "/status" => {
@@ -9595,6 +9638,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
             Overlay::ModePicker { .. } => 7,
             Overlay::AuthProviderPicker { .. } => 5,
+            Overlay::OrchestratePicker { .. } => 7,
+            Overlay::GoalPicker { .. } => 7,
             Overlay::AuthPicker { .. } => {
                 let wanted = PROVIDERS.len() * 2 + 3;
                 let reserved = 3 + notice_rows + composer_rows as usize + 1;
@@ -9737,6 +9782,12 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::AuthProviderPicker { provider, selected } => {
                 draw_auth_provider_picker(frame, chunks[1], state, *provider, *selected)
+            }
+            Overlay::OrchestratePicker { selected } => {
+                draw_orchestrate_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::GoalPicker { selected } => {
+                draw_goal_picker(frame, chunks[1], state, *selected)
             }
             Overlay::ThreadPicker {
                 selected,
@@ -11225,6 +11276,136 @@ fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
             ),
             style,
         ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn open_runs_picker(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, include_archived: bool) {
+    let runs = store
+        .lock()
+        .unwrap()
+        .list_orchestration_runs(10)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|run| include_archived || run.archived_at.is_none())
+        .collect::<Vec<_>>();
+    if runs.is_empty() {
+        state.notice = Some(if include_archived {
+            "no orchestration runs yet".to_string()
+        } else {
+            "no active orchestration runs; /runs --all includes archived runs".to_string()
+        });
+        return;
+    }
+    let choices: Vec<RunChoice> = runs
+        .iter()
+        .map(|run| RunChoice {
+            id: run.id.clone(),
+            label: format!(
+                "{}  {:<9}  {}{}",
+                &run.id[..8.min(run.id.len())],
+                run.status,
+                run.summary.as_deref().unwrap_or(&run.goal),
+                if run.archived_at.is_some() {
+                    " (archived)"
+                } else {
+                    ""
+                }
+            ),
+        })
+        .collect();
+    state.overlay = Overlay::RunPicker {
+        selected: 0,
+        runs: choices,
+    };
+}
+
+fn draw_orchestrate_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    selected: usize,
+) {
+    let rows = [
+        (
+            "Orchestrate mode",
+            "prompts spawn worker harnesses".to_string(),
+        ),
+        (
+            "Single harness mode",
+            "prompts run on the current provider".to_string(),
+        ),
+        (
+            "Plan-only goal",
+            "preview the plan before any worker starts".to_string(),
+        ),
+        ("Recent runs", "open the stored run list".to_string()),
+    ];
+    let mut lines = vec![Line::styled(
+        format!(
+            "orchestrate · current: {} · ↑↓ select · enter · esc close",
+            state.thread.session_mode.as_str()
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (label, detail)) in rows.iter().enumerate() {
+        let active = (index == 0 && state.thread.session_mode == SessionMode::Orchestrate)
+            || (index == 1 && state.thread.session_mode == SessionMode::Single);
+        let cursor = if index == selected { "❯" } else { " " };
+        let marker = if active { "●" } else { " " };
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(
+            format!("{cursor} {marker} {label} · {detail}"),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_goal_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
+    let current = match (&state.goal, state.goal_paused) {
+        (Some(goal), true) => format!("{goal} (paused)"),
+        (Some(goal), false) => goal.clone(),
+        (None, _) => "none".to_string(),
+    };
+    let rows = [
+        (
+            "Set a new goal",
+            "start typing the done criteria".to_string(),
+        ),
+        ("Pause goal", "stop injecting it into new turns".to_string()),
+        ("Resume goal", "inject it into new turns again".to_string()),
+        ("Clear goal", "remove it from this thread".to_string()),
+    ];
+    let mut lines = vec![Line::styled(
+        truncate_chars(
+            &format!("goal · current: {current} · ↑↓ select · enter · esc close"),
+            area.width.saturating_sub(2) as usize,
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (label, detail)) in rows.iter().enumerate() {
+        let cursor = if index == selected { "❯" } else { " " };
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(format!("{cursor} {label} · {detail}"), style));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -21456,6 +21637,123 @@ mod tests {
         assert_eq!(state.thread.reasoning_effort.as_deref(), Some("high"));
         let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
         assert!(text.contains("effort high"), "{text}");
+    }
+
+    #[test]
+    fn orchestrate_command_opens_a_picker_and_switches_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/orchestrate".to_string();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(
+            state.overlay,
+            Overlay::OrchestratePicker { selected: 0 }
+        ));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        for value in [
+            "orchestrate · current:",
+            "Orchestrate mode",
+            "Single harness mode",
+            "Plan-only goal",
+            "Recent runs",
+        ] {
+            assert!(text.contains(value), "{value} missing: {text}");
+        }
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.thread.session_mode, SessionMode::Single);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("single harness mode"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn goal_command_opens_a_picker_and_pauses_the_goal() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.goal = Some("ship the reviewer gate".to_string());
+        state.goal_paused = false;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/goal".to_string();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::GoalPicker { selected: 0 }));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        for value in [
+            "goal · current: ship the reviewer gate",
+            "Set a new goal",
+            "Pause goal",
+            "Resume goal",
+            "Clear goal",
+        ] {
+            assert!(text.contains(value), "{value} missing: {text}");
+        }
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(state.goal_paused);
+        assert_eq!(state.goal.as_deref(), Some("ship the reviewer gate"));
+    }
+
+    #[test]
+    fn goal_picker_set_row_returns_to_the_composer() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.goal = None;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.overlay = Overlay::GoalPicker { selected: 0 };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.input, "/goal ");
     }
 
     #[test]

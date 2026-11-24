@@ -22,7 +22,7 @@
 ## How to get to it (user POV)
 
 New interactive sessions start in orchestrate mode: type the goal in the composer. If the source checkout is dirty, baton asks first: Enter snapshots the working tree into each worker, `s` runs a single harness in the live checkout, Esc cancels. The startup banner shows the version, cwd, mode, model, reasoning effort when set, permissions, and billing. `/effort high` sets the current thread effort and `/effort default` clears it. Exact greetings run one normal turn; a plan with no tasks falls back to one worker. `/orchestrate --plan-only <goal>` previews the resolved plan in an overlay without creating a run; Enter starts that exact plan, Esc returns the goal to the composer.
-`/orchestrate off` or `/switch` moves to a single harness; `/orchestrate on` moves back. `/runs` lists recent runs, `/runs --all` includes archived runs, and `/runs <id>` reopens a stored worker report. MCP exposes the same durable history through `baton_orchestration_runs` and `baton_orchestration_report`.
+A bare `/orchestrate` opens a picker for orchestrate mode, single-harness mode, a plan-only goal, and recent runs. `/orchestrate off` or `/switch` moves to a single harness; `/orchestrate on` moves back. `/runs` lists recent runs, `/runs --all` includes archived runs, and `/runs <id>` reopens a stored worker report. MCP exposes the same durable history through `baton_orchestration_runs` and `baton_orchestration_report`.
 `baton --mode single` starts a single-harness session; `baton --mode orchestrate`
 forces orchestration. `baton --effort high` applies effort to an exec, new, or interactive thread; it is global only where the harness supports it. Set `"defaultMode": "single"` in `~/.baton/config.json` to opt out.
 

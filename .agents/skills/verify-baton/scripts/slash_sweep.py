@@ -50,9 +50,9 @@ COMMANDS = [
     ("/diff", ["no checkpoints yet"]),
     ("/rewind", ["nothing to rewind to yet"]),
     ("/retry", ["retry: no failed or unverified turns"]),
-    ("/goal", ["usage: /goal"]),
+    ("/goal", ["goal · current:", "Pause goal", "Clear goal"]),
     ("/multi", ["usage: /multi"]),
-    ("/orchestrate", ["usage: /orchestrate"]),
+    ("/orchestrate", ["orchestrate · current:", "Plan-only goal", "Recent runs"]),
     ("/orchestrate off", ["single harness mode"]),
     ("/orchestrate on", ["orchestrate mode"]),
     (

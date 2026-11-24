@@ -7,7 +7,7 @@ A terminal user can see installed Claude Code and Codex skills, but Baton only l
 ## Goals
 
 - Insert a selected skill into the composer with one key.
-- Use T3 Code's portable model: insert `$name` in the composer, then rewrite the final Claude payload to `/name` only when the harness is Claude.
+- Use the portable token model: insert `$name` in the composer, then rewrite the final Claude payload to `/name` only when the harness is Claude.
 - Keep the selected row visible past eight skills, sanitize row labels, and reject names that cannot form a provider token.
 - Keep the stored transcript in the user's `$name` form while the provider payload follows its native syntax.
 
@@ -76,7 +76,7 @@ cargo test --locked --lib sync::tests::skill_roots -- --nocapture
 
 - Insert `/name` directly into the composer. Rejected because Baton treats every leading `/` as one of its own commands, so `/review` would open Baton's review overlay and an unknown skill would produce `unknown command`.
 - Insert `/name` only after a hidden mode or bypass submit. Rejected because it adds a second composer grammar and still breaks when a goal or handoff prefix is prepended.
-- Insert `$name` for every source and rewrite only the final Claude payload. Chosen because it matches T3 Code's composer model, keeps the stored transcript portable, and survives goal and handoff wrappers because the rewrite runs after they are built.
+- Insert `$name` for every source and rewrite only the final Claude payload. Chosen because it keeps the stored transcript portable and survives goal and handoff wrappers because the rewrite runs after they are built.
 - Prefix the existing composer text for Claude. Rejected because `/skills` runs as a command and clears the composer before the picker opens, and a later goal or handoff wrapper can still move a leading slash away from the start.
 - Keep the picker display-only. Rejected because it leaves the user to remember the invocation syntax and was the gap this slice closes.
 

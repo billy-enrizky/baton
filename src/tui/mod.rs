@@ -358,9 +358,11 @@ enum ToolStatus {
 
 #[derive(Debug, Clone)]
 struct AgentEntry {
+    id: Option<String>,
     label: String,
     status: String,
     turn: i64,
+    live: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -787,6 +789,7 @@ pub struct TuiState {
     queued_provider: Option<ProviderId>,
     streaming_text: String,
     tool_lines: Vec<ToolLine>,
+    live_subagents: Vec<AgentEntry>,
     overlay: Overlay,
     approvals: Vec<ApprovalState>,
     review: Option<ReviewState>,
@@ -912,6 +915,7 @@ pub fn run_tui(
         queued_provider: None,
         streaming_text: String::new(),
         tool_lines: Vec::new(),
+        live_subagents: Vec::new(),
         overlay: Overlay::None,
         approvals: Vec::new(),
         review: None,
@@ -2570,17 +2574,77 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                 state.tool_lines.push(ToolLine { id, label, status });
             }
         }
+        TurnEvent::SubagentStarted { id, name, detail } => {
+            let label = match detail {
+                Some(detail) if !detail.is_empty() => format!("{name} · {detail}"),
+                _ => name,
+            };
+            if let Some(id) = id.as_deref() {
+                if let Some(entry) = state
+                    .live_subagents
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.status == "running" && entry.id.as_deref() == Some(id))
+                {
+                    entry.label = label;
+                    return;
+                }
+            }
+            state.live_subagents.push(AgentEntry {
+                id,
+                label,
+                status: "running".to_string(),
+                turn: 0,
+                live: true,
+            });
+        }
+        TurnEvent::SubagentFinished {
+            id,
+            name,
+            status,
+            detail,
+        } => {
+            let label = match detail {
+                Some(detail) if !detail.is_empty() => format!("{name} · {detail}"),
+                _ => name.clone(),
+            };
+            let matched = match id.as_deref() {
+                Some(id) => state
+                    .live_subagents
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.status == "running" && entry.id.as_deref() == Some(id)),
+                None => state
+                    .live_subagents
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| entry.status == "running" && entry.label.starts_with(&name)),
+            };
+            match matched {
+                Some(entry) => {
+                    entry.status = status;
+                    entry.label = label;
+                }
+                None => state.live_subagents.push(AgentEntry {
+                    id,
+                    label,
+                    status,
+                    turn: 0,
+                    live: true,
+                }),
+            }
+        }
         TurnEvent::ProviderTurnId { .. }
         | TurnEvent::ProviderSession { .. }
-        | TurnEvent::Usage { .. }
-        | TurnEvent::SubagentStarted { .. }
-        | TurnEvent::SubagentFinished { .. } => {}
+        | TurnEvent::Usage { .. } => {}
         // Approval requests need their thread id, so the run loop routes them
         // through apply_turn_event_for_thread before calling this function.
         TurnEvent::ApprovalRequest { .. } => {}
         TurnEvent::TurnCompleted { .. }
         | TurnEvent::TurnInterrupted { .. }
-        | TurnEvent::TurnFailed { .. } => {}
+        | TurnEvent::TurnFailed { .. } => {
+            state.live_subagents.clear();
+        }
     }
 }
 
@@ -8247,6 +8311,7 @@ fn handle_command(
             let mut entries = stored
                 .iter()
                 .map(|row| AgentEntry {
+                    id: row.call_id.clone(),
                     label: match row.detail.as_deref() {
                         Some(detail) if !detail.is_empty() => {
                             format!("{} · {detail}", row.name)
@@ -8255,12 +8320,24 @@ fn handle_command(
                     },
                     status: row.status.clone(),
                     turn: row.turn,
+                    live: false,
                 })
                 .collect::<Vec<_>>();
             if entries.is_empty() {
                 entries = agent_entries(state);
             }
+            for live in &state.live_subagents {
+                let duplicate = live.id.as_deref().is_some_and(|id| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.id.as_deref() == Some(id))
+                });
+                if !duplicate {
+                    entries.push(live.clone());
+                }
+            }
             if entries.is_empty() {
+                state.overlay = Overlay::None;
                 state.notice = Some(
                     "no subagent tool calls in this thread; Claude Task calls appear here"
                         .to_string(),
@@ -11925,9 +12002,11 @@ fn agent_entries(state: &TuiState) -> Vec<AgentEntry> {
             continue;
         }
         entries.push(AgentEntry {
+            id: line.id.clone(),
             label: line.label.clone(),
             status: status.to_string(),
             turn: 0,
+            live: true,
         });
     }
     for message in tool_messages(state, None) {
@@ -11949,9 +12028,11 @@ fn agent_entries(state: &TuiState) -> Vec<AgentEntry> {
             continue;
         }
         entries.push(AgentEntry {
+            id: None,
             label: label.to_string(),
             status: status.to_string(),
             turn: message.turn,
+            live: false,
         });
     }
     entries
@@ -11990,10 +12071,11 @@ fn draw_agents_picker(
             Style::default().fg(COLORS.muted)
         };
         let cursor = if index == selected { "❯" } else { " " };
+        let live = if entry.live { " · live" } else { "" };
         lines.push(Line::styled(
             truncate_chars(
                 &format!(
-                    "{cursor} {marker} {scope}{} · {}",
+                    "{cursor} {marker} {scope}{} · {}{live}",
                     entry.label, entry.status
                 ),
                 width,
@@ -14452,6 +14534,7 @@ mod tests {
             queued_provider: None,
             streaming_text: String::new(),
             tool_lines: Vec::new(),
+            live_subagents: Vec::new(),
             overlay: Overlay::None,
             approvals: Vec::new(),
             review: None,
@@ -26718,6 +26801,73 @@ exit 1
         let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
         assert!(text.contains("Explore · Find the parser"), "{text}");
         assert!(text.contains("turn 3"), "{text}");
+    }
+
+    #[test]
+    fn live_subagent_events_feed_agents_picker() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_turn_event(
+            &mut state,
+            TurnEvent::SubagentStarted {
+                id: Some("s1".into()),
+                name: "Explore".into(),
+                detail: Some("Find the parser".into()),
+            },
+        );
+        handle_command(&mut state, &store, &sender, "/agents");
+        let Overlay::AgentsPicker { entries, .. } = &state.overlay else {
+            panic!("expected the agents picker");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "Explore · Find the parser");
+        assert_eq!(entries[0].status, "running");
+        assert!(entries[0].live);
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("running · live"), "{text}");
+
+        apply_turn_event(
+            &mut state,
+            TurnEvent::SubagentFinished {
+                id: Some("s1".into()),
+                name: "Explore".into(),
+                status: "done".into(),
+                detail: Some("found the parser".into()),
+            },
+        );
+        assert_eq!(state.live_subagents.len(), 1);
+        assert_eq!(state.live_subagents[0].status, "done");
+        assert_eq!(
+            state.live_subagents[0].label,
+            "Explore · found the parser"
+        );
+        handle_command(&mut state, &store, &sender, "/agents");
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("done · live"), "{text}");
+
+        apply_turn_event(
+            &mut state,
+            TurnEvent::TurnCompleted {
+                final_text: "done".into(),
+                usage: None,
+                native_session_id: None,
+                rollout_path: None,
+            },
+        );
+        assert!(state.live_subagents.is_empty());
+        handle_command(&mut state, &store, &sender, "/agents");
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("no subagent tool calls"),
+            "{:?}",
+            state.notice
+        );
     }
 
     #[test]

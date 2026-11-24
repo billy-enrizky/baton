@@ -22,6 +22,25 @@ pub fn default_model(provider: ProviderId) -> &'static str {
     catalog(provider).first().copied().unwrap_or("default")
 }
 
+/// Keep the adapter's live order, then append known models the live probe
+/// omitted. A short or degraded listing must not hide a model the picker
+/// already knew.
+pub fn merge_live_catalog(provider: ProviderId, live: Vec<String>) -> Vec<String> {
+    let mut merged: Vec<String> = Vec::new();
+    for model in live {
+        let model = model.trim();
+        if !model.is_empty() && !merged.iter().any(|existing| existing == model) {
+            merged.push(model.to_string());
+        }
+    }
+    for known in catalog(provider) {
+        if !merged.iter().any(|existing| existing == known) {
+            merged.push((*known).to_string());
+        }
+    }
+    merged
+}
+
 /// The environment variable the harness itself reads for the API key. A
 /// custom `apiKeyEnv` changes where baton reads the key, not where the child
 /// expects it.
@@ -92,5 +111,38 @@ mod tests {
         let catalog = catalog(ProviderId::Codex);
         assert!(catalog.contains(&"gpt-6.2-sol"));
         assert!(catalog.contains(&"gpt-6.2-astra"));
+    }
+
+    #[test]
+    fn live_catalog_merge_keeps_live_order_and_adds_known_models() {
+        let merged = merge_live_catalog(
+            ProviderId::Codex,
+            vec![
+                " gpt-6.1-sol ".to_string(),
+                "new-model".to_string(),
+                "gpt-6.1-sol".to_string(),
+                String::new(),
+            ],
+        );
+        assert_eq!(merged[0], "gpt-6.1-sol");
+        assert_eq!(merged[1], "new-model");
+        assert!(merged.contains(&"gpt-6.2-sol".to_string()));
+        assert_eq!(
+            merged
+                .iter()
+                .filter(|model| model.as_str() == "gpt-6.1-sol")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn live_catalog_merge_returns_the_known_catalog_when_live_is_empty() {
+        let merged = merge_live_catalog(ProviderId::Antigravity, Vec::new());
+        let expected = catalog(ProviderId::Antigravity)
+            .iter()
+            .map(|model| (*model).to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(merged, expected);
     }
 }

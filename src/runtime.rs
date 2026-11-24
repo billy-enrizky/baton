@@ -742,7 +742,10 @@ async fn load_provider_models(
             &crate::paths::claude_global_settings_dir(),
         );
         if !models.is_empty() {
-            return Ok(models);
+            return Ok(crate::models::merge_live_catalog(
+                ProviderId::Claude,
+                models,
+            ));
         }
     }
     let input = ModelListInput {
@@ -758,7 +761,7 @@ async fn load_provider_models(
                 )
                 .await
                 .map_err(|_| anyhow::anyhow!("{provider} model catalog timed out"))??;
-                return Ok(models);
+                return Ok(crate::models::merge_live_catalog(provider, models));
             }
         }
     }
@@ -2616,7 +2619,17 @@ mod tests {
                 assert_eq!(thread_id, thread.id);
                 assert_eq!(provider, ProviderId::Codex);
                 assert_eq!(request_id, 7);
-                assert_eq!(models, vec!["live:/tmp/models".to_string()]);
+                assert_eq!(models.first().map(String::as_str), Some("live:/tmp/models"));
+                for known in crate::models::catalog(ProviderId::Codex) {
+                    assert!(
+                        models.contains(&(*known).to_string()),
+                        "known model {known} is missing from {models:?}"
+                    );
+                }
+                assert_eq!(
+                    models.len(),
+                    1 + crate::models::catalog(ProviderId::Codex).len()
+                );
                 assert!(error.is_none());
             }
             _ => unreachable!(),

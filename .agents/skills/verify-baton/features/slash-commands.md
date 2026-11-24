@@ -40,6 +40,7 @@ prefix, opens the picker, and completes the retry through the fake harness.
 Installed-binary proof: the same slash probe passed against the v0.4.0 default curl install and the v0.4.0 Homebrew binary. The stable summaries live in the gitignored `v0.4.0-release/curl/summary.json` and `v0.4.0-release/brew/summary.json` evidence directories.
 
 ## Gotchas
+- `/model` merges the live list with the static known catalog, so a short or degraded live probe still shows every known model.
 - The displayed permission banner uses the provider default when the explicit value is `default`. The command notice reports the selected value; the banner reports the effective provider mode.
 - `/open` choices come from the current store. A temporary home has no threads, so it may show no choices until a thread is created.
 - Turn-number choices for `/review`, `/commands`, and `/fork --turn` come from the current thread history.

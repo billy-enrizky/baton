@@ -94,6 +94,14 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Create a linked worktree for a GitHub issue
+    Task {
+        /// Issue number on the origin repository
+        number: u64,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     /// Update baton to the latest version
     Update,
     /// Open the interactive workspace (default)

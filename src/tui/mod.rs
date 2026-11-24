@@ -99,6 +99,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/worktree",
         "fork this conversation into an isolated git worktree",
     ),
+    (
+        "/task",
+        "start a GitHub issue in a new worktree; /task <number> or no argument to pick",
+    ),
     ("/threads", "list threads in this directory"),
     ("/pin", "pin, unpin, or move a pinned thread"),
     ("/inbox", "all threads that need attention"),
@@ -416,6 +420,13 @@ enum FilesPickerEvent {
     },
 }
 
+enum IssuePickerEvent {
+    Loaded {
+        request: u64,
+        result: Result<crate::tasks::IssueList, String>,
+    },
+}
+
 enum FileRefEvent {
     Loaded {
         root: String,
@@ -607,6 +618,14 @@ enum Overlay {
         loading: bool,
         request: u64,
     },
+    IssuePicker {
+        selected: usize,
+        issues: Vec<crate::tasks::Issue>,
+        root: Option<std::path::PathBuf>,
+        repo: String,
+        loading: bool,
+        error: Option<String>,
+    },
     CheckpointPicker {
         selected: usize,
         checkpoints: Vec<(i64, String)>,
@@ -746,6 +765,9 @@ pub struct TuiState {
     file_ref_sender: std::sync::mpsc::Sender<FileRefEvent>,
     file_ref_receiver: std::sync::mpsc::Receiver<FileRefEvent>,
     file_ref: FileRefCache,
+    issue_picker_sender: std::sync::mpsc::Sender<IssuePickerEvent>,
+    issue_picker_receiver: std::sync::mpsc::Receiver<IssuePickerEvent>,
+    issue_request: u64,
     pending_editor_open: Option<PendingEditorOpen>,
     grep_picker_sender: std::sync::mpsc::Sender<GrepPickerEvent>,
     grep_picker_receiver: std::sync::mpsc::Receiver<GrepPickerEvent>,
@@ -791,6 +813,7 @@ pub fn run_tui(
     let (native_rewind_sender, native_rewind_receiver) = std::sync::mpsc::channel();
     let (files_picker_sender, files_picker_receiver) = std::sync::mpsc::channel();
     let (file_ref_sender, file_ref_receiver) = std::sync::mpsc::channel();
+    let (issue_picker_sender, issue_picker_receiver) = std::sync::mpsc::channel();
     let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
     let bell_enabled = crate::config::notifications(&home).bell;
     let mut state = TuiState {
@@ -865,6 +888,9 @@ pub fn run_tui(
         file_ref_sender,
         file_ref_receiver,
         file_ref: FileRefCache::default(),
+        issue_picker_sender,
+        issue_picker_receiver,
+        issue_request: 0,
         pending_editor_open: None,
         grep_picker_sender,
         grep_picker_receiver,
@@ -966,6 +992,9 @@ pub fn run_tui(
         }
         while let Ok(event) = state.file_ref_receiver.try_recv() {
             apply_file_ref_event(&mut state, event);
+        }
+        while let Ok(event) = state.issue_picker_receiver.try_recv() {
+            apply_issue_picker_event(&mut state, event);
         }
         let mut grep_events = Vec::new();
         while let Ok(event) = state.grep_picker_receiver.try_recv() {
@@ -2858,6 +2887,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/new", _) => Some("new [title]"),
         ("/fork", _) => Some("fork [--turn N] [title]"),
         ("/worktree", _) => Some("worktree [title]"),
+        ("/task", _) => Some("task [issue number]"),
         ("/open", _) => Some("open <thread id prefix>"),
         ("/files", _) => Some("files [--ignored] [query] [:<line>]"),
         ("/grep", _) => Some("grep [--case|--case-sensitive] [--word] [--regex] <query>"),
@@ -5245,6 +5275,51 @@ fn handle_key(
                 request,
             };
         }
+        Overlay::IssuePicker {
+            mut selected,
+            issues,
+            root,
+            repo,
+            loading,
+            error,
+        } => {
+            let mut keep = true;
+            match key.code {
+                KeyCode::Esc => keep = false,
+                KeyCode::Up if !issues.is_empty() => {
+                    selected = (selected + issues.len() - 1) % issues.len();
+                }
+                KeyCode::Down if !issues.is_empty() => {
+                    selected = (selected + 1) % issues.len();
+                }
+                KeyCode::Enter if !loading && error.is_none() && !issues.is_empty() => {
+                    keep = false;
+                    if let (Some(root), Some(issue)) = (root.clone(), issues.get(selected).cloned())
+                    {
+                        begin_issue_task(
+                            state,
+                            store,
+                            crate::tasks::TaskPlan {
+                                root,
+                                repo: repo.clone(),
+                                issue,
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            }
+            if keep {
+                state.overlay = Overlay::IssuePicker {
+                    selected,
+                    issues,
+                    root,
+                    repo,
+                    loading,
+                    error,
+                };
+            }
+        }
         Overlay::CheckpointPicker {
             selected,
             checkpoints,
@@ -5578,6 +5653,137 @@ fn apply_files_picker_event(state: &mut TuiState, event: FilesPickerEvent) {
             );
         }
     }
+}
+
+fn open_issue_picker(state: &mut TuiState) {
+    if state.running {
+        state.notice = Some("wait for the current turn to finish before starting a task".into());
+        return;
+    }
+    state.issue_request += 1;
+    let request = state.issue_request;
+    state.overlay = Overlay::IssuePicker {
+        selected: 0,
+        issues: Vec::new(),
+        root: None,
+        repo: String::new(),
+        loading: true,
+        error: None,
+    };
+    let cwd = state.thread.cwd.clone();
+    let sender = state.issue_picker_sender.clone();
+    std::thread::spawn(move || {
+        let result = crate::tasks::list_open_issues(std::path::Path::new(&cwd), 30)
+            .map_err(|error| error.to_string());
+        let _ = sender.send(IssuePickerEvent::Loaded { request, result });
+    });
+}
+
+fn apply_issue_picker_event(state: &mut TuiState, event: IssuePickerEvent) {
+    let IssuePickerEvent::Loaded { request, result } = event;
+    if request != state.issue_request {
+        return;
+    }
+    let selected = match &state.overlay {
+        Overlay::IssuePicker { selected, .. } => *selected,
+        _ => return,
+    };
+    state.overlay = match result {
+        Ok(list) => {
+            let issues = list.issues;
+            Overlay::IssuePicker {
+                selected: selected.min(issues.len().saturating_sub(1)),
+                issues,
+                root: Some(list.root),
+                repo: list.repo,
+                loading: false,
+                error: None,
+            }
+        }
+        Err(error) => Overlay::IssuePicker {
+            selected,
+            issues: Vec::new(),
+            root: None,
+            repo: String::new(),
+            loading: false,
+            error: Some(crate::sanitize::sanitize_terminal_text(&error).into_owned()),
+        },
+    };
+}
+
+fn start_issue_task(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, number: u64) {
+    start_issue_task_with(state, store, number, &crate::git_workflow::gh_binary());
+}
+
+fn start_issue_task_with(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    number: u64,
+    gh: &std::path::Path,
+) {
+    if state.running {
+        state.notice = Some("wait for the current turn to finish before starting a task".into());
+        return;
+    }
+    let plan =
+        match crate::tasks::plan_task_with(std::path::Path::new(&state.thread.cwd), number, gh) {
+            Ok(plan) => plan,
+            Err(error) => {
+                state.notice = Some(
+                    crate::sanitize::sanitize_terminal_text(&format!("task: {error}")).into_owned(),
+                );
+                return;
+            }
+        };
+    begin_issue_task(state, store, plan);
+}
+
+fn begin_issue_task(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    plan: crate::tasks::TaskPlan,
+) {
+    if state.running {
+        state.notice = Some("wait for the current turn to finish before starting a task".into());
+        return;
+    }
+    let worktree = match crate::tasks::create_worktree(&state.home, &plan) {
+        Ok(worktree) => worktree,
+        Err(error) => {
+            state.notice = Some(format!("cannot create task worktree: {error}"));
+            return;
+        }
+    };
+    let title = format!("#{} {}", plan.issue.number, plan.issue.title);
+    state.thread = {
+        let guard = store.lock().unwrap();
+        guard.draft_thread(NewThread {
+            title,
+            cwd: worktree.path.to_string_lossy().to_string(),
+            current_provider: state.thread.current_provider,
+            current_model: None,
+        })
+    };
+    state.thread.session_mode = SessionMode::Single;
+    state.thread.permission_mode = state.permission_mode;
+    state.history.clear();
+    state.queued_messages.clear();
+    state.thread.reasoning_effort = None;
+    state.goal = None;
+    state.goal_paused = false;
+    state.thread.goal = None;
+    state.thread.goal_paused = false;
+    state.branch_label = None;
+    state.diff_output = None;
+    state.scroll_offset = 0;
+    state.overlay = Overlay::None;
+    state.banner_cache.borrow_mut().take();
+    state.set_input(plan.issue.prompt());
+    state.notice = Some(format!(
+        "task #{} ready in {} · review the prompt, then press enter",
+        plan.issue.number,
+        worktree.path.display()
+    ));
 }
 
 fn apply_native_rewind_event(
@@ -7885,6 +8091,17 @@ fn handle_command(
                 Err(error) => state.notice = Some(format!("cannot fork: {error}")),
             }
         }
+        "/task" => match args.first() {
+            None => open_issue_picker(state),
+            Some(argument) => match argument.parse::<u64>() {
+                Ok(number) => start_issue_task(state, store, number),
+                Err(_) => {
+                    state.notice = Some(format!(
+                        "usage: /task [issue number]; {argument:?} is not an issue number"
+                    ));
+                }
+            },
+        },
         "/worktree" => {
             if state.running {
                 state.notice =
@@ -9314,6 +9531,15 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                     filtered.len().min(8) + 5 + usize::from(state.files_picker_include_ignored)
                 }
             }
+            Overlay::IssuePicker {
+                issues, loading, ..
+            } => {
+                if *loading {
+                    7
+                } else {
+                    issues.len().min(10) + 5
+                }
+            }
             Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
             Overlay::DirtyConfirm { .. } => 5,
             Overlay::CommandList { expanded, .. } => {
@@ -9482,6 +9708,22 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                     loading: *loading,
                     spinner: spinner_frame,
                 },
+            ),
+            Overlay::IssuePicker {
+                selected,
+                issues,
+                repo,
+                loading,
+                error,
+                ..
+            } => draw_issue_picker(
+                frame,
+                chunks[1],
+                *selected,
+                issues,
+                repo,
+                *loading,
+                error.as_deref(),
             ),
             Overlay::CheckpointPicker {
                 selected,
@@ -11265,6 +11507,81 @@ struct FilesPickerView<'a> {
     spinner: usize,
 }
 
+fn draw_issue_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    selected: usize,
+    issues: &[crate::tasks::Issue],
+    repo: &str,
+    loading: bool,
+    error: Option<&str>,
+) {
+    let visible = issues.len().min(10);
+    let selected = selected.min(issues.len().saturating_sub(1));
+    let start = if issues.len() <= visible {
+        0
+    } else {
+        selected
+            .saturating_sub(visible / 2)
+            .min(issues.len() - visible)
+    };
+    let repo = crate::sanitize::sanitize_terminal_text(repo);
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!(
+            "issues · {} · {} open · ↑↓ select · enter start · esc close",
+            if repo.is_empty() {
+                "origin"
+            } else {
+                repo.as_ref()
+            },
+            issues.len()
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    if loading {
+        lines.push(Line::styled(
+            "loading open issues…",
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    if let Some(error) = error {
+        lines.push(Line::styled(
+            crate::sanitize::sanitize_terminal_text(error).into_owned(),
+            Style::default().fg(COLORS.warning),
+        ));
+    }
+    if !loading && error.is_none() && issues.is_empty() {
+        lines.push(Line::styled(
+            "no open issues",
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    for (index, issue) in issues.iter().enumerate().skip(start).take(visible) {
+        let cursor = if index == selected { "❯" } else { " " };
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let title = crate::sanitize::sanitize_terminal_text(&issue.title);
+        lines.push(Line::styled(
+            format!(
+                "{cursor} #{:<4} {}{}",
+                issue.number,
+                title,
+                issue.label_summary()
+            ),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_files_picker(frame: &mut ratatui::Frame, area: Rect, view: FilesPickerView<'_>) {
     let FilesPickerView {
         entries,
@@ -12789,6 +13106,7 @@ mod tests {
             .unwrap_or_default();
         let (files_picker_sender, files_picker_receiver) = std::sync::mpsc::channel();
         let (file_ref_sender, file_ref_receiver) = std::sync::mpsc::channel();
+        let (issue_picker_sender, issue_picker_receiver) = std::sync::mpsc::channel();
         let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
         TuiState {
             bell_enabled: crate::config::notifications(home).bell,
@@ -12866,6 +13184,9 @@ mod tests {
             file_ref_sender,
             file_ref_receiver,
             file_ref: FileRefCache::default(),
+            issue_picker_sender,
+            issue_picker_receiver,
+            issue_request: 0,
             pending_editor_open: None,
             grep_picker_sender,
             grep_picker_receiver,
@@ -22432,6 +22753,174 @@ exit 1
             text.contains("enter on an empty composer sends the next queued message"),
             "{text}"
         );
+    }
+
+    fn task_repo() -> (tempfile::TempDir, std::path::PathBuf) {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "task@example.com"]);
+        git(&["config", "user.name", "task"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.path().join("README.md"), "# task\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        let origin = repo.path().to_string_lossy().to_string();
+        git(&["remote", "add", "origin", &origin]);
+        let gh = repo.path().join("fake-gh-task");
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+set -eu
+if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"nameWithOwner":"example/repo"}'
+  exit 0
+fi
+if [ "$1" = "issue" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"number":12,"title":"Fix the parser","url":"https://github.com/example/repo/issues/12","body":"The parser drops tokens.","state":"OPEN","labels":[{"name":"bug"}]}'
+  exit 0
+fi
+exit 1
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (repo, gh)
+    }
+
+    fn task_issue() -> crate::tasks::Issue {
+        crate::tasks::Issue {
+            number: 12,
+            title: "Fix the parser".to_string(),
+            url: "https://github.com/example/repo/issues/12".to_string(),
+            body: "The parser drops tokens.".to_string(),
+            state: "OPEN".to_string(),
+            labels: vec!["bug".to_string()],
+        }
+    }
+
+    #[test]
+    fn task_command_creates_a_worktree_thread_and_prompt() {
+        let (repo, gh) = task_repo();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        start_issue_task_with(&mut state, &store, 12, &gh);
+
+        assert_eq!(state.thread.title, "#12 Fix the parser");
+        assert_eq!(state.thread.session_mode, SessionMode::Single);
+        assert!(
+            state.thread.cwd.contains("/worktrees/"),
+            "the thread lives in the task worktree: {}",
+            state.thread.cwd
+        );
+        assert!(std::path::Path::new(&state.thread.cwd).is_dir());
+        assert!(state.input.contains("Work on issue #12: Fix the parser"));
+        assert!(state
+            .input
+            .contains("https://github.com/example/repo/issues/12"));
+        assert!(state.input.contains("The parser drops tokens."));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("task #12 ready"), "{notice}");
+    }
+
+    #[test]
+    fn issue_picker_enter_starts_the_selected_task() {
+        let (repo, _gh) = task_repo();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        state.overlay = Overlay::IssuePicker {
+            selected: 0,
+            issues: vec![task_issue()],
+            root: Some(repo.path().to_path_buf()),
+            repo: "example/repo".to_string(),
+            loading: false,
+            error: None,
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(state.thread.title, "#12 Fix the parser");
+        assert!(state.input.contains("Work on issue #12"));
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn issue_picker_shows_an_error_and_cancels_with_escape() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.issue_request = 3;
+        state.overlay = Overlay::IssuePicker {
+            selected: 0,
+            issues: Vec::new(),
+            root: None,
+            repo: String::new(),
+            loading: true,
+            error: None,
+        };
+        apply_issue_picker_event(
+            &mut state,
+            IssuePickerEvent::Loaded {
+                request: 3,
+                result: Err("gh is not authenticated".to_string()),
+            },
+        );
+        match &state.overlay {
+            Overlay::IssuePicker { error, loading, .. } => {
+                assert_eq!(error.as_deref(), Some("gh is not authenticated"));
+                assert!(!loading);
+            }
+            _ => panic!("issue picker closed on an error"),
+        }
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("gh is not authenticated"), "{text}");
+
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn task_command_refuses_a_running_turn_and_a_bad_number() {
+        let (repo, gh) = task_repo();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let original = state.thread.id.clone();
+        state.running = true;
+        start_issue_task_with(&mut state, &store, 12, &gh);
+        assert_eq!(state.thread.id, original);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("wait for the current turn"));
+
+        state.running = false;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/task twelve");
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("is not an issue number"));
+        assert!(matches!(state.overlay, Overlay::None));
     }
 
     #[test]

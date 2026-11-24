@@ -544,7 +544,7 @@ pub fn checks(cwd: &Path) -> Result<PullRequestChecks> {
     checks_with(cwd, &gh_binary())
 }
 
-fn gh_binary() -> PathBuf {
+pub(crate) fn gh_binary() -> PathBuf {
     std::env::var_os("BATON_GH_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("gh"))
@@ -648,7 +648,7 @@ fn run_gh(root: &Path, gh: &Path, args: &[&str], allow_pending: bool) -> Result<
     )
 }
 
-fn gh_command(root: &Path, gh: &Path, args: &[&str]) -> Command {
+pub(crate) fn gh_command(root: &Path, gh: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(gh);
     command
         .args(args)
@@ -984,7 +984,7 @@ fn live_remote_heads(
     Ok(heads)
 }
 
-fn run_command_with_timeout(
+pub(crate) fn run_command_with_timeout(
     mut command: Command,
     label: &str,
     timeout: Duration,
@@ -1105,7 +1105,7 @@ fn kill_process_group(pid: u32) {
 #[cfg(not(unix))]
 fn kill_process_group(_pid: u32) {}
 
-fn remote_url_for_gh(url: &str) -> String {
+pub(crate) fn remote_url_for_gh(url: &str) -> String {
     let lower = url.to_ascii_lowercase();
     for scheme in ["https://", "http://"] {
         if lower.starts_with(scheme) {
@@ -1365,7 +1365,7 @@ fn status_entries(root: &Path) -> Result<StatusEntries> {
     })
 }
 
-fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
+pub(crate) fn git_text(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = git_bytes(cwd, args)?;
     Ok(String::from_utf8_lossy(&output).trim().to_string())
 }

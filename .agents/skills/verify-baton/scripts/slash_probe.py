@@ -23,6 +23,26 @@ def screen_text(transcript: bytearray, width: int, height: int) -> str:
     return "\n".join(screen.lines())
 
 
+def select_memory_row(
+    master: int,
+    transcript: bytearray,
+    width: int,
+    height: int,
+    label: str,
+    tries: int = 30,
+) -> bool:
+    os.write(master, b"\x1b[H")
+    pump(master, 0.1, transcript)
+    needle = f"❯ {label}  "
+    for _ in range(tries):
+        text = screen_text(transcript, width, height)
+        if any(needle in line for line in text.splitlines()):
+            return True
+        os.write(master, b"\x1b[B")
+        pump(master, 0.08, transcript)
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/baton")
@@ -81,6 +101,16 @@ def main() -> int:
         )
         + "\n"
     )
+    (claude_config / "CLAUDE.md").write_text("# user memory\n")
+    (claude_config / "rules").mkdir(parents=True)
+    (claude_config / "rules" / "one.md").write_text("# user rule\n")
+    (Path(workdir) / "CLAUDE.md").write_text("# project memory\n")
+    (Path(workdir) / "AGENTS.md").write_text("# shared agents memory\n")
+    (codex_config / "AGENTS.md").write_text("# codex memory\n")
+    auto_memory = claude_config / "projects" / "probe-project" / "memory"
+    auto_memory.mkdir(parents=True)
+    (auto_memory / "MEMORY.md").write_text("# Memory\n\n- probe index\n")
+    (auto_memory / "topic.md").write_text("# Topic\n\n- probe topic\n")
     evidence = Path(args.evidence_dir) / f"slash-probe-{int(time.time())}"
     evidence.mkdir(parents=True, exist_ok=True)
     pid, master = pty.fork()
@@ -95,6 +125,14 @@ def main() -> int:
         env["PATH"] = f"{editor_bin}{os.pathsep}{env.get('PATH', '')}"
         env["CLAUDE_CONFIG_DIR"] = str(claude_config)
         env["CODEX_HOME"] = str(codex_config)
+        env["CLAUDE_CODE_PROJECT_DIR_NAME"] = "probe-project"
+        for name in (
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+            "CLAUDE_CODE_REMOTE",
+            "CLAUDE_CODE_REMOTE_MEMORY_DIR",
+            "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE",
+        ):
+            env.pop(name, None)
         env.pop("VISUAL", None)
         os.execvpe(str(binary), [str(binary)], env)
 
@@ -287,6 +325,72 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
+        if editor_capture.exists():
+            editor_capture.unlink()
+        os.write(master, b"/memory\r")
+        pump(master, 0.8, transcript)
+        memory_picker = screen_text(transcript, args.width, args.height)
+        memory_required = [
+            "Memory ·",
+            "Claude Code",
+            "User instructions",
+            "one.md",
+            "Project instructions",
+            "Local instructions",
+            "Codex",
+            "Auto memory",
+            "Auto-memory",
+            "Auto-memory index",
+            "topic.md",
+            "Open auto-memory folder",
+            "←→ toggle",
+            "enter open",
+            "esc close",
+        ]
+        missing.extend(value for value in memory_required if value not in memory_picker)
+        (evidence / "memory-picker-screen.txt").write_text(memory_picker + "\n")
+        if not select_memory_row(
+            master, transcript, args.width, args.height, "Auto-memory"
+        ):
+            missing.append("auto-memory row selection")
+        os.write(master, b"\r")
+        pump(master, 0.5, transcript)
+        memory_toggle = screen_text(transcript, args.width, args.height)
+        if "auto-memory user setting off" not in memory_toggle:
+            missing.append("auto-memory toggle notice")
+        claude_settings = claude_config / "settings.json"
+        if not claude_settings.is_file():
+            missing.append("Claude settings file")
+        else:
+            settings = json.loads(claude_settings.read_text())
+            (evidence / "claude-memory-settings.json").write_text(
+                json.dumps(settings, indent=2) + "\n"
+            )
+            if settings.get("autoMemoryEnabled") is not False:
+                missing.append("auto-memory persisted setting")
+        (evidence / "memory-toggle-screen.txt").write_text(memory_toggle + "\n")
+        if not select_memory_row(
+            master, transcript, args.width, args.height, "Project instructions"
+        ):
+            missing.append("project instructions row selection")
+        os.write(master, b"\r")
+        if not wait_for(master, "opened ", 5.0, transcript):
+            missing.append("memory editor opened notice")
+        pump(master, 0.5, transcript)
+        memory_open = screen_text(transcript, args.width, args.height)
+        (evidence / "memory-open-screen.txt").write_text(memory_open + "\n")
+        if not editor_capture.is_file():
+            missing.append("memory editor process")
+        else:
+            editor_args = editor_capture.read_text().splitlines()
+            (evidence / "memory-open-args.txt").write_text(
+                json.dumps(editor_args, indent=2) + "\n"
+            )
+            if not editor_args or editor_args[-1] != str(
+                (Path(workdir).resolve() / "CLAUDE.md")
+            ):
+                missing.append("memory editor target")
+
         os.write(master, b"/files ")
         pump(master, 0.5, transcript)
         files_hint = screen_text(transcript, args.width, args.height)
@@ -384,7 +488,7 @@ def main() -> int:
         os.write(master, b"/files \r")
         pump(master, 1.5, transcript)
         recent_picker = screen_text(transcript, args.width, args.height)
-        for value in ["files · 2 · enter insert", "README.md", "❯ src/parser/mod.rs"]:
+        for value in ["files · 4 · enter insert", "README.md", "❯ src/parser/mod.rs"]:
             if value not in recent_picker:
                 missing.append(f"recent file ranking: {value}")
         if 'files matching "pmod rs"' in recent_picker:

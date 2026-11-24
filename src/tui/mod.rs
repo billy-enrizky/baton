@@ -116,7 +116,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/rewind", "rewind to a previous message"),
     ("/retry", "retry a failed or unverified turn as a new turn"),
     ("/goal", "set a multi-turn objective the agent works toward"),
-    ("/memories", "list, add, remove, or clear governed memories"),
+    ("/memory", "edit user, project, rule, and auto-memory files"),
     ("/find", "search the conversation"),
     (
         "/multi",
@@ -183,7 +183,7 @@ Common
   /status                     what is happening now
   /activity                   every turn, tool call, diff, and usage
   /commands                   every command this thread ran
-  /memories                   project and global notes ($memories)
+  /memory                     memory files and auto-memory
   /effort                     reasoning effort picker
   /orchestrate [on|off] [goal]  split work across harnesses
   /runs                       orchestration history
@@ -488,6 +488,10 @@ enum Overlay {
         selected: usize,
         skills: Vec<(String, String)>,
     },
+    MemoryPicker {
+        selected: usize,
+        listing: Box<crate::memory_files::MemoryListing>,
+    },
     CopyPicker {
         selected: usize,
         replies: Vec<ReplyChoice>,
@@ -622,6 +626,7 @@ pub struct TuiState {
     goal_paused: bool,
     custom_commands: Vec<(String, String)>,
     home: std::path::PathBuf,
+    memory_environment: crate::memory_files::MemoryEnvironment,
     thread: ThreadRow,
     adapter_lifecycles: std::collections::HashMap<ProviderId, AdapterLifecycle>,
     history: Vec<MessageRow>,
@@ -735,6 +740,7 @@ pub fn run_tui(
         goal_paused,
         custom_commands,
         home,
+        memory_environment: crate::memory_files::MemoryEnvironment::from_env(),
         thread,
         adapter_lifecycles,
         history,
@@ -2654,10 +2660,6 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/rewind", _) => Some("rewind [--native]"),
         ("/retry", _) => Some("retry <turn>"),
         ("/goal", _) => Some("goal pause|resume|clear|<done criteria>"),
-        ("/memories", "add") => Some("memories add [--global] <text>"),
-        ("/memories", "remove") => Some("memories remove <id>"),
-        ("/memories", "clear") => Some("memories clear [--global]"),
-        ("/memories", _) => Some("memories list|add|remove|clear"),
         ("/find", _) => Some("find <text>"),
         ("/multi", _) => Some("multi [--worktrees] [provider ...] <prompt>"),
         ("/orchestrate", _) => Some("orchestrate on|off|--plan-only|<goal>"),
@@ -2775,41 +2777,6 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 ] {
                     push_suggestion(&mut suggestions, command, flag, description);
                 }
-            }
-        }
-        "/memories" => {
-            for (action, description) in [
-                ("list", "list project memories"),
-                ("add", "add a project memory"),
-                ("add --global", "add a global memory"),
-                ("remove", "remove a memory by id"),
-                ("clear", "clear project memories"),
-                ("clear --global", "clear global memories"),
-            ] {
-                push_suggestion(&mut suggestions, command, action, description);
-            }
-            let cwd = crate::memory::project_key(&state.thread.cwd);
-            let memories = state
-                .store
-                .lock()
-                .unwrap()
-                .list_memories(&cwd)
-                .unwrap_or_default();
-            for memory in memories.into_iter().take(10) {
-                let preview: String = memory
-                    .text
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(60)
-                    .collect();
-                push_suggestion(
-                    &mut suggestions,
-                    command,
-                    &format!("remove {}", memory.id),
-                    format!("remove {} memory: {preview}", memory.scope),
-                );
             }
         }
         "/multi" => {
@@ -3270,6 +3237,174 @@ fn launch_picker_editor(
                     .into_owned(),
             );
             false
+        }
+    }
+}
+
+fn prepare_absolute_editor_open(
+    path: &std::path::Path,
+    line: Option<u64>,
+) -> std::result::Result<PendingEditorOpen, String> {
+    let editor = crate::files::editor_from_env().ok_or_else(|| {
+        "no editor configured; set VISUAL or EDITOR before opening memory".to_string()
+    })?;
+    let command = crate::files::build_open_command_at_line(&editor, path, line)
+        .map_err(|error| error.to_string())?;
+    if crate::doctor::find_executable(&command.program).is_none() {
+        return Err(format!(
+            "editor {} is not on PATH; set VISUAL or EDITOR to an installed editor",
+            command.program
+        ));
+    }
+    let label = crate::sanitize::sanitize_terminal_text(&path.display().to_string()).into_owned();
+    Ok(PendingEditorOpen { command, label })
+}
+
+fn open_memory_picker(state: &mut TuiState, selected: usize) {
+    let listing = crate::memory_files::discover(
+        std::path::Path::new(&state.thread.cwd),
+        &state.memory_environment,
+    );
+    let selected = selected.min(listing.row_count().saturating_sub(1));
+    state.overlay = Overlay::MemoryPicker {
+        selected,
+        listing: Box::new(listing),
+    };
+}
+
+fn apply_memory_action(
+    state: &mut TuiState,
+    selected: usize,
+    listing: crate::memory_files::MemoryListing,
+) {
+    let Some((_, row)) = listing.row(selected) else {
+        return;
+    };
+    match row.action.clone() {
+        crate::memory_files::MemoryAction::ToggleAutoMemory => {
+            if !listing.auto_memory.can_toggle {
+                let reason = listing
+                    .auto_memory
+                    .read_only_reason
+                    .as_deref()
+                    .unwrap_or("this session cannot change auto memory");
+                state.notice = Some(
+                    crate::sanitize::sanitize_terminal_text(&format!(
+                        "auto-memory is read-only: {reason}"
+                    ))
+                    .into_owned(),
+                );
+                state.overlay = Overlay::MemoryPicker {
+                    selected,
+                    listing: Box::new(listing),
+                };
+                return;
+            }
+            let desired = !listing.auto_memory.user_enabled.unwrap_or(true);
+            match crate::memory_files::toggle_auto_memory(&state.memory_environment, desired) {
+                Ok(path) => {
+                    let refreshed = crate::memory_files::discover(
+                        std::path::Path::new(&state.thread.cwd),
+                        &state.memory_environment,
+                    );
+                    let effective = refreshed.auto_memory.enabled;
+                    let mut notice = format!(
+                        "auto-memory user setting {} · saved in {}",
+                        if desired { "on" } else { "off" },
+                        path.display()
+                    );
+                    if effective != desired {
+                        notice.push_str(&format!(
+                            " · effective {} from {}",
+                            if effective { "on" } else { "off" },
+                            refreshed.auto_memory.enabled_source
+                        ));
+                    }
+                    state.notice =
+                        Some(crate::sanitize::sanitize_terminal_text(&notice).into_owned());
+                    let selected = selected.min(refreshed.row_count().saturating_sub(1));
+                    state.overlay = Overlay::MemoryPicker {
+                        selected,
+                        listing: Box::new(refreshed),
+                    };
+                }
+                Err(error) => {
+                    state.notice = Some(
+                        crate::sanitize::sanitize_terminal_text(&format!(
+                            "cannot update auto-memory: {error}"
+                        ))
+                        .into_owned(),
+                    );
+                    state.overlay = Overlay::MemoryPicker {
+                        selected,
+                        listing: Box::new(listing),
+                    };
+                }
+            }
+        }
+        crate::memory_files::MemoryAction::OpenFile { path } => {
+            let open = match prepare_absolute_editor_open(&path, None) {
+                Ok(open) => open,
+                Err(error) => {
+                    state.notice = Some(
+                        crate::sanitize::sanitize_terminal_text(&format!("memory: {error}"))
+                            .into_owned(),
+                    );
+                    state.overlay = Overlay::MemoryPicker {
+                        selected,
+                        listing: Box::new(listing),
+                    };
+                    return;
+                }
+            };
+            if let Err(error) = crate::memory_files::ensure_memory_file(&path) {
+                state.notice = Some(
+                    crate::sanitize::sanitize_terminal_text(&format!(
+                        "cannot create memory file: {error}"
+                    ))
+                    .into_owned(),
+                );
+                state.overlay = Overlay::MemoryPicker {
+                    selected,
+                    listing: Box::new(listing),
+                };
+                return;
+            }
+            state.notice = Some(format!("opening {}", open.label));
+            state.pending_editor_open = Some(open);
+            state.overlay = Overlay::None;
+        }
+        crate::memory_files::MemoryAction::OpenFolder { path } => {
+            let open = match prepare_absolute_editor_open(&path, None) {
+                Ok(open) => open,
+                Err(error) => {
+                    state.notice = Some(
+                        crate::sanitize::sanitize_terminal_text(&format!("memory: {error}"))
+                            .into_owned(),
+                    );
+                    state.overlay = Overlay::MemoryPicker {
+                        selected,
+                        listing: Box::new(listing),
+                    };
+                    return;
+                }
+            };
+            if let Err(error) = crate::memory_files::ensure_memory_dir(&path) {
+                state.notice = Some(
+                    crate::sanitize::sanitize_terminal_text(&format!(
+                        "cannot create auto-memory folder: {error}"
+                    ))
+                    .into_owned(),
+                );
+                state.overlay = Overlay::MemoryPicker {
+                    selected,
+                    listing: Box::new(listing),
+                };
+                return;
+            }
+            state.notice = Some(format!("opening {}", open.label));
+            state.pending_editor_open = Some(open);
+            state.overlay = Overlay::None;
         }
     }
 }
@@ -3941,6 +4076,53 @@ fn handle_key(
             }
             _ => {
                 state.overlay = Overlay::SkillsPicker { selected, skills };
+            }
+        },
+        Overlay::MemoryPicker {
+            mut selected,
+            listing,
+        } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                let count = listing.row_count();
+                if count > 0 {
+                    selected = (selected + count - 1) % count;
+                }
+                state.overlay = Overlay::MemoryPicker { selected, listing };
+            }
+            KeyCode::Down => {
+                let count = listing.row_count();
+                if count > 0 {
+                    selected = (selected + 1) % count;
+                }
+                state.overlay = Overlay::MemoryPicker { selected, listing };
+            }
+            KeyCode::Home => {
+                state.overlay = Overlay::MemoryPicker {
+                    selected: 0,
+                    listing,
+                };
+            }
+            KeyCode::End => {
+                let selected = listing.row_count().saturating_sub(1);
+                state.overlay = Overlay::MemoryPicker { selected, listing };
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let toggle = listing
+                    .row(selected)
+                    .map(|(_, row)| {
+                        row.action == crate::memory_files::MemoryAction::ToggleAutoMemory
+                    })
+                    .unwrap_or(false);
+                if toggle {
+                    apply_memory_action(state, selected, *listing);
+                } else {
+                    state.overlay = Overlay::MemoryPicker { selected, listing };
+                }
+            }
+            KeyCode::Enter => apply_memory_action(state, selected, *listing),
+            _ => {
+                state.overlay = Overlay::MemoryPicker { selected, listing };
             }
         },
         Overlay::ModePicker { mut selected } => match key.code {
@@ -6041,7 +6223,7 @@ fn handle_command(
                     "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · esc: clear · drag transcript to copy",
                 );
                 help.push_str(
-                    "\npaste a multi-line prompt: it stays in the composer · typing during a turn steers it · enter on an empty composer sends the next queued message · $memories injects saved memories",
+                    "\npaste a multi-line prompt: it stays in the composer · typing during a turn steers it · enter on an empty composer sends the next queued message",
                 );
                 help
             } else {
@@ -6054,105 +6236,6 @@ fn handle_command(
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
             state.notice = None;
-        }
-        "/memories" => {
-            let cwd = crate::memory::project_key(&state.thread.cwd);
-            match args.first().map(String::as_str) {
-                None | Some("list") => {
-                    let memories = store
-                        .lock()
-                        .unwrap()
-                        .list_memories(&cwd)
-                        .unwrap_or_default();
-                    if memories.is_empty() {
-                        state.notice = Some(
-                            "memories: none · /memories add <text> · /memories add --global <text> · use $memories in a prompt"
-                                .into(),
-                        );
-                    } else {
-                        let mut text = format!(
-                            "memories: {} · $memories injects them into a prompt",
-                            memories.len()
-                        );
-                        for memory in &memories {
-                            let preview: String = memory
-                                .text
-                                .lines()
-                                .next()
-                                .unwrap_or("")
-                                .chars()
-                                .take(80)
-                                .collect();
-                            text.push_str(&format!(
-                                "\n  {}. {} · {preview}",
-                                memory.id, memory.scope
-                            ));
-                        }
-                        text.push_str("\n\n/memories add [--global] <text> · /memories remove <id> · /memories clear [--global]");
-                        state.notice = Some(text);
-                    }
-                }
-                Some("add") => {
-                    let global = args.iter().any(|arg| arg == "--global");
-                    let text = args
-                        .iter()
-                        .skip(1)
-                        .filter(|arg| *arg != "--global")
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    if text.trim().is_empty() {
-                        state.notice = Some("usage: /memories add [--global] <text>".into());
-                    } else {
-                        let scope = if global { "global" } else { "project" };
-                        match store.lock().unwrap().add_memory(scope, &cwd, &text) {
-                            Ok(id) => {
-                                state.notice = Some(format!(
-                                    "memory {id} saved ({scope}) · use $memories in a prompt"
-                                ));
-                            }
-                            Err(error) => {
-                                state.notice = Some(format!("cannot save memory: {error}"))
-                            }
-                        }
-                    }
-                }
-                Some("remove") => {
-                    let id = args.get(1).and_then(|value| value.parse::<i64>().ok());
-                    match id {
-                        Some(id) => match store.lock().unwrap().remove_memory(&cwd, id) {
-                            Ok(true) => state.notice = Some(format!("memory {id} removed")),
-                            Ok(false) => {
-                                state.notice = Some(format!(
-                                    "memory {id} not found for this project (global memories are removable too)"
-                                ))
-                            }
-                            Err(error) => state.notice = Some(format!("cannot remove memory: {error}")),
-                        },
-                        None => state.notice = Some("usage: /memories remove <id>".into()),
-                    }
-                }
-                Some("clear") => {
-                    let global = args.iter().any(|arg| arg == "--global");
-                    match store.lock().unwrap().clear_memories(&cwd, global) {
-                        Ok(count) => {
-                            state.notice = Some(format!(
-                                "cleared {count} {} memory(s)",
-                                if global { "global" } else { "project" }
-                            ));
-                        }
-                        Err(error) => {
-                            state.notice = Some(format!("cannot clear memories: {error}"))
-                        }
-                    }
-                }
-                Some(_) => {
-                    state.notice = Some(
-                        "usage: /memories · /memories add [--global] <text> · /memories remove <id> · /memories clear [--global]"
-                            .into(),
-                    );
-                }
-            }
         }
         "/goal" => {
             if let Some(action) = args.first().map(String::as_str) {
@@ -6767,6 +6850,13 @@ fn handle_command(
             Ok(result) => state.notice = Some(result),
             Err(error) => state.notice = Some(format!("cannot create memory file: {error}")),
         },
+        "/memory" => {
+            if !args.is_empty() {
+                state.notice = Some("usage: /memory".into());
+            } else {
+                open_memory_picker(state, 0);
+            }
+        }
         "/export" => {
             let lines: Vec<String> = state
                 .history
@@ -8454,6 +8544,11 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::SettingsPicker { categories, .. } => categories.len().min(5) + 5,
             Overlay::McpPicker { .. } => 8,
             Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
+            Overlay::MemoryPicker { listing, .. } => {
+                let warning_lines =
+                    listing.warnings.len().min(3) + usize::from(listing.warnings.len() > 3);
+                listing.row_count().min(10) + 6 + warning_lines
+            }
             Overlay::RolesPicker { roles, .. } => roles.len() + 6,
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
@@ -8554,6 +8649,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::SkillsPicker { selected, skills } => {
                 draw_skills_picker(frame, chunks[1], skills, *selected)
+            }
+            Overlay::MemoryPicker { selected, listing } => {
+                draw_memory_picker(frame, chunks[1], listing, *selected)
             }
             Overlay::ModePicker { selected } => {
                 draw_mode_picker(frame, chunks[1], state, *selected)
@@ -9332,6 +9430,84 @@ fn draw_skills_picker(
         let name = skill_label(name, 64);
         let source = skill_label(source, 16);
         lines.push(Line::styled(format!("{cursor} {name} ({source})"), style));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_memory_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    listing: &crate::memory_files::MemoryListing,
+    selected: usize,
+) {
+    let rows = listing.iter();
+    let visible = (area.height.saturating_sub(5) as usize).min(10);
+    let count = listing.row_count();
+    let selected = selected.min(count.saturating_sub(1));
+    let start = if visible == 0 || count <= visible {
+        0
+    } else {
+        selected.saturating_sub(visible - 1).min(count - visible)
+    };
+    let position = if count > visible {
+        format!(" · {}/{}", selected + 1, count)
+    } else {
+        String::new()
+    };
+    let read_only_toggle = listing
+        .row(selected)
+        .map(|(_, row)| {
+            row.action == crate::memory_files::MemoryAction::ToggleAutoMemory
+                && !listing.auto_memory.can_toggle
+        })
+        .unwrap_or(false);
+    let action_hint = if read_only_toggle {
+        "↑↓ select · auto-memory read-only · enter open · esc close"
+    } else {
+        "↑↓ select · ←→ toggle · enter open/toggle · esc close"
+    };
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!("Memory{position} · {action_hint}"),
+        Style::default().fg(COLORS.muted),
+    )];
+    let mut current_section = "";
+    for (index, (section, row)) in rows.enumerate().skip(start).take(visible) {
+        if section.title != current_section {
+            current_section = section.title;
+            lines.push(Line::styled(
+                current_section,
+                Style::default()
+                    .fg(COLORS.secondary)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        let label = crate::sanitize::sanitize_terminal_text(&row.label);
+        let detail = crate::sanitize::sanitize_terminal_text(&row.detail);
+        lines.push(Line::styled(format!("{cursor} {label}  {detail}"), style));
+    }
+    for warning in listing.warnings.iter().take(3) {
+        let warning = crate::sanitize::sanitize_terminal_text(warning);
+        lines.push(Line::styled(
+            format!("! {warning}"),
+            Style::default().fg(COLORS.warning),
+        ));
+    }
+    if listing.warnings.len() > 3 {
+        lines.push(Line::styled(
+            format!("! and {} more warning(s)", listing.warnings.len() - 3),
+            Style::default().fg(COLORS.warning),
+        ));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -11215,6 +11391,11 @@ mod tests {
             goal_paused: false,
             custom_commands: Vec::new(),
             home: home.to_path_buf(),
+            memory_environment: crate::memory_files::MemoryEnvironment::for_test(
+                home.join("claude"),
+                home.join("codex"),
+                home.to_path_buf(),
+            ),
             thread,
             adapter_lifecycles: std::collections::HashMap::new(),
             history,
@@ -11402,7 +11583,6 @@ mod tests {
             "/rewind",
             "/retry",
             "/goal",
-            "/memories",
             "/find",
             "/multi",
             "/orchestrate",
@@ -11426,17 +11606,6 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let cwd = crate::memory::project_key(&state.thread.cwd);
-        let memory_id = store
-            .lock()
-            .unwrap()
-            .add_memory("project", &cwd, "prefer focused tests")
-            .unwrap();
-        state.input = "/memories remove ".to_string();
-        assert!(suggestions_for(&state)
-            .iter()
-            .any(|suggestion| suggestion.insert == format!("/memories remove {memory_id}")));
-
         state.history = vec![
             MessageRow {
                 id: 1,
@@ -19388,70 +19557,400 @@ mod tests {
     }
 
     #[test]
-    fn memories_command_adds_lists_and_removes() {
+    fn memory_command_opens_harness_memory_files_and_auto_memory() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
+        let mut env = crate::memory_files::MemoryEnvironment::for_test(
+            home.path().join("claude"),
+            home.path().join("codex"),
+            home.path().to_path_buf(),
+        );
+        env.project_dir_name = Some("test-project".to_string());
+        std::fs::create_dir_all(env.config_dir.join("rules")).unwrap();
+        std::fs::write(env.config_dir.join("CLAUDE.md"), "user").unwrap();
+        std::fs::write(env.config_dir.join("rules").join("one.md"), "rule").unwrap();
+        std::fs::create_dir_all(env.codex_home.clone()).unwrap();
+        std::fs::write(env.codex_home.join("AGENTS.md"), "codex").unwrap();
+        std::fs::write(home.path().join("CLAUDE.md"), "project").unwrap();
+        std::fs::write(home.path().join("AGENTS.md"), "agents").unwrap();
+        let memory = env
+            .config_dir
+            .join("projects")
+            .join("test-project")
+            .join("memory");
+        std::fs::create_dir_all(&memory).unwrap();
+        std::fs::write(memory.join("MEMORY.md"), "index").unwrap();
+        std::fs::write(memory.join("topic.md"), "topic").unwrap();
+        state.memory_environment = env;
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
 
-        handle_command(
-            &mut state,
-            &store,
-            &engine_command_sender,
-            "/memories add Use tabs",
+        handle_command(&mut state, &store, &engine_command_sender, "/memory");
+        let Overlay::MemoryPicker { listing, .. } = &state.overlay else {
+            panic!("expected memory picker");
+        };
+        let labels = listing
+            .rows()
+            .into_iter()
+            .map(|(_, row)| row.label.as_str())
+            .collect::<Vec<_>>();
+        assert!(labels.contains(&"User instructions"));
+        assert!(labels.contains(&"Project instructions"));
+        assert!(labels.contains(&"Auto-memory"));
+        assert!(labels.contains(&"Auto-memory index"));
+        assert!(labels.iter().any(|label| label.ends_with("topic.md")));
+        assert!(labels.contains(&"Open auto-memory folder"));
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(text.contains("Memory ·"), "{text}");
+        assert!(text.contains("←→ toggle"), "{text}");
+        assert!(text.contains("enter open"), "{text}");
+        assert!(
+            text.contains("Auto-memory  user unset · effective on · default"),
+            "{text}"
         );
-        assert!(state.notice.as_deref().unwrap_or("").contains("saved"));
-        handle_command(&mut state, &store, &engine_command_sender, "/memories");
-        let listed = state.notice.as_deref().unwrap_or("");
-        assert!(listed.contains("Use tabs"), "{listed}");
-        assert!(listed.contains("project"), "{listed}");
+    }
 
-        let id = store
-            .lock()
-            .unwrap()
-            .list_memories(&crate::memory::project_key(&state.thread.cwd))
-            .unwrap()[0]
-            .id;
-        handle_command(
+    #[test]
+    fn memory_picker_toggles_auto_memory_and_persists_the_user_setting() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.memory_environment = crate::memory_files::MemoryEnvironment::for_test(
+            home.path().join("claude"),
+            home.path().join("codex"),
+            home.path().to_path_buf(),
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/memory");
+        let toggle_index = match &state.overlay {
+            Overlay::MemoryPicker { listing, .. } => listing
+                .rows()
+                .iter()
+                .position(|(_, row)| {
+                    row.action == crate::memory_files::MemoryAction::ToggleAutoMemory
+                })
+                .expect("auto-memory toggle"),
+            _ => panic!("expected memory picker"),
+        };
+        if let Overlay::MemoryPicker { selected, .. } = &mut state.overlay {
+            *selected = toggle_index;
+        }
+        handle_key(
             &mut state,
             &store,
             &engine_command_sender,
-            &format!("/memories remove {id}"),
+            key(KeyCode::Enter),
         );
-        assert!(store
-            .lock()
-            .unwrap()
-            .list_memories(&crate::memory::project_key(&state.thread.cwd))
-            .unwrap()
-            .is_empty());
+        let settings = home.path().join("claude").join("settings.json");
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(value["autoMemoryEnabled"], false);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("auto-memory user setting off"));
+        let Overlay::MemoryPicker { listing, .. } = &state.overlay else {
+            panic!("toggle keeps the picker open");
+        };
+        assert!(!listing.auto_memory.enabled);
 
-        handle_command(
+        handle_key(
             &mut state,
             &store,
             &engine_command_sender,
-            "/memories add --global Answer briefly",
+            key(KeyCode::Enter),
         );
-        let memories = store
-            .lock()
-            .unwrap()
-            .list_memories(&crate::memory::project_key(&state.thread.cwd))
+        let value: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(value["autoMemoryEnabled"], true);
+    }
+
+    #[test]
+    fn memory_picker_toggle_shows_when_a_project_setting_masks_the_user_value() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(
+            home.path().join(".claude").join("settings.json"),
+            r#"{"autoMemoryEnabled":false}"#,
+        )
+        .unwrap();
+        state.memory_environment = crate::memory_files::MemoryEnvironment::for_test(
+            home.path().join("claude"),
+            home.path().join("codex"),
+            home.path().to_path_buf(),
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/memory");
+        let toggle_index = match &state.overlay {
+            Overlay::MemoryPicker { listing, .. } => listing
+                .rows()
+                .iter()
+                .position(|(_, row)| {
+                    row.action == crate::memory_files::MemoryAction::ToggleAutoMemory
+                })
+                .expect("auto-memory toggle"),
+            _ => panic!("expected memory picker"),
+        };
+        if let Overlay::MemoryPicker { selected, .. } = &mut state.overlay {
+            *selected = toggle_index;
+        }
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let Overlay::MemoryPicker { listing, .. } = &state.overlay else {
+            panic!("toggle keeps the picker open");
+        };
+        let detail = &listing.rows()[toggle_index].1.detail;
+        assert!(detail.contains("user off"), "{detail}");
+        assert!(detail.contains("effective off"), "{detail}");
+        assert!(detail.contains("project settings"), "{detail}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("auto-memory user setting on"), "{notice}");
+        assert!(
+            notice.contains("effective off from project settings"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn memory_picker_creates_a_missing_file_and_prepares_the_editor() {
+        let _editor_env = tests::EDITOR_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let visual = std::env::var_os("VISUAL");
+        let editor = std::env::var_os("EDITOR");
+        std::env::set_var("VISUAL", "true");
+        std::env::remove_var("EDITOR");
+
+        state.memory_environment = crate::memory_files::MemoryEnvironment::for_test(
+            home.path().join("claude"),
+            home.path().join("codex"),
+            home.path().to_path_buf(),
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/memory");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let path = home.path().join("claude").join("CLAUDE.md");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# CLAUDE.md\n\n");
+        let open = state.pending_editor_open.as_ref().expect("editor launch");
+        assert_eq!(open.command.program, "true");
+        assert!(open.label.ends_with("claude/CLAUDE.md"));
+        assert!(matches!(state.overlay, Overlay::None));
+
+        match visual {
+            Some(value) => std::env::set_var("VISUAL", value),
+            None => std::env::remove_var("VISUAL"),
+        }
+        match editor {
+            Some(value) => std::env::set_var("EDITOR", value),
+            None => std::env::remove_var("EDITOR"),
+        }
+    }
+
+    #[test]
+    fn memory_picker_missing_editor_does_not_create_the_file() {
+        let _editor_env = tests::EDITOR_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let visual = std::env::var_os("VISUAL");
+        let editor = std::env::var_os("EDITOR");
+        std::env::set_var("VISUAL", home.path().join("missing-editor"));
+        std::env::remove_var("EDITOR");
+
+        state.memory_environment = crate::memory_files::MemoryEnvironment::for_test(
+            home.path().join("claude"),
+            home.path().join("codex"),
+            home.path().to_path_buf(),
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/memory");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let path = home.path().join("claude").join("CLAUDE.md");
+        assert!(!path.exists(), "a missing editor must not create the file");
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("not on PATH"));
+        assert!(matches!(state.overlay, Overlay::MemoryPicker { .. }));
+
+        match visual {
+            Some(value) => std::env::set_var("VISUAL", value),
+            None => std::env::remove_var("VISUAL"),
+        }
+        match editor {
+            Some(value) => std::env::set_var("EDITOR", value),
+            None => std::env::remove_var("EDITOR"),
+        }
+    }
+
+    #[test]
+    fn memory_picker_scrolls_to_the_selected_row_past_ten_entries() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let env = crate::memory_files::MemoryEnvironment::for_test(
+            home.path().join("claude"),
+            home.path().join("codex"),
+            home.path().to_path_buf(),
+        );
+        std::fs::create_dir_all(env.config_dir.join("rules")).unwrap();
+        for index in 0..12 {
+            std::fs::write(
+                env.config_dir
+                    .join("rules")
+                    .join(format!("rule-{index:02}.md")),
+                "rule",
+            )
             .unwrap();
-        assert_eq!(memories.len(), 1);
-        assert_eq!(memories[0].scope, "global");
-        assert_eq!(memories[0].text, "Answer briefly");
+        }
+        state.memory_environment = env;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/memory");
+        let selected = match &state.overlay {
+            Overlay::MemoryPicker { listing, .. } => listing
+                .rows()
+                .iter()
+                .position(|(_, row)| row.label.ends_with("rule-11.md"))
+                .expect("last rule"),
+            _ => panic!("expected memory picker"),
+        };
+        if let Overlay::MemoryPicker {
+            selected: current, ..
+        } = &mut state.overlay
+        {
+            *current = selected;
+        }
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(text.contains("rule-11.md"), "{text}");
+        assert!(text.contains("Memory · 13/"), "{text}");
+    }
 
-        handle_command(
+    #[test]
+    fn memory_picker_opens_the_auto_memory_folder() {
+        let _editor_env = tests::EDITOR_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let visual = std::env::var_os("VISUAL");
+        let editor = std::env::var_os("EDITOR");
+        std::env::set_var("VISUAL", "true");
+        std::env::remove_var("EDITOR");
+        state.memory_environment = crate::memory_files::MemoryEnvironment::for_test(
+            home.path().join("claude"),
+            home.path().join("codex"),
+            home.path().to_path_buf(),
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/memory");
+        let (folder_index, memory) = match &state.overlay {
+            Overlay::MemoryPicker { listing, .. } => (
+                listing
+                    .rows()
+                    .iter()
+                    .position(|(_, row)| {
+                        matches!(
+                            row.action,
+                            crate::memory_files::MemoryAction::OpenFolder { .. }
+                        )
+                    })
+                    .expect("auto-memory folder"),
+                listing.auto_memory.directory.clone(),
+            ),
+            _ => panic!("expected memory picker"),
+        };
+        if let Overlay::MemoryPicker { selected, .. } = &mut state.overlay {
+            *selected = folder_index;
+        }
+        handle_key(
             &mut state,
             &store,
             &engine_command_sender,
-            "/memories clear --global",
+            key(KeyCode::Enter),
         );
-        assert!(store
-            .lock()
-            .unwrap()
-            .list_memories(&crate::memory::project_key(&state.thread.cwd))
-            .unwrap()
-            .is_empty());
+        assert!(memory.is_dir(), "auto-memory folder was created");
+        let open = state.pending_editor_open.as_ref().expect("editor launch");
+        assert!(open.label.ends_with("memory"));
+        assert!(matches!(state.overlay, Overlay::None));
+
+        match visual {
+            Some(value) => std::env::set_var("VISUAL", value),
+            None => std::env::remove_var("VISUAL"),
+        }
+        match editor {
+            Some(value) => std::env::set_var("EDITOR", value),
+            None => std::env::remove_var("EDITOR"),
+        }
+    }
+
+    #[test]
+    fn auto_memory_toggle_is_read_only_when_the_environment_disables_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let mut env = crate::memory_files::MemoryEnvironment::for_test(
+            home.path().join("claude"),
+            home.path().join("codex"),
+            home.path().to_path_buf(),
+        );
+        env.disable_auto_memory = Some(true);
+        state.memory_environment = env;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/memory");
+        let toggle_index = match &state.overlay {
+            Overlay::MemoryPicker { listing, .. } => listing
+                .rows()
+                .iter()
+                .position(|(_, row)| {
+                    row.action == crate::memory_files::MemoryAction::ToggleAutoMemory
+                })
+                .expect("auto-memory toggle"),
+            _ => panic!("expected memory picker"),
+        };
+        if let Overlay::MemoryPicker { selected, .. } = &mut state.overlay {
+            *selected = toggle_index;
+        }
+        let text = buffer_lines(&render_state(&state, 120, 34)).join("\n");
+        assert!(text.contains("auto-memory read-only"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("auto-memory is read-only"));
+        assert!(!home.path().join("claude").join("settings.json").exists());
+        assert!(matches!(state.overlay, Overlay::MemoryPicker { .. }));
     }
 
     #[test]

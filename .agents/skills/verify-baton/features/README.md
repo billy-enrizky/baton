@@ -30,7 +30,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Harness matrix | CLI | Codex, Claude, Cursor, Grok, OpenCode, and Antigravity are checked for a live ICA turn or an explicit external account block |
 | Output sanitization | CLI and TUI | Control sequences are replaced before `exec` stdout and the transcript; unit proof only |
 | Activity | TUI and CLI | `/activity` and `baton activity --json` index every turn's tools, diff, and usage |
-| Memories | TUI and CLI | `/memories`, `$memories`, and `baton memories` share canonical project/global rows |
+| Memory files | TUI | `/memory` lists Claude and Codex instruction files, opens or creates them in the editor, and toggles Claude auto-memory |
 | Grok | CLI | `grok agent stdio` completes a turn on the ICA endpoint |
 | Cursor | CLI | `cursor-agent acp` gives the login hint and rejects a custom endpoint |
 | Process registry | CLI | `baton ps --json` returns a stable schema and no false live processes |

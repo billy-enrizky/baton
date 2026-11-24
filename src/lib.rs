@@ -14,6 +14,7 @@ pub mod harness_config;
 pub mod inbox;
 pub mod mcp;
 pub mod memory;
+pub mod memory_files;
 pub mod models;
 pub mod notify;
 pub mod orchestrate;

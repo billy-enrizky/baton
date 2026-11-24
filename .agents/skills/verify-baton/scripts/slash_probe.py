@@ -74,7 +74,24 @@ def main() -> int:
         "exit 0\n"
     )
     editor.chmod(0o755)
-    subprocess.run(["git", "init", "-q"], cwd=workdir, check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=workdir, check=True)
+    no_hooks = Path(home) / "no-hooks"
+    no_hooks.mkdir()
+    subprocess.run(
+        ["git", "config", "core.hooksPath", str(no_hooks)], cwd=workdir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "commit.gpgsign", "false"], cwd=workdir, check=True
+    )
+    subprocess.run(
+        ["git", "config", "status.showUntrackedFiles", "all"],
+        cwd=workdir,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "probe@example.com"], cwd=workdir, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "probe"], cwd=workdir, check=True)
     (Path(workdir) / ".git" / "info" / "exclude").write_text(".env\n")
     (Path(workdir) / ".env").write_text("IGNORED_MARKER=present\n")
     claude_config = Path(home) / "claude-config"
@@ -390,6 +407,67 @@ def main() -> int:
                 (Path(workdir).resolve() / "CLAUDE.md")
             ):
                 missing.append("memory editor target")
+
+        os.write(master, b"/git\r")
+        pump(master, 0.8, transcript)
+        git_picker = screen_text(transcript, args.width, args.height)
+        git_required = [
+            "Git ·",
+            "Status",
+            "Commit all changes",
+            "Commit staged changes",
+            "Cancel",
+        ]
+        missing.extend(value for value in git_required if value not in git_picker)
+        (evidence / "git-picker-screen.txt").write_text(git_picker + "\n")
+        os.write(master, b"\x1b[B")
+        pump(master, 0.1, transcript)
+        os.write(master, b"\r")
+        if not wait_for(master, "message: baton:", 5.0, transcript):
+            missing.append("git confirm screen")
+        pump(master, 0.2, transcript)
+        git_confirm = screen_text(transcript, args.width, args.height)
+        git_confirm_required = [
+            "Commit ·",
+            "message: baton:",
+            "enter confirm",
+            "src/parser/mod.rs",
+            "README.md",
+        ]
+        missing.extend(
+            value for value in git_confirm_required if value not in git_confirm
+        )
+        (evidence / "git-confirm-screen.txt").write_text(git_confirm + "\n")
+        os.write(master, b"\r")
+        if not wait_for(master, "committed ", 5.0, transcript):
+            missing.append("git commit notice")
+        pump(master, 0.4, transcript)
+        (evidence / "git-committed-screen.txt").write_text(
+            screen_text(transcript, args.width, args.height) + "\n"
+        )
+        committed = subprocess.run(
+            ["git", "-C", workdir, "log", "-1", "--format=%s"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        (evidence / "git-log-subject.txt").write_text(committed + "\n")
+        if committed != "baton: update 4 files":
+            missing.append("git generated commit message")
+        committed_names = subprocess.run(
+            ["git", "-C", workdir, "show", "--name-only", "--format=", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        (evidence / "git-committed-files.txt").write_text(committed_names)
+        expected_names = sorted(
+            ["AGENTS.md", "CLAUDE.md", "README.md", "src/parser/mod.rs"]
+        )
+        if sorted(committed_names.splitlines()) != expected_names:
+            missing.append("git committed file set")
+        if ".env" in committed_names.splitlines():
+            missing.append("git committed an ignored file")
 
         os.write(master, b"/files ")
         pump(master, 0.5, transcript)

@@ -8,7 +8,7 @@
 - Free-form commands still accept typed text.
 
 ## How to get to it (user POV)
-Open the TUI and type `/mode `, `/model`, `/switch `, `/effort `, `/auth `, `/mcp `, `/orchestrate `, or `/runs `.
+Open the TUI and type `/mode `, `/model`, `/switch `, `/effort `, `/auth `, `/mcp `, `/orchestrate `, `/git `, or `/runs `.
 
 ## Driving it with the PTY harness
 ```sh
@@ -32,3 +32,4 @@ Installed-binary proof: the same slash probe passed against the v0.4.0 default c
 - Turn-number choices for `/review`, `/commands`, and `/fork --turn` come from the current thread history.
 - `/mcp remove`, `/runs`, and `/copy` choices come from the MCP registry, current store, and conversation.
 - `/pin move ` offers both directions only for pinned threads in the current project. The probe enters the full ID from the picker row because the move notice, refreshed order, and boundary result are part of the proof.
+- `/git` completes status, commit, and commit --staged. The probe commits the isolated repository and checks the real git subject and exact file list.

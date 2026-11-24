@@ -235,6 +235,9 @@ def main() -> int:
         model_picker = screen_text(transcript, args.width, args.height)
         model_required = ["models ·", "type to filter", "enter", "esc"]
         missing.extend(value for value in model_required if value not in model_picker)
+        for value in ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"]:
+            if value not in model_picker:
+                missing.append(f"model picker known catalog: {value}")
         model_header = re.search(
             r"[a-z-]+ models · (\d+)/(\d+) · type to filter · enter · esc",
             model_picker,

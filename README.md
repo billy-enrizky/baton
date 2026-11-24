@@ -14,7 +14,7 @@ New sessions orchestrate by default: the prompt is the goal, a coordinator split
 - **Reads the same context jsonl.** `baton import` discovers existing native sessions (claude transcripts, codex rollouts) and imports them as resumable baton threads.
 - **Checkpoints.** Every turn ends with a hidden git ref capturing the working tree. `/rewind` restores the conversation and optionally the code.
 - **Review from the terminal.** `/review` shows the turn diff with context, keeps notes on exact changed lines, and sends them back as a steer or the next prompt.
-- **Live catalogs.** `/switch` loads the provider's current model list (Codex, OpenCode, and ACP providers), with type-to-filter search.
+- **Live catalogs.** `/switch` loads the provider's current model list (Codex, OpenCode, and ACP providers), with type-to-filter search. A short or degraded live probe keeps the known catalog instead of hiding models Baton already ships.
 - **Parallel, then merged.** `/multi` fans one prompt across providers and opens a merged live view; press Enter to inspect any child thread. `/multi --worktrees` runs the same fan-out as isolated orchestration workers, so `i` merges and `p` opens PRs through the existing worker flows.
 - **Queued by provider.** If two threads target the same provider at once, the second waits in a durable `queued` phase and starts when the adapter is free instead of failing.
 - **Agent-readable state.** `status`, `threads`, `turns`, `queue`, `exec`, and `orchestrate` have versioned JSON output. `exec --stream-json` and `orchestrate --stream-json` emit one JSON event per line and end with a result row. `baton mcp` exposes the same durable state over MCP stdio.

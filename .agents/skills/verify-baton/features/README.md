@@ -6,7 +6,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 |---|---|---|
 | Doctor | CLI | `baton doctor` next action, six providers, readiness, database count |
 | TUI status | TUI | `/status` shows thread, phase, queue, and adapter lifecycle |
-| Slash choices | TUI | typing a command argument lists valid choices or its syntax, filters them, and completes with Tab or Enter |
+| Slash choices | TUI | typing a command argument lists valid choices or its syntax, filters them, and completes with Tab or Enter; `slash_sweep.py` runs every command and requires its stable surface |
 | Settings | TUI | `/settings` writes global default mode and bell choices, shows the selected category's options, and labels harness rows read-only |
 | Auth billing | TUI | `/auth` lists every harness with subscription and API rows, marks the current mode, names the key variable or `missing`, applies a keyed choice, and keeps the picker open on a missing key or malformed config |
 | Roles | TUI and CLI | `/roles` shows the four resolved role rows and detail; `baton roles --json` also returns effort, prompt source/path, and parsed hook declarations |

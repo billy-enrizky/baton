@@ -21,6 +21,17 @@ The probe types `/find ` and requires its argument syntax, then types `/mode `, 
 
 The probe filters `/auth antigravity ` and requires both billing choices. It opens `/auth`, requires the `1/12` position, the key row, the missing-key row, and the apply hint, wraps to `12/12`, applies `codex api`, checks the persisted mode, selects `grok api` without a key, and requires the picker to stay open with `no API key for grok` before Escape.
 
+The full sweep runs every command in one isolated session and requires each
+command's stable surface, no panic or unknown-command text, and a clean `/exit`:
+
+```sh
+uv run --no-project python .agents/skills/verify-baton/scripts/slash_sweep.py \
+  --binary target/debug/baton \
+  --evidence-dir local_docs/verification/evidence
+```
+
+`/quit` is covered by the slash probe.
+
 The retry probe owns `/retry ` completion because it needs failed turns. It
 requires `/retry 1` and `/retry 10` with their failed-turn descriptions, then
 types the exact `/retry 1` form to prove it wins over the longer completion

@@ -34,6 +34,8 @@ The scope is the GitHub Actions workflow for the public Baton repository, the tr
 | Skipped required checks | Zero | Now |
 | Workflow-level false green | Zero in the workflow and aggregator; adversarial test-process tampering remains a residual risk | Now for the workflow; Phase 3 for a sandbox |
 
+Startup is measured by `scripts/bench.py` against `scripts/bench-baseline.json` for the debug binary and `scripts/bench-release-baseline.json` for release. The gate compares the minimum of N process starts divided by the minimum of N control spawns, because a busy host slows every process by 20 percent or more and an absolute millisecond threshold then reports the host as a regression. Phase checks use the minimum sample and add `--slack-ms` (0.1 ms by default), because a 0.35 ms phase cannot resolve a 10 percent band on a shared machine; phases recorded below `--resolution-ms` are reported and not enforced. `startup.process` is reported and not enforced because it includes runtime init outside Baton's work. A scaled-down baseline is the negative control: it fails the ratio and the phase it understates.
+
 The false-green goal is scoped to the workflow and aggregator. A test process with write access can alter its own log or manifest; that residual risk is listed in Risks and mitigations and is why the manifest check is called detection, not a sandbox.
 
 Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every required command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command. The post-build `--version` smoke check runs outside the budget because the build it checks is already budgeted.

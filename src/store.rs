@@ -120,6 +120,9 @@ pub struct OrchestrationTaskRow {
     pub reasoning_effort: Option<String>,
     pub text: Option<String>,
     pub error: Option<String>,
+    pub review_status: Option<String>,
+    pub review_text: Option<String>,
+    pub reviewed_at: Option<String>,
     pub created_at: String,
     pub finished_at: Option<String>,
 }
@@ -424,6 +427,9 @@ fn apply_schema(db: &Connection) -> Result<()> {
     ensure_column(db, "orchestration_tasks", "merged_at", "TEXT")?;
     ensure_column(db, "orchestration_tasks", "position", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(db, "orchestration_tasks", "pr_url", "TEXT")?;
+    ensure_column(db, "orchestration_tasks", "review_status", "TEXT")?;
+    ensure_column(db, "orchestration_tasks", "review_text", "TEXT")?;
+    ensure_column(db, "orchestration_tasks", "reviewed_at", "TEXT")?;
     ensure_column(db, "orchestration_tasks", "snapshot_base", "TEXT")?;
     ensure_column(db, "orchestration_tasks", "snapshot_tree", "TEXT")?;
     ensure_column(db, "orchestration_tasks", "reasoning_effort", "TEXT")?;
@@ -688,13 +694,16 @@ fn map_orchestration_task(row: &rusqlite::Row) -> rusqlite::Result<Orchestration
         status: row.get(11)?,
         text: row.get(12)?,
         error: row.get(13)?,
-        created_at: row.get(14)?,
-        finished_at: row.get(15)?,
-        merged_at: row.get(16)?,
-        pr_url: row.get(17)?,
-        snapshot_base: row.get(18)?,
-        snapshot_tree: row.get(19)?,
-        reasoning_effort: row.get(20)?,
+        review_status: row.get(14)?,
+        review_text: row.get(15)?,
+        reviewed_at: row.get(16)?,
+        created_at: row.get(17)?,
+        finished_at: row.get(18)?,
+        merged_at: row.get(19)?,
+        pr_url: row.get(20)?,
+        snapshot_base: row.get(21)?,
+        snapshot_tree: row.get(22)?,
+        reasoning_effort: row.get(23)?,
     })
 }
 
@@ -2388,10 +2397,17 @@ impl BatonStore {
             params![run_id],
             |row| row.get(0),
         )?;
+        let blocked_reviews: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ? AND review_status IN ('request_changes', 'failed')",
+            params![run_id],
+            |row| row.get(0),
+        )?;
         let status = if cancelled > 0 {
             "cancelled"
         } else if needs_input > 0 {
             "needs_input"
+        } else if blocked_reviews > 0 {
+            "needs_review"
         } else if total > 0 && completed == total {
             "completed"
         } else if completed > 0 {
@@ -2523,7 +2539,7 @@ impl BatonStore {
 
     pub fn list_orchestration_tasks(&self, run_id: &str) -> Result<Vec<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree, reasoning_effort FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
+            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, review_status, review_text, reviewed_at, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree, reasoning_effort FROM orchestration_tasks WHERE run_id = ? ORDER BY position, created_at, id",
         )?;
         let rows = statement
             .query_map(params![run_id], map_orchestration_task)?
@@ -2536,12 +2552,29 @@ impl BatonStore {
         thread_id: &str,
     ) -> Result<Option<OrchestrationTaskRow>> {
         let mut statement = self.db.prepare(
-            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree, reasoning_effort FROM orchestration_tasks WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, review_status, review_text, reviewed_at, created_at, finished_at, merged_at, pr_url, snapshot_base, snapshot_tree, reasoning_effort FROM orchestration_tasks WHERE thread_id = ? ORDER BY created_at DESC LIMIT 1",
         )?;
         let row = statement
             .query_row(params![thread_id], map_orchestration_task)
             .optional()?;
         Ok(row)
+    }
+
+    /// Record the reviewer verdict for one task. Reviews are written after the
+    /// task row exists so a reviewer failure cannot lose the worker result.
+    pub fn set_orchestration_task_review(
+        &self,
+        run_id: &str,
+        id: &str,
+        status: &str,
+        text: Option<&str>,
+        reviewed_at: &str,
+    ) -> Result<()> {
+        self.db.execute(
+            "UPDATE orchestration_tasks SET review_status = ?, review_text = ?, reviewed_at = ? WHERE run_id = ? AND id = ?",
+            params![status, text, reviewed_at, run_id, id],
+        )?;
+        Ok(())
     }
 
     pub fn update_orchestration_task_failure(
@@ -2611,12 +2644,20 @@ impl BatonStore {
         let cancelled = tasks.iter().any(|task| task.status == "cancelled");
         let needs_input = tasks.iter().any(|task| task.status == "needs_input");
         let running = tasks.iter().any(|task| task.status == "running");
+        let blocked_reviews = tasks.iter().any(|task| {
+            matches!(
+                task.review_status.as_deref(),
+                Some("request_changes") | Some("failed")
+            )
+        });
         let status = if running {
             "running"
         } else if cancelled {
             "cancelled"
         } else if needs_input {
             "needs_input"
+        } else if blocked_reviews {
+            "needs_review"
         } else if completed == tasks.len() {
             "completed"
         } else if completed == 0 {

@@ -110,13 +110,14 @@ Useful top-level keys:
 
 ## Roles
 
-Baton has four roles: orchestrator, planner, implementor, and reviewer. Defaults are Claude `claude-opus-5-5` for orchestrator and planner, Codex `gpt-6.2-sol` for implementor, and Codex `gpt-6.2-astra` for reviewer. A normal orchestration uses the planner role for its coordinator turn and the implementor role for matching worker tasks. `/roles` shows the resolved rows and Enter shows the provider, model, effort, prompt source, config source, and parsed hook events. `baton roles --json` exposes the same registry.
+Baton has four roles: orchestrator, planner, implementor, and reviewer. Defaults are Claude `claude-opus-5-5` for orchestrator and planner, Codex `gpt-6.2-sol` for implementor, and Codex `gpt-6.2-astra` for reviewer. A normal orchestration uses the planner role for its coordinator turn and the implementor role for matching worker tasks. After every completed worker, the reviewer role reads that worker's commit and answers `APPROVE` or `REQUEST_CHANGES`; only an approved commit can be integrated or shipped. `/roles` shows the resolved rows and Enter shows the provider, model, effort, prompt source, config source, and parsed hook events. `baton roles --json` exposes the same registry.
 
 Override models in `~/.baton/roles.json`:
 
 ```json
 {
   "schema_version": 1,
+  "review": true,
   "roles": {
     "orchestrator": { "provider": "claude", "model": "claude-opus-5-5" },
     "planner": { "provider": "claude", "model": "claude-opus-5-5" },
@@ -126,7 +127,9 @@ Override models in `~/.baton/roles.json`:
 }
 ```
 
-A role must set `provider` and `model` together. `effort` is accepted only for a provider that supports reasoning effort. Malformed JSON, a partial provider/model pair, an unknown provider, an unknown hook event, an empty hook command, or a timeout outside 1 to 300 seconds fails closed. Declared `before_plan`, `after_plan`, `before_implement`, and `after_implement` hooks run in that order with the declared timeout: a failing plan hook aborts the run, a failing `before_implement` hook fails the task before the worker starts, and a failing `after_implement` hook fails the task before its commit. The review hooks wait for the reviewer phase.
+`review` defaults to `true`. Set it to `false` to skip the reviewer turn; a skipped review does not block integration or shipping. The run reports each worker's review status as `approve`, `request_changes`, `failed`, or `skipped`, and a run with a blocking review finishes as `needs_review`.
+
+A role must set `provider` and `model` together. `effort` is accepted only for a provider that supports reasoning effort. Malformed JSON, a partial provider/model pair, an unknown provider, an unknown hook event, an empty hook command, or a timeout outside 1 to 300 seconds fails closed. Declared `before_plan`, `after_plan`, `before_implement`, and `after_implement` hooks run in that order with the declared timeout: a failing plan hook aborts the run, a failing `before_implement` hook fails the task before the worker starts, and a failing `after_implement` hook fails the task before its commit. `before_review` runs before the reviewer turn and `after_review` runs after the verdict; a failing review hook records `failed` for that worker and blocks integration and shipping.
 
 To run every role on Codex with DeepSeek V4.1 Flash:
 
@@ -156,7 +159,7 @@ Hooks are declared in the same file:
 }
 ```
 
-Known events are `before_plan`, `after_plan`, `before_implement`, `after_implement`, `before_review`, and `after_review`. Hook declarations are validated and shown by `/roles`; execution is not wired yet.
+Known events are `before_plan`, `after_plan`, `before_implement`, `after_implement`, `before_review`, and `after_review`. Hook declarations are validated and shown by `/roles`, and all six events run with the declared timeout.
 
 ## MCP, skills, and memory
 

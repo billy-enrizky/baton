@@ -9183,7 +9183,12 @@ fn draw_orchestration_report(
     }
     for (index, task) in report.tasks.iter().enumerate() {
         task_starts.push(lines.len());
+        let blocked_review = matches!(
+            task.review_status.as_deref(),
+            Some("request_changes") | Some("failed")
+        );
         let (marker, status_color) = match task.status.as_str() {
+            "completed" if blocked_review => ("!", COLORS.warning),
             "completed" => ("✓", COLORS.success),
             "needs_input" => ("?", COLORS.warning),
             "cancelled" => ("⊘", COLORS.warning),
@@ -9275,6 +9280,25 @@ fn draw_orchestration_report(
                 truncate_chars(&format!("    error: {error}"), width),
                 Style::default().fg(COLORS.error),
             ));
+        }
+        if let Some(review) = &task.review_status {
+            let color = if matches!(review.as_str(), "request_changes" | "failed") {
+                COLORS.warning
+            } else {
+                COLORS.muted
+            };
+            lines.push(Line::styled(
+                truncate_chars(&format!("    review: {review}"), width),
+                Style::default().fg(color),
+            ));
+            if let Some(text) = &task.review_text {
+                for line in text.lines().filter(|line| !line.trim().is_empty()).take(2) {
+                    lines.push(Line::styled(
+                        truncate_chars(&format!("    {line}"), width),
+                        Style::default().fg(COLORS.text),
+                    ));
+                }
+            }
         }
         lines.push(Line::raw(""));
     }
@@ -23539,6 +23563,9 @@ exit 1
                     status: "completed".to_string(),
                     text: Some("one is done".to_string()),
                     error: None,
+                    review_status: None,
+                    review_text: None,
+                    reviewed_at: None,
                     pr_url: None,
                     merged_at: None,
                     created_at: String::new(),
@@ -23558,6 +23585,9 @@ exit 1
                     status: "failed".to_string(),
                     text: None,
                     error: Some("boom".to_string()),
+                    review_status: None,
+                    review_text: None,
+                    reviewed_at: None,
                     pr_url: None,
                     merged_at: None,
                     created_at: String::new(),
@@ -24740,6 +24770,23 @@ exit 1
             text.contains("question: approve the worker change?"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn orchestration_report_renders_a_blocked_review() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let mut report = sample_report(None);
+        report.status = "needs_review".to_string();
+        report.tasks[0].review_status = Some("request_changes".to_string());
+        report.tasks[0].review_text =
+            Some("REQUEST_CHANGES\nThe error path is untested.".to_string());
+        state.orchestration_report = Some(report);
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("needs_review"), "{text}");
+        assert!(text.contains("review: request_changes"), "{text}");
+        assert!(text.contains("The error path is untested."), "{text}");
     }
 
     #[test]

@@ -144,6 +144,11 @@ pub struct WorkerResult {
     pub status: String,
     pub text: Option<String>,
     pub error: Option<String>,
+    /// "approve", "request_changes", "failed", or "skipped". None means the
+    /// run predates the reviewer phase.
+    pub review_status: Option<String>,
+    pub review_text: Option<String>,
+    pub reviewed_at: Option<String>,
     pub pr_url: Option<String>,
     pub merged_at: Option<String>,
     pub created_at: String,
@@ -337,7 +342,7 @@ Each worker runs in its own git worktree, so tasks must not depend on another ta
 Choose the best installed harness for each task from: PROVIDERS. Default every task to DEFAULT_WORKER. Choose another harness only when the goal explicitly names one.
 When the goal explicitly names a model for a task, set that task's "model" field. Otherwise omit "model" so Baton applies the role default for the default worker provider; a task on another harness uses its config default.
 When the goal explicitly names a reasoning effort, set that task's "effort" field. Use a lowercase value such as low, medium, high, xhigh, or max. Only codex and claude support effort. Otherwise omit "effort" so Baton applies the role default for the default worker provider; another harness uses its default.
-Reviewer execution is not active in this request. Do not wait for a reviewer verdict; return only the plan.
+Baton runs a reviewer after each completed worker, outside this planning request. Do not wait for a reviewer verdict; return only the plan.
 Every worker starts in its own worktree, so each prompt must refer to the current working directory, never to the source checkout path.
 Return ONLY a JSON object, with no markdown fences or commentary:
 {"summary":"one sentence","tasks":[{"title":"short task name","provider":"DEFAULT_WORKER","prompt":"complete self-contained instructions for the worker"}]}"#;
@@ -766,6 +771,9 @@ fn panicked_worker(fallback: &WorkerFallback) -> (usize, WorkerResult) {
     (
         fallback.index,
         WorkerResult {
+            review_status: None,
+            review_text: None,
+            reviewed_at: None,
             id: uuid::Uuid::new_v4().to_string(),
             title: fallback.title.clone(),
             provider: fallback.provider,
@@ -856,6 +864,9 @@ fn run_worker_inner(
         return (
             index,
             WorkerResult {
+                review_status: None,
+                review_text: None,
+                reviewed_at: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 title: task.title.clone(),
                 provider,
@@ -882,6 +893,9 @@ fn run_worker_inner(
             return (
                 index,
                 WorkerResult {
+                    review_status: None,
+                    review_text: None,
+                    reviewed_at: None,
                     id: uuid::Uuid::new_v4().to_string(),
                     title: task.title.clone(),
                     provider,
@@ -923,6 +937,9 @@ fn run_worker_inner(
                     return (
                         index,
                         WorkerResult {
+                            review_status: None,
+                            review_text: None,
+                            reviewed_at: None,
                             id: uuid::Uuid::new_v4().to_string(),
                             title: task.title.clone(),
                             provider,
@@ -957,6 +974,9 @@ fn run_worker_inner(
                 return (
                     index,
                     WorkerResult {
+                        review_status: None,
+                        review_text: None,
+                        reviewed_at: None,
                         id: uuid::Uuid::new_v4().to_string(),
                         title: task.title.clone(),
                         provider,
@@ -988,6 +1008,9 @@ fn run_worker_inner(
         return (
             index,
             WorkerResult {
+                review_status: None,
+                review_text: None,
+                reviewed_at: None,
                 id: uuid::Uuid::new_v4().to_string(),
                 title: task.title.clone(),
                 provider,
@@ -1104,6 +1127,9 @@ fn run_worker_inner(
     (
         index,
         WorkerResult {
+            review_status: None,
+            review_text: None,
+            reviewed_at: None,
             id: uuid::Uuid::new_v4().to_string(),
             title: task.title.clone(),
             provider,
@@ -1123,6 +1149,223 @@ fn run_worker_inner(
             finished_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         },
     )
+}
+
+pub const REVIEW_APPROVE: &str = "approve";
+pub const REVIEW_REQUEST_CHANGES: &str = "request_changes";
+pub const REVIEW_FAILED: &str = "failed";
+pub const REVIEW_SKIPPED: &str = "skipped";
+const MAX_REVIEW_DIFF_CHARS: usize = 12_000;
+const MAX_REVIEW_EVIDENCE_CHARS: usize = 4_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewOutcome {
+    pub status: &'static str,
+    pub text: String,
+}
+
+/// The reviewer is asked for a line that is exactly `APPROVE` or
+/// `REQUEST_CHANGES`. A missing verdict fails closed, because an unreadable
+/// review must not read as approval.
+pub fn parse_review_verdict(text: &str) -> &'static str {
+    fn verdict(line: &str) -> Option<&'static str> {
+        let line = line
+            .trim()
+            .trim_start_matches(|character: char| !character.is_ascii_alphanumeric());
+        let rest = line.to_ascii_uppercase();
+        let word_ends = |prefix: &str| {
+            !rest[prefix.len()..]
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphabetic())
+        };
+        if rest.starts_with("APPROVE") && word_ends("APPROVE") {
+            return Some(REVIEW_APPROVE);
+        }
+        for prefix in ["REQUEST_CHANGES", "REQUEST CHANGES"] {
+            if rest.starts_with(prefix) && word_ends(prefix) {
+                return Some(REVIEW_REQUEST_CHANGES);
+            }
+        }
+        None
+    }
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(found) = verdict(line) {
+            return found;
+        }
+        // A label such as `Verdict: APPROVE` keeps the verdict after the
+        // colon. Only the tail is read when the label itself has no verdict.
+        if let Some((label, tail)) = line.rsplit_once(':') {
+            if !label.to_ascii_uppercase().contains("APPROVE")
+                && !label.to_ascii_uppercase().contains("REQUEST")
+            {
+                if let Some(found) = verdict(tail) {
+                    return found;
+                }
+            }
+        }
+    }
+    REVIEW_REQUEST_CHANGES
+}
+
+fn bounded_review_text(text: &str, max: usize, marker: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max {
+        return trimmed.to_string();
+    }
+    let mut capped = trimmed.chars().take(max).collect::<String>();
+    capped.push_str(marker);
+    capped
+}
+
+fn review_diff(cwd: &Path, commit: &str) -> Result<String> {
+    let output = Command::new("git")
+        .args(["show", "--format=", "--patch", commit])
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("cannot read commit {commit} in {}", cwd.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git show {commit} failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(bounded_review_text(
+        &String::from_utf8_lossy(&output.stdout),
+        MAX_REVIEW_DIFF_CHARS,
+        "\n[...diff truncated]",
+    ))
+}
+
+fn reviewer_prompt(reviewer: &RoleSpec, task: &WorkerResult, diff: &str) -> String {
+    let reported = match task.text.as_deref() {
+        Some(text) => text,
+        None => "(the worker reported no text)",
+    };
+    let evidence = bounded_review_text(
+        reported,
+        MAX_REVIEW_EVIDENCE_CHARS,
+        "\n[...worker report truncated]",
+    );
+    format!(
+        "{prompt}\n\nTask: {title}\nWorker: {provider}/{model}\nCommit: {commit}\n\nWorker report:\n{evidence}\n\nDiff:\n{diff}\n\nCheck the diff against the task and the worker's claims. End with a line that is exactly APPROVE or REQUEST_CHANGES.",
+        prompt = reviewer.prompt,
+        title = task.title,
+        provider = task.provider,
+        model = task.model,
+        commit = task.commit.as_deref().unwrap_or("(none)"),
+    )
+}
+
+/// One reviewer turn over a completed worker's commit. The reviewer runs in the
+/// worker worktree with a role marker, so a harness or fixture can tell the two
+/// turns apart.
+fn review_task(
+    task: &WorkerResult,
+    home: &Path,
+    repo_root: &Path,
+    reviewer: &RoleSpec,
+    binary: &Path,
+    permission_mode: PermissionMode,
+    cancel: Option<&AtomicBool>,
+) -> ReviewOutcome {
+    let Some(commit) = task.commit.as_deref() else {
+        return ReviewOutcome {
+            status: REVIEW_SKIPPED,
+            text: "no commit to review".to_string(),
+        };
+    };
+    if is_cancelled(cancel) {
+        return ReviewOutcome {
+            status: REVIEW_FAILED,
+            text: "review cancelled".to_string(),
+        };
+    }
+    let cwd = task
+        .worktree
+        .as_ref()
+        .map(|worktree| worktree.path.clone())
+        .unwrap_or_else(|| repo_root.to_path_buf());
+    if let Err(error) = crate::roles::run_hooks(home, "before_review", &cwd) {
+        return ReviewOutcome {
+            status: REVIEW_FAILED,
+            text: format!("before_review hook failed: {error}"),
+        };
+    }
+    let diff = match review_diff(&cwd, commit) {
+        Ok(diff) => diff,
+        Err(error) => {
+            return ReviewOutcome {
+                status: REVIEW_FAILED,
+                text: error.to_string(),
+            };
+        }
+    };
+    let mut command = Command::new(binary);
+    command
+        .arg("-C")
+        .arg(&cwd)
+        .arg("exec")
+        .arg("-p")
+        .arg(reviewer.provider.as_str())
+        .arg("-m")
+        .arg(&reviewer.model)
+        .arg("--json");
+    if let Some(effort) = reviewer.effort.as_deref() {
+        command.arg("--effort").arg(effort);
+    }
+    apply_permission_args(&mut command, permission_mode);
+    command
+        .arg(reviewer_prompt(reviewer, task, &diff))
+        .env("BATON_HOME", home)
+        .env("BATON_DISABLE_SKILL_DISPATCH", "1")
+        .env("BATON_ROLE", "reviewer");
+    let outcome = match run_command_cancellable(command, cancel) {
+        Ok(result) => {
+            let (_, text, error, phase) = parse_exec_output(&result.stdout, &result.stderr);
+            if !result.status.success() || phase.as_deref() != Some("completed") {
+                ReviewOutcome {
+                    status: REVIEW_FAILED,
+                    text: error
+                        .unwrap_or_else(|| format!("reviewer turn exited with {}", result.status)),
+                }
+            } else {
+                let text = text.unwrap_or_default();
+                ReviewOutcome {
+                    status: parse_review_verdict(&text),
+                    text,
+                }
+            }
+        }
+        Err(error) => ReviewOutcome {
+            status: REVIEW_FAILED,
+            text: format!("cannot run reviewer: {error}"),
+        },
+    };
+    if let Err(error) = crate::roles::run_hooks(home, "after_review", &cwd) {
+        return ReviewOutcome {
+            status: REVIEW_FAILED,
+            text: format!(
+                "after_review hook failed: {error} (verdict: {})",
+                outcome.text
+            ),
+        };
+    }
+    outcome
+}
+
+pub fn review_blocked(tasks: &[WorkerResult]) -> Vec<String> {
+    tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.review_status.as_deref(),
+                Some(REVIEW_REQUEST_CHANGES) | Some(REVIEW_FAILED)
+            )
+        })
+        .map(|task| task.title.clone())
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1214,6 +1457,32 @@ fn ensure_no_worker_questions(tasks: &[OrchestrationTaskRow]) -> Result<()> {
         anyhow::bail!(
             "worker(s) waiting for input: {}; answer them before integrating or opening PRs",
             waiting.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn ensure_reviews_clear(tasks: &[OrchestrationTaskRow]) -> Result<()> {
+    let blocked = tasks
+        .iter()
+        .filter(|task| {
+            matches!(
+                task.review_status.as_deref(),
+                Some(REVIEW_REQUEST_CHANGES) | Some(REVIEW_FAILED)
+            )
+        })
+        .map(|task| {
+            format!(
+                "{} ({})",
+                task.title,
+                task.review_status.as_deref().unwrap_or("unknown")
+            )
+        })
+        .collect::<Vec<_>>();
+    if !blocked.is_empty() {
+        anyhow::bail!(
+            "review did not approve: {}; fix the review findings before integrating or opening PRs",
+            blocked.join(", ")
         );
     }
     Ok(())
@@ -1364,6 +1633,7 @@ pub fn integrate(
         anyhow::bail!("run {} has no tasks", &run_id[..8.min(run_id.len())]);
     }
     ensure_no_worker_questions(&tasks)?;
+    ensure_reviews_clear(&tasks)?;
     for index in selection {
         if *index == 0 || *index > tasks.len() {
             anyhow::bail!(
@@ -1578,6 +1848,7 @@ fn open_prs_with_gh(
         anyhow::bail!("run {} has no tasks", &run_id[..8.min(run_id.len())]);
     }
     ensure_no_worker_questions(&tasks)?;
+    ensure_reviews_clear(&tasks)?;
     for index in selection {
         if *index == 0 || *index > tasks.len() {
             anyhow::bail!(
@@ -2137,8 +2408,14 @@ fn run_with_worker_bin_and_progress(
             .collect::<Vec<_>>()
     });
     results.sort_by_key(|(index, _)| *index);
+    let reviewer = registry.get(RoleId::Reviewer);
+    let review_enabled = registry.review;
+    let reviewer_bin = worker_bin
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_exe().ok())
+        .unwrap_or_else(|| PathBuf::from("baton"));
     let mut tasks = Vec::new();
-    for (position, (_, task)) in results.into_iter().enumerate() {
+    for (position, (_, mut task)) in results.into_iter().enumerate() {
         store.add_orchestration_task(
             &task.id,
             &run_id,
@@ -2160,15 +2437,58 @@ fn run_with_worker_bin_and_progress(
             task.snapshot.as_ref().map(|snapshot| snapshot.tree.as_str()),
             task.effort.as_deref(),
         )?;
+        if task.status == "completed" && task.commit.is_some() {
+            let outcome = if review_enabled {
+                emit(
+                    progress,
+                    OrchestrationProgress::WorkerFinished {
+                        index: position + 1,
+                        title: format!("review {}", task.title),
+                        status: "running".to_string(),
+                        commit: task.commit.clone(),
+                        error: None,
+                    },
+                );
+                review_task(
+                    &task,
+                    home,
+                    &repo_root,
+                    reviewer,
+                    &reviewer_bin,
+                    permission_mode,
+                    None,
+                )
+            } else {
+                ReviewOutcome {
+                    status: REVIEW_SKIPPED,
+                    text: "review disabled by roles.json".to_string(),
+                }
+            };
+            let reviewed_at =
+                chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            store.set_orchestration_task_review(
+                &run_id,
+                &task.id,
+                outcome.status,
+                Some(&outcome.text),
+                &reviewed_at,
+            )?;
+            task.review_status = Some(outcome.status.to_string());
+            task.review_text = Some(outcome.text);
+            task.reviewed_at = Some(reviewed_at);
+        }
         tasks.push(task);
     }
     let completed = tasks.iter().filter(|task| task.status == "completed").count();
     let cancelled = tasks.iter().any(|task| task.status == "cancelled");
     let needs_input = tasks.iter().any(|task| task.status == "needs_input");
+    let blocked_reviews = review_blocked(&tasks);
     let status = if cancelled {
         "cancelled"
     } else if needs_input {
         "needs_input"
+    } else if !blocked_reviews.is_empty() {
+        "needs_review"
     } else if completed == tasks.len() {
         "completed"
     } else if completed == 0 {
@@ -2246,6 +2566,15 @@ pub fn render(report: &RunReport) -> String {
                 &commit[..8.min(commit.len())]
             ));
         }
+        if let Some(review) = &task.review_status {
+            lines.push(format!("      review: {review}"));
+            if let Some(text) = &task.review_text {
+                let preview: Vec<&str> = text.lines().take(3).collect();
+                if !preview.is_empty() {
+                    lines.push(format!("      {}", preview.join(" ")));
+                }
+            }
+        }
         if let Some(question) = task.text.as_deref().and_then(worker_question) {
             lines.push(format!("      question: {question}"));
         } else if let Some(text) = &task.text {
@@ -2275,6 +2604,9 @@ pub fn to_json(report: &RunReport) -> serde_json::Value {
                 "question": task.text.as_deref().and_then(worker_question),
                 "prompt": task.prompt,
                 "status": task.status,
+                "review_status": task.review_status,
+                "review_text": task.review_text,
+                "reviewed_at": task.reviewed_at,
                 "thread_id": task.thread_id,
                 "text": task.text,
                 "error": task.error,
@@ -2450,6 +2782,9 @@ pub fn report_from_rows(store: &BatonStore, cwd: &Path, run_id: &str) -> Result<
                 _ => None,
             };
             WorkerResult {
+                review_status: task.review_status,
+                review_text: task.review_text,
+                reviewed_at: task.reviewed_at,
                 id: task.id,
                 title: task.title,
                 provider: task.provider,
@@ -3089,7 +3424,10 @@ mod tests {
         assert!(prompt.contains("role default for the default worker provider"), "{prompt}");
         assert!(prompt.contains("explicitly names a reasoning effort"), "{prompt}");
         assert!(prompt.contains("Only codex and claude support effort"), "{prompt}");
-        assert!(prompt.contains("Reviewer execution is not active"), "{prompt}");
+        assert!(
+            prompt.contains("runs a reviewer after each completed worker"),
+            "{prompt}"
+        );
     }
 
     #[test]
@@ -3687,6 +4025,12 @@ exit 1
         path
     }
 
+    /// These fixtures emulate a single harness turn, so the review gate is
+    /// turned off unless a test is about the reviewer itself.
+    fn no_review(home: &Path) {
+        std::fs::write(home.join("roles.json"), r#"{"review":false}"#).unwrap();
+    }
+
     fn worker_script_for_text(dir: &Path, name: &str, body: &str, text: &str) -> PathBuf {
         let path = dir.join(name);
         let result = serde_json::json!({
@@ -3729,6 +4073,7 @@ exit 1
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "init"]);
         let home = tempfile::tempdir().unwrap();
+        no_review(home.path());
         let worker = worker_script_for_text(home.path(), "question-worker", worker_body, worker_text);
         let plan_path = home.path().join("plan.json");
         std::fs::write(&plan_path, plan).unwrap();
@@ -3781,6 +4126,7 @@ exit 1
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "init"]);
         let home = tempfile::tempdir().unwrap();
+        no_review(home.path());
         let worker = worker_script(home.path(), "fake-worker", worker_body);
         let plan_path = home.path().join("plan.json");
         std::fs::write(&plan_path, plan).unwrap();
@@ -3866,6 +4212,7 @@ exit 1
         )
         .unwrap();
         let store = BatonStore::memory().unwrap();
+        no_review(home.path());
         let worker = worker_script(
             home.path(),
             "snapshot-worker",
@@ -3977,6 +4324,7 @@ exit 1
         )
         .unwrap();
         let store = BatonStore::memory().unwrap();
+        no_review(home.path());
         let worker = worker_script(
             home.path(),
             "snapshot-integrator",
@@ -4070,6 +4418,7 @@ printf 'worker\n' > worker.txt",
         )
         .unwrap();
         let store = BatonStore::memory().unwrap();
+        no_review(home.path());
         let worker = worker_script(
             home.path(),
             "snapshot-conflict",
@@ -4403,6 +4752,7 @@ printf 'worker\n' > worker.txt",
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "init"]);
         let home = tempfile::tempdir().unwrap();
+        no_review(home.path());
         let plan_path = repo.path().join("plan.json");
         std::fs::write(
             &plan_path,
@@ -4679,5 +5029,190 @@ printf 'worker\n' > worker.txt",
         let error =
             open_prs_with_gh(&store, repo.path(), &report.run_id, &[], Some(&gh)).unwrap_err();
         assert!(error.to_string().contains("no git remote"), "{error}");
+    }
+
+    #[test]
+    fn review_verdicts_fail_closed() {
+        let cases = [
+            ("APPROVE", REVIEW_APPROVE),
+            ("approve", REVIEW_APPROVE),
+            ("Verdict: APPROVE", REVIEW_APPROVE),
+            ("REQUEST_CHANGES", REVIEW_REQUEST_CHANGES),
+            (
+                "request changes: the error path is untested",
+                REVIEW_REQUEST_CHANGES,
+            ),
+            ("Looks good overall\nAPPROVE\n", REVIEW_APPROVE),
+            ("I cannot approve this diff", REVIEW_REQUEST_CHANGES),
+            ("APPROVES nothing", REVIEW_REQUEST_CHANGES),
+            ("", REVIEW_REQUEST_CHANGES),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(parse_review_verdict(text), expected, "{text:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    fn review_fixture(
+        roles: Option<&str>,
+        reviewer_text: &str,
+        reviewer_marker: bool,
+    ) -> (tempfile::TempDir, tempfile::TempDir, BatonStore, RunReport) {
+        use std::os::unix::fs::PermissionsExt;
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {:?}: {}",
+                args,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@test"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.path().join("a.txt"), "base\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "init"]);
+        let home = tempfile::tempdir().unwrap();
+        let plan_path = home.path().join("plan.json");
+        std::fs::write(
+            &plan_path,
+            r#"{"summary":"one worker","tasks":[{"title":"first task","provider":"codex","prompt":"do the work"}]}"#,
+        )
+        .unwrap();
+        if let Some(roles) = roles {
+            std::fs::write(home.path().join("roles.json"), roles).unwrap();
+        }
+        let worker_json = serde_json::json!({
+            "schema_version": 1,
+            "thread_id": "worker-thread",
+            "ok": true,
+            "phase": "completed",
+            "error": null,
+            "text": "worker done",
+        });
+        let review_json = serde_json::json!({
+            "schema_version": 1,
+            "thread_id": "review-thread",
+            "ok": true,
+            "phase": "completed",
+            "error": null,
+            "text": reviewer_text,
+        });
+        let marker = if reviewer_marker {
+            "touch \"$BATON_HOME/review-ran.txt\"\n"
+        } else {
+            ""
+        };
+        let script = format!(
+            "#!/bin/sh\nset -eu\ncd \"$2\" || exit 1\nif [ \"${{BATON_ROLE:-}}\" = reviewer ]; then\n{marker}  printf '%s\\n' '{review_json}'\nelse\n  printf 'work\\n' > worker.txt\n  printf '%s\\n' '{worker_json}'\nfi\n"
+        );
+        let worker = home.path().join("review-harness");
+        std::fs::write(&worker, script).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let store = BatonStore::memory().unwrap();
+        let report = run_with_worker_bin(
+            "review fixture",
+            repo.path(),
+            home.path(),
+            ProviderId::Codex,
+            "test-model",
+            4,
+            Some(&plan_path),
+            &store,
+            Some(&worker),
+            PermissionMode::Default,
+        )
+        .unwrap();
+        (repo, home, store, report)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reviewer_approval_completes_the_run_and_integration() {
+        let (repo, _home, store, report) = review_fixture(None, "APPROVE", false);
+        assert_eq!(report.status, "completed");
+        let task = &report.tasks[0];
+        assert_eq!(task.review_status.as_deref(), Some(REVIEW_APPROVE));
+        assert_eq!(task.review_text.as_deref(), Some("APPROVE"));
+        let rows = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert_eq!(rows[0].review_status.as_deref(), Some(REVIEW_APPROVE));
+        assert!(rows[0].reviewed_at.is_some());
+        let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
+        assert_eq!(integrated.merged.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn request_changes_blocks_integration_and_shipping() {
+        let (repo, home, store, report) =
+            review_fixture(None, "REQUEST_CHANGES\nThe error path is untested.", false);
+        assert_eq!(report.status, "needs_review");
+        assert_eq!(
+            report.tasks[0].review_status.as_deref(),
+            Some(REVIEW_REQUEST_CHANGES)
+        );
+        let error = integrate(&store, repo.path(), &report.run_id, &[]).unwrap_err();
+        let error = error.to_string();
+        assert!(error.contains("review did not approve"), "{error}");
+        assert!(error.contains("first task"), "{error}");
+        let gh = fake_gh(home.path());
+        let error =
+            open_prs_with_gh(&store, repo.path(), &report.run_id, &[], Some(&gh)).unwrap_err();
+        assert!(
+            error.to_string().contains("review did not approve"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn role_settings_can_disable_the_reviewer() {
+        let (repo, home, store, report) =
+            review_fixture(Some(r#"{"review":false}"#), "APPROVE", true);
+        assert_eq!(report.status, "completed");
+        assert_eq!(
+            report.tasks[0].review_status.as_deref(),
+            Some(REVIEW_SKIPPED)
+        );
+        assert!(
+            !home.path().join("review-ran.txt").exists(),
+            "a disabled reviewer must not start a turn"
+        );
+        let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
+        assert_eq!(integrated.merged.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_review_hook_fails_the_review_and_blocks_integration() {
+        let (repo, _home, store, report) = review_fixture(
+            Some(r#"{"hooks":{"before_review":[{"argv":["sh","-c","exit 4"]}]}}"#),
+            "APPROVE",
+            true,
+        );
+        assert_eq!(report.status, "needs_review");
+        let task = &report.tasks[0];
+        assert_eq!(task.review_status.as_deref(), Some(REVIEW_FAILED));
+        assert!(
+            task.review_text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("before_review"),
+            "{:?}",
+            task.review_text
+        );
+        let error = integrate(&store, repo.path(), &report.run_id, &[]).unwrap_err();
+        assert!(
+            error.to_string().contains("review did not approve"),
+            "{error}"
+        );
     }
 }

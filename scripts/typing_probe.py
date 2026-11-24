@@ -87,34 +87,8 @@ def reap(pid: int, timeout_s: float) -> int:
     return -9
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--binary", default="target/debug/baton")
-    parser.add_argument("--runs", type=int, default=40)
-    parser.add_argument("--text", default="the quick brown fox jumps over 13 lazy dogs")
-    parser.add_argument(
-        "--slash",
-        action="store_true",
-        help="measure time from `/` to the suggestion list instead of typing letters",
-    )
-    parser.add_argument("--suggestion", default="switch", help="text that proves the list rendered")
-    parser.add_argument("--width", type=int, default=120)
-    parser.add_argument("--height", type=int, default=34)
-    parser.add_argument("--ready", default="Ask anything")
-    parser.add_argument("--warmup", type=float, default=3.0)
-    parser.add_argument("--timeout", type=float, default=8.0)
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--baseline", type=Path, help="record the result to this file")
-    parser.add_argument("--check", type=Path, help="baseline file to compare against")
-    parser.add_argument("--tolerance", type=float, default=0.10)
-    parser.add_argument("--force", action="store_true", help="compare across machines")
-    args = parser.parse_args()
-
-    binary = Path(args.binary).resolve()
-    if not binary.is_file():
-        print(f"missing binary: {binary}", file=sys.stderr)
-        return 2
-
+def measure(binary: Path, args: argparse.Namespace) -> dict | None:
+    """Run the probe once and return its percentiles, or None on a setup failure."""
     home = tempfile.mkdtemp(prefix="baton-typing-home-")
     workdir = tempfile.mkdtemp(prefix="baton-typing-cwd-")
     pid, master = pty.fork()
@@ -138,7 +112,7 @@ def main() -> int:
                     break
         else:
             print("TUI did not show the composer", file=sys.stderr)
-            return 1
+            return None
         drain(master, QUIET_MS, args.timeout)
         time.sleep(args.warmup)
 
@@ -150,7 +124,7 @@ def main() -> int:
                 elapsed = (time.perf_counter() - start) * 1000.0
                 if not hit:
                     print("suggestion list did not render", file=sys.stderr)
-                    return 1
+                    return None
                 samples.append(elapsed)
                 os.write(master, b"\x1b")
                 drain(master, QUIET_MS, 1.0)
@@ -176,7 +150,7 @@ def main() -> int:
 
     if not samples:
         print("no samples collected", file=sys.stderr)
-        return 1
+        return None
     ordered = sorted(samples)
     p95_index = max(0, int(len(ordered) * 0.95) - 1)
     result = {
@@ -187,10 +161,74 @@ def main() -> int:
         "max_ms": ordered[-1],
         "exit_code": exit_code,
     }
+    return result
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--binary", default="target/debug/baton")
+    parser.add_argument("--runs", type=int, default=40)
+    parser.add_argument("--text", default="the quick brown fox jumps over 13 lazy dogs")
+    parser.add_argument(
+        "--slash",
+        action="store_true",
+        help="measure time from `/` to the suggestion list instead of typing letters",
+    )
+    parser.add_argument("--suggestion", default="switch", help="text that proves the list rendered")
+    parser.add_argument("--width", type=int, default=120)
+    parser.add_argument("--height", type=int, default=34)
+    parser.add_argument("--ready", default="Ask anything")
+    parser.add_argument("--warmup", type=float, default=3.0)
+    parser.add_argument("--timeout", type=float, default=8.0)
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--baseline", type=Path, help="record the result to this file")
+    parser.add_argument("--check", type=Path, help="baseline file to compare against")
+    parser.add_argument("--tolerance", type=float, default=0.10)
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=3,
+        help="whole-probe repetitions; the minimum percentile is compared",
+    )
+    parser.add_argument(
+        "--slack-ms",
+        type=float,
+        default=0.1,
+        help="absolute slack added to each limit for measurement noise",
+    )
+    parser.add_argument("--force", action="store_true", help="compare across machines")
+    args = parser.parse_args()
+
+    binary = Path(args.binary).resolve()
+    if not binary.is_file():
+        print(f"missing binary: {binary}", file=sys.stderr)
+        return 2
+
+    results = []
+    for _ in range(args.repeat):
+        result = measure(binary, args)
+        if result is None:
+            return 1
+        results.append(result)
+    machine = results[0]["machine"]
+    p50s = [r["p50_ms"] for r in results]
+    p95s = [r["p95_ms"] for r in results]
+    result = {
+        "machine": machine,
+        "samples": results[0]["samples"],
+        "runs": len(results),
+        "p50_ms": statistics.median(p50s),
+        "p50_min_ms": min(p50s),
+        "p95_ms": statistics.median(p95s),
+        "p95_min_ms": min(p95s),
+        "max_ms": max(r["max_ms"] for r in results),
+        "exit_code": max(r["exit_code"] for r in results),
+    }
     label = "slash" if args.slash else "typing"
     print(json.dumps(result, indent=2) if args.json else
-          f"{label}: {result['samples']} samples, p50 {result['p50_ms']:.1f} ms, p95 {result['p95_ms']:.1f} ms, max {result['max_ms']:.1f} ms")
-    if exit_code != 0:
+          f"{label}: {result['runs']} runs x {result['samples']} samples, "
+          f"p50 min {result['p50_min_ms']:.1f} ms (median {result['p50_ms']:.1f}), "
+          f"p95 min {result['p95_min_ms']:.1f} ms (median {result['p95_ms']:.1f}), max {result['max_ms']:.1f}")
+    if result["exit_code"] != 0:
         return 1
     if args.baseline:
         args.baseline.write_text(json.dumps(result, indent=2) + "\n")
@@ -203,9 +241,15 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        if "p50_min_ms" not in baseline:
+            print(
+                f"baseline {args.check} predates repeated samples; re-record it with --baseline",
+                file=sys.stderr,
+            )
+            return 2
         failures = []
-        for key in ("p50_ms", "p95_ms"):
-            limit = baseline[key] * (1.0 + args.tolerance)
+        for key in ("p50_min_ms", "p95_min_ms"):
+            limit = baseline[key] * (1.0 + args.tolerance) + args.slack_ms
             if result[key] > limit:
                 failures.append(f"{key} {result[key]:.2f} ms > {limit:.2f} ms ({baseline[key]:.2f} baseline)")
         for failure in failures:

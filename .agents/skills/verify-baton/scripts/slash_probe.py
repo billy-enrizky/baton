@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tui_probe import Screen, pump, reap, set_size, wait_for
+from tui_probe import Screen, binary_identity, pump, reap, set_size, wait_for
 
 
 def screen_text(transcript: bytearray, width: int, height: int) -> str:
@@ -722,6 +722,23 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
+        os.write(master, b"/git status\r")
+        if not wait_for_screen(
+            master,
+            "Git status ·",
+            10.0,
+            transcript,
+            args.width,
+            args.height,
+        ):
+            missing.append("direct /git status command")
+        git_status = screen_text(transcript, args.width, args.height)
+        if "esc close" not in git_status:
+            missing.append("direct /git status close hint")
+        (evidence / "git-status-direct-screen.txt").write_text(git_status + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
         subprocess.run(
             ["git", "-C", workdir, "checkout", "-q", "-b", "feat/pr"], check=True
         )
@@ -1058,6 +1075,7 @@ def main() -> int:
         passed = not missing and not rejected and exit_code == 0
         summary = {
             "passed": passed,
+            "binary": binary_identity(binary),
             "missing": missing,
             "rejected": rejected,
             "exit_code": exit_code,

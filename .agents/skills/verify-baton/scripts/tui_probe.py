@@ -3,6 +3,7 @@
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import pty
@@ -10,11 +11,49 @@ import re
 import select
 import signal
 import struct
+import subprocess
 import sys
 import tempfile
 import termios
 import time
 from pathlib import Path
+
+
+def binary_identity(binary: Path) -> dict[str, str | None]:
+    identity: dict[str, str | None] = {
+        "path": str(binary),
+        "sha256": None,
+        "version": None,
+        "source_commit": None,
+    }
+    try:
+        identity["sha256"] = hashlib.sha256(binary.read_bytes()).hexdigest()
+    except OSError:
+        pass
+    try:
+        version = subprocess.run(
+            [str(binary), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if version.returncode == 0:
+            identity["version"] = version.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    root = Path(__file__).resolve().parents[4]
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if commit.returncode == 0:
+            identity["source_commit"] = commit.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return identity
 
 
 class Screen:

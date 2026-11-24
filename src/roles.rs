@@ -206,6 +206,78 @@ fn validate_hooks(hooks: &BTreeMap<String, Vec<HookSpec>>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookOutcome {
+    pub event: String,
+    pub command: String,
+    pub output: String,
+}
+
+/// Run every hook declared for `event` in `cwd`, in declaration order. The
+/// first failure stops the sequence, so a later hook cannot mask it.
+pub fn run_hooks(home: &Path, event: &str, cwd: &Path) -> Result<Vec<HookOutcome>> {
+    let registry = load(home)?;
+    run_hooks_from(&registry, event, cwd)
+}
+
+pub(crate) fn run_hooks_from(
+    registry: &RoleRegistry,
+    event: &str,
+    cwd: &Path,
+) -> Result<Vec<HookOutcome>> {
+    let Some(specs) = registry.hooks.get(event) else {
+        return Ok(Vec::new());
+    };
+    let mut outcomes = Vec::new();
+    for spec in specs {
+        let command = spec.argv.join(" ");
+        let mut process = std::process::Command::new(&spec.argv[0]);
+        process.args(&spec.argv[1..]).current_dir(cwd);
+        let output = crate::git_workflow::run_command_with_timeout(
+            process,
+            &format!("{event} hook {command}"),
+            std::time::Duration::from_secs(spec.timeout_secs),
+        )?;
+        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.trim().is_empty() {
+            if !text.is_empty() && !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str(&stderr);
+        }
+        let success = output.status.success();
+        let output = bounded_hook_output(&text);
+        outcomes.push(HookOutcome {
+            event: event.to_string(),
+            command: command.clone(),
+            output: output.clone(),
+        });
+        if !success {
+            anyhow::bail!(
+                "hook `{command}` for {event} failed: {}",
+                if output.is_empty() {
+                    "no output".to_string()
+                } else {
+                    output
+                }
+            );
+        }
+    }
+    Ok(outcomes)
+}
+
+fn bounded_hook_output(text: &str) -> String {
+    const MAX_CHARS: usize = 2_000;
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut capped = trimmed.chars().take(MAX_CHARS).collect::<String>();
+    capped.push_str("\n[...hook output truncated]");
+    capped
+}
+
 pub(crate) fn safe_model_token(value: &str) -> bool {
     let value = value.trim();
     !value.is_empty()
@@ -423,5 +495,63 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("prompt exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hooks_run_in_the_working_directory_in_order() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("roles.json"),
+            r#"{"hooks":{"after_implement":[{"argv":["sh","-c","echo one > hook.txt"]},{"argv":["sh","-c","echo two >> hook.txt"]}]}}"#,
+        )
+        .unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let outcomes = run_hooks(home.path(), "after_implement", work.path()).unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].event, "after_implement");
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("hook.txt"))
+                .unwrap()
+                .trim(),
+            "one\ntwo"
+        );
+        assert!(run_hooks(home.path(), "before_plan", work.path())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_hook_reports_its_output_and_stops_the_sequence() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("roles.json"),
+            r#"{"hooks":{"after_implement":[{"argv":["sh","-c","echo boom >&2; exit 3"]},{"argv":["sh","-c","touch second.txt"]}]}}"#,
+        )
+        .unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let error = run_hooks(home.path(), "after_implement", work.path()).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("after_implement"), "{message}");
+        assert!(message.contains("boom"), "{message}");
+        assert!(
+            !work.path().join("second.txt").exists(),
+            "a later hook must not run after a failure"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hook_timeout_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("roles.json"),
+            r#"{"hooks":{"before_implement":[{"argv":["sh","-c","sleep 5"],"timeout_secs":1}]}}"#,
+        )
+        .unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let error = run_hooks(home.path(), "before_implement", work.path()).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
     }
 }

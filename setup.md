@@ -126,7 +126,7 @@ Override models in `~/.baton/roles.json`:
 }
 ```
 
-A role must set `provider` and `model` together. `effort` is accepted only for a provider that supports reasoning effort. Malformed JSON, a partial provider/model pair, an unknown provider, an unknown hook event, an empty hook command, or a timeout outside 1 to 300 seconds fails closed.
+A role must set `provider` and `model` together. `effort` is accepted only for a provider that supports reasoning effort. Malformed JSON, a partial provider/model pair, an unknown provider, an unknown hook event, an empty hook command, or a timeout outside 1 to 300 seconds fails closed. Declared `before_plan`, `after_plan`, `before_implement`, and `after_implement` hooks run in that order with the declared timeout: a failing plan hook aborts the run, a failing `before_implement` hook fails the task before the worker starts, and a failing `after_implement` hook fails the task before its commit. The review hooks wait for the reviewer phase.
 
 To run every role on Codex with DeepSeek V4.1 Flash:
 

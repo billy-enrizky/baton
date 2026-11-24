@@ -2,6 +2,7 @@
 //! requests, and history rewrites are deliberately out of scope.
 
 use anyhow::{bail, Context, Result};
+use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -97,6 +98,32 @@ pub struct PushOutcome {
     pub remote: String,
     pub remote_branch: String,
     pub upstream: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestSummary {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub mergeable: String,
+    pub head_ref: String,
+    pub draft: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestCheck {
+    pub name: String,
+    pub state: String,
+    pub bucket: String,
+    pub description: String,
+    pub link: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestChecks {
+    pub pr: PullRequestSummary,
+    pub checks: Vec<PullRequestCheck>,
 }
 
 impl GitStatus {
@@ -482,6 +509,119 @@ fn push_arguments(plan: &PushPlan) -> Vec<String> {
         plan.remote.clone(),
         format!("{}:{}", plan.head, plan.remote_ref),
     ]
+}
+
+pub fn checks(cwd: &Path) -> Result<PullRequestChecks> {
+    checks_with(cwd, &gh_binary())
+}
+
+fn gh_binary() -> PathBuf {
+    std::env::var_os("BATON_GH_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("gh"))
+}
+
+fn checks_with(cwd: &Path, gh: &Path) -> Result<PullRequestChecks> {
+    let root = repo_root(cwd)?;
+    let view = run_gh(
+        &root,
+        gh,
+        &[
+            "pr",
+            "view",
+            "--json",
+            "number,title,url,state,mergeable,headRefName,isDraft",
+        ],
+        false,
+    )?;
+    let view: Value = serde_json::from_slice(&view).context("gh pr view returned invalid JSON")?;
+    let number = view
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("gh pr view did not return a pull request number")?;
+    let pr = PullRequestSummary {
+        number,
+        title: string_field(&view, "title"),
+        url: string_field(&view, "url"),
+        state: string_field(&view, "state"),
+        mergeable: string_field(&view, "mergeable"),
+        head_ref: string_field(&view, "headRefName"),
+        draft: view
+            .get("isDraft")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    };
+    let checks = run_gh(
+        &root,
+        gh,
+        &[
+            "pr",
+            "checks",
+            &number.to_string(),
+            "--json",
+            "name,state,bucket,description,link",
+        ],
+        true,
+    )?;
+    let checks: Vec<Value> =
+        serde_json::from_slice(&checks).context("gh pr checks returned invalid JSON")?;
+    let checks = checks
+        .into_iter()
+        .take(200)
+        .filter_map(|value| {
+            let name = string_field(&value, "name");
+            if name.is_empty() {
+                return None;
+            }
+            let link = string_field(&value, "link");
+            Some(PullRequestCheck {
+                name,
+                state: string_field(&value, "state"),
+                bucket: string_field(&value, "bucket"),
+                description: string_field(&value, "description")
+                    .chars()
+                    .take(500)
+                    .collect(),
+                link: if link.is_empty() { None } else { Some(link) },
+            })
+        })
+        .collect();
+    Ok(PullRequestChecks { pr, checks })
+}
+
+fn string_field(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn run_gh(root: &Path, gh: &Path, args: &[&str], allow_pending: bool) -> Result<Vec<u8>> {
+    let output = Command::new(gh)
+        .args(args)
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .output()
+        .with_context(|| format!("cannot run {} {}", gh.display(), args.join(" ")))?;
+    if output.status.success() || (allow_pending && output.status.code() == Some(8)) {
+        return Ok(output.stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if allow_pending && stderr.to_lowercase().contains("no checks reported") {
+        return Ok(b"[]".to_vec());
+    }
+    let command = args.iter().take(2).copied().collect::<Vec<_>>().join(" ");
+    bail!(
+        "gh {command} failed: {}",
+        if stderr.is_empty() {
+            "no error output"
+        } else {
+            &stderr
+        }
+    )
 }
 
 pub fn generate_message(files: &[String]) -> String {
@@ -1471,5 +1611,113 @@ mod tests {
         add_remote(unborn.path(), "origin", bare.path());
         let error = plan_push(unborn.path(), "origin").unwrap_err();
         assert!(error.to_string().contains("no commits"), "{error}");
+    }
+
+    fn fake_gh(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn checks_reports_the_current_pull_request_and_its_checks() {
+        let repo = repo();
+        let gh = fake_gh(
+            repo.path(),
+            "fake-gh",
+            r#"if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  cat <<'JSON'
+{"number":42,"title":"Add checks","url":"https://github.com/example/repo/pull/42","state":"OPEN","mergeable":"MERGEABLE","headRefName":"feat/checks","isDraft":false}
+JSON
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
+  cat <<'JSON'
+[{"name":"Test","state":"SUCCESS","bucket":"pass","description":"","link":"https://example/check"},{"name":"Lint","state":"PENDING","bucket":"pending","description":"waiting","link":""}]
+JSON
+  exit 0
+fi
+exit 1"#,
+        );
+        let report = checks_with(repo.path(), &gh).unwrap();
+        assert_eq!(report.pr.number, 42);
+        assert_eq!(report.pr.title, "Add checks");
+        assert_eq!(report.pr.head_ref, "feat/checks");
+        assert!(!report.pr.draft);
+        assert_eq!(report.checks.len(), 2);
+        assert_eq!(report.checks[0].bucket, "pass");
+        assert_eq!(
+            report.checks[0].link.as_deref(),
+            Some("https://example/check")
+        );
+        assert_eq!(report.checks[1].state, "PENDING");
+        assert_eq!(report.checks[1].link, None);
+    }
+
+    #[test]
+    fn checks_accepts_pending_exit_8_and_an_empty_check_list() {
+        let repo = repo();
+        let gh = fake_gh(
+            repo.path(),
+            "fake-gh-pending",
+            r#"if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"number":7,"title":"Pending","url":"u","state":"OPEN","mergeable":"UNKNOWN","headRefName":"b","isDraft":true}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
+  printf '%s\n' '[]'
+  exit 8
+fi
+exit 1"#,
+        );
+        let report = checks_with(repo.path(), &gh).unwrap();
+        assert_eq!(report.pr.number, 7);
+        assert!(report.pr.draft);
+        assert!(report.checks.is_empty());
+    }
+
+    #[test]
+    fn checks_treats_no_checks_reported_as_an_empty_list() {
+        let repo = repo();
+        let gh = fake_gh(
+            repo.path(),
+            "fake-gh-empty",
+            r#"if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"number":3,"title":"Empty","url":"u","state":"OPEN","mergeable":"MERGEABLE","headRefName":"b","isDraft":false}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
+  printf 'no checks reported on the branch\n' >&2
+  exit 1
+fi
+exit 1"#,
+        );
+        let report = checks_with(repo.path(), &gh).unwrap();
+        assert!(report.checks.is_empty());
+    }
+
+    #[test]
+    fn checks_reports_a_missing_gh_or_missing_pull_request() {
+        let repo = repo();
+        let error = checks_with(repo.path(), Path::new("/nonexistent/gh")).unwrap_err();
+        assert!(error.to_string().contains("cannot run"), "{error}");
+
+        let gh = fake_gh(
+            repo.path(),
+            "fake-gh-no-pr",
+            r#"printf 'no pull requests found for branch\n' >&2
+exit 1"#,
+        );
+        let error = checks_with(repo.path(), &gh).unwrap_err();
+        assert!(error.to_string().contains("gh pr view failed"), "{error}");
+        assert!(
+            error.to_string().contains("no pull requests found"),
+            "{error}"
+        );
     }
 }

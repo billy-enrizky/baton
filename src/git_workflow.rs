@@ -11,6 +11,7 @@ const MAX_MESSAGE_CHARS: usize = 200;
 pub struct GitStatus {
     pub root: PathBuf,
     pub branch: String,
+    pub head_ref: Option<String>,
     pub upstream: Option<String>,
     pub ahead: usize,
     pub behind: usize,
@@ -68,6 +69,39 @@ pub struct CommitOutcome {
     pub message: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushTarget {
+    pub remote: String,
+    pub local_branch: String,
+    pub local_ref: String,
+    pub remote_branch: String,
+    pub remote_ref: String,
+    pub upstream: bool,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushPlan {
+    pub root: PathBuf,
+    pub branch: String,
+    pub head: String,
+    pub local_ref: String,
+    pub remote: String,
+    pub remote_branch: String,
+    pub remote_ref: String,
+    pub upstream: bool,
+    pub ahead: usize,
+    pub behind: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushOutcome {
+    pub remote: String,
+    pub remote_branch: String,
+    pub upstream: bool,
+}
+
 impl GitStatus {
     pub fn changed_files(&self) -> Vec<String> {
         let mut files = self
@@ -113,9 +147,16 @@ impl GitStatus {
 
 pub fn inspect(cwd: &Path) -> Result<GitStatus> {
     let root = repo_root(cwd)?;
-    let branch = match git_text(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"]) {
-        Ok(branch) if !branch.trim().is_empty() => branch.trim().to_string(),
-        _ => {
+    let head_ref = git_text(&root, &["symbolic-ref", "--quiet", "HEAD"])
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| value.starts_with("refs/heads/"));
+    let branch = match head_ref.as_deref() {
+        Some(head_ref) => head_ref
+            .strip_prefix("refs/heads/")
+            .unwrap_or(head_ref)
+            .to_string(),
+        None => {
             let sha = git_text(&root, &["rev-parse", "--short", "HEAD"])?;
             format!("detached at {}", sha.trim())
         }
@@ -148,6 +189,7 @@ pub fn inspect(cwd: &Path) -> Result<GitStatus> {
     Ok(GitStatus {
         root,
         branch,
+        head_ref,
         upstream,
         ahead,
         behind,
@@ -272,6 +314,185 @@ pub fn commit(plan: &CommitPlan) -> Result<CommitOutcome> {
         files: plan.files.len(),
         message: plan.message.clone(),
     })
+}
+
+pub fn list_push_targets(cwd: &Path) -> Result<Vec<PushTarget>> {
+    let status = inspect(cwd)?;
+    if status.branch.starts_with("detached at ") {
+        bail!("detached HEAD; check out a branch before pushing");
+    }
+    if let Some(operation) = status.operation.as_deref() {
+        bail!("{operation} is in progress; finish it before pushing");
+    }
+    if status.conflicts {
+        bail!("unresolved conflicts; resolve them before pushing");
+    }
+    let head_ref = status
+        .head_ref
+        .clone()
+        .context("detached HEAD; check out a branch before pushing")?;
+    let remotes = git_text(&status.root, &["remote"])?
+        .lines()
+        .map(str::trim)
+        .filter(|remote| !remote.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if remotes.is_empty() {
+        bail!("no git remote is configured");
+    }
+    let (upstream_remote, upstream_branch) = upstream_target(&status.root, &status.branch)
+        .map(|(remote, branch)| (Some(remote), Some(branch)))
+        .unwrap_or_default();
+    let upstream_resolved = status.upstream.is_some();
+    let mut targets = remotes
+        .into_iter()
+        .map(|remote| {
+            let upstream = upstream_resolved
+                && upstream_remote.as_deref() == Some(remote.as_str())
+                && upstream_branch.is_some();
+            let remote_branch = if upstream {
+                upstream_branch
+                    .clone()
+                    .unwrap_or_else(|| status.branch.clone())
+            } else {
+                status.branch.clone()
+            };
+            let remote_ref = if remote_branch.starts_with("refs/heads/") {
+                remote_branch.clone()
+            } else {
+                format!("refs/heads/{remote_branch}")
+            };
+            let remote_branch = remote_ref
+                .strip_prefix("refs/heads/")
+                .unwrap_or(&remote_ref)
+                .to_string();
+            PushTarget {
+                remote,
+                local_branch: status.branch.clone(),
+                local_ref: head_ref.clone(),
+                remote_branch,
+                remote_ref,
+                upstream,
+                ahead: if upstream { status.ahead } else { 0 },
+                behind: if upstream { status.behind } else { 0 },
+            }
+        })
+        .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        (!left.upstream, &left.remote).cmp(&(!right.upstream, &right.remote))
+    });
+    Ok(targets)
+}
+
+fn upstream_target(root: &Path, branch: &str) -> Option<(String, String)> {
+    let remote = git_text(
+        root,
+        &["config", "--get", &format!("branch.{branch}.remote")],
+    )
+    .ok()?
+    .trim()
+    .to_string();
+    if remote.is_empty() || remote == "." {
+        return None;
+    }
+    let merge = git_text(
+        root,
+        &["config", "--get", &format!("branch.{branch}.merge")],
+    )
+    .ok()?;
+    let merge = merge.trim();
+    let branch = merge.strip_prefix("refs/heads/").unwrap_or(merge);
+    if branch.is_empty() {
+        return None;
+    }
+    Some((remote, branch.to_string()))
+}
+
+pub fn plan_push(cwd: &Path, remote: &str) -> Result<PushPlan> {
+    let targets = list_push_targets(cwd)?;
+    let target = targets
+        .into_iter()
+        .find(|target| target.remote == remote)
+        .with_context(|| format!("remote {remote} is not configured"))?;
+    let root = repo_root(cwd)?;
+    let head = head_sha(&root)?.context("the branch has no commits to push")?;
+    if target.upstream {
+        if target.behind > 0 {
+            bail!(
+                "upstream {} has {} commit(s) you do not; pull or merge before pushing",
+                target.remote,
+                target.behind
+            );
+        }
+        if target.ahead == 0 {
+            bail!("nothing to push; the branch matches its upstream");
+        }
+    }
+    Ok(PushPlan {
+        root,
+        branch: target.local_branch,
+        head,
+        local_ref: target.local_ref,
+        remote: target.remote,
+        remote_branch: target.remote_branch,
+        remote_ref: target.remote_ref,
+        upstream: target.upstream,
+        ahead: target.ahead,
+        behind: target.behind,
+    })
+}
+
+pub fn push(plan: &PushPlan) -> Result<PushOutcome> {
+    let status = inspect(&plan.root)?;
+    if status.branch != plan.branch {
+        bail!(
+            "branch changed from {} to {}; review the push again",
+            plan.branch,
+            status.branch
+        );
+    }
+    if let Some(operation) = status.operation.as_deref() {
+        bail!("{operation} is in progress; finish it before pushing");
+    }
+    if status.conflicts {
+        bail!("unresolved conflicts; resolve them before pushing");
+    }
+    if current_head(&plan.root)?.as_deref() != Some(plan.head.as_str()) {
+        bail!("HEAD moved since the confirmation; review the push again");
+    }
+    let arguments = push_arguments(plan);
+    let output = Command::new("git")
+        .args(&arguments)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .current_dir(&plan.root)
+        .output()
+        .with_context(|| format!("cannot run git {}", arguments.join(" ")))?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            arguments.join(" "),
+            std::str::from_utf8(&output.stderr)
+                .unwrap_or("push failed")
+                .trim()
+        );
+    }
+    Ok(PushOutcome {
+        remote: plan.remote.clone(),
+        remote_branch: plan.remote_branch.clone(),
+        upstream: plan.upstream,
+    })
+}
+
+fn push_arguments(plan: &PushPlan) -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        "push.autoSetupRemote=false".to_string(),
+        "push".to_string(),
+        "--porcelain".to_string(),
+        "--".to_string(),
+        plan.remote.clone(),
+        format!("{}:{}", plan.local_ref, plan.remote_ref),
+    ]
 }
 
 pub fn generate_message(files: &[String]) -> String {
@@ -400,7 +621,7 @@ fn revision_counts(root: &Path, upstream: &str) -> Result<(usize, usize)> {
     let ahead = parts.next().and_then(|value| value.parse().ok());
     match (ahead, behind) {
         (Some(ahead), Some(behind)) => Ok((ahead, behind)),
-        _ => Ok((0, 0)),
+        _ => bail!("cannot parse revision counts from git"),
     }
 }
 
@@ -557,6 +778,7 @@ mod tests {
             &["config", "core.hooksPath", hooks.to_str().unwrap()],
         );
         git(root.path(), &["config", "commit.gpgsign", "false"]);
+        git(root.path(), &["config", "push.autoSetupRemote", "false"]);
         git(root.path(), &["config", "status.showUntrackedFiles", "all"]);
         let excludes = std::env::temp_dir().join("baton-test-empty-excludes");
         std::fs::write(&excludes, "").unwrap();
@@ -579,6 +801,16 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {args:?}");
+    }
+
+    fn bare_remote() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        git(root.path(), &["init", "--bare", "-q", "-b", "main"]);
+        root
+    }
+
+    fn add_remote(repo: &Path, name: &str, remote: &Path) {
+        git(repo, &["remote", "add", name, remote.to_str().unwrap()]);
     }
 
     #[test]
@@ -938,5 +1170,285 @@ mod tests {
         let plan = plan_commit(repo.path(), CommitMode::All, None).unwrap();
         commit(&plan).unwrap();
         assert!(inspect(repo.path()).unwrap().is_clean());
+    }
+
+    #[test]
+    fn push_targets_prefer_the_configured_upstream() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git(
+            repo.path(),
+            &["branch", "--set-upstream-to=origin/main", "main"],
+        );
+        std::fs::write(repo.path().join("ahead.txt"), "ahead\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "ahead"]);
+        add_remote(repo.path(), "backup", bare.path());
+
+        let targets = list_push_targets(repo.path()).unwrap();
+        assert_eq!(targets[0].remote, "origin");
+        assert!(targets[0].upstream);
+        assert_eq!(targets[0].ahead, 1);
+        assert_eq!(targets[0].behind, 0);
+        assert_eq!(targets[1].remote, "backup");
+        assert!(!targets[1].upstream);
+    }
+
+    #[test]
+    fn push_targets_handle_a_remote_name_with_a_slash() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "team/origin", bare.path());
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/team/origin/main", "HEAD"],
+        );
+        git(
+            repo.path(),
+            &["branch", "--set-upstream-to=team/origin/main", "main"],
+        );
+        let targets = list_push_targets(repo.path()).unwrap();
+        assert_eq!(targets[0].remote, "team/origin");
+        assert!(targets[0].upstream);
+    }
+
+    #[test]
+    fn push_target_uses_a_different_upstream_branch() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        git(repo.path(), &["checkout", "-q", "-b", "feature"]);
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git(
+            repo.path(),
+            &["branch", "--set-upstream-to=origin/main", "feature"],
+        );
+        std::fs::write(repo.path().join("ahead.txt"), "ahead\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "ahead"]);
+        let targets = list_push_targets(repo.path()).unwrap();
+        assert_eq!(targets[0].remote, "origin");
+        assert!(targets[0].upstream);
+        assert_eq!(targets[0].remote_branch, "main");
+        assert_eq!(targets[0].remote_ref, "refs/heads/main");
+        assert_eq!(targets[0].ahead, 1);
+    }
+
+    #[test]
+    fn missing_tracking_ref_does_not_fabricate_an_upstream() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", "HEAD"],
+        );
+        git(
+            repo.path(),
+            &["branch", "--set-upstream-to=origin/main", "main"],
+        );
+        git(
+            repo.path(),
+            &["update-ref", "-d", "refs/remotes/origin/main"],
+        );
+        let targets = list_push_targets(repo.path()).unwrap();
+        assert!(!targets[0].upstream);
+        assert_eq!(targets[0].remote_branch, "main");
+        assert_eq!(targets[0].ahead, 0);
+        assert_eq!(targets[0].behind, 0);
+    }
+
+    #[test]
+    fn push_sends_the_branch_and_never_forces() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        std::fs::write(repo.path().join("pushed.txt"), "pushed\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "pushed"]);
+
+        let plan = plan_push(repo.path(), "origin").unwrap();
+        let arguments = push_arguments(&plan);
+        assert!(!arguments.iter().any(|argument| argument.contains("force")));
+        assert_eq!(
+            arguments,
+            vec![
+                "-c",
+                "push.autoSetupRemote=false",
+                "push",
+                "--porcelain",
+                "--",
+                "origin",
+                "refs/heads/main:refs/heads/main"
+            ]
+        );
+        push(&plan).unwrap();
+        let branch_remote = Command::new("git")
+            .args(["config", "--get", "branch.main.remote"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let branch_merge = Command::new("git")
+            .args(["config", "--get", "branch.main.merge"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(
+            !branch_remote.status.success(),
+            "push must not set upstream"
+        );
+        assert!(!branch_merge.status.success(), "push must not set upstream");
+        let local = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let remote = git_text(bare.path(), &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(local, remote);
+    }
+
+    #[test]
+    fn push_refuses_nothing_to_push_and_a_behind_branch() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        git(repo.path(), &["push", "-q", "-u", "origin", "main"]);
+        let error = plan_push(repo.path(), "origin").unwrap_err();
+        assert!(error.to_string().contains("nothing to push"), "{error}");
+
+        git(repo.path(), &["checkout", "-q", "-b", "remote-work"]);
+        std::fs::write(repo.path().join("remote.txt"), "remote\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "remote"]);
+        let remote_head = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        git(repo.path(), &["checkout", "-q", "main"]);
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", remote_head.trim()],
+        );
+        let error = plan_push(repo.path(), "origin").unwrap_err();
+        assert!(error.to_string().contains("pull or merge"), "{error}");
+    }
+
+    #[test]
+    fn push_refuses_no_remote_detached_head_and_an_operation() {
+        let repo = repo();
+        let error = list_push_targets(repo.path()).unwrap_err();
+        assert!(error.to_string().contains("no git remote"), "{error}");
+
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        git(repo.path(), &["checkout", "-q", "--detach", "HEAD"]);
+        let error = list_push_targets(repo.path()).unwrap_err();
+        assert!(error.to_string().contains("detached HEAD"), "{error}");
+        git(repo.path(), &["checkout", "-q", "main"]);
+        std::fs::write(repo.path().join(".git").join("MERGE_HEAD"), "x\n").unwrap();
+        let error = list_push_targets(repo.path()).unwrap_err();
+        assert!(error.to_string().contains("merge"), "{error}");
+    }
+
+    #[test]
+    fn push_refuses_a_moved_head() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        std::fs::write(repo.path().join("first.txt"), "first\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "first"]);
+        let plan = plan_push(repo.path(), "origin").unwrap();
+        std::fs::write(repo.path().join("second.txt"), "second\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "second"]);
+        let error = push(&plan).unwrap_err();
+        assert!(error.to_string().contains("HEAD moved"), "{error}");
+    }
+
+    #[test]
+    fn push_remote_named_like_an_option_stays_a_remote() {
+        let repo = repo();
+        let bare = bare_remote();
+        git(
+            repo.path(),
+            &[
+                "config",
+                "remote.--force.url",
+                bare.path().to_str().unwrap(),
+            ],
+        );
+        git(
+            repo.path(),
+            &[
+                "config",
+                "remote.--force.fetch",
+                "+refs/heads/*:refs/remotes/--force/*",
+            ],
+        );
+        std::fs::write(repo.path().join("pushed.txt"), "pushed\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "pushed"]);
+        let targets = list_push_targets(repo.path()).unwrap();
+        assert!(targets.iter().any(|target| target.remote == "--force"));
+        let plan = plan_push(repo.path(), "--force").unwrap();
+        let arguments = push_arguments(&plan);
+        assert_eq!(arguments[4], "--");
+        assert_eq!(arguments[5], "--force");
+        push(&plan).unwrap();
+        let local = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let remote = git_text(bare.path(), &["rev-parse", "refs/heads/main"]).unwrap();
+        assert_eq!(local, remote);
+    }
+
+    #[test]
+    fn push_rejects_a_non_fast_forward_update_without_forcing() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        git(repo.path(), &["push", "-q", "origin", "main"]);
+        git(repo.path(), &["checkout", "-q", "-b", "remote-work"]);
+        std::fs::write(repo.path().join("remote.txt"), "remote\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "remote"]);
+        git(repo.path(), &["push", "-q", "origin", "remote-work:main"]);
+        let remote_before = git_text(bare.path(), &["rev-parse", "refs/heads/main"]).unwrap();
+        git(repo.path(), &["checkout", "-q", "main"]);
+        std::fs::write(repo.path().join("local.txt"), "local\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "local"]);
+        for key in ["branch.main.remote", "branch.main.merge"] {
+            let _ = Command::new("git")
+                .args(["config", "--unset-all", key])
+                .current_dir(repo.path())
+                .output();
+        }
+        let plan = plan_push(repo.path(), "origin").unwrap();
+        let error = push(&plan).unwrap_err();
+        let message = error.to_string().to_ascii_lowercase();
+        assert!(
+            message.contains("rejected") || message.contains("non-fast-forward"),
+            "{error}"
+        );
+        assert_eq!(
+            git_text(bare.path(), &["rev-parse", "refs/heads/main"]).unwrap(),
+            remote_before
+        );
+    }
+
+    #[test]
+    fn plan_push_refuses_an_unborn_branch_and_a_missing_remote() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        let error = plan_push(repo.path(), "missing").unwrap_err();
+        assert!(error.to_string().contains("not configured"), "{error}");
+
+        let unborn = tempfile::tempdir().unwrap();
+        git(unborn.path(), &["init", "-q", "-b", "main"]);
+        add_remote(unborn.path(), "origin", bare.path());
+        let error = plan_push(unborn.path(), "origin").unwrap_err();
+        assert!(error.to_string().contains("no commits"), "{error}");
     }
 }

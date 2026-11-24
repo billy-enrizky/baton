@@ -20,7 +20,9 @@ fn git(cwd: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
     for (key, value) in env {
         command.env(key, value);
     }
-    let output = command.output().with_context(|| format!("git {:?}", args))?;
+    let output = command
+        .output()
+        .with_context(|| format!("git {:?}", args))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("git {:?} failed: {}", args, stderr.trim());
@@ -35,9 +37,52 @@ fn resolve_head(cwd: &Path) -> Result<String> {
     }
 }
 
+/// A turn needs a snapshot only when the tree differs from HEAD, or when the
+/// turn moves HEAD. One status call answers both, where a snapshot costs five
+/// more git processes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeState {
+    pub clean: bool,
+    pub head: Option<String>,
+}
+
+pub fn worktree_state(cwd: &Path) -> Result<WorktreeState> {
+    let output = git(
+        cwd,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--untracked-files=normal",
+        ],
+        &[],
+    )?;
+    let mut state = WorktreeState {
+        clean: true,
+        head: None,
+    };
+    for line in output.lines() {
+        if let Some(oid) = line.strip_prefix("# branch.oid ") {
+            let oid = oid.trim();
+            if !oid.is_empty() && oid != "(initial)" {
+                state.head = Some(oid.to_string());
+            }
+        } else if line.starts_with('#') || line.trim().is_empty() {
+            continue;
+        } else {
+            state.clean = false;
+        }
+    }
+    Ok(state)
+}
+
 pub fn capture_checkpoint(cwd: &Path, thread_id: &str, turn: i64) -> Result<String> {
     let reference = checkpoint_ref(thread_id, turn);
-    capture_checkpoint_at(cwd, &reference, &format!("baton checkpoint {thread_id} turn {turn}"))?;
+    capture_checkpoint_at(
+        cwd,
+        &reference,
+        &format!("baton checkpoint {thread_id} turn {turn}"),
+    )?;
     Ok(reference)
 }
 
@@ -88,4 +133,76 @@ pub fn diff_checkpoints(cwd: &Path, ref_a: &str, ref_b: &str) -> Result<String> 
 pub fn restore_checkpoint(cwd: &Path, reference: &str) -> Result<()> {
     git(cwd, &["read-tree", "-u", "--reset", reference], &[])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn repo() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "checkpoint@example.com"]);
+        git(&["config", "user.name", "checkpoint"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        root
+    }
+
+    fn head(cwd: &Path) -> String {
+        git(cwd, &["rev-parse", "HEAD"], &[])
+            .unwrap()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn worktree_state_reports_a_clean_head_and_every_dirty_kind() {
+        let root = repo();
+        std::fs::write(root.path().join("a.txt"), "one\n").unwrap();
+        git(root.path(), &["add", "."], &[]).unwrap();
+        git(root.path(), &["commit", "-qm", "init"], &[]).unwrap();
+        let committed = head(root.path());
+
+        let state = worktree_state(root.path()).unwrap();
+        assert!(state.clean);
+        assert_eq!(state.head.as_deref(), Some(committed.as_str()));
+
+        std::fs::write(root.path().join("a.txt"), "two\n").unwrap();
+        assert!(!worktree_state(root.path()).unwrap().clean, "modified file");
+        git(root.path(), &["checkout", "--", "a.txt"], &[]).unwrap();
+
+        std::fs::write(root.path().join("new.txt"), "new\n").unwrap();
+        assert!(
+            !worktree_state(root.path()).unwrap().clean,
+            "untracked file"
+        );
+        std::fs::remove_file(root.path().join("new.txt")).unwrap();
+
+        std::fs::write(root.path().join("a.txt"), "three\n").unwrap();
+        git(root.path(), &["add", "a.txt"], &[]).unwrap();
+        assert!(!worktree_state(root.path()).unwrap().clean, "staged file");
+        assert!(worktree_state(root.path()).unwrap().head.is_some());
+    }
+
+    #[test]
+    fn worktree_state_handles_a_repository_without_commits() {
+        let root = repo();
+        let state = worktree_state(root.path()).unwrap();
+        assert!(state.clean, "an empty repository has no changes");
+        assert_eq!(state.head, None, "there is no commit to snapshot");
+
+        std::fs::write(root.path().join("only.txt"), "content\n").unwrap();
+        let state = worktree_state(root.path()).unwrap();
+        assert!(!state.clean);
+        assert_eq!(state.head, None);
+    }
 }

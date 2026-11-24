@@ -31,4 +31,5 @@ and the TUI exits 0.
 - `/rewind --native` supports Codex and OpenCode only and refuses while a turn is running.
 - The composer is prefilled after a rewind. Clear it with Escape before typing a slash command, or the command joins the prompt.
 - Failed turns have no checkpoint, so no code-restore confirmation appears. That is the expected path here.
+- A turn that leaves the worktree clean and HEAD where it started also has no checkpoint: there is nothing to restore or show. A turn that edits files, or commits, still records one.
 - The provider revert is history-only; files stay as they are.

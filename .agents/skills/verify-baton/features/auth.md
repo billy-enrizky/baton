@@ -5,7 +5,7 @@
 - An API row names the configured key variable and whether it resolves, for example `key CODEX_ICA_API_KEY` or `missing XAI_API_KEY`.
 - The current mode carries a `●` marker, only the selected row carries `❯`, and the header always shows the selected position and the total, for example `1/12`.
 - Enter applies a valid choice and closes the picker. A missing API key or a malformed `config.json` keeps the picker open and names the exact variable or parse error.
-- `/auth <provider>` prints the resolved auth for that provider. `/auth <provider> subscription|api` writes the same mode without opening the picker. Completion lists all twelve choices.
+- `/auth <provider>` opens a two-row picker for that provider with the current mode marked. `/auth <provider> subscription|api` writes the same mode without opening the picker. Completion lists all twelve choices.
 
 ## Problem statement
 
@@ -21,7 +21,7 @@ Non-goals: provider login, named profiles, endpoint editing, key entry, keychain
 
 `auth_choices` yields the twelve `(provider, mode)` pairs from `PROVIDERS`. The overlay height is `min(12 + 3, terminal height - transcript minimum - composer - notice - status)`, and `draw_auth_picker` windows that many rows around the selection. A terminal with room shows every choice; a short one scrolls with the selected row visible. `apply_auth_mode` is the only write path. It resolves the effective config, refuses API mode when no key resolves, loads `config.json` with `load_config_file_strict`, writes the mode, and invalidates the banner cache. The command and the Enter key both call it.
 
-`/auth <provider>` remains read-only and uses `describe_auth`. Completion derives its choices from the same provider list, and the usage notice names every provider.
+`/auth <provider>` opens the scoped picker and writes nothing until a row is chosen. Completion derives its choices from the same provider list, and the usage notice names every provider.
 
 ## Alternatives considered
 
@@ -38,7 +38,7 @@ Non-goals: provider login, named profiles, endpoint editing, key entry, keychain
 cargo test --locked --lib -- auth_picker auth_query switch_query
 ```
 
-The tests prove that a tall terminal shows every provider and a short one scrolls with the selected row visible, only one row carries the selection cursor, a keyed API choice writes `config.json` and closes the picker, a missing key keeps the picker open with the variable name, a malformed config is refused without a write, and `/auth <provider>` answers with `codex billing: ...` while leaving `config.json` byte-identical.
+The tests prove that a tall terminal shows every provider and a short one scrolls with the selected row visible, only one row carries the selection cursor, a keyed API choice writes `config.json` and closes the picker, a missing key keeps the picker open with the variable name, a malformed config is refused without a write, and `/auth <provider>` opens the scoped picker with the current mode marked while leaving `config.json` byte-identical.
 
 ### PTY
 ```sh
@@ -47,7 +47,7 @@ uv run --no-project python .agents/skills/verify-baton/scripts/slash_probe.py \
   --evidence-dir local_docs/verification/evidence/auth-probe
 ```
 
-The probe filters `/auth antigravity `, opens `/auth`, requires `billing mode · 1/12`, the key and missing rows, `antigravity api` without scrolling, and the apply hint, wraps to `12/12`, applies `codex api`, checks the persisted mode, runs `/auth codex` and requires the `codex billing:` notice with an unchanged config, selects `grok api` without a key, and requires the picker to stay open with `no API key for grok`.
+The probe filters `/auth antigravity `, opens `/auth`, requires `billing mode · 1/12`, the key and missing rows, `antigravity api` without scrolling, and the apply hint, wraps to `12/12`, applies `codex api`, checks the persisted mode, runs `/auth codex` and requires the scoped `codex billing` picker with the api row marked and an unchanged config, selects `grok api` without a key, and requires the picker to stay open with `no API key for grok`.
 
 ## Risks and mitigations
 

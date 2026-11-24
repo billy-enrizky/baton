@@ -34,7 +34,7 @@ COMMANDS = [
     ("/effort", ["reasoning effort", "xhigh", "max"]),
     ("/mode", ["permission mode", "acceptEdits", "plan"]),
     ("/auth", ["billing mode", "1/12", "enter apply"]),
-    ("/auth codex", ["codex billing:"]),
+    ("/auth codex", ["codex billing", "subscription", "api"]),
     ("/roles", ["roles (4)", "orchestrator", "reviewer"]),
     ("/settings", ["+ global", "default session mode", "enter apply"]),
     ("/mcp", ["MCP servers", "add server", "sync to all harnesses"]),

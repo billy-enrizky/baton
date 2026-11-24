@@ -421,12 +421,15 @@ def main() -> int:
         os.write(master, b"/auth codex\r")
         pump(master, 0.6, transcript)
         auth_query = screen_text(transcript, args.width, args.height)
-        if "codex billing:" not in auth_query:
-            missing.append("auth query notice names the provider")
+        for value in ["codex billing", "● api", "subscription"]:
+            if value not in auth_query:
+                missing.append(f"auth scoped picker: {value}")
         queried = json.loads(config_path.read_text())
         if queried.get("codex", {}).get("mode") != "api":
             missing.append("auth query mutated the codex billing mode")
         (evidence / "auth-query-screen.txt").write_text(auth_query + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
 
         os.write(master, b"/auth\r")
         pump(master, 0.6, transcript)

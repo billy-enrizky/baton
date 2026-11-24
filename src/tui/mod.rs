@@ -600,6 +600,10 @@ enum Overlay {
     AuthPicker {
         selected: usize,
     },
+    AuthProviderPicker {
+        provider: ProviderId,
+        selected: usize,
+    },
     RolesPicker {
         selected: usize,
         roles: Vec<crate::roles::RoleSpec>,
@@ -4996,6 +5000,29 @@ fn handle_key(
                 state.overlay = Overlay::AuthPicker { selected };
             }
         },
+        Overlay::AuthProviderPicker {
+            provider,
+            mut selected,
+        } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up | KeyCode::Down => {
+                selected = (selected + 1) % 2;
+                state.overlay = Overlay::AuthProviderPicker { provider, selected };
+            }
+            KeyCode::Enter => {
+                let mode = if selected == 1 {
+                    crate::config::AuthMode::Api
+                } else {
+                    crate::config::AuthMode::Subscription
+                };
+                if !apply_auth_mode(state, provider, mode) {
+                    state.overlay = Overlay::AuthProviderPicker { provider, selected };
+                }
+            }
+            _ => {
+                state.overlay = Overlay::AuthProviderPicker { provider, selected };
+            }
+        },
         Overlay::ThreadPicker {
             selected,
             threads,
@@ -8010,10 +8037,14 @@ fn handle_command(
                 }
                 (Some(provider), None) => match ProviderId::parse(provider) {
                     Some(parsed) => {
-                        state.notice = Some(format!(
-                            "{parsed} billing: {}",
-                            describe_auth(resolved.for_provider(parsed))
-                        ));
+                        let selected = match resolved.for_provider(parsed).mode {
+                            crate::config::AuthMode::Api => 1,
+                            crate::config::AuthMode::Subscription => 0,
+                        };
+                        state.overlay = Overlay::AuthProviderPicker {
+                            provider: parsed,
+                            selected,
+                        };
                     }
                     None => state.notice = Some("unknown provider".into()),
                 },
@@ -9563,6 +9594,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
             Overlay::ModePicker { .. } => 7,
+            Overlay::AuthProviderPicker { .. } => 5,
             Overlay::AuthPicker { .. } => {
                 let wanted = PROVIDERS.len() * 2 + 3;
                 let reserved = 3 + notice_rows + composer_rows as usize + 1;
@@ -9702,6 +9734,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::AuthPicker { selected } => {
                 draw_auth_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::AuthProviderPicker { provider, selected } => {
+                draw_auth_provider_picker(frame, chunks[1], state, *provider, *selected)
             }
             Overlay::ThreadPicker {
                 selected,
@@ -11188,6 +11223,59 @@ fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
                 "{cursor} {marker} {} {mode_label} · {detail}",
                 provider_label(provider)
             ),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_auth_provider_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    provider: ProviderId,
+    selected: usize,
+) {
+    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let config = resolved.for_provider(provider);
+    let mut lines = vec![Line::styled(
+        format!(
+            "{} billing · ↑↓ select · enter apply · esc close",
+            provider_label(provider)
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    let modes = [
+        crate::config::AuthMode::Subscription,
+        crate::config::AuthMode::Api,
+    ];
+    for (index, mode) in modes.into_iter().enumerate() {
+        let is_api = mode == crate::config::AuthMode::Api;
+        let marker = if config.mode == mode { "●" } else { " " };
+        let detail = if is_api {
+            let env_name = crate::sanitize::sanitize_terminal_text(&config.api_key_env_name);
+            if config.api_key.is_some() {
+                format!("key {env_name}")
+            } else {
+                format!("missing {env_name}")
+            }
+        } else {
+            "harness login".to_string()
+        };
+        let label = if is_api { "api" } else { "subscription" };
+        let cursor = if index == selected { "❯" } else { " " };
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(
+            format!("{cursor} {marker} {label} · {detail}"),
             style,
         ));
     }
@@ -21426,7 +21514,7 @@ mod tests {
     }
 
     #[test]
-    fn auth_query_describes_billing_instead_of_completing_to_a_mode() {
+    fn auth_query_opens_a_scoped_picker_for_that_harness() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("config.json");
         std::fs::write(&path, r#"{"codex":{"mode":"subscription"}}"#).unwrap();
@@ -21446,14 +21534,62 @@ mod tests {
             "Enter must run the query, not complete it: {}",
             state.input
         );
-        assert!(matches!(state.overlay, Overlay::None));
-        let notice = state.notice.as_deref().unwrap_or("");
-        assert!(notice.contains("codex billing:"), "{notice}");
-        assert!(notice.contains("subscription"), "{notice}");
+        assert!(matches!(
+            state.overlay,
+            Overlay::AuthProviderPicker {
+                provider: ProviderId::Codex,
+                selected: 0
+            }
+        ));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("codex billing"), "{text}");
+        assert!(text.contains("subscription"), "{text}");
+        assert!(text.contains("api"), "{text}");
+        assert!(text.contains("● subscription"), "{text}");
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             r#"{"codex":{"mode":"subscription"}}"#,
-            "a billing query must not rewrite config.json"
+            "opening the scoped picker must not rewrite config.json"
+        );
+    }
+
+    #[test]
+    fn auth_scoped_picker_applies_the_other_mode() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("BATON_TEST_CODEX_KEY", "probe-key");
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"codex":{"apiKeyEnv":"BATON_TEST_CODEX_KEY"}}"#,
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::AuthProviderPicker {
+            provider: ProviderId::Codex,
+            selected: 0,
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        std::env::remove_var("BATON_TEST_CODEX_KEY");
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("codex billing set to api"), "{notice}");
+        let file = crate::config::load_config_file(home.path()).unwrap();
+        assert_eq!(
+            file.providers["codex"].mode,
+            Some(crate::config::AuthMode::Api)
         );
     }
 

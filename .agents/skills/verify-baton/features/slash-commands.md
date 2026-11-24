@@ -8,6 +8,7 @@
 - `/auth <provider>` and `/switch <provider>` are complete commands. Enter runs them, so a billing or harness query is never rewritten into `/auth <provider> subscription` or `/switch <provider> <model>`.
 - Every command answers after a space with a completion list, an argument syntax hint, or an explicit no-arguments hint. A command with no choices says `enter runs it` instead of claiming a choice will complete.
 - The `/auth` picker sizes to the terminal: it shows all twelve rows when there is room and keeps the selected row visible when there is not.
+- `/effort <value>` accepts only the six offered levels. Any other token opens the effort picker and sets a notice naming the valid levels, so a typo cannot be stored as a thread effort. `normalize_reasoning_effort` stays lenient for role and harness configuration, which may carry provider-specific values.
 - Free-form commands still accept typed text.
 
 ## How to get to it (user POV)

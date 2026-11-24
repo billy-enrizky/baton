@@ -7530,6 +7530,18 @@ fn handle_command(
                     Err(error) => state.notice = Some(format!("cannot clear effort: {error}")),
                 }
             }
+            Some(value) if !EFFORT_VALUES.contains(&value.to_ascii_lowercase().as_str()) => {
+                let selected = state
+                    .thread
+                    .reasoning_effort
+                    .as_deref()
+                    .and_then(|effort| EFFORT_VALUES.iter().position(|level| *level == effort))
+                    .unwrap_or(0);
+                state.overlay = Overlay::EffortPicker { selected };
+                state.notice = Some(format!(
+                    "unknown effort {value}; choose default, low, medium, high, xhigh, or max"
+                ));
+            }
             Some(value) => match normalize_reasoning_effort(value) {
                 Some(effort) if state.thread.current_provider.supports_effort() => {
                     let result = {
@@ -15264,6 +15276,39 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(persisted.reasoning_effort, None);
+    }
+
+    #[test]
+    fn effort_command_rejects_a_level_it_does_not_offer() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        for value in ["bogus", "x-high", "minimal"] {
+            handle_command(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                &format!("/effort {value}"),
+            );
+            assert_eq!(
+                state.thread.reasoning_effort, None,
+                "/effort {value} must not set an unoffered level"
+            );
+            assert!(
+                matches!(state.overlay, Overlay::EffortPicker { .. }),
+                "/effort {value} must open the picker"
+            );
+            let notice = state.notice.as_deref().unwrap_or("");
+            assert!(notice.contains("unknown effort"), "{notice}");
+            assert!(notice.contains("xhigh"), "{notice}");
+            state.overlay = Overlay::None;
+        }
+
+        handle_command(&mut state, &store, &engine_command_sender, "/effort MAX");
+        assert_eq!(state.thread.reasoning_effort.as_deref(), Some("max"));
     }
 
     #[test]

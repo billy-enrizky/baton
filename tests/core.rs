@@ -279,8 +279,13 @@ fn worker_followup_updates_task_and_clears_merge_and_pr_markers() {
     assert!(task.merged_at.is_none(), "a new commit is no longer merged");
     assert!(task.pr_url.is_none(), "a new commit must be pushed again");
     assert_eq!(
+        task.review_status.as_deref(),
+        Some("pending"),
+        "a new commit must be reviewed again"
+    );
+    assert_eq!(
         store.list_orchestration_runs(10).unwrap()[0].status,
-        "completed"
+        "needs_review"
     );
 
     store

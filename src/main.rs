@@ -936,6 +936,7 @@ fn main_result(started: Instant) -> Result<()> {
             all,
             run,
             archive,
+            review,
             integrate,
             open_prs,
             tasks,
@@ -947,6 +948,7 @@ fn main_result(started: Instant) -> Result<()> {
                 && (list
                     || run.is_some()
                     || archive.is_some()
+                    || review.is_some()
                     || integrate.is_some()
                     || open_prs.is_some()
                     || plan_only)
@@ -1094,6 +1096,32 @@ fn main_result(started: Instant) -> Result<()> {
                 }
                 return Ok(());
             }
+            if let Some(run_id) = review {
+                let report = orchestrate::review_run(
+                    &store,
+                    &home,
+                    &cwd,
+                    &run_id,
+                    &tasks,
+                    permission_override,
+                )?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&orchestrate::to_json(&report))?
+                    );
+                } else {
+                    println!("{}", orchestrate::render(&report));
+                }
+                if report
+                    .tasks
+                    .iter()
+                    .any(|task| task.review_status.as_deref() == Some(orchestrate::REVIEW_FAILED))
+                {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             if let Some(run_id) = integrate {
                 let report = orchestrate::integrate(&store, &cwd, &run_id, &tasks)?;
                 if json {
@@ -1112,7 +1140,7 @@ fn main_result(started: Instant) -> Result<()> {
             let goal = goal.join(" ");
             if goal.trim().is_empty() {
                 anyhow::bail!(
-                    "usage: baton orchestrate [--plan-only] <goal> | --list [--all] | --run <id> | --archive <run-id> | --integrate <run-id> | --open-prs <run-id>"
+                    "usage: baton orchestrate [--plan-only] <goal> | --list [--all] | --run <id> | --archive <run-id> | --review <run-id> | --integrate <run-id> | --open-prs <run-id>"
                 );
             }
             let resolved = resolve_config(&home, &cwd);

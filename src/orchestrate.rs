@@ -1155,6 +1155,7 @@ pub const REVIEW_APPROVE: &str = "approve";
 pub const REVIEW_REQUEST_CHANGES: &str = "request_changes";
 pub const REVIEW_FAILED: &str = "failed";
 pub const REVIEW_SKIPPED: &str = "skipped";
+pub const REVIEW_PENDING: &str = "pending";
 const MAX_REVIEW_DIFF_CHARS: usize = 12_000;
 const MAX_REVIEW_EVIDENCE_CHARS: usize = 4_000;
 
@@ -1361,11 +1362,108 @@ pub fn review_blocked(tasks: &[WorkerResult]) -> Vec<String> {
         .filter(|task| {
             matches!(
                 task.review_status.as_deref(),
-                Some(REVIEW_REQUEST_CHANGES) | Some(REVIEW_FAILED)
+                Some(REVIEW_PENDING) | Some(REVIEW_REQUEST_CHANGES) | Some(REVIEW_FAILED)
             )
         })
         .map(|task| task.title.clone())
         .collect()
+}
+
+/// Re-run the reviewer over the completed worker commits of a stored run.
+/// Follow-up turns that create a commit mark the task `pending`, so integration
+/// stays blocked until a reviewer reads the new commit.
+pub fn review_run(
+    store: &BatonStore,
+    home: &Path,
+    cwd: &Path,
+    run_id: &str,
+    selection: &[usize],
+    permission_override: Option<PermissionMode>,
+) -> Result<RunReport> {
+    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("baton"));
+    review_run_with_bin(
+        store,
+        home,
+        cwd,
+        run_id,
+        selection,
+        permission_override,
+        Some(&binary),
+    )
+}
+
+fn review_run_with_bin(
+    store: &BatonStore,
+    home: &Path,
+    cwd: &Path,
+    run_id: &str,
+    selection: &[usize],
+    permission_override: Option<PermissionMode>,
+    binary: Option<&Path>,
+) -> Result<RunReport> {
+    let run_id = resolve_run_id(store, run_id)?;
+    let repo_root = worktree::repo_root(cwd)?;
+    let registry = crate::roles::load(home)?;
+    if !registry.review {
+        anyhow::bail!(
+            "review is disabled in roles.json; remove \"review\": false to run the reviewer"
+        );
+    }
+    let reviewer = registry.get(RoleId::Reviewer);
+    let permission_mode = permission_override.unwrap_or_else(|| {
+        resolve_config(home, cwd)
+            .for_provider(reviewer.provider)
+            .permission_mode
+    });
+    let report = report_from_rows(store, cwd, &run_id)?;
+    if report.tasks.is_empty() {
+        anyhow::bail!("run {} has no tasks", &run_id[..8.min(run_id.len())]);
+    }
+    for index in selection {
+        if *index == 0 || *index > report.tasks.len() {
+            anyhow::bail!(
+                "--task {index} is out of range (the run has {} tasks)",
+                report.tasks.len()
+            );
+        }
+    }
+    let binary = binary
+        .map(Path::to_path_buf)
+        .or_else(|| std::env::current_exe().ok())
+        .unwrap_or_else(|| PathBuf::from("baton"));
+    let mut reviewed = 0usize;
+    for (offset, task) in report.tasks.iter().enumerate() {
+        let index = offset + 1;
+        if !selection.is_empty() && !selection.contains(&index) {
+            continue;
+        }
+        if task.status != "completed" || task.commit.is_none() {
+            continue;
+        }
+        let outcome = review_task(
+            task,
+            home,
+            &repo_root,
+            reviewer,
+            &binary,
+            permission_mode,
+            None,
+        );
+        let reviewed_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        store.set_orchestration_task_review(
+            &run_id,
+            &task.id,
+            outcome.status,
+            Some(&outcome.text),
+            &reviewed_at,
+        )?;
+        reviewed += 1;
+    }
+    if reviewed == 0 {
+        anyhow::bail!("no completed worker commits to review");
+    }
+    store.refresh_orchestration_run_status(&run_id)?;
+    report_from_rows(store, cwd, &run_id)
 }
 
 #[derive(Debug, Clone)]
@@ -1468,7 +1566,7 @@ fn ensure_reviews_clear(tasks: &[OrchestrationTaskRow]) -> Result<()> {
         .filter(|task| {
             matches!(
                 task.review_status.as_deref(),
-                Some(REVIEW_REQUEST_CHANGES) | Some(REVIEW_FAILED)
+                Some(REVIEW_PENDING) | Some(REVIEW_REQUEST_CHANGES) | Some(REVIEW_FAILED)
             )
         })
         .map(|task| {
@@ -3864,7 +3962,12 @@ mod tests {
         assert_eq!(task.text.as_deref(), Some("used green"));
         assert!(task.merged_at.is_none(), "new work invalidates the merge marker");
         assert!(task.pr_url.is_none(), "new work invalidates the PR marker");
-        assert_eq!(run_status(&store, "run-complete"), "completed");
+        assert_eq!(
+            task.review_status.as_deref(),
+            Some(REVIEW_PENDING),
+            "new work must be reviewed again"
+        );
+        assert_eq!(run_status(&store, "run-complete"), "needs_review");
     }
 
     #[test]
@@ -5170,6 +5273,63 @@ printf 'worker\n' > worker.txt",
             error.to_string().contains("review did not approve"),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_followup_commit_stays_pending_until_the_reviewer_reads_it() {
+        let (repo, home, store, report) = review_fixture(None, "APPROVE", false);
+        let worktree = report.tasks[0].worktree.clone().expect("worktree");
+        std::fs::write(worktree.path.join("followup.txt"), "new work\n").unwrap();
+        let outcome =
+            record_worker_followup(&store, "worker-thread", true, None, TurnPhase::Completed)
+                .unwrap()
+                .expect("a follow-up for the worker thread");
+        assert_eq!(outcome.status, "completed");
+        let rows = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert_eq!(rows[0].review_status.as_deref(), Some(REVIEW_PENDING));
+        let error = integrate(&store, repo.path(), &report.run_id, &[]).unwrap_err();
+        let error = error.to_string();
+        assert!(error.contains("review did not approve"), "{error}");
+        assert!(error.contains("first task"), "{error}");
+
+        let harness = home.path().join("review-harness");
+        let refreshed = review_run_with_bin(
+            &store,
+            home.path(),
+            repo.path(),
+            &report.run_id,
+            &[],
+            None,
+            Some(&harness),
+        )
+        .unwrap();
+        assert_eq!(
+            refreshed.tasks[0].review_status.as_deref(),
+            Some(REVIEW_APPROVE)
+        );
+        assert_eq!(refreshed.status, "completed");
+        let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
+        assert_eq!(integrated.merged.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn review_run_refuses_when_the_role_disables_review() {
+        let (repo, home, store, report) =
+            review_fixture(Some(r#"{"review":false}"#), "APPROVE", false);
+        let harness = home.path().join("review-harness");
+        let error = review_run_with_bin(
+            &store,
+            home.path(),
+            repo.path(),
+            &report.run_id,
+            &[],
+            None,
+            Some(&harness),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("disabled"), "{error}");
     }
 
     #[cfg(unix)]

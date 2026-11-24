@@ -160,6 +160,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures",
+ "libc",
  "ratatui",
  "reqwest",
  "rusqlite",

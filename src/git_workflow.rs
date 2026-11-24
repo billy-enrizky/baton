@@ -5,7 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 const MAX_MESSAGE_CHARS: usize = 200;
@@ -926,6 +926,11 @@ fn run_command_with_timeout(
     timeout: Duration,
 ) -> Result<Output> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("cannot run {label}"))?;
@@ -955,17 +960,36 @@ fn run_command_with_timeout(
                 std::thread::sleep(CHILD_POLL_INTERVAL);
             }
             Ok(None) => {
-                let _ = child.kill();
+                kill_child_tree(&mut child);
                 let _ = child.wait();
+                wait_for_readers(
+                    &stdout_reader,
+                    &stderr_reader,
+                    Instant::now() + Duration::from_secs(1),
+                );
                 bail!("{label} timed out after {timeout:?}");
             }
             Err(error) => {
-                let _ = child.kill();
+                kill_child_tree(&mut child);
                 let _ = child.wait();
+                wait_for_readers(
+                    &stdout_reader,
+                    &stderr_reader,
+                    Instant::now() + Duration::from_secs(1),
+                );
                 return Err(error).with_context(|| format!("cannot wait for {label}"));
             }
         }
     };
+    if !wait_for_readers(&stdout_reader, &stderr_reader, started + timeout) {
+        kill_process_group(child.id());
+        wait_for_readers(
+            &stdout_reader,
+            &stderr_reader,
+            Instant::now() + Duration::from_secs(1),
+        );
+        bail!("{label} output did not close before the {timeout:?} timeout");
+    }
     let (stdout_read, stdout) = stdout_reader
         .join()
         .map_err(|_| anyhow!("{label} stdout reader panicked"))?;
@@ -980,6 +1004,42 @@ fn run_command_with_timeout(
         stderr,
     })
 }
+
+fn wait_for_readers<T, U>(
+    stdout: &std::thread::JoinHandle<T>,
+    stderr: &std::thread::JoinHandle<U>,
+    deadline: Instant,
+) -> bool {
+    while !stdout.is_finished() || !stderr.is_finished() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(CHILD_POLL_INTERVAL);
+    }
+    true
+}
+
+fn kill_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        kill_process_group(child.id());
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    // The child is a process-group leader; a negative pid signals the whole group.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: u32) {}
 
 fn remote_url_for_gh(url: &str) -> String {
     for scheme in ["https://", "http://"] {
@@ -2350,5 +2410,34 @@ exit 1"#,
             .unwrap_err();
         assert!(error.to_string().contains("timed out"), "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
+
+        let home = tempfile::tempdir().unwrap();
+        let pid_path = home.path().join("child.pid");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 5 & echo $! > \"$BATON_CHILD_PID\""])
+            .env("BATON_CHILD_PID", &pid_path);
+        let started = Instant::now();
+        let error = run_command_with_timeout(command, "pipe fixture", Duration::from_millis(100))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("output did not close"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            let alive = unsafe { libc::kill(pid, 0) } == 0;
+            if !alive {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("background child {pid} survived the process-group kill");
     }
 }

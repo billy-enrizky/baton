@@ -49,6 +49,8 @@ pub enum EngineEvent {
         provider: ProviderId,
         request_id: u64,
         models: Vec<String>,
+        live: usize,
+        cached: usize,
         error: Option<String>,
     },
     TurnRejected {
@@ -520,15 +522,17 @@ pub async fn run_engine(
                 let sender = engine_event_sender.clone();
                 tokio::spawn(async move {
                     let result = load_provider_models(&store, &home, &adapters, &thread_id, provider).await;
-                    let (models, error) = match result {
-                        Ok(models) => (models, None),
-                        Err(error) => (Vec::new(), Some(error.to_string())),
+                    let (models, live, cached, error) = match result {
+                        Ok(catalog) => (catalog.models, catalog.live, catalog.cached, catalog.error),
+                        Err(error) => (Vec::new(), 0, 0, Some(error.to_string())),
                     };
                     let _ = sender.send(EngineEvent::ModelsLoaded {
                         thread_id,
                         provider,
                         request_id,
                         models,
+                        live,
+                        cached,
                         error,
                     });
                 });
@@ -728,7 +732,7 @@ async fn load_provider_models(
     adapters: &[SharedAdapter],
     thread_id: &str,
     provider: ProviderId,
-) -> Result<Vec<String>> {
+) -> Result<crate::models::ModelCatalog> {
     let cwd = {
         let store = store.lock().unwrap();
         store
@@ -737,15 +741,13 @@ async fn load_provider_models(
             .cwd
     };
     let config = resolve_config(home, std::path::Path::new(&cwd));
+    let cached = crate::models::read_cached_catalog(home, provider);
     if provider == ProviderId::Claude {
         let models = crate::harness_config::read_claude_model_catalog(
             &crate::paths::claude_global_settings_dir(),
         );
         if !models.is_empty() {
-            return Ok(crate::models::merge_live_catalog(
-                ProviderId::Claude,
-                models,
-            ));
+            return Ok(finish_catalog(home, provider, models, cached));
         }
     }
     let input = ModelListInput {
@@ -759,13 +761,66 @@ async fn load_provider_models(
                     std::time::Duration::from_secs(20),
                     adapter.list_models(input),
                 )
-                .await
-                .map_err(|_| anyhow::anyhow!("{provider} model catalog timed out"))??;
-                return Ok(crate::models::merge_live_catalog(provider, models));
+                .await;
+                return match models {
+                    Ok(Ok(models)) => Ok(finish_catalog(home, provider, models, cached)),
+                    Ok(Err(error)) => Ok(cached_catalog(provider, cached, error.to_string())),
+                    Err(_) => Ok(cached_catalog(
+                        provider,
+                        cached,
+                        format!("{provider} model catalog timed out"),
+                    )),
+                };
             }
         }
     }
-    anyhow::bail!("{provider} is busy; keeping the cached model list")
+    Ok(cached_catalog(
+        provider,
+        cached,
+        format!("{provider} is busy"),
+    ))
+}
+
+/// A shorter live list does not replace a fuller cached one, so a degraded
+/// probe cannot shrink what the picker knows.
+fn finish_catalog(
+    home: &std::path::Path,
+    provider: ProviderId,
+    live: Vec<String>,
+    cached: Vec<String>,
+) -> crate::models::ModelCatalog {
+    if !live.is_empty() && live.len() >= cached.len() {
+        let _ = crate::models::write_cached_catalog(home, provider, &live);
+    }
+    let cached_only = cached
+        .iter()
+        .filter(|model| {
+            !live
+                .iter()
+                .any(|live_model| live_model.trim() == model.trim())
+        })
+        .count();
+    let models = crate::models::merge_catalogs(provider, live.clone(), &cached);
+    crate::models::ModelCatalog {
+        models,
+        live: live.len(),
+        cached: cached_only,
+        error: None,
+    }
+}
+
+fn cached_catalog(
+    provider: ProviderId,
+    cached: Vec<String>,
+    error: String,
+) -> crate::models::ModelCatalog {
+    let models = crate::models::merge_catalogs(provider, Vec::new(), &cached);
+    crate::models::ModelCatalog {
+        models,
+        live: 0,
+        cached: cached.len(),
+        error: Some(error),
+    }
 }
 
 async fn execute_turn(
@@ -1188,6 +1243,49 @@ mod tests {
         let stored = store.get_thread(&thread.id).unwrap().expect("thread persisted");
         assert_eq!(stored.permission_mode, PermissionMode::BypassPermissions);
         assert_eq!(stored.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn a_short_live_catalog_does_not_shrink_the_cache() {
+        let home = tempfile::tempdir().unwrap();
+        let fuller = [
+            "gpt-6.1-sol".to_string(),
+            "gpt-6.2-sol".to_string(),
+            "gpt-7-preview".to_string(),
+        ];
+        crate::models::write_cached_catalog(home.path(), ProviderId::Codex, &fuller).unwrap();
+        let cached = crate::models::read_cached_catalog(home.path(), ProviderId::Codex);
+        let catalog = finish_catalog(
+            home.path(),
+            ProviderId::Codex,
+            vec!["gpt-6.1-sol".to_string()],
+            cached,
+        );
+        assert_eq!(catalog.live, 1);
+        assert!(catalog.cached >= 1, "the cached-only models are counted");
+        assert!(catalog.models.contains(&"gpt-7-preview".to_string()));
+        assert!(catalog.error.is_none());
+        let after = crate::models::read_cached_catalog(home.path(), ProviderId::Codex);
+        assert!(
+            after.contains(&"gpt-7-preview".to_string()),
+            "the fuller cache survives a short live probe"
+        );
+    }
+
+    #[test]
+    fn a_failed_live_probe_still_offers_the_cached_and_known_models() {
+        let home = tempfile::tempdir().unwrap();
+        crate::models::write_cached_catalog(home.path(), ProviderId::Grok, &["grok-5".to_string()])
+            .unwrap();
+        let cached = crate::models::read_cached_catalog(home.path(), ProviderId::Grok);
+        let catalog = cached_catalog(ProviderId::Grok, cached, "timed out".to_string());
+        assert_eq!(catalog.error.as_deref(), Some("timed out"));
+        assert_eq!(catalog.live, 0);
+        assert!(catalog.models.contains(&"grok-5".to_string()));
+        assert!(
+            catalog.models.contains(&"grok-4.6".to_string()),
+            "the static catalog still appears"
+        );
     }
 
     #[derive(Clone, Copy)]
@@ -2614,8 +2712,11 @@ mod tests {
                 provider,
                 request_id,
                 models,
+                live,
+                cached: _,
                 error,
             } => {
+                assert_eq!(live, 1, "one live model came from the adapter");
                 assert_eq!(thread_id, thread.id);
                 assert_eq!(provider, ProviderId::Codex);
                 assert_eq!(request_id, 7);

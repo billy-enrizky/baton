@@ -1523,6 +1523,8 @@ fn apply_engine_event(
             provider,
             request_id,
             models,
+            live,
+            cached,
             error,
         } => {
             if thread_id != state.thread.id || request_id != state.model_request_id {
@@ -1543,13 +1545,13 @@ fn apply_engine_event(
                 }
                 return;
             }
+            let known = models.len().saturating_sub(live + cached);
             let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
             let default_model = resolved.for_provider(provider).model.clone();
-            let mut live = models;
-            if !default_model.is_empty() && !live.contains(&default_model) {
-                live.insert(0, default_model);
+            let mut picker_models = models;
+            if !default_model.is_empty() && !picker_models.contains(&default_model) {
+                picker_models.insert(0, default_model);
             }
-            let count = live.len();
             if let Overlay::ModelPicker {
                 models: current,
                 selected,
@@ -1561,13 +1563,21 @@ fn apply_engine_event(
                     .get(*selected)
                     .and_then(|index| current.get(*index))
                     .cloned();
-                *current = live;
+                *current = picker_models;
                 let filtered = model_filter_indices(current, filter);
                 *selected = previous
                     .and_then(|model| filtered.iter().position(|index| current[*index] == model))
                     .unwrap_or(0);
             }
-            state.notice = Some(format!("loaded {count} live model(s) for {provider}"));
+            state.notice = Some(match (&error, live, cached) {
+                (Some(error), _, cached) => format!(
+                    "live catalog unavailable for {provider}: {error}; showing {cached} cached and {known} known model(s)"
+                ),
+                (None, live, 0) => format!("loaded {live} live model(s) for {provider}"),
+                (None, live, cached) => {
+                    format!("loaded {live} live and {cached} cached model(s) for {provider}")
+                }
+            });
         }
         EngineEvent::TurnRejected {
             thread_id,
@@ -15029,6 +15039,8 @@ mod tests {
                 provider: ProviderId::Codex,
                 request_id,
                 models: vec!["selected-model".into(), "live-model".into()],
+                live: 2,
+                cached: 0,
                 error: None,
             },
             &engine_command_sender,
@@ -15075,6 +15087,8 @@ mod tests {
                 provider: ProviderId::Codex,
                 request_id: 1,
                 models: vec!["stale-model".into()],
+                live: 1,
+                cached: 0,
                 error: None,
             },
             &engine_command_sender,
@@ -15093,6 +15107,8 @@ mod tests {
                 provider: ProviderId::Codex,
                 request_id: 2,
                 models: vec!["fresh-model".into()],
+                live: 1,
+                cached: 0,
                 error: None,
             },
             &engine_command_sender,

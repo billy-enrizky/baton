@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const MAX_MESSAGE_CHARS: usize = 200;
+const MAX_PR_TITLE_CHARS: usize = 200;
+const MAX_PR_BODY_CHARS: usize = 4000;
+const MAX_PR_COMMITS: usize = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitStatus {
@@ -124,6 +127,26 @@ pub struct PullRequestCheck {
 pub struct PullRequestChecks {
     pub pr: PullRequestSummary,
     pub checks: Vec<PullRequestCheck>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestPlan {
+    pub root: PathBuf,
+    pub branch: String,
+    pub head: String,
+    pub remote: String,
+    pub repo: String,
+    pub base: String,
+    pub title: String,
+    pub body: String,
+    pub commit_count: usize,
+    pub commits: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequestOutcome {
+    pub url: String,
+    pub number: Option<u64>,
 }
 
 impl GitStatus {
@@ -599,11 +622,7 @@ fn string_field(value: &Value, key: &str) -> String {
 }
 
 fn run_gh(root: &Path, gh: &Path, args: &[&str], allow_pending: bool) -> Result<Vec<u8>> {
-    let output = Command::new(gh)
-        .args(args)
-        .current_dir(root)
-        .env("GH_PROMPT_DISABLED", "1")
-        .env("GH_NO_UPDATE_NOTIFIER", "1")
+    let output = gh_command(root, gh, args)
         .output()
         .with_context(|| format!("cannot run {} {}", gh.display(), args.join(" ")))?;
     if output.status.success() || (allow_pending && output.status.code() == Some(8)) {
@@ -622,6 +641,304 @@ fn run_gh(root: &Path, gh: &Path, args: &[&str], allow_pending: bool) -> Result<
             &stderr
         }
     )
+}
+
+fn gh_command(root: &Path, gh: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(gh);
+    command
+        .args(args)
+        .current_dir(root)
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1");
+    command
+}
+
+fn run_gh_allow_no_pr(root: &Path, gh: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
+    let output = gh_command(root, gh, args)
+        .output()
+        .with_context(|| format!("cannot run {} {}", gh.display(), args.join(" ")))?;
+    if output.status.success() {
+        return Ok(Some(output.stdout));
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if stderr.to_lowercase().contains("no pull requests found") {
+        return Ok(None);
+    }
+    bail!(
+        "gh pr view failed: {}",
+        if stderr.is_empty() {
+            "no error output"
+        } else {
+            &stderr
+        }
+    )
+}
+
+pub fn plan_pr(cwd: &Path, title: Option<&str>) -> Result<PullRequestPlan> {
+    plan_pr_with(cwd, title, &gh_binary())
+}
+
+fn plan_pr_with(cwd: &Path, title: Option<&str>, gh: &Path) -> Result<PullRequestPlan> {
+    let status = inspect(cwd)?;
+    if status.branch.starts_with("detached at ") {
+        bail!("detached HEAD; check out a branch before opening a pull request");
+    }
+    if let Some(operation) = status.operation.as_deref() {
+        bail!("{operation} is in progress; finish it before opening a pull request");
+    }
+    if status.conflicts {
+        bail!("unresolved conflicts; resolve them before opening a pull request");
+    }
+    let root = status.root;
+    let remotes = git_text(&root, &["remote"])?;
+    if !remotes.lines().any(|remote| remote.trim() == "origin") {
+        bail!("no origin remote; push the branch to origin before opening a pull request");
+    }
+    let origin_url = remote_url_for_gh(&git_text(&root, &["remote", "get-url", "origin"])?);
+    let view = run_gh(
+        &root,
+        gh,
+        &[
+            "repo",
+            "view",
+            &origin_url,
+            "--json",
+            "nameWithOwner,defaultBranchRef",
+        ],
+        false,
+    )?;
+    let view: Value =
+        serde_json::from_slice(&view).context("gh repo view returned invalid JSON")?;
+    let repo = string_field(&view, "nameWithOwner");
+    if repo.is_empty() {
+        bail!("gh repo view did not return a repository name");
+    }
+    let base = view
+        .get("defaultBranchRef")
+        .and_then(|value| value.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("gh repo view did not return a default branch")?
+        .to_string();
+    if let Some(existing) = run_gh_allow_no_pr(
+        &root,
+        gh,
+        &[
+            "pr",
+            "view",
+            &status.branch,
+            "--repo",
+            &repo,
+            "--json",
+            "url,number,state",
+        ],
+    )? {
+        let existing: Value =
+            serde_json::from_slice(&existing).context("gh pr view returned invalid JSON")?;
+        let url = string_field(&existing, "url");
+        bail!(
+            "a pull request already exists for {}: {}",
+            status.branch,
+            if url.is_empty() {
+                "see gh pr view"
+            } else {
+                &url
+            }
+        );
+    }
+    let range = format!("origin/{base}..HEAD");
+    let ahead = git_text(&root, &["rev-list", "--count", &range])?
+        .parse::<usize>()
+        .context("cannot parse commits ahead of the remote base")?;
+    if ahead == 0 {
+        bail!("no commits ahead of origin/{base}; push the branch before opening a pull request");
+    }
+    let head = current_head(&root)?.context("the branch has no commits to open a pull request")?;
+    let branch_ref = format!("refs/remotes/origin/{}", status.branch);
+    let remote_head = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &branch_ref])
+        .current_dir(&root)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string());
+    let Some(remote_head) = remote_head else {
+        bail!(
+            "branch {} is not on origin; push it before opening a pull request",
+            status.branch
+        );
+    };
+    if remote_head != head {
+        bail!(
+            "branch {} is not pushed at HEAD; push it before opening a pull request",
+            status.branch
+        );
+    }
+    let log = git_text(&root, &["log", "--format=%s", "--reverse", &range])?;
+    let (title, body, commits) = pull_request_text(&log, title);
+    Ok(PullRequestPlan {
+        root,
+        branch: status.branch,
+        head,
+        remote: "origin".to_string(),
+        repo,
+        base,
+        title,
+        body,
+        commit_count: ahead,
+        commits,
+    })
+}
+
+pub fn create_pr(plan: &PullRequestPlan) -> Result<PullRequestOutcome> {
+    create_pr_with(plan, &gh_binary())
+}
+
+fn create_pr_with(plan: &PullRequestPlan, gh: &Path) -> Result<PullRequestOutcome> {
+    let status = inspect(&plan.root)?;
+    if status.branch != plan.branch {
+        bail!(
+            "branch changed from {} to {}; review the pull request again",
+            plan.branch,
+            status.branch
+        );
+    }
+    if let Some(operation) = status.operation.as_deref() {
+        bail!("{operation} is in progress; finish it before opening a pull request");
+    }
+    if status.conflicts {
+        bail!("unresolved conflicts; resolve them before opening a pull request");
+    }
+    if current_head(&plan.root)?.as_deref() != Some(plan.head.as_str()) {
+        bail!("HEAD moved since the confirmation; review the pull request again");
+    }
+    let remote_head = live_remote_head(&plan.root, &plan.remote, &plan.branch)?;
+    if remote_head != plan.head {
+        bail!(
+            "the remote branch {} moved since the confirmation; review the pull request again",
+            plan.branch
+        );
+    }
+    let output = run_gh(
+        &plan.root,
+        gh,
+        &[
+            "pr",
+            "create",
+            "--repo",
+            &plan.repo,
+            "--base",
+            &plan.base,
+            "--head",
+            &plan.branch,
+            "--title",
+            &plan.title,
+            "--body",
+            &plan.body,
+        ],
+        false,
+    )?;
+    let output = String::from_utf8_lossy(&output);
+    let url = output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| line.starts_with("https://"))
+        .context("gh pr create returned no pull request URL")?
+        .to_string();
+    let number = url.rsplit('/').next().and_then(|part| part.parse().ok());
+    Ok(PullRequestOutcome { url, number })
+}
+
+fn pull_request_text(log: &str, supplied: Option<&str>) -> (String, String, Vec<String>) {
+    let mut subjects = log
+        .lines()
+        .map(sanitize_pr_text)
+        .filter(|subject| !subject.is_empty())
+        .collect::<Vec<_>>();
+    let last_subject = subjects.last().cloned();
+    let total_commits = subjects.len();
+    subjects.truncate(MAX_PR_COMMITS);
+    let title = supplied
+        .map(sanitize_pr_text)
+        .filter(|title| !title.is_empty())
+        .or(last_subject)
+        .unwrap_or_else(|| "Baton changes".to_string())
+        .chars()
+        .take(MAX_PR_TITLE_CHARS)
+        .collect();
+    let mut body_lines = vec!["## Summary".to_string(), String::new()];
+    body_lines.extend(subjects.iter().map(|subject| format!("- {subject}")));
+    if total_commits > subjects.len() {
+        let remaining = total_commits - subjects.len();
+        body_lines.push(if remaining == 1 {
+            "- and 1 more commit".to_string()
+        } else {
+            format!("- and {remaining} more commits")
+        });
+    }
+    let body = body_lines
+        .join("\n")
+        .chars()
+        .take(MAX_PR_BODY_CHARS)
+        .collect();
+    (title, body, subjects)
+}
+
+fn live_remote_head(root: &Path, remote: &str, branch: &str) -> Result<String> {
+    let reference = format!("refs/heads/{branch}");
+    let output = Command::new("git")
+        .args(["ls-remote", "--exit-code", "--heads", remote, &reference])
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .with_context(|| format!("cannot run git ls-remote for {remote}/{branch}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        bail!(
+            "cannot read {remote}/{branch}: {}",
+            if stderr.is_empty() {
+                "the branch is missing from the remote"
+            } else {
+                &stderr
+            }
+        );
+    }
+    let output = String::from_utf8_lossy(&output.stdout);
+    output
+        .lines()
+        .find_map(|line| line.split_whitespace().next())
+        .map(str::to_string)
+        .context("git ls-remote returned no branch head")
+}
+
+fn remote_url_for_gh(url: &str) -> String {
+    for scheme in ["https://", "http://"] {
+        if let Some(rest) = url.strip_prefix(scheme) {
+            if let Some(at) = rest.find('@') {
+                if !rest[..at].contains('/') {
+                    return format!("{scheme}{}", &rest[at + 1..]);
+                }
+            }
+        }
+    }
+    url.to_string()
+}
+
+fn sanitize_pr_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_string()
 }
 
 pub fn generate_message(files: &[String]) -> String {
@@ -1719,5 +2036,203 @@ exit 1"#,
             error.to_string().contains("no pull requests found"),
             "{error}"
         );
+    }
+
+    fn pr_repo() -> tempfile::TempDir {
+        let repo = repo();
+        let base = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let origin = repo.path().to_string_lossy().to_string();
+        git(repo.path(), &["remote", "add", "origin", &origin]);
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", &base],
+        );
+        git(repo.path(), &["checkout", "-q", "-b", "feat/pr"]);
+        std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "Add feature"]);
+        let head = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/feat/pr", &head],
+        );
+        repo
+    }
+
+    fn pr_gh(repo: &Path) -> PathBuf {
+        fake_gh(
+            repo,
+            "fake-gh-pr",
+            r#"if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"defaultBranchRef":{"name":"main"},"nameWithOwner":"example/repo"}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf 'no pull requests found for branch\n' >&2
+  exit 1
+fi
+exit 1"#,
+        )
+    }
+
+    #[test]
+    fn plan_pr_builds_the_base_title_and_body() {
+        let repo = pr_repo();
+        let gh = pr_gh(repo.path());
+        let plan = plan_pr_with(repo.path(), Some("Custom title"), &gh).unwrap();
+        assert_eq!(plan.base, "main");
+        assert_eq!(plan.branch, "feat/pr");
+        assert_eq!(plan.remote, "origin");
+        assert_eq!(plan.repo, "example/repo");
+        assert_eq!(
+            remote_url_for_gh("https://token@github.com/example/repo.git"),
+            "https://github.com/example/repo.git"
+        );
+        assert_eq!(plan.title, "Custom title");
+        assert_eq!(plan.body, "## Summary\n\n- Add feature");
+        assert_eq!(plan.commit_count, 1);
+        assert_eq!(plan.commits, vec!["Add feature"]);
+        assert_eq!(
+            plan.head,
+            git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap()
+        );
+
+        let generated = plan_pr_with(repo.path(), None, &gh).unwrap();
+        assert_eq!(generated.title, "Add feature");
+    }
+
+    #[test]
+    fn plan_pr_refuses_existing_pr_and_unready_remote_states() {
+        let repo = pr_repo();
+        let existing_gh = fake_gh(
+            repo.path(),
+            "fake-gh-existing-pr",
+            r#"if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"defaultBranchRef":{"name":"main"},"nameWithOwner":"example/repo"}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"url":"https://github.com/example/repo/pull/9","number":9,"state":"OPEN"}'
+  exit 0
+fi
+exit 1"#,
+        );
+        let error = plan_pr_with(repo.path(), None, &existing_gh).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert!(
+            error
+                .to_string()
+                .contains("https://github.com/example/repo/pull/9"),
+            "{error}"
+        );
+
+        let gh = pr_gh(repo.path());
+        git(
+            repo.path(),
+            &["update-ref", "-d", "refs/remotes/origin/feat/pr"],
+        );
+        let error = plan_pr_with(repo.path(), None, &gh).unwrap_err();
+        assert!(error.to_string().contains("not on origin"), "{error}");
+
+        let head = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/feat/pr", &head],
+        );
+        std::fs::write(repo.path().join("stale.txt"), "stale\n").unwrap();
+        git(repo.path(), &["add", "stale.txt"]);
+        git(repo.path(), &["commit", "-q", "-m", "Stale head"]);
+        let error = plan_pr_with(repo.path(), None, &gh).unwrap_err();
+        assert!(error.to_string().contains("not pushed at HEAD"), "{error}");
+
+        git(repo.path(), &["checkout", "-q", "main"]);
+        let head = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        git(
+            repo.path(),
+            &["update-ref", "refs/remotes/origin/main", &head],
+        );
+        let error = plan_pr_with(repo.path(), None, &gh).unwrap_err();
+        assert!(error.to_string().contains("no commits ahead"), "{error}");
+
+        git(repo.path(), &["remote", "remove", "origin"]);
+        let error = plan_pr_with(repo.path(), None, &gh).unwrap_err();
+        assert!(error.to_string().contains("origin"), "{error}");
+    }
+
+    #[test]
+    fn create_pr_uses_the_planned_arguments_and_rejects_a_moved_head() {
+        let repo = pr_repo();
+        let log = repo.path().join("gh.log");
+        let gh = fake_gh(
+            repo.path(),
+            "fake-gh-create",
+            &format!(
+                r#"if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{{"defaultBranchRef":{{"name":"main"}},"nameWithOwner":"example/repo"}}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf 'no pull requests found for branch\n' >&2
+  exit 1
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  printf '%s\n' "$*" > '{}'
+  printf 'https://github.com/example/repo/pull/42\n'
+  exit 0
+fi
+exit 1"#,
+                log.display()
+            ),
+        );
+        let plan = plan_pr_with(repo.path(), Some("Custom title"), &gh).unwrap();
+        let outcome = create_pr_with(&plan, &gh).unwrap();
+        assert_eq!(outcome.url, "https://github.com/example/repo/pull/42");
+        assert_eq!(outcome.number, Some(42));
+        let logged = std::fs::read_to_string(&log).unwrap();
+        for value in [
+            "pr create",
+            "--repo example/repo",
+            "--base main",
+            "--head feat/pr",
+            "--title Custom title",
+            "--body ## Summary",
+        ] {
+            assert!(logged.contains(value), "missing {value} in {logged}");
+        }
+
+        let empty_remote = bare_remote();
+        git(
+            repo.path(),
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                empty_remote.path().to_str().unwrap(),
+            ],
+        );
+        let error = create_pr_with(&plan, &gh).unwrap_err();
+        assert!(
+            error.to_string().contains("cannot read origin/feat/pr"),
+            "{error}"
+        );
+
+        std::fs::write(repo.path().join("second.txt"), "second\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "Move head"]);
+        let error = create_pr_with(&plan, &gh).unwrap_err();
+        assert!(error.to_string().contains("HEAD moved"), "{error}");
+    }
+
+    #[test]
+    fn pull_request_text_uses_the_last_subject_after_body_truncation() {
+        let log = (1..=21)
+            .map(|index| format!("commit {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (title, body, commits) = pull_request_text(&log, None);
+        assert_eq!(title, "commit 21");
+        assert_eq!(commits.len(), MAX_PR_COMMITS);
+        assert_eq!(commits.last().map(String::as_str), Some("commit 20"));
+        assert!(body.contains("- and 1 more commit"), "{body}");
     }
 }

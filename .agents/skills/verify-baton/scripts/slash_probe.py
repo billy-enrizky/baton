@@ -23,6 +23,22 @@ def screen_text(transcript: bytearray, width: int, height: int) -> str:
     return "\n".join(screen.lines())
 
 
+def wait_for_screen(
+    master: int,
+    needle: str,
+    timeout: float,
+    transcript: bytearray,
+    width: int,
+    height: int,
+) -> bool:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        pump(master, 0.1, transcript)
+        if needle in screen_text(transcript, width, height):
+            return True
+    return False
+
+
 def select_memory_row(
     master: int,
     transcript: bytearray,
@@ -78,16 +94,36 @@ def main() -> int:
     gh.write_text(
         "#!/bin/sh\n"
         "set -eu\n"
+        "if [ \"$1\" = \"repo\" ] && [ \"$2\" = \"view\" ]; then\n"
+        "  printf '%s\\n' '{\"defaultBranchRef\":{\"name\":\"main\"},\"nameWithOwner\":\"example/repo\"}'\n"
+        "  exit 0\n"
+        "fi\n"
         "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n"
-        "  cat <<'JSON'\n"
+        "  if [ \"${3:-}\" = \"--json\" ]; then\n"
+        "    cat <<'JSON'\n"
         '{"number":42,"title":"Add checks","url":"https://github.com/example/repo/pull/42","state":"OPEN","mergeable":"MERGEABLE","headRefName":"feat/checks","isDraft":false}\n'
         "JSON\n"
-        "  exit 0\n"
+        "    exit 0\n"
+        "  fi\n"
+        "  if [ \"${4:-}\" != \"--repo\" ] || [ \"${5:-}\" != \"example/repo\" ]; then\n"
+        "    printf 'missing --repo example/repo\\n' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "  printf 'no pull requests found for branch\\n' >&2\n"
+        "  exit 1\n"
         "fi\n"
         "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then\n"
         "  cat <<'JSON'\n"
         '[{"name":"Test","state":"SUCCESS","bucket":"pass","description":"","link":"https://example/check"},{"name":"Lint","state":"PENDING","bucket":"pending","description":"waiting","link":""}]\n'
         "JSON\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"create\" ]; then\n"
+        "  if [ \"${3:-}\" != \"--repo\" ] || [ \"${4:-}\" != \"example/repo\" ]; then\n"
+        "    printf 'missing --repo example/repo\\n' >&2\n"
+        "    exit 1\n"
+        "  fi\n"
+        "  printf 'https://github.com/example/repo/pull/43\\n'\n"
         "  exit 0\n"
         "fi\n"
         "exit 1\n"
@@ -667,6 +703,69 @@ def main() -> int:
         (evidence / "git-checks-screen.txt").write_text(git_checks + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
+
+        os.write(master, b"/git checks\r")
+        if not wait_for_screen(
+            master,
+            "Git checks · #42",
+            10.0,
+            transcript,
+            args.width,
+            args.height,
+        ):
+            missing.append("direct /git checks command")
+        direct_checks = screen_text(transcript, args.width, args.height)
+        for value in ["Add checks", "Test · SUCCESS"]:
+            if value not in direct_checks:
+                missing.append(f"direct /git checks row: {value}")
+        (evidence / "git-checks-direct-screen.txt").write_text(direct_checks + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        subprocess.run(
+            ["git", "-C", workdir, "checkout", "-q", "-b", "feat/pr"], check=True
+        )
+        (Path(workdir) / "feature.txt").write_text("feature\n")
+        subprocess.run(
+            ["git", "-C", workdir, "add", "feature.txt"], check=True
+        )
+        subprocess.run(
+            ["git", "-C", workdir, "commit", "-q", "-m", "Add pull request"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", workdir, "push", "-q", "origin", "feat/pr"], check=True
+        )
+        os.write(master, b"/git pr\r")
+        if not wait_for(master, "Pull request ·", 10.0, transcript):
+            missing.append("git pull request confirmation")
+        pump(master, 0.2, transcript)
+        git_pr = screen_text(transcript, args.width, args.height)
+        for value in [
+            "Pull request · example/repo · feat/pr → origin/main",
+            "title: Add pull request",
+            "- Add pull request",
+            "enter create",
+        ]:
+            if value not in git_pr:
+                missing.append(f"git pull request row: {value}")
+        (evidence / "git-pr-confirm-screen.txt").write_text(git_pr + "\n")
+        os.write(master, b"\r")
+        if not wait_for_screen(
+            master,
+            "opened pull request #43",
+            30.0,
+            transcript,
+            args.width,
+            args.height,
+        ):
+            missing.append("git pull request notice")
+        pump(master, 0.3, transcript)
+        git_pr_result = screen_text(transcript, args.width, args.height)
+        if "https://github.com/example/repo/pull/43" not in git_pr_result:
+            missing.append("git pull request URL")
+        (evidence / "git-pr-result-screen.txt").write_text(git_pr_result + "\n")
+        subprocess.run(["git", "-C", workdir, "checkout", "-q", "main"], check=True)
 
         os.write(master, b"/files ")
         pump(master, 0.5, transcript)

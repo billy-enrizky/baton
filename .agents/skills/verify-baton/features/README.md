@@ -32,7 +32,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Output sanitization | CLI and TUI | Control sequences are replaced before `exec` stdout and the transcript; unit proof only |
 | Activity | TUI and CLI | `/activity` and `baton activity --json` index every turn's tools, diff, and usage |
 | Memory files | TUI | `/memory` lists Claude and Codex instruction files, opens or creates them in the editor, and toggles Claude auto-memory |
-| Git status, commit, push, and checks | TUI | `/git` inspects the repository, confirms exact commit plans, pushes a chosen remote without force, and lists the current pull request's `gh` checks |
+| Git status, commit, push, checks, and pull request | TUI | `/git` inspects the repository, confirms exact commit plans, pushes a chosen remote without force, lists the current pull request's `gh` checks, and opens a pull request after a title and body preview |
 | Grok | CLI | `grok agent stdio` completes a turn on the ICA endpoint |
 | Cursor | CLI | `cursor-agent acp` gives the login hint and rejects a custom endpoint |
 | Process registry | CLI | `baton ps --json` returns a stable schema and no false live processes |

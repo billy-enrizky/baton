@@ -43,7 +43,7 @@ The TUI has three overlays: the picker, a read-only status view, and the confirm
 
 ## Implementation scope and sequence
 
-This feature file covers the whole `/git` surface. The memory-to-commit slice is already in `1c5be70`, including `src/git_workflow.rs`, `src/lib.rs`, and the `src/worktree.rs` test fixture. The push slice modifies only `src/git_workflow.rs`, `src/tui/mod.rs`, this file, `.agents/skills/verify-baton/features/README.md`, `.agents/skills/verify-baton/features/slash-commands.md`, `.agents/skills/verify-baton/scripts/slash_probe.py`, `README.md`, `docs/parity.md` (the D14 row only), `docs/ci.md`, and `ci/test-inventory-floor.txt`. It does not change `src/lib.rs`, `src/worktree.rs`, or the upstream pins.
+This feature file covers the whole `/git` surface. The memory-to-commit slice is already in `1c5be70`, including `src/git_workflow.rs`, `src/lib.rs`, and the `src/worktree.rs` test fixture. The push slice modifies only `src/git_workflow.rs`, `src/tui/mod.rs`, this file, `.agents/skills/verify-baton/features/README.md`, `.agents/skills/verify-baton/features/slash-commands.md`, `.agents/skills/verify-baton/scripts/slash_probe.py`, `README.md`, `.agents/parity.md` (the D14 row only), `docs/ci.md`, and `ci/test-inventory-floor.txt`. It does not change `src/lib.rs`, `src/worktree.rs`, or the upstream pins.
 
 1. Resolve the exact branch from `git symbolic-ref HEAD`, plan the push against the validated HEAD commit, and build a canonical `refs/heads/<branch>` destination after `--`.
 2. Add the Push current branch row, push target picker, push confirmation, open-work gate on every attempt, exact `/git push` completion, and TUI tests.

@@ -200,7 +200,7 @@ The PTY `slash_probe.py` checks the `/files` and `/grep` headings and affordance
 - TUI ignored files use an explicit `--ignored` flag instead of Orca's automatic second pass. A terminal picker that silently includes `.env` would be a security and attention trap, so Baton reuses the CLI opt-in, one shared cap, and a persistent warning. Reopen if the warning and flag prove unnecessary for everyday work.
 - The editor mapping is deliberately small and explicit: Code-family editors use `--goto`, Vim-family, Emacs-family, and nano use `+line`, and Helix, Sublime, Zed, and unknown editors receive `path:line`. A configurable placeholder was rejected for this slice because it adds configuration and hides the fallback; reopen if a common editor needs another form.
 
-The reasons and reversal conditions for the broader file-navigation decisions live in the [parity ledger](../../../../docs/parity.md). This document keeps the slice-specific choices and proof.
+The reasons and reversal conditions for the broader file-navigation decisions live in the [parity ledger](../../../parity.md). This document keeps the slice-specific choices and proof.
 
 ## Risks and mitigations
 

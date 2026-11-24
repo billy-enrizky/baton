@@ -612,6 +612,10 @@ enum Overlay {
     GoalPicker {
         selected: usize,
     },
+    QueuePicker {
+        selected: usize,
+        clear_armed: bool,
+    },
     RolesPicker {
         selected: usize,
         roles: Vec<crate::roles::RoleSpec>,
@@ -5169,6 +5173,162 @@ fn handle_key(
                 state.overlay = Overlay::GoalPicker { selected };
             }
         },
+        Overlay::QueuePicker {
+            mut selected,
+            clear_armed,
+        } => {
+            let count = state.queued_messages.len();
+            if count == 0 {
+                state.overlay = Overlay::None;
+                state.notice = Some("queue: empty".into());
+                return;
+            }
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Up if key.modifiers == KeyModifiers::CONTROL => {
+                    if selected > 0 {
+                        let mut messages = state.queued_messages.clone();
+                        messages.swap(selected, selected - 1);
+                        match store
+                            .lock()
+                            .unwrap()
+                            .replace_queued_messages(&state.thread.id, &messages)
+                        {
+                            Ok(()) => {
+                                state.queued_messages = messages;
+                                selected -= 1;
+                                state.notice =
+                                    Some(format!("moved queued item {} up", selected + 2));
+                            }
+                            Err(error) => {
+                                state.notice = Some(format!("cannot reorder the queue: {error}"))
+                            }
+                        }
+                    }
+                    state.overlay = Overlay::QueuePicker {
+                        selected,
+                        clear_armed: false,
+                    };
+                }
+                KeyCode::Down if key.modifiers == KeyModifiers::CONTROL => {
+                    if selected + 1 < count {
+                        let mut messages = state.queued_messages.clone();
+                        messages.swap(selected, selected + 1);
+                        match store
+                            .lock()
+                            .unwrap()
+                            .replace_queued_messages(&state.thread.id, &messages)
+                        {
+                            Ok(()) => {
+                                state.queued_messages = messages;
+                                selected += 1;
+                                state.notice = Some(format!("moved queued item {} down", selected));
+                            }
+                            Err(error) => {
+                                state.notice = Some(format!("cannot reorder the queue: {error}"))
+                            }
+                        }
+                    }
+                    state.overlay = Overlay::QueuePicker {
+                        selected,
+                        clear_armed: false,
+                    };
+                }
+                KeyCode::Up => {
+                    selected = (selected + count - 1) % count;
+                    state.overlay = Overlay::QueuePicker {
+                        selected,
+                        clear_armed: false,
+                    };
+                }
+                KeyCode::Down => {
+                    selected = (selected + 1) % count;
+                    state.overlay = Overlay::QueuePicker {
+                        selected,
+                        clear_armed: false,
+                    };
+                }
+                KeyCode::Enter => {
+                    if send_queued_item(state, store, engine_command_sender, selected) {
+                        state.overlay = Overlay::None;
+                    } else if !state.queued_messages.is_empty() {
+                        selected = selected.min(state.queued_messages.len() - 1);
+                        state.overlay = Overlay::QueuePicker {
+                            selected,
+                            clear_armed: false,
+                        };
+                    }
+                }
+                KeyCode::Char('e') => {
+                    state.input = format!("/queue edit {} ", selected + 1);
+                    state.overlay = Overlay::None;
+                }
+                KeyCode::Char('d') => {
+                    let mut messages = state.queued_messages.clone();
+                    messages.remove(selected);
+                    match store
+                        .lock()
+                        .unwrap()
+                        .replace_queued_messages(&state.thread.id, &messages)
+                    {
+                        Ok(()) => {
+                            state.queued_messages = messages;
+                            let deleted = selected + 1;
+                            if state.queued_messages.is_empty() {
+                                state.overlay = Overlay::None;
+                                state.notice =
+                                    Some(format!("deleted queued item {deleted}; queue: empty"));
+                            } else {
+                                selected = selected.min(state.queued_messages.len() - 1);
+                                state.overlay = Overlay::QueuePicker {
+                                    selected,
+                                    clear_armed: false,
+                                };
+                                state.notice = Some(format!("deleted queued item {deleted}"));
+                            }
+                        }
+                        Err(error) => {
+                            state.notice = Some(format!("cannot delete from the queue: {error}"))
+                        }
+                    }
+                }
+                KeyCode::Char('c') => {
+                    if !clear_armed {
+                        state.overlay = Overlay::QueuePicker {
+                            selected,
+                            clear_armed: true,
+                        };
+                        state.notice =
+                            Some(format!("press c again to clear {count} queued message(s)"));
+                    } else {
+                        state.queued_messages.clear();
+                        match store
+                            .lock()
+                            .unwrap()
+                            .clear_queued_messages(&state.thread.id)
+                        {
+                            Ok(()) => {
+                                state.overlay = Overlay::None;
+                                state.notice = Some("queue cleared".into());
+                            }
+                            Err(error) => {
+                                state.notice = Some(format!("cannot clear queue: {error}"));
+                                state.overlay = Overlay::QueuePicker {
+                                    selected,
+                                    clear_armed: false,
+                                };
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    state.overlay = Overlay::QueuePicker {
+                        selected,
+                        clear_armed: false,
+                    };
+                }
+            }
+        }
         Overlay::ThreadPicker {
             selected,
             threads,
@@ -6120,6 +6280,31 @@ fn effective_permission_mode(
         provider_default
     } else {
         selected
+    }
+}
+
+fn send_queued_item(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    index: usize,
+) -> bool {
+    let taken = store
+        .lock()
+        .unwrap()
+        .take_queued_message(&state.thread.id, index);
+    match taken {
+        Ok(Some(text)) => {
+            state.queued_messages.remove(index);
+            state.notice = Some(format!("sent queued item {}", index + 1));
+            dispatch_message(state, store, engine_command_sender, text, false);
+            true
+        }
+        Ok(None) => false,
+        Err(error) => {
+            state.notice = Some(format!("cannot send from queue: {error}"));
+            false
+        }
     }
 }
 
@@ -7806,18 +7991,8 @@ fn handle_command(
                         ));
                         return;
                     };
-                    let taken = store
-                        .lock()
-                        .unwrap()
-                        .take_queued_message(&state.thread.id, index);
-                    match taken {
-                        Ok(Some(text)) => {
-                            state.queued_messages.remove(index);
-                            state.notice = Some(format!("sent queued item {}", index + 1));
-                            dispatch_message(state, store, engine_command_sender, text, false);
-                        }
-                        Ok(None) => state.notice = Some("queue: no item at that position".into()),
-                        Err(error) => state.notice = Some(format!("cannot send from queue: {error}")),
+                    if !send_queued_item(state, store, engine_command_sender, index) {
+                        state.notice = Some("queue: no item at that position".into());
                     }
                 }
                 "edit" => {
@@ -7862,13 +8037,10 @@ fn handle_command(
                     if state.queued_messages.is_empty() {
                         state.notice = Some("queue: empty".into());
                     } else {
-                        let mut text = format!("queue: {} waiting", state.queued_messages.len());
-                        for (index, message) in state.queued_messages.iter().enumerate() {
-                            let preview: String = message.lines().next().unwrap_or("").chars().take(70).collect();
-                            text.push_str(&format!("\n  {}. {preview}", index + 1));
-                        }
-                        text.push_str("\n\n/queue send <n> · /queue edit <n> <text> · /queue move <n> <n> · /queue clear");
-                        state.notice = Some(text);
+                        state.overlay = Overlay::QueuePicker {
+                            selected: 0,
+                            clear_armed: false,
+                        };
                     }
                 }
                 _ => state.notice = Some("usage: /queue · /queue send <n> · /queue edit <n> <text> · /queue move <from> <to> · /queue clear".into()),
@@ -9743,6 +9915,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::AuthProviderPicker { .. } => 5,
             Overlay::OrchestratePicker { .. } => 7,
             Overlay::GoalPicker { .. } => 7,
+            Overlay::QueuePicker { .. } => state.queued_messages.len().min(8) + 5,
             Overlay::AuthPicker { .. } => {
                 let wanted = PROVIDERS.len() * 2 + 3;
                 let reserved = 3 + notice_rows + composer_rows as usize + 1;
@@ -9892,6 +10065,10 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GoalPicker { selected } => {
                 draw_goal_picker(frame, chunks[1], state, *selected)
             }
+            Overlay::QueuePicker {
+                selected,
+                clear_armed,
+            } => draw_queue_picker(frame, chunks[1], state, *selected, *clear_armed),
             Overlay::ThreadPicker {
                 selected,
                 threads,
@@ -11509,6 +11686,57 @@ fn draw_goal_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
             Style::default().fg(COLORS.muted)
         };
         lines.push(Line::styled(format!("{cursor} {label} · {detail}"), style));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_queue_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    selected: usize,
+    clear_armed: bool,
+) {
+    let count = state.queued_messages.len();
+    let width = area.width.saturating_sub(2) as usize;
+    let hint = if clear_armed {
+        format!("queue · {count} waiting · press c again to clear · esc cancels")
+    } else {
+        format!(
+            "queue · {count} waiting · enter send · e edit · d delete · c clear · ctrl+↑/↓ move · esc close"
+        )
+    };
+    let mut lines = vec![Line::styled(
+        truncate_chars(&hint, width),
+        Style::default().fg(if clear_armed {
+            COLORS.warning
+        } else {
+            COLORS.muted
+        }),
+    )];
+    for (index, message) in state.queued_messages.iter().take(8).enumerate() {
+        let preview: String = message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(width.saturating_sub(6))
+            .collect();
+        let cursor = if index == selected { "❯" } else { " " };
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(
+            format!("{cursor} {}. {preview}", index + 1),
+            style,
+        ));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -18565,12 +18793,25 @@ mod tests {
         enqueue_message(&mut state, &store, "second line\nrest".into());
 
         handle_command(&mut state, &store, &engine_command_sender, "/queue");
-        let notice = state.notice.clone().unwrap_or_default();
-        assert!(notice.contains("queue: 2 waiting"));
-        assert!(notice.contains("1. first"));
-        assert!(notice.contains("2. second line"));
-        assert!(!notice.contains("rest"), "previews stay on one line");
+        assert!(matches!(
+            state.overlay,
+            Overlay::QueuePicker {
+                selected: 0,
+                clear_armed: false
+            }
+        ));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("queue · 2 waiting"), "{text}");
+        assert!(text.contains("1. first"), "{text}");
+        assert!(text.contains("2. second line"), "{text}");
+        assert!(!text.contains("rest"), "previews stay on one line");
 
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
         handle_command(&mut state, &store, &engine_command_sender, "/queue clear");
         assert!(state.queued_messages.is_empty());
         assert!(store
@@ -25491,6 +25732,174 @@ exit 1
             .as_deref()
             .unwrap_or_default()
             .contains("usage: /queue move"));
+    }
+
+    fn queue_fixture(
+        items: &[&str],
+    ) -> (
+        tempfile::TempDir,
+        Arc<Mutex<BatonStore>>,
+        TuiState,
+        tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+        tokio::sync::mpsc::UnboundedReceiver<EngineCommand>,
+    ) {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        for text in items {
+            store
+                .lock()
+                .unwrap()
+                .enqueue_message(&state.thread.id, text)
+                .unwrap();
+        }
+        state.queued_messages = store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        (home, store, state, sender, receiver)
+    }
+
+    #[test]
+    fn queue_command_opens_a_picker_and_sends_the_selected_item() {
+        let (_home, store, mut state, sender, mut receiver) = queue_fixture(&["first", "second"]);
+        handle_command(&mut state, &store, &sender, "/queue");
+        assert!(matches!(
+            state.overlay,
+            Overlay::QueuePicker {
+                selected: 0,
+                clear_armed: false
+            }
+        ));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        for value in [
+            "queue · 2 waiting",
+            "1. first",
+            "enter send",
+            "e edit",
+            "d delete",
+        ] {
+            assert!(text.contains(value), "{value} missing: {text}");
+        }
+        handle_key(&mut state, &store, &sender, key(KeyCode::Down));
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("sent queued item 2"),
+            "{:?}",
+            state.notice
+        );
+        match receiver.try_recv().expect("the selected item dispatches") {
+            EngineCommand::Submit { text, .. } => assert_eq!(text, "second"),
+            _ => panic!("expected a submit for the sent item"),
+        }
+        assert_eq!(state.queued_messages, vec!["first"]);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
+            vec!["first"]
+        );
+    }
+
+    #[test]
+    fn queue_picker_deletes_and_clears_with_a_second_press() {
+        let (_home, store, mut state, sender, _receiver) =
+            queue_fixture(&["first", "second", "third"]);
+        handle_command(&mut state, &store, &sender, "/queue");
+        handle_key(&mut state, &store, &sender, key(KeyCode::Char('d')));
+        assert_eq!(state.queued_messages, vec!["second", "third"]);
+        assert!(matches!(
+            state.overlay,
+            Overlay::QueuePicker {
+                selected: 0,
+                clear_armed: false
+            }
+        ));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("deleted queued item 1"),
+            "{:?}",
+            state.notice
+        );
+        handle_key(&mut state, &store, &sender, key(KeyCode::Char('c')));
+        assert!(matches!(
+            state.overlay,
+            Overlay::QueuePicker {
+                clear_armed: true,
+                ..
+            }
+        ));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("press c again"),
+            "{:?}",
+            state.notice
+        );
+        handle_key(&mut state, &store, &sender, key(KeyCode::Char('c')));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(state.queued_messages.is_empty());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_queued_messages(&state.thread.id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn queue_picker_moves_the_selected_item_and_hands_edit_to_the_composer() {
+        let (_home, store, mut state, sender, _receiver) =
+            queue_fixture(&["first", "second", "third"]);
+        handle_command(&mut state, &store, &sender, "/queue");
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.queued_messages, vec!["second", "first", "third"]);
+        assert!(matches!(
+            state.overlay,
+            Overlay::QueuePicker { selected: 1, .. }
+        ));
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
+            vec!["second", "first", "third"]
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+        );
+        assert_eq!(state.queued_messages, vec!["first", "second", "third"]);
+        assert!(matches!(
+            state.overlay,
+            Overlay::QueuePicker { selected: 0, .. }
+        ));
+        handle_key(&mut state, &store, &sender, key(KeyCode::Down));
+        handle_key(&mut state, &store, &sender, key(KeyCode::Char('e')));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.input, "/queue edit 2 ");
     }
 
     #[test]

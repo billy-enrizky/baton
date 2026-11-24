@@ -138,6 +138,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/commands",
         "deep dive into every command this thread ran; /commands <turn>",
     ),
+    (
+        "/agents",
+        "list the subagent tool calls this thread started",
+    ),
     ("/queue", "show or clear queued follow-ups"),
     ("/turns", "list durable turn phases"),
     (
@@ -350,6 +354,13 @@ enum ToolStatus {
     Running,
     Done,
     Failed,
+}
+
+#[derive(Debug, Clone)]
+struct AgentEntry {
+    label: String,
+    status: String,
+    turn: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -697,6 +708,10 @@ enum Overlay {
         selected: usize,
         expanded: bool,
         turn: Option<i64>,
+    },
+    AgentsPicker {
+        selected: usize,
+        entries: Vec<AgentEntry>,
     },
     EffortPicker {
         selected: usize,
@@ -3021,6 +3036,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/orchestrate", _) => Some("orchestrate on|off|--plan-only|<goal>"),
         ("/runs", _) => Some("runs --all|<run id>"),
         ("/commands", _) => Some("commands [turn]"),
+        ("/agents", _) => Some("agents (no arguments)"),
         ("/git", "review") => Some("git review approve|request-changes|comment [body]"),
         ("/git", "merge") => Some("git merge squash|merge|rebase"),
         ("/git", _) => Some(
@@ -4470,6 +4486,41 @@ fn handle_key(
             }
             if keep {
                 state.overlay = Overlay::RetryPicker { selected, choices };
+            }
+        }
+        Overlay::AgentsPicker {
+            mut selected,
+            entries,
+        } => {
+            let mut keep = true;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => keep = false,
+                KeyCode::Up => {
+                    if !entries.is_empty() {
+                        selected = (selected + entries.len() - 1) % entries.len();
+                    }
+                }
+                KeyCode::Down => {
+                    if !entries.is_empty() {
+                        selected = (selected + 1) % entries.len();
+                    }
+                }
+                KeyCode::Enter | KeyCode::Char('y') => {
+                    if let Some(entry) = entries.get(selected) {
+                        match crate::clipboard::copy(&entry.label) {
+                            Ok(()) => {
+                                state.notice = Some(format!("copied subagent: {}", entry.label))
+                            }
+                            Err(error) => {
+                                state.notice = Some(format!("cannot copy subagent: {error}"))
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if keep {
+                state.overlay = Overlay::AgentsPicker { selected, entries };
             }
         }
         Overlay::CommandList {
@@ -8185,6 +8236,20 @@ fn handle_command(
                 };
             }
         }
+        "/agents" => {
+            let entries = agent_entries(state);
+            if entries.is_empty() {
+                state.notice = Some(
+                    "no subagent tool calls in this thread; Claude Task calls appear here"
+                        .to_string(),
+                );
+            } else {
+                state.overlay = Overlay::AgentsPicker {
+                    selected: 0,
+                    entries,
+                };
+            }
+        }
         "/queue" => {
             let action = args.first().map(String::as_str).unwrap_or("");
             match action {
@@ -10199,6 +10264,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::CheckpointPicker { checkpoints, .. } => checkpoints.len().min(8) + 4,
             Overlay::DirtyConfirm { .. } => 5,
+            Overlay::AgentsPicker { entries, .. } => entries.len().min(10) + 4,
             Overlay::CommandList { expanded, .. } => {
                 state
                     .history
@@ -10415,6 +10481,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 expanded,
                 turn,
             } => draw_command_list(frame, chunks[1], state, *selected, *expanded, *turn),
+            Overlay::AgentsPicker { selected, entries } => {
+                draw_agents_picker(frame, chunks[1], entries, *selected)
+            }
             Overlay::EffortPicker { selected } => {
                 draw_effort_picker(frame, chunks[1], state, *selected)
             }
@@ -11804,6 +11873,110 @@ fn draw_effort_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
         lines.push(Line::styled(
             format!("{} uses the harness default", state.thread.current_provider),
             Style::default().fg(COLORS.warning),
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn is_agent_label(label: &str) -> bool {
+    label.starts_with("Task ") || label.starts_with("Agent ")
+}
+
+fn agent_entries(state: &TuiState) -> Vec<AgentEntry> {
+    let mut entries: Vec<AgentEntry> = Vec::new();
+    for line in &state.tool_lines {
+        if !is_agent_label(&line.label) {
+            continue;
+        }
+        let status = match line.status {
+            ToolStatus::Running => "running",
+            ToolStatus::Done => "done",
+            ToolStatus::Failed => "failed",
+        };
+        if entries
+            .iter()
+            .any(|entry| entry.label == line.label && entry.status == status)
+        {
+            continue;
+        }
+        entries.push(AgentEntry {
+            label: line.label.clone(),
+            status: status.to_string(),
+            turn: 0,
+        });
+    }
+    for message in tool_messages(state, None) {
+        let Some((marker, label)) = message.text.split_once(' ') else {
+            continue;
+        };
+        if !is_agent_label(label) {
+            continue;
+        }
+        let status = match marker {
+            "✓" => "done",
+            "✗" => "failed",
+            _ => "running",
+        };
+        if entries
+            .iter()
+            .any(|entry| entry.label == label && entry.status == status)
+        {
+            continue;
+        }
+        entries.push(AgentEntry {
+            label: label.to_string(),
+            status: status.to_string(),
+            turn: message.turn,
+        });
+    }
+    entries
+}
+
+fn draw_agents_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    entries: &[AgentEntry],
+    selected: usize,
+) {
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines = vec![Line::styled(
+        format!(
+            "subagents · {} · ↑↓ select · enter copies · esc close",
+            entries.len()
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, entry) in entries.iter().take(10).enumerate() {
+        let marker = match entry.status.as_str() {
+            "done" => "✓",
+            "failed" => "✗",
+            _ => "·",
+        };
+        let scope = if entry.turn > 0 {
+            format!("turn {} · ", entry.turn)
+        } else {
+            String::new()
+        };
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(
+            truncate_chars(
+                &format!(
+                    "{cursor} {marker} {scope}{} · {}",
+                    entry.label, entry.status
+                ),
+                width,
+            ),
+            style,
         ));
     }
     let block = Block::default()
@@ -26414,6 +26587,81 @@ exit 1
             .unwrap();
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         (home, store, state, sender, receiver)
+    }
+
+    #[test]
+    fn agents_command_lists_task_and_agent_tool_calls() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.history = vec![
+            crate::store::MessageRow {
+                id: 1,
+                thread_id: state.thread.id.clone(),
+                turn: 1,
+                role: "tool".to_string(),
+                provider: Some("claude".to_string()),
+                model: None,
+                text: "✓ Task Explore the parser".to_string(),
+                created_at: String::new(),
+            },
+            crate::store::MessageRow {
+                id: 2,
+                thread_id: state.thread.id.clone(),
+                turn: 2,
+                role: "tool".to_string(),
+                provider: Some("claude".to_string()),
+                model: None,
+                text: "✗ Agent Review docs".to_string(),
+                created_at: String::new(),
+            },
+            crate::store::MessageRow {
+                id: 3,
+                thread_id: state.thread.id.clone(),
+                turn: 2,
+                role: "tool".to_string(),
+                provider: Some("claude".to_string()),
+                model: None,
+                text: "✓ shell cargo test".to_string(),
+                created_at: String::new(),
+            },
+        ];
+        state.tool_lines.push(ToolLine {
+            id: Some("live".to_string()),
+            label: "Task Run tests".to_string(),
+            status: ToolStatus::Running,
+        });
+
+        handle_command(&mut state, &store, &sender, "/agents");
+        let Overlay::AgentsPicker { entries, selected } = &state.overlay else {
+            panic!("expected the agents picker");
+        };
+        assert_eq!(*selected, 0);
+        assert_eq!(entries.len(), 3);
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        for value in [
+            "subagents · 3",
+            "Explore the parser",
+            "Review docs",
+            "Run tests",
+            "running",
+            "turn 1",
+        ] {
+            assert!(text.contains(value), "{value} missing: {text}");
+        }
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("copied subagent: Task Run tests"),
+            "{:?}",
+            state.notice
+        );
+        handle_key(&mut state, &store, &sender, key(KeyCode::Esc));
+        assert!(matches!(state.overlay, Overlay::None));
     }
 
     #[test]

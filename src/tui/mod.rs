@@ -516,6 +516,10 @@ enum Overlay {
         report: Box<crate::git_workflow::PullRequestChecks>,
         scroll: usize,
     },
+    GitPrConfirm {
+        plan: Box<crate::git_workflow::PullRequestPlan>,
+        scroll: usize,
+    },
     CopyPicker {
         selected: usize,
         replies: Vec<ReplyChoice>,
@@ -2691,7 +2695,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/orchestrate", _) => Some("orchestrate on|off|--plan-only|<goal>"),
         ("/runs", _) => Some("runs --all|<run id>"),
         ("/commands", _) => Some("commands [turn]"),
-        ("/git", _) => Some("git status|commit [--staged] [message]|push"),
+        ("/git", _) => Some("git status|commit [--staged] [message]|push|checks|pr [title]"),
         ("/queue", _) => Some("queue [send <n> | edit <n> <text> | move <from> <to> | clear]"),
         ("/mcp", "add") => Some("mcp add <name> <command> [args...]"),
         ("/mcp", "remove") => Some("mcp remove <name>"),
@@ -2860,6 +2864,11 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 ("commit", "commit all changes in the repository"),
                 ("commit --staged", "commit only staged changes"),
                 ("push", "push the current branch to a remote"),
+                ("checks", "read the current pull request checks"),
+                (
+                    "pr",
+                    "open a pull request with a generated or supplied title",
+                ),
             ] {
                 push_suggestion(&mut suggestions, command, action, description);
             }
@@ -3571,6 +3580,7 @@ fn apply_git_picker(
         }
         3 => open_git_push_picker(state, store),
         4 => open_git_checks(state),
+        5 => open_git_pr_confirm(state, store, None),
         _ => state.overlay = Overlay::None,
     }
 }
@@ -3585,6 +3595,67 @@ fn open_git_checks(state: &mut TuiState) {
         }
         Err(error) => {
             state.notice = Some(git_line(&format!("git checks: {error}")));
+        }
+    }
+}
+
+fn open_git_pr_confirm(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, title: Option<&str>) {
+    state.overlay = Overlay::None;
+    let cwd = std::path::Path::new(&state.thread.cwd);
+    let root = match crate::git_workflow::inspect(cwd) {
+        Ok(status) => status.root,
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git: {error}")));
+            return;
+        }
+    };
+    if let Some(reason) = git_open_work(state, store, &root) {
+        state.notice = Some(git_line(&format!(
+            "git: {reason}; wait for it before opening a pull request"
+        )));
+        return;
+    }
+    match crate::git_workflow::plan_pr(cwd, title) {
+        Ok(plan) => {
+            state.overlay = Overlay::GitPrConfirm {
+                plan: Box::new(plan),
+                scroll: 0,
+            };
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git: {error}")));
+            open_git_picker(state, store);
+        }
+    }
+}
+
+fn create_git_pr(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    plan: crate::git_workflow::PullRequestPlan,
+) {
+    if let Some(reason) = git_open_work(state, store, &plan.root) {
+        state.notice = Some(git_line(&format!(
+            "git: {reason}; wait for it before opening a pull request"
+        )));
+        open_git_picker(state, store);
+        return;
+    }
+    match crate::git_workflow::create_pr(&plan) {
+        Ok(outcome) => {
+            let number = outcome
+                .number
+                .map(|number| format!(" #{number}"))
+                .unwrap_or_default();
+            state.notice = Some(git_line(&format!(
+                "opened pull request{number} · {}",
+                outcome.url
+            )));
+            state.overlay = Overlay::None;
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git pr failed: {error}")));
+            open_git_picker(state, store);
         }
     }
 }
@@ -4425,7 +4496,7 @@ fn handle_key(
                 state.overlay = Overlay::None;
             }
             KeyCode::Up => {
-                selected = (selected + 5) % 6;
+                selected = (selected + 6) % 7;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4433,7 +4504,7 @@ fn handle_key(
                 };
             }
             KeyCode::Down => {
-                selected = (selected + 1) % 6;
+                selected = (selected + 1) % 7;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4449,7 +4520,7 @@ fn handle_key(
             }
             KeyCode::End => {
                 state.overlay = Overlay::GitPicker {
-                    selected: 5,
+                    selected: 6,
                     status,
                     blocked,
                 };
@@ -4536,6 +4607,19 @@ fn handle_key(
                         scroll = next;
                     }
                     state.overlay = Overlay::GitChecks { report, scroll };
+                }
+            }
+        }
+        Overlay::GitPrConfirm { plan, mut scroll } => {
+            let max = plan.body.lines().count().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc => open_git_picker(state, store),
+                KeyCode::Enter => create_git_pr(state, store, *plan),
+                code => {
+                    if let Some(next) = git_scroll_key(code, scroll, max) {
+                        scroll = next;
+                    }
+                    state.overlay = Overlay::GitPrConfirm { plan, scroll };
                 }
             }
         }
@@ -7209,9 +7293,17 @@ fn handle_command(
                 open_git_confirm(state, store, mode, message.as_deref());
             }
             Some("push") => open_git_push_picker(state, store),
+            Some("pr") => {
+                let title = if args.len() > 1 {
+                    Some(args[1..].join(" "))
+                } else {
+                    None
+                };
+                open_git_pr_confirm(state, store, title.as_deref());
+            }
             Some(other) => {
                 state.notice = Some(git_line(&format!(
-                    "unknown /git action: {other} · usage: /git status|commit [--staged] [--] [message]|push"
+                    "unknown /git action: {other} · usage: /git status|commit [--staged] [--] [message]|push|checks|pr [title]"
                 )));
             }
         },
@@ -8968,7 +9060,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitPicker {
                 status, blocked, ..
             } => {
-                9 + usize::from(blocked.is_some())
+                10 + usize::from(blocked.is_some())
                     + usize::from(status.operation.is_some())
                     + usize::from(status.conflicts)
             }
@@ -8981,6 +9073,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitPushPicker { targets, .. } => targets.len().min(8) + 4,
             Overlay::GitPushConfirm { .. } => 8,
             Overlay::GitChecks { report, .. } => report.checks.len().min(12) + 5,
+            Overlay::GitPrConfirm { plan, .. } => plan.body.lines().count().min(10) + 7,
             Overlay::RolesPicker { roles, .. } => roles.len() + 6,
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
@@ -9102,6 +9195,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitPushConfirm { plan } => draw_git_push_confirm(frame, chunks[1], plan),
             Overlay::GitChecks { report, scroll } => {
                 draw_git_checks(frame, chunks[1], report, *scroll)
+            }
+            Overlay::GitPrConfirm { plan, scroll } => {
+                draw_git_pr_confirm(frame, chunks[1], plan, *scroll)
             }
             Overlay::ModePicker { selected } => {
                 draw_mode_picker(frame, chunks[1], state, *selected)
@@ -10076,6 +10172,10 @@ fn draw_git_picker(
             "Checks".to_string(),
             "GitHub pull request checks".to_string(),
         ),
+        (
+            "Open pull request".to_string(),
+            "gh pr create with a title and body confirmation".to_string(),
+        ),
         ("Cancel".to_string(), "esc".to_string()),
     ];
     let mut lines = vec![Line::styled(
@@ -10656,6 +10756,58 @@ fn draw_git_checks(
                 git_line(state)
             ),
             style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_git_pr_confirm(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    plan: &crate::git_workflow::PullRequestPlan,
+    scroll: usize,
+) {
+    let body: Vec<&str> = plan.body.lines().collect();
+    let visible = body.len().min(10);
+    let start = if body.len() <= visible {
+        0
+    } else {
+        scroll.min(body.len() - visible)
+    };
+    let position = if body.len() > visible {
+        format!(" · {}/{}", start + 1, body.len())
+    } else {
+        String::new()
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "Pull request · {} → {}/{} · {} commit(s){position} · enter create · esc back",
+                git_line(&plan.branch),
+                git_line(&plan.remote),
+                git_line(&plan.base),
+                plan.commit_count
+            ),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            format!("title: {}", git_line(&plan.title)),
+            Style::default()
+                .fg(COLORS.secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            format!("head: {}", git_line(&plan.head)),
+            Style::default().fg(COLORS.muted),
+        ),
+    ];
+    for line in body.iter().skip(start).take(visible) {
+        lines.push(Line::styled(
+            git_line(line),
+            Style::default().fg(COLORS.text),
         ));
     }
     let block = Block::default()
@@ -12561,6 +12713,7 @@ mod tests {
             "/orchestrate",
             "/runs",
             "/commands",
+            "/git",
             "/queue",
             "/mcp",
             "/copy",
@@ -21486,6 +21639,109 @@ exit 1
     }
 
     #[test]
+    fn git_pr_confirm_creates_the_planned_pull_request() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        let run_git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        let base = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let base = String::from_utf8_lossy(&base.stdout).trim().to_string();
+        let remote = git_bare_remote();
+        git_add_remote(repo.path(), "origin", remote.path());
+        run_git(&["update-ref", "refs/remotes/origin/main", &base]);
+        run_git(&["checkout", "-q", "-b", "feat/pr"]);
+        std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-q", "-m", "Add feature"]);
+        run_git(&["push", "-q", "origin", "feat/pr"]);
+
+        let gh = repo.path().join("fake-gh-pr");
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+set -eu
+if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"defaultBranchRef":{"name":"main"}}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf 'no pull requests found for branch\n' >&2
+  exit 1
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  printf 'https://github.com/example/repo/pull/42\n'
+  exit 0
+fi
+exit 1
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("BATON_GH_BIN", &gh);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/git");
+        for _ in 0..5 {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Down),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let Overlay::GitPrConfirm { plan, .. } = &state.overlay else {
+            panic!("expected pull request confirmation");
+        };
+        assert_eq!(plan.title, "Add feature");
+        assert!(plan.body.contains("## Summary"));
+        assert!(plan.body.contains("- Add feature"));
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(
+            text.contains("Pull request · feat/pr → origin/main"),
+            "{text}"
+        );
+        assert!(text.contains("title: Add feature"), "{text}");
+        assert!(text.contains("- Add feature"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        std::env::remove_var("BATON_GH_BIN");
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("opened pull request #42"), "{notice}");
+        assert!(
+            notice.contains("https://github.com/example/repo/pull/42"),
+            "{notice}"
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
     fn git_push_picker_and_push_to_a_local_remote() {
         let repo = tempfile::tempdir().unwrap();
         git_repo(repo.path());
@@ -21710,6 +21966,14 @@ exit 1
         );
         assert!(
             suggestions.contains(&"/git push".to_string()),
+            "{suggestions:?}"
+        );
+        assert!(
+            suggestions.contains(&"/git checks".to_string()),
+            "{suggestions:?}"
+        );
+        assert!(
+            suggestions.contains(&"/git pr".to_string()),
             "{suggestions:?}"
         );
     }

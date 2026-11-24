@@ -72,7 +72,7 @@ baton doctor
 - Git for checkpoints, worktrees, and `/git`.
 - `VISUAL` or `EDITOR` for Ctrl+O in `/files` and `/grep`, and for `/memory`.
 - Optional: `rg` for faster file and content search. Baton falls back to `git`.
-- Optional: `gh` for `/git` checks and opening pull requests from orchestration reports.
+- Optional: authenticated `gh` for `/git checks`, `/git pr`, and opening pull requests from orchestration reports.
 
 ## Upgrade
 

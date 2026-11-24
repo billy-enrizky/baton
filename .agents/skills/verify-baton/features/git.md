@@ -1,22 +1,24 @@
-# Git status, commit, push, and checks
+# Git status, commit, push, checks, and pull request
 
 ## Sub-features
-- `/git` opens a picker with Status, Commit all changes, Commit staged changes, Push current branch, Checks, and Cancel. Esc closes it.
+- `/git` opens a picker with Status, Commit all changes, Commit staged changes, Push current branch, Checks, Open pull request, and Cancel. Esc closes it.
 - `/git status` opens a scrollable repository view with the branch, upstream and ahead/behind counts, in-progress operation, unresolved conflicts, and every changed path with its status code.
 - `/git commit [--staged] [--] [message]` opens a scrollable confirmation with the generated or supplied message, the branch, the mode, and every planned path. Enter commits; Esc returns to the picker. `--staged` is recognized only as the first argument, and `--` starts the message.
 - `/git push` opens a remote picker, then a confirmation naming the local branch, remote, remote branch, and ahead/behind counts. Enter pushes; Esc returns. The push never forces, never pulls or merges, and does not set an upstream.
 - Checks opens the current pull request from `gh` and lists every check with its bucket, state, and description. The PR number, title, state, mergeability, head branch, and URL sit above the check rows. Up/Down, PageUp/PageDown, Home, and End scroll; Esc closes.
+- `/git pr [title]` opens a confirmation naming the source branch, the `origin` base branch, the commit count, the title, the HEAD SHA, and the generated body. Enter runs `gh pr create`; Esc returns to the picker.
 - The commit uses the thread's repository root. It refuses an operation in progress, unresolved conflicts, an empty selection, a stale branch, a moved HEAD, or a changed worktree fingerprint. It is blocked while another thread sharing the worktree has open work.
+- Pull request creation refuses a detached HEAD, an operation, conflicts, a missing `origin`, a branch that is not pushed at HEAD, no commits ahead of the base, an existing pull request, a missing authenticated `gh`, or a moved HEAD after confirmation.
 
 ## Problem statement
 
-Baton could commit worker branches during an orchestration run, but a normal thread had no terminal path to inspect the repository and commit its work. The user had to leave the TUI, run git by hand, and return knowing the branch and file state from memory.
+Baton could commit and push worker branches during an orchestration run, but a normal thread had no terminal path to inspect the repository, commit its work, or finish the delivery loop. The user had to leave the TUI, run git and `gh` by hand, and return knowing the branch, remote, and review state from memory.
 
 ## Goals and non-goals
 
-Goals: one `/git` submenu that shows the repository state, prepares a deterministic commit message, confirms every exact path, commits all changes or only staged changes, pushes the current branch to a chosen remote, and reports the short SHA or pushed ref. The flow must refuse an operation, conflict, concurrent worktree work, or stale plan before it mutates the repository or remote.
+Goals: one `/git` submenu that shows the repository state, prepares a deterministic commit message, confirms every exact path, commits all changes or only staged changes, pushes the current branch to a chosen remote, lists pull request checks, and opens a pull request from a previewed title and body. The flow must refuse an operation, conflict, concurrent worktree work, stale plan, unpushed branch, existing pull request, or moved HEAD before it mutates the repository, remote, or forge.
 
-Non-goals: pull, fetch, pull request creation, review, merge, force-push, upstream configuration, amend, rebase, hunk staging, file-level selection, issue linking, or rewriting history. The confirmation does not run an editor for the message. The slice does not change the orchestration worker ship path, which keeps its existing `open_prs_with_gh` implementation.
+Non-goals: pull, fetch, pull request review, merge, draft toggling, reviewers, labels, multi-forge routing, force-push, upstream configuration, amend, rebase, hunk staging, file-level selection, issue linking, or rewriting history. The confirmation does not run an editor for the title or body. The slice does not change the orchestration worker ship path, which keeps its existing `open_prs_with_gh` implementation.
 
 ## Proposed architecture
 
@@ -32,6 +34,10 @@ The TUI has three overlays: the picker, a read-only status view, and the confirm
 
 `checks` resolves the repository root, runs `gh pr view --json number,title,url,state,mergeable,headRefName,isDraft`, then `gh pr checks <number> --json name,state,bucket,description,link`. A pending checks exit code 8 is a successful report, and a `no checks reported` message becomes an empty list. The path can be overridden with `BATON_GH_BIN`. The TUI shows the PR header and up to 200 checks, 12 rows at a time, with a pass/fail/pending marker and the description.
 
+`plan_pr` inspects the repository, refuses a detached HEAD, an operation, or conflicts, requires `origin`, and reads the base with `gh repo view --json defaultBranchRef`. It treats `no pull requests found` from `gh pr view <branch> --json url,number,state` as no existing PR and refuses any other successful result. It requires commits ahead of `origin/<base>` and requires `refs/remotes/origin/<branch>` to resolve to the current HEAD, so `gh pr create --head` cannot publish a stale branch. Commit subjects are sanitized, capped at 20 rows, and inserted into a `## Summary` body capped at 4,000 characters. The title is the last subject or a sanitized supplied title capped at 200 characters.
+
+`create_pr` rechecks the branch, operation, conflicts, and HEAD, then runs `gh pr create --base <base> --head <branch> --title <title> --body <body>`. It reads the last `https://` line as the URL and parses the trailing number for the notice. The TUI keeps the push confirmation and pull request confirmation separate so the user sees each remote mutation before it happens.
+
 ## Alternatives considered
 
 - Shelling out to `git` was chosen over `git2` or `gix`. Hooks, signing, configuration, and exact porcelain behavior come from the user's git; a library would add a dependency and still need to model them.
@@ -43,17 +49,20 @@ The TUI has three overlays: the picker, a read-only status view, and the confirm
 - A remote picker was chosen over implicitly pushing the configured upstream. It makes a first push and a multi-remote repository explicit.
 - `git push` without `--set-upstream` was chosen so a push does not silently rewrite tracking configuration. The confirmation says when the branch is not tracked.
 - No force mode was added. A non-fast-forward push fails and the user resolves it with a pull or merge outside the flow.
-- `gh` was chosen for checks because the repository already uses it for worker pull requests. A forge abstraction waits for the `/git pr` and multi-forge slice.
+- `gh` was chosen for checks and pull request creation because the repository already uses it for worker pull requests. A forge abstraction waits for a multi-forge slice.
+- Pull request creation requires the branch to be pushed at HEAD instead of pushing implicitly. The user sees the remote mutation in `/git push`, and the pull request preview cannot publish a stale branch.
+- The title defaults to the last commit subject and the body is the ordered commit list. Both are visible in the confirmation before `gh pr create`; a supplied `/git pr <title>` replaces only the title.
 
 ## Implementation scope and sequence
 
-This feature file covers the whole `/git` surface. The memory-to-commit slice landed in `1c5be70`; push landed in `b03db19`; checks land in this slice. The checks slice modifies `src/git_workflow.rs`, `src/tui/mod.rs`, this file, `.agents/skills/verify-baton/features/README.md`, `.agents/skills/verify-baton/scripts/slash_probe.py`, `README.md`, `.agents/parity.md` (the D14 row only), and `ci/test-inventory-floor.txt`. It does not change `src/lib.rs`, `src/worktree.rs`, or the upstream pins.
+This feature file covers the whole `/git` surface. The memory-to-commit slice landed in `1c5be70`; push landed in `b03db19`; checks landed in `322efd8`; pull request creation lands in this slice. This slice modifies `src/git_workflow.rs`, `src/tui/mod.rs`, this file, `.agents/skills/verify-baton/features/README.md`, `.agents/skills/verify-baton/features/slash-commands.md`, `.agents/skills/verify-baton/scripts/slash_probe.py`, `README.md`, `install.md`, `.agents/parity.md` (the D14 row only), and `ci/test-inventory-floor.txt`. It does not change `src/lib.rs`, `src/worktree.rs`, or the upstream pins.
 
 1. Resolve the exact branch from `git symbolic-ref HEAD`, plan the push against the validated HEAD commit, and build a canonical `refs/heads/<branch>` destination after `--`.
 2. Add the Push current branch row, push target picker, push confirmation, open-work gate on every attempt, exact `/git push` completion, and TUI tests.
 3. Extend the PTY probe to commit the isolated repository, assert the exact generated subject, exact committed file set, and excluded untracked ignored file, then push to a local bare remote and assert the remote head.
 4. Add the Checks row, resolve the PR with `gh pr view`, list checks with `gh pr checks`, render the scrollable check view, and cover a fake `gh` in the unit and PTY probes.
-5. Update the README, D14 row, feature map, slash inventory, and test inventory floor; run the affected checks and the CI self-tests.
+5. Add the Open pull request row and `/git pr [title]`, plan the base and body, require the branch at HEAD on `origin`, preview the plan, create through `gh pr create`, and recheck HEAD before submission.
+6. Update the README, install guide, D14 row, feature map, slash inventory, and test inventory floor; run the affected checks and the CI self-tests.
 
 ## Rollback
 
@@ -76,10 +85,14 @@ A push updates the remote and cannot be undone locally. To retract pushed work, 
 - Git's terminal credential prompt is disabled with `GIT_TERMINAL_PROMPT=0`, but a credential helper, askpass helper, or SSH passphrase prompt may still open and block the TUI. Configure noninteractive credentials before pushing.
 - Checks needs `gh` on PATH and an open pull request for the current branch. A missing CLI, no pull request, or a non-GitHub remote produces a notice and leaves the picker unchanged. Pending checks use exit code 8 as a valid report, and `no checks reported` is an empty list.
 - The checks view is read-only and capped at 200 rows. A check description is capped at 500 characters; names, states, descriptions, and URLs pass through `git_line` before rendering.
+- Pull request creation needs an authenticated `gh`, a GitHub `origin`, a pushed branch at HEAD, commits ahead of the base, and no existing PR for the branch. Failures leave the picker usable and name the next action.
+- The default base comes from `gh repo view`; a fork whose upstream base differs from the origin default needs the remote and base resolved outside this slice. The confirmation always names the remote and base it will use.
+- The generated title and body are capped and sanitized. A multi-line custom title is collapsed to one line; control characters are replaced before it reaches `gh`.
+- `gh pr create` can still reject a valid plan because of organization policy, protected branches, missing permissions, or a stale remote. Baton reports the `gh` error and does not retry with weaker flags.
 
 ## How to get to it (user POV)
 
-Type `/git`. The picker starts on Status and says it covers the whole repository. Use Up/Down or Home/End to move, Enter to run the row, and Esc to close. Enter on Status opens the scrollable status view; Enter on Commit all changes or Commit staged changes opens the confirmation; Enter on Push current branch opens the remote picker; Enter on Checks opens the current PR's check list. In the confirmation, Up/Down/PageUp/PageDown/Home/End scroll every path, Enter commits, and Esc returns to the picker. In the push picker, choose a remote or Cancel; the push confirmation names the exact ref and never forces. In the checks view, Up/Down/PageUp/PageDown/Home/End scroll and Esc closes. `/git status` opens the status view. `/git commit [--staged] [--] [message]` opens the confirmation directly; `--staged` is only a flag as the first argument, and quotes are literal text joined by single spaces. `/git push` opens the remote picker directly.
+Type `/git`. The picker starts on Status and says it covers the whole repository. Use Up/Down or Home/End to move, Enter to run the row, and Esc to close. Enter on Status opens the scrollable status view; Enter on Commit all changes or Commit staged changes opens the confirmation; Enter on Push current branch opens the remote picker; Enter on Checks opens the current PR's check list; Enter on Open pull request opens the title and body confirmation. In the confirmation, Up/Down/PageUp/PageDown/Home/End scroll every path, Enter commits, and Esc returns to the picker. In the push picker, choose a remote or Cancel; the push confirmation names the exact ref and never forces. In the checks view, Up/Down/PageUp/PageDown/Home/End scroll and Esc closes. In the pull request confirmation, Up/Down/PageUp/PageDown/Home/End scroll the body, Enter creates, and Esc returns. `/git status` opens the status view. `/git commit [--staged] [--] [message]` opens the confirmation directly; `--staged` is only a flag as the first argument, and quotes are literal text joined by single spaces. `/git push` opens the remote picker directly. `/git pr [title]` opens the pull request confirmation directly.
 
 ## Verification paths
 
@@ -88,6 +101,7 @@ Type `/git`. The picker starts on Status and says it covers the whole repository
 cargo test --locked --lib git_workflow::tests
 cargo test --locked --lib tui::tests::git_command_flow
 cargo test --locked --lib tui::tests::git_checks_picker_shows_the_current_pr_and_checks
+cargo test --locked --lib tui::tests::git_pr_confirm_creates_the_planned_pull_request
 cargo test --locked --lib tui::tests::git_status_uses_the_repository_root_and_closes_with_escape
 cargo test --locked --lib tui::tests::git_confirmation_scrolls_past_the_visible_window
 cargo test --locked --lib tui::tests::git_commit_is_blocked_by_open_work_in_the_worktree
@@ -101,9 +115,12 @@ cargo test --locked --lib git_workflow::tests::checks_reports_the_current_pull_r
 cargo test --locked --lib git_workflow::tests::checks_accepts_pending_exit_8_and_an_empty_check_list
 cargo test --locked --lib git_workflow::tests::checks_treats_no_checks_reported_as_an_empty_list
 cargo test --locked --lib git_workflow::tests::checks_reports_a_missing_gh_or_missing_pull_request
+cargo test --locked --lib git_workflow::tests::plan_pr_builds_the_base_title_and_body
+cargo test --locked --lib git_workflow::tests::plan_pr_refuses_existing_pr_and_unready_remote_states
+cargo test --locked --lib git_workflow::tests::create_pr_uses_the_planned_arguments_and_rejects_a_moved_head
 ```
 
-The module tests cover clean and dirty inspection, staged versus unstaged codes, upstream ahead and behind, a missing upstream, merge refusal, every other operation marker including the sequencer, an unmerged index without a marker, untracked ignored exclusion, force-added ignored inclusion, staged-only commits, generated and supplied messages, message validation and the 200-character cap, a changed branch, a changed path set, a content change that does not mutate the index, a moved HEAD, a failing hook that leaves the index staged, a successful hook whose tree change is reported, detached HEAD commit support, a trailing-space repository root, push target ordering, a remote name with a slash, a differently named upstream branch, a gone tracking ref, a real push to a local bare remote under `push.recurseSubmodules=only` and `push.followTags=true`, canonical head-refspec arguments, a branch named `refs/heads/topic`, a remote named `--force`, nothing-to-push and behind-upstream refusal, an actual non-fast-forward rejection, no-remote/detached/operation refusal, unborn and missing-remote refusal, a moved-head push refusal, no upstream auto-setup, PR check parsing, pending exit 8, an empty check list, no checks reported, a missing `gh`, no pull request, and non-UTF-8 path refusal on Linux. The TUI tests cover the picker and Esc, the status overlay from a subdirectory, the repository-root scope, an operation and conflict warning with every-file scrolling, confirmation scrolling, the actual commit from the picker, staged planning, free-form `--staged` text, a worktree-scoped open-work block that clears after the work finishes, an orchestration-start block, an exact `/git commit` through the composer, a push target picker with upstream ahead/behind, a real push confirmation and notice, push cancel/no-remote, a stale push confirmation cancelled after open work starts, the checks view with a fake `gh`, a non-repository notice, and completion. Every git fixture pins `main` and disables hooks, signing, `push.autoSetupRemote`, and ambient untracked-file settings in normal cases; hook tests opt back into a local hook.
+The module tests cover clean and dirty inspection, staged versus unstaged codes, upstream ahead and behind, a missing upstream, merge refusal, every other operation marker including the sequencer, an unmerged index without a marker, untracked ignored exclusion, force-added ignored inclusion, staged-only commits, generated and supplied messages, message validation and the 200-character cap, a changed branch, a changed path set, a content change that does not mutate the index, a moved HEAD, a failing hook that leaves the index staged, a successful hook whose tree change is reported, detached HEAD commit support, a trailing-space repository root, push target ordering, a remote name with a slash, a differently named upstream branch, a gone tracking ref, a real push to a local bare remote under `push.recurseSubmodules=only` and `push.followTags=true`, canonical head-refspec arguments, a branch named `refs/heads/topic`, a remote named `--force`, nothing-to-push and behind-upstream refusal, an actual non-fast-forward rejection, no-remote/detached/operation refusal, unborn and missing-remote refusal, a moved-head push refusal, no upstream auto-setup, PR check parsing, pending exit 8, an empty check list, no checks reported, pull request planning, a supplied title overrides the last commit subject, generated body and commit list, existing-PR refusal, missing origin, no commits ahead, a branch not on origin, a stale branch, a missing or invalid `gh` response, `gh pr create` argument construction, URL and number parsing, and a moved HEAD refusal. TUI tests cover the picker and Esc, the status overlay from a subdirectory, the repository-root scope, an operation and conflict warning with every-file scrolling, confirmation scrolling, the actual commit from the picker, staged planning, free-form `--staged` text, a worktree-scoped open-work block that clears after the work finishes, an orchestration-start block, an exact `/git commit` through the composer, a push target picker with upstream ahead/behind, a real push confirmation and notice, push cancel/no-remote, a stale push confirmation cancelled after open work starts, the checks view with a fake `gh`, the pull request confirmation and created notice with a fake `gh`, a non-repository notice, and completion. Every git fixture pins `main` and disables hooks, signing, `push.autoSetupRemote`, and ambient untracked-file settings in normal cases; hook tests opt back into a local hook.
 
 ### PTY
 ```sh
@@ -112,7 +129,7 @@ The module tests cover clean and dirty inspection, staged versus unstaged codes,
   --evidence-dir local_docs/verification/evidence
 ```
 
-The probe creates an isolated repository with a configured identity, disabled hooks and signing, an empty `core.excludesFile`, an untracked ignored `.env`, a fake `gh`, and a local bare remote. It opens `/git`, selects Commit all changes, requires the confirmation to list `src/parser/mod.rs`, commits, then checks the exact subject `baton: update 4 files`, the exact committed set (`AGENTS.md`, `CLAUDE.md`, `README.md`, `src/parser/mod.rs`), and that `.env` is absent. It then opens `/git push`, selects `origin/main`, confirms, checks the pushed notice, and asserts the bare remote head equals the local head. It reopens `/git`, selects Checks, and requires the fake PR `#42`, `Add checks`, the passing `Test`, and the pending `Lint` row.
+The probe creates an isolated repository with a configured identity, disabled hooks and signing, an empty `core.excludesFile`, an untracked ignored `.env`, a fake `gh`, and a local bare remote. It opens `/git`, selects Commit all changes, requires the confirmation to list `src/parser/mod.rs`, commits, then checks the exact subject `baton: update 4 files`, the exact committed set (`AGENTS.md`, `CLAUDE.md`, `README.md`, `src/parser/mod.rs`), and that `.env` is absent. It then opens `/git push`, selects `origin/main`, confirms, checks the pushed notice, and asserts the bare remote head equals the local head. It reopens `/git`, selects Checks, and requires the fake PR `#42`, `Add checks`, the passing `Test`, and the pending `Lint` row. It checks out `feat/pr`, commits a feature file, pushes the branch to the bare remote, runs `/git pr`, requires the preview with `feat/pr -> origin/main`, `Add pull request`, the body row, and the create hint, presses Enter, and requires `opened pull request #43` with the fake URL. It then returns to `main`.
 
 ## Gotchas
 - Git must have a configured `user.name` and `user.email`; the probe and tests configure both in their isolated repositories.

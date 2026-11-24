@@ -51,7 +51,16 @@ COMMANDS = [
     ("/orchestrate", ["usage: /orchestrate"]),
     ("/orchestrate off", ["single harness mode"]),
     ("/orchestrate on", ["orchestrate mode"]),
-    ("/git", ["Git · whole repository", "Commit all changes", "Push current branch"]),
+    (
+        "/git",
+        [
+            "Git · whole repository",
+            "Commit all changes",
+            "Push current branch",
+            "Checks",
+            "Open pull request",
+        ],
+    ),
     ("/compact", ["not enough conversation to compact"]),
     ("/init", ["created "]),
     ("/export", ["nothing to export"]),

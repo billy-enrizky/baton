@@ -32,6 +32,7 @@ pub mod skill_dispatch;
 pub mod status;
 pub mod store;
 pub mod sync;
+pub mod tasks;
 pub mod tui;
 pub mod types;
 pub mod usage;

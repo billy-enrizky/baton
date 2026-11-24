@@ -17,7 +17,10 @@ from tui_probe import Screen, binary_identity, pump, set_size, wait_for
 
 COMMANDS = [
     ("/help", ["Type what you want to do"]),
-    ("/help all", ["/auth", "/turns"]),
+    # The unit test `help_all_lists_every_command` proves every registered
+    # command is in the help text; this screen checks that a recently added
+    # command reaches the rendered surface, which clips on a short terminal.
+    ("/help all", ["/auth", "/task"]),
     ("/status", ["thread:", "adapters:"]),
     ("/usage", ["no usage yet"]),
     ("/context", ["context:"]),
@@ -70,6 +73,7 @@ COMMANDS = [
     ("/new", ["new thread, unsaved until you send a message"]),
     ("/fork", ["nothing to fork yet"]),
     ("/worktree", ["source checkout has uncommitted changes"]),
+    ("/task", ["issues ·"]),
     ("/exit", []),
 ]
 

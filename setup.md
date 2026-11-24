@@ -12,7 +12,7 @@ Optional, only for the features that use them:
 
 | Tool or setting | Needed for |
 |---|---|
-| Authenticated `gh` | `/git checks`, `/git pr`, and pull request creation from an orchestration report. The rest of `/git` works without it. |
+| Authenticated `gh` | `/git checks`, `/git pr`, `/task`, and pull request creation from an orchestration report. The rest of `/git` works without it. |
 | `rg` | `/files` and `/grep`. Without it Baton falls back to `git grep` inside a repository. |
 | `VISUAL` or `EDITOR` | Opening a file from `/files`, `/grep`, or `/memory`. |
 | An MCP server | Whatever you add with `/mcp`; nothing is configured for you. |

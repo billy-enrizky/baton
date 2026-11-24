@@ -21,6 +21,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | File navigation | TUI; CLI | `/files [--ignored]` inserts a selected project path or `path:line` and warns when ignored files are included; Ctrl+O launches that target or a selected `/grep` match in `VISUAL` or `EDITOR`; `/grep` and `baton grep` search file contents with sorted previews; `baton files` ranks project paths with ripgrep or git; and `baton open` launches the editor with `-C`-directory containment |
 | Composer file mentions | TUI | typing `@path` offers ranked project files and Tab or Enter replaces only the mention token; ordinary text and addresses never start an index load |
 | Shell completions | CLI | `baton completions <shell>` generates from the clap command graph and handles a broken pipe |
+| Issue tasks | CLI and TUI | `/task [number]` or `baton task <number>` reads an open issue from `origin` and creates a linked worktree; no number opens an issue picker |
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |
 | Native rewind | CLI | `baton rewind --native` truncates Codex or OpenCode history and keeps the session |

@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, status, store, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, status, store, tasks, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -471,6 +471,39 @@ fn main_result(started: Instant) -> Result<()> {
             }
             if !result_ok || !stream.saw_output {
                 std::process::exit(1);
+            }
+            return Ok(());
+        }
+        cli::Commands::Task { number, json } => {
+            if cli.mode.is_some() {
+                anyhow::bail!("--mode applies to the interactive TUI; omit it for task");
+            }
+            if cli.thread.is_some() {
+                anyhow::bail!("task creates a new worktree; omit --thread");
+            }
+            let plan = tasks::plan_task(&cwd, number)?;
+            let worktree = tasks::create_worktree(&home, &plan)?;
+            if json {
+                let value = serde_json::json!({
+                    "number": plan.issue.number,
+                    "title": plan.issue.title,
+                    "url": plan.issue.url,
+                    "repo": plan.repo,
+                    "path": worktree.path.to_string_lossy(),
+                    "branch": worktree.branch,
+                    "base": worktree.base_ref,
+                });
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                let base = worktree.base_ref.chars().take(8).collect::<String>();
+                println!(
+                    "task #{} at {} on branch {} from {}",
+                    plan.issue.number,
+                    worktree.path.display(),
+                    worktree.branch,
+                    base
+                );
+                println!("{}", plan.issue.url);
             }
             return Ok(());
         }

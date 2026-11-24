@@ -55,6 +55,24 @@ pub fn turn_event_json(thread_id: &str, event: &TurnEvent) -> Value {
             "type": "assistant_text",
             "text": text,
         }),
+        TurnEvent::SubagentStarted { id, name, detail } => json!({
+            "type": "subagent_started",
+            "id": id,
+            "name": name,
+            "detail": detail,
+        }),
+        TurnEvent::SubagentFinished {
+            id,
+            name,
+            status,
+            detail,
+        } => json!({
+            "type": "subagent_finished",
+            "id": id,
+            "name": name,
+            "status": status,
+            "detail": detail,
+        }),
         TurnEvent::ToolStarted { id, tool, detail } => json!({
             "type": "tool_started",
             "id": id,

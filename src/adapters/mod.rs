@@ -242,6 +242,20 @@ pub enum TurnEvent {
         respond: oneshot::Sender<ApprovalDecision>,
     },
     Usage { usage: TurnUsage },
+    /// A child agent started. The id is the provider's tool call or child
+    /// thread id when it exposes one.
+    SubagentStarted {
+        id: Option<String>,
+        name: String,
+        detail: Option<String>,
+    },
+    /// A child agent finished, failed, or was interrupted.
+    SubagentFinished {
+        id: Option<String>,
+        name: String,
+        status: String,
+        detail: Option<String>,
+    },
     TurnCompleted {
         final_text: String,
         usage: Option<TurnUsage>,

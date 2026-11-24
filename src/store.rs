@@ -167,6 +167,20 @@ pub struct MessageRow {
 }
 
 #[derive(Debug, Clone)]
+pub struct SubagentRow {
+    pub id: i64,
+    pub thread_id: String,
+    pub turn: i64,
+    pub provider: String,
+    pub call_id: Option<String>,
+    pub name: String,
+    pub detail: Option<String>,
+    pub status: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct NativeRewindPending {
     pub thread_id: String,
     pub provider: ProviderId,
@@ -305,6 +319,19 @@ CREATE TABLE IF NOT EXISTS queued_messages (
   created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS queued_messages_thread_idx ON queued_messages (thread_id, id);
+CREATE TABLE IF NOT EXISTS subagents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  thread_id TEXT NOT NULL,
+  turn INTEGER NOT NULL,
+  provider TEXT NOT NULL,
+  call_id TEXT,
+  name TEXT NOT NULL,
+  detail TEXT,
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS subagents_thread_turn_idx ON subagents (thread_id, turn, id);
 CREATE TABLE IF NOT EXISTS prompt_history (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   cwd TEXT NOT NULL,
@@ -1977,6 +2004,49 @@ impl BatonStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_subagent(
+        &self,
+        thread_id: &str,
+        turn: i64,
+        provider: &str,
+        call_id: Option<&str>,
+        name: &str,
+        detail: Option<&str>,
+        status: &str,
+        started_at: &str,
+        finished_at: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO subagents (thread_id, turn, provider, call_id, name, detail, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![thread_id, turn, provider, call_id, name, detail, status, started_at, finished_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_subagents(&self, thread_id: &str) -> Result<Vec<SubagentRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, thread_id, turn, provider, call_id, name, detail, status, started_at, finished_at FROM subagents WHERE thread_id = ? ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map(params![thread_id], |row| {
+                Ok(SubagentRow {
+                    id: row.get(0)?,
+                    thread_id: row.get(1)?,
+                    turn: row.get(2)?,
+                    provider: row.get(3)?,
+                    call_id: row.get(4)?,
+                    name: row.get(5)?,
+                    detail: row.get(6)?,
+                    status: row.get(7)?,
+                    started_at: row.get(8)?,
+                    finished_at: row.get(9)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     pub fn add_message(
         &self,
         thread_id: &str,
@@ -2971,5 +3041,51 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.thread_open_work(&thread.id).unwrap(), None);
+    }
+
+    #[test]
+    fn subagents_round_trip_in_order() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store.draft_thread(NewThread {
+            title: "subagents".into(),
+            cwd: "/repo".into(),
+            current_provider: ProviderId::Claude,
+            current_model: None,
+        });
+        store
+            .add_subagent(
+                &thread.id,
+                1,
+                "claude",
+                Some("toolu_1"),
+                "Explore",
+                Some("Find the parser"),
+                "done",
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            )
+            .unwrap();
+        store
+            .add_subagent(
+                &thread.id,
+                2,
+                "codex",
+                None,
+                "review",
+                None,
+                "unknown",
+                "2026-01-01T00:02:00Z",
+                None,
+            )
+            .unwrap();
+        let rows = store.list_subagents(&thread.id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "Explore");
+        assert_eq!(rows[0].call_id.as_deref(), Some("toolu_1"));
+        assert_eq!(rows[0].status, "done");
+        assert_eq!(rows[0].detail.as_deref(), Some("Find the parser"));
+        assert_eq!(rows[1].provider, "codex");
+        assert_eq!(rows[1].status, "unknown");
+        assert!(rows[1].finished_at.is_none());
     }
 }

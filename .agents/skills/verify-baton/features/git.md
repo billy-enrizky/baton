@@ -131,7 +131,10 @@ cargo test --locked --lib git_workflow::tests::checks_reports_a_missing_gh_or_mi
 cargo test --locked --lib git_workflow::tests::plan_pr_builds_the_base_title_and_body
 cargo test --locked --lib git_workflow::tests::plan_pr_refuses_existing_pr_and_unready_remote_states
 cargo test --locked --lib git_workflow::tests::create_pr_uses_the_planned_arguments_and_rejects_a_moved_head
-cargo test --locked --lib git_workflow::tests::pull_request_text_uses_the_last_subject_after_body_truncation
+cargo test --locked --lib git_workflow::tests::pull_request_text_lists_newest_first_and_counts_earlier_commits
+cargo test --locked --lib git_workflow::tests::pull_request_text_drops_the_oldest_listed_subject_to_fit_the_body_cap
+cargo test --locked --lib git_workflow::tests::pull_request_text_prefers_the_supplied_title_then_the_head_subject
+cargo test --locked --lib git_workflow::tests::create_pr_refuses_remote_branches_that_moved_after_the_preview
 cargo test --locked --lib git_workflow::tests::create_pr_refuses_a_changed_branch_operation_and_conflicts
 cargo test --locked --lib git_workflow::tests::remote_commands_time_out_and_kill_the_child
 ```

@@ -1,6 +1,6 @@
 # Baton CI/CD design
 
-This document defines the GitHub Actions system for Baton, the measurements that justify it, and the acceptance record for rollout. The parity scope is in [parity.md](parity.md). The recorded measurement rules are in [ci-acceptance.md](ci-acceptance.md).
+This document defines the GitHub Actions system for Baton, the measurements that justify it, and the acceptance record for rollout. The parity scope is in [parity.md](../.agents/parity.md). The recorded measurement rules are in [ci-acceptance.md](ci-acceptance.md).
 
 The design is staged. Phase 1 creates one honest full-suite gate with hard budgets and real CI data. Sharding and diff-aware selection arrive only after that data exists, because a shard plan built from macOS timings would be a guess. Formatting and Clippy ratchets prevent new debt while the full lint baseline is cleaned.
 
@@ -188,7 +188,7 @@ This is visible in the PR, the merge API, and the next main run. It is not silen
 
 | Phase | Change | Files | Acceptance |
 |---|---|---|---|
-| 1A | Design and acceptance record | Create `docs/parity.md`, `docs/ci.md`, `docs/ci-acceptance.md`, `scripts/check_parity_paths.py`, `scripts/check_doc_links.py`; modify `README.md` | Both checkers print `0 missing`; the EGM review record has two consecutive clean rounds |
+| 1A | Design and acceptance record | Create `.agents/parity.md`, `docs/ci.md`, `docs/ci-acceptance.md`, `scripts/check_parity_paths.py`, `scripts/check_doc_links.py`; modify `README.md` | Both checkers print `0 missing`; the EGM review record has two consecutive clean rounds |
 | 1B | Trusted helpers, skills, and formal model | Create `ci/*.sh`, `ci/fixtures/**`, `ci/fmt-baseline.txt`, `ci/clippy-baseline.txt`, `ci/test-inventory-floor.txt`, `ci/formal/ci-admission/**`, `rust-toolchain.toml`, `.agents/skills/verify-baton-ci/**`, `.agents/skills/verify-baton-ci-formal/**` | `ci/selftest.sh` passes; a budget overrun exits 124; the formal gate passes locally; `cargo check`, `cargo build`, `cargo test`, and `ci/test-inventory.sh` pass |
 | 1C | Full-suite workflow | Create `.github/workflows/ci.yml`; modify `docs/ci.md` | Done: run 44982816103 executed every job with `verify` green, and run 44983114852 is the first green `main` push |
 | 2 | Record real timings and choose the test runner | `ci/test-timings.sh` records per-binary times; `docs/ci-acceptance.md` records the warm path and rejected runners | In progress: `cargo test` and the x64 runner retained; nextest count shards and the free ARM runner were rejected; the p50 miss remains |
@@ -229,8 +229,8 @@ Triggers: `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review
 | Changed path class | check | build | test | debt | docs_only | has_tests | full_suite_reason |
 |---|---|---|---|---|---|---|---|
 | Any `*.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `build.rs` | true | true | true | true | false | true | `code` |
-| `.github/workflows/**`, `ci/**`, `docs/ci.md`, `docs/parity.md` | true | true | true | true | false | true | `meta` |
-| `docs/**`, `*.md`, `LICENSE` only | false | false | false | false | true | false | `docs` |
+| `.github/workflows/**`, `ci/**`, `docs/ci.md`, `.agents/parity.md` | true | true | true | true | false | true | `meta` |
+| `docs/**`, `*.md`, `LICENSE`, `NOTICE` only | false | false | false | false | true | false | `docs` |
 | `.gitignore` or any other unknown path | true | true | true | true | false | true | `unknown` |
 | Empty diff | true | true | true | true | false | true | `empty` |
 

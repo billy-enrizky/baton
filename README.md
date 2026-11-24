@@ -1,10 +1,8 @@
 # baton
 
-One terminal CLI for every coding agent harness. Same thread, any model, native prompt caching. The TUI opens with a Codex-style header showing the baton version, working directory, session mode, coordinator or harness model, permissions, and billing.
+One terminal CLI for every coding agent harness. Same thread, any model, native prompt caching. The TUI opens with a status header showing the baton version, working directory, session mode, coordinator or harness model, permissions, and billing.
 
 New sessions orchestrate by default: the prompt is the goal, a coordinator splits it, and independent workers run in separate git worktrees, each on the harness that fits the task. `/switch` moves to a single harness when one agent is the right shape. Hit a wall in that harness, switch to another, and keep going in the same thread with Claude Code or Codex holding the context.
-
-baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t3code). Adapter protocol knowledge and the native session scanner are ported from t3code (MIT). The Rust implementation follows codex-rs patterns (ratatui TUI, sequential session loop, split line transports).
 
 ## What it does
 
@@ -20,8 +18,8 @@ baton is a terminal-first reimagining of [t3code](https://github.com/pingdotgg/t
 - **Parallel, then merged.** `/multi` fans one prompt across providers and opens a merged live view; press Enter to inspect any child thread. `/multi --worktrees` runs the same fan-out as isolated orchestration workers, so `i` merges and `p` opens PRs through the existing worker flows.
 - **Queued by provider.** If two threads target the same provider at once, the second waits in a durable `queued` phase and starts when the adapter is free instead of failing.
 - **Agent-readable state.** `status`, `threads`, `turns`, `queue`, `exec`, and `orchestrate` have versioned JSON output. `exec --stream-json` and `orchestrate --stream-json` emit one JSON event per line and end with a result row. `baton mcp` exposes the same durable state over MCP stdio.
-- **Subscription or API billing.** Each provider runs on its harness login or an API key, switchable per provider (`baton auth <provider> api`).
-- **codex-style keys.** Esc interrupts, Esc-Esc backtracks to a previous prompt, streaming Markdown with tables and aligned columns, tinted diffs, and per-tool activity rows.
+- **Subscription or API billing.** Each provider runs on its harness login or an API key. `/auth` opens a billing picker for every harness and shows which key variable is set or missing; `baton auth <provider> api` does the same from the command line.
+- **Familiar terminal keys.** Esc interrupts, Esc-Esc backtracks to a previous prompt, streaming Markdown with tables and aligned columns, tinted diffs, and per-tool activity rows.
 
 ## Install
 
@@ -52,58 +50,11 @@ baton
 
 The installer downloads the release for your OS and checks its SHA-256. If no release asset matches, it falls back to a source build when Cargo is installed. The harness CLIs you want to drive must still be on PATH.
 
-Provider login (one time each):
+See [Install Baton](install.md) for supported platforms, checksum verification, upgrades, uninstall, and editor and search prerequisites.
 
-```
-baton login codex        # codex login
-baton login claude       # claude auth login
-baton login cursor       # cursor-agent login
-baton login grok         # grok login
-baton login opencode     # opencode auth login
-baton login antigravity  # prints the Google sign-in instructions
-```
+## Set up a harness
 
-API-rate billing: set the provider's key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `CURSOR_API_KEY`, `XAI_API_KEY`, `OPENCODE_API_KEY`, `GEMINI_API_KEY`) and run `baton auth <provider> api`.
-
-Antigravity runs as `agy acp`. To use an API key and a custom Gemini endpoint, add this to `~/.baton/config.json`:
-
-```json
-{
-  "antigravity": {
-    "mode": "api",
-    "apiKeyEnv": "CODEX_ICA_API_KEY",
-    "apiBaseUrl": "https://api.servicesessentials.ibm.com"
-  },
-  "defaultModels": { "antigravity": "gemini-3.7-flash" }
-}
-```
-
-`apiKeyEnv` is the variable baton reads; the child receives `GEMINI_API_KEY`. The base URL is the endpoint root because `agy` appends `/v1beta` itself, so do not add `/v1`.
-
-Grok uses the same override shape with the OpenAI-compatible `/v1` base. Baton spawns `grok agent stdio` and maps the base URL to `GROK_XAI_API_BASE_URL` and `GROK_MODELS_BASE_URL`:
-
-```json
-{
-  "grok": {
-    "mode": "api",
-    "apiKeyEnv": "CODEX_ICA_API_KEY",
-    "apiBaseUrl": "https://api.servicesessentials.ibm.com/v1"
-  },
-  "defaultModels": { "grok": "gemini-3.7-flash" }
-}
-```
-
-Cursor is installed as `cursor-agent` and baton spawns `cursor-agent acp`. Cursor validates its own API keys, so the ICA key is rejected; run `cursor-agent login` and use subscription auth instead. Cursor cannot use the ICA endpoint.
-
-OpenCode can use an OpenAI-compatible ICA provider through its own `opencode.json`; Baton does not map a custom OpenCode base URL. Keep harness CLIs current with `grok update`, `cursor-agent update`, and `opencode upgrade`. To verify every advertised harness and record either a live turn or an explicit account block, run the harness matrix probe from a source checkout:
-
-```
-.agents/skills/verify-baton/scripts/harness_matrix_probe.py \
-  --binary target/debug/baton \
-  --evidence-dir local_docs/verification/evidence
-```
-
-The default run skips a live Claude turn and checks Cursor's capability only. Add `--include-claude` only when you approve a live Claude subscription turn.
+Run `baton login <provider>` once for each harness you want to drive, or set the provider's API key and choose API billing with `/auth`. The setup guide covers every key variable, custom endpoints, roles, MCP, skills, memory, and troubleshooting: [Set up Baton](setup.md).
 
 ## Start here
 
@@ -161,7 +112,7 @@ baton bench startup [--json] [--repeat N]  # per-phase startup timings over the 
 
 In the TUI, `/grep [--case|--case-sensitive] [--word] [--regex] <query>` searches in the background and opens a picker of `path:line` matches: typing narrows the loaded results, Enter inserts `path:line ` into the composer, Ctrl+O launches the selected match at its line in `VISUAL` or `EDITOR`, and Esc clears the filter before closing. Results are capped at 200; when the cap is hit, the footer says to rerun `/grep` for a fresh search. Binary and cache paths are skipped. Esc hides the panel, and a search already running finishes in the background. `/files [--ignored] [query]` opens a picker over the capped inventory for the current thread's project directory and loads it in the background. Gitignored files stay out unless `--ignored` is explicit; that mode shows a warning because build output and secrets such as `.env` can appear. Recently picked files sort first within a match tier: typing narrows the loaded rows, Enter inserts the selected path and a trailing space into the composer, Esc clears the filter before closing, and Esc closes immediately while the scan is still running. Ctrl+O launches `VISUAL` or `EDITOR` at the selected file, including the parsed line target. Both pickers restore the TUI and show an opened notice; a missing editor or invalid command leaves the picker open. `/open` still selects threads, and the CLI `baton open path:line` launches the editor at that line.
 
-In the TUI: `/help /activity /status /git /switch /model /effort /mode /auth /roles /new /fork /worktree /threads /pin /inbox /open /files /grep /usage /checkpoints /diff /review /rewind /retry /goal /find /multi /orchestrate /runs /commands /queue /turns /memory /compact /context /init /export /settings /mcp /skills /copy /clear /quit /exit`. Typing a command followed by space lists its valid choices, or shows the argument syntax when the command takes free-form text. Partial text filters the choices, and Tab or Enter completes the selection. A `--` prefix offers flag completions for `/files` and `/grep` without intercepting a bare `/files` or `/grep` Enter. `/roles` opens the role registry with the resolved orchestrator, planner, implementor, and reviewer models and prompt sources; Enter shows the selected role's detail. `/settings` opens global default session mode and terminal-bell choices above the current harness's read-only settings; Enter writes a global choice to `config.json`, applies the bell immediately, and shows the selected category's full option list. `/skills` opens the discovered Claude Code and Codex skill picker; Enter inserts `$name` and reports the source. A Claude thread rewrites the final provider payload to `/name`; the stored composer and transcript keep `$name`. The notice warns when the source harness differs or when `/orchestrate off` is needed. New sessions and `/new` use the configured default session mode, which is orchestrate until changed; `/fork` keeps the source mode and `/worktree` starts single. `/orchestrate off` switches the current thread to a single harness, `/orchestrate on` switches back, and `/switch` also returns to single-harness mode. In orchestrate mode a composer prompt launches a coordinator run instead of a single turn. `/orchestrate --plan-only <goal>` opens a plan preview with effective models and waits for Enter to run or Esc to edit. `/runs` lists recent durable runs, `/runs --all` includes archived runs, and `/runs <id>` reopens a stored worker report even after it is archived. `/pin` opens the current project's thread picker; Enter toggles a durable pin and pinned threads sort first. In that picker, Ctrl+Up and Ctrl+Down reorder the selected pinned thread without closing the picker; `/pin move <id> up` and `/pin move <id> down` provide the same order from the command line, and completion lists both directions. Press `i` in a report to merge completed worker branches, `p` to push them and open pull requests, or `a` to archive the run. Approvals answer with y/a/n and remain scoped to the thread that requested them. Ctrl+C interrupts a running turn or cancels an active orchestration, including its worker process groups; press twice to exit when idle. Drag in the transcript to select character ranges across wrapped rows; `/copy` copies the latest assistant reply. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably. `/fork [--turn N] [title]` branches the conversation into a new thread; both threads share the same working tree, and the fork starts with a transcript handoff instead of the source provider session. `/worktree [title]` forks the conversation into a new thread whose cwd is an isolated git worktree, binds that thread to a one-task orchestration run, and switches to it. The next successful turn commits there, after which the run report can integrate or ship the work. `/rewind --native` opens the rewind picker and uses Codex or OpenCode native rollback with the durable recovery marker; plain `/rewind` keeps the transcript-only path. `/retry` lists failed or unverified turns with stored prompt previews. Same-harness rows show native-session coverage; cross-harness rows show the switch instruction. The selected-turn detail shows the bounded error and full prompt length. The picker names the durable current harness, effective model, permission mode, and session coverage, and `/retry <turn>` opens it with that row selected. Enter submits the first user message as one new turn when the failed turn used that same harness. A turn from another harness is refused with a switch instruction, so a stored prompt cannot bypass the redacted handoff preview. Open, queued, native-rewind, or live orchestration work blocks the retry, and an engine-rejected retry is shown without entering the queue.
+In the TUI: `/help /activity /status /git /switch /model /effort /mode /auth /roles /new /fork /worktree /threads /pin /inbox /open /files /grep /usage /checkpoints /diff /review /rewind /retry /goal /find /multi /orchestrate /runs /commands /queue /turns /memory /compact /context /init /export /settings /mcp /skills /copy /clear /quit /exit`. Typing a command followed by space lists its valid choices, or shows the argument syntax when the command takes free-form text. Partial text filters the choices, and Tab or Enter completes the selection. A `--` prefix offers flag completions for `/files` and `/grep` without intercepting a bare `/files` or `/grep` Enter. `/roles` opens the role registry with the resolved orchestrator, planner, implementor, and reviewer models and prompt sources; Enter shows the selected role's detail. `/settings` opens global default session mode and terminal-bell choices above the current harness's read-only settings; Enter writes a global choice to `config.json`, applies the bell immediately, and shows the selected category's full option list. `/skills` opens the discovered Claude Code and Codex skill picker; Enter inserts `$name` and reports the source. A Claude thread rewrites the final provider payload to `/name`; the stored composer and transcript keep `$name`. The notice warns when the source harness differs or when `/orchestrate off` is needed. New sessions and `/new` use the configured default session mode, which is orchestrate until changed; `/fork` keeps the source mode and `/worktree` starts single. `/orchestrate off` switches the current thread to a single harness, `/orchestrate on` switches back, and `/switch` also returns to single-harness mode. In orchestrate mode a composer prompt launches a coordinator run instead of a single turn. `/orchestrate --plan-only <goal>` opens a plan preview with effective models and waits for Enter to run or Esc to edit. `/runs` lists recent durable runs, `/runs --all` includes archived runs, and `/runs <id>` reopens a stored worker report even after it is archived. `/pin` opens the current project's thread picker; Enter toggles a durable pin and pinned threads sort first. In that picker, Ctrl+Up and Ctrl+Down reorder the selected pinned thread without closing the picker; `/pin move <id> up` and `/pin move <id> down` provide the same order from the command line, and completion lists both directions. Press `i` in a report to merge completed worker branches, `p` to push them and open pull requests, or `a` to archive the run. Approvals answer with y/a/n, and `c` copies the approval prompt. Pickers and previews copy their selected text with `c`; the model picker uses `ctrl+y` so `c` remains a filter character. Approvals remain scoped to the thread that requested them. Ctrl+C interrupts a running turn or cancels an active orchestration, including its worker process groups; press twice to exit when idle. Drag in the transcript to select character ranges across wrapped rows; `/copy` copies the latest assistant reply. While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode; other providers queue it durably. `/fork [--turn N] [title]` branches the conversation into a new thread; both threads share the same working tree, and the fork starts with a transcript handoff instead of the source provider session. `/worktree [title]` forks the conversation into a new thread whose cwd is an isolated git worktree, binds that thread to a one-task orchestration run, and switches to it. The next successful turn commits there, after which the run report can integrate or ship the work. `/rewind --native` opens the rewind picker and uses Codex or OpenCode native rollback with the durable recovery marker; plain `/rewind` keeps the transcript-only path. `/retry` lists failed or unverified turns with stored prompt previews. Same-harness rows show native-session coverage; cross-harness rows show the switch instruction. The selected-turn detail shows the bounded error and full prompt length. The picker names the durable current harness, effective model, permission mode, and session coverage, and `/retry <turn>` opens it with that row selected. Enter submits the first user message as one new turn when the failed turn used that same harness. A turn from another harness is refused with a switch instruction, so a stored prompt cannot bypass the redacted handoff preview. Open, queued, native-rewind, or live orchestration work blocks the retry, and an engine-rejected retry is shown without entering the queue.
 
 `/inbox` lists threads with failed, unverified, interrupted, needs-input, or queued work across the store; Enter opens the selected thread. `/activity` opens an index of every turn with provider, phase, tool calls, diff, and usage; Enter expands a turn, `y` copies the summary, and `d` opens its diff. `baton activity --json` exposes the same index to agents. `/commands [turn]` opens a deep dive of every command and tool call, grouped by provider; Enter expands and `y` copies it. `/memory` lists Claude user, project, local, and rule files, Codex user instructions and existing user override, project `AGENTS.md` and an existing root `AGENTS.override.md`, and the project auto-memory index and topic files. Enter opens the selected file or creates it first, `Open auto-memory folder` opens the directory in the editor, and Auto-memory toggles Claude's user `autoMemoryEnabled` setting. `/memories` is gone; `$memories` still expands governed notes in a prompt, and `baton memories` remains for scripts. `/git` opens Status, Commit all changes, Commit staged changes, Push current branch, and Cancel. Status scrolls every changed path with its code; the commit confirmation scrolls every planned path and names the branch and message before Enter commits the whole repository. Push picks a remote, names the exact ref and ahead/behind counts, never forces, and does not change the upstream. `/effort` opens a reasoning-effort picker and the composer footer shows the active effort. `/auth` opens a scrollable billing picker for every harness, marks the current mode, shows the API key variable or `missing`, applies a keyed choice, and stays open with the exact variable name when the key is absent.
 
@@ -252,12 +203,13 @@ cargo test     # unit + protocol tests
 cargo build --release
 ```
 
-Planning and verification records:
+User guides:
 
-- [Terminal parity ledger](docs/parity.md)
-- [CI design](docs/ci.md)
-- [CI acceptance record](docs/ci-acceptance.md)
+- [Install Baton](install.md)
+- [Set up Baton](setup.md)
+
+Contributor and release-engineering records live under `docs/` and `.agents/`.
 
 ## License
 
-MIT.
+MIT. See [NOTICE](NOTICE) for upstream attribution.

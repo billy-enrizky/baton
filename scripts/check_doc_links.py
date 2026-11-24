@@ -16,7 +16,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("documents", nargs="*", type=Path, default=[
         Path("README.md"),
-        Path("docs/parity.md"),
+        Path("install.md"),
+        Path("setup.md"),
+        Path(".agents/parity.md"),
         Path("docs/ci.md"),
         Path("docs/ci-acceptance.md"),
     ])

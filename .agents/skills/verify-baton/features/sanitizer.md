@@ -25,6 +25,6 @@ Needs a live provider, so it is not a CI gate. The expected output shows `a`, th
 
 ## Limits
 
-- Shell overlay and PTY output are not wired yet. That is D9 in `docs/parity.md`.
+- Shell overlay and PTY output are not wired yet. That is D9 in `.agents/parity.md`.
 - JSON output is intentionally raw and must not be sanitized.
 - Ratatui already drops C0 at the cell level, so the transcript is defence in depth; the CLI stdout path is the one without a second line of defence.

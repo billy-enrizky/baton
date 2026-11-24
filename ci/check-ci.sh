@@ -183,6 +183,16 @@ end
   fail!("CI010", "#{job_name} must read changes.outputs.#{output}") unless condition.include?(output)
 end
 
+changes_text = Array(changes["steps"]).map { |step| step["run"].to_s }.join("\n")
+if changes_text.include?("--files")
+  unless changes_text.include?("github.event.pull_request.head.sha")
+    fail!("CI018", "changes classifies a file list without the immutable event head SHA")
+  end
+  if changes_text.include?("refs/pull/")
+    fail!("CI018", "changes reads refs/pull/, which is refreshed asynchronously and can name the previous head")
+  end
+end
+
 required_commands = {
   "changes" => ["classify-paths.sh"],
   "selection" => ["classify-paths.sh", "check-ci.sh", "--base", "selftest.sh", "gate-integrity.sh"],

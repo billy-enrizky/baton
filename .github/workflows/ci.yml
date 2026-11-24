@@ -55,15 +55,20 @@ jobs:
             exit 0
           fi
           base='${{ github.event.pull_request.base.sha }}'
-          pr='${{ github.event.pull_request.number }}'
+          head='${{ github.event.pull_request.head.sha }}'
           git init --quiet "$dest/repo"
           git -C "$dest/repo" remote add origin "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY.git"
-          if ! git -C "$dest/repo" fetch --no-tags --quiet --depth=1 origin "$base" "refs/pull/$pr/merge:refs/remotes/pull/merge"; then
+          # The event pair is immutable for this run. The pull request merge ref
+          # is refreshed asynchronously, so after a force-push it can still
+          # describe the previous head and classify the previous base-to-head
+          # diff. The selection guard diffs this same base against HEAD, so
+          # reading anything else here can make the jobs disagree and fail the PR.
+          if ! git -C "$dest/repo" fetch --no-tags --quiet --depth=1 origin "$base" "$head"; then
             echo "trusted commits are unavailable; selecting every gate" >&2
             emit_full unknown | tee -a "$GITHUB_OUTPUT"
             exit 0
           fi
-          if ! git -C "$dest/repo" diff --name-only --no-renames --diff-filter=ACDMRT "$base" refs/remotes/pull/merge > "$dest/files.txt"; then
+          if ! git -C "$dest/repo" diff --name-only --no-renames --diff-filter=ACDMRT "$base" "$head" > "$dest/files.txt"; then
             echo "changed files are unavailable; selecting every gate" >&2
             emit_full unknown | tee -a "$GITHUB_OUTPUT"
             exit 0

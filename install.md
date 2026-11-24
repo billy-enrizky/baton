@@ -56,6 +56,14 @@ baton --version
 baton doctor
 ```
 
+PowerShell:
+
+```powershell
+Get-Command baton
+baton --version
+baton doctor
+```
+
 `baton doctor` reports each harness binary, auth readiness, config files, database size, thread count, and tracked provider processes.
 
 ## Requirements
@@ -80,7 +88,16 @@ brew uninstall baton     # Homebrew
 cargo uninstall baton    # source install
 ```
 
-Data lives in `~/.baton` unless `BATON_HOME` is set. Remove that directory only when you also want to delete threads, checkpoints, and config.
+Data lives in `~/.baton` unless `BATON_HOME` is set. Remove that directory only when you also want to delete threads, configuration, and the checkpoint index.
+
+Checkpoint snapshots are hidden Git refs under `refs/baton/checkpoints/` in each project repository, not files under `~/.baton`. Deleting the Baton data directory leaves those refs. To remove them from a repository:
+
+```sh
+git -C <repository> for-each-ref --format='delete %(refname)' refs/baton/checkpoints \
+  | git -C <repository> update-ref --stdin
+```
+
+Review the ref list first with `git -C <repository> for-each-ref refs/baton/checkpoints` if you want to keep some snapshots.
 
 ## Next
 

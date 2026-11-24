@@ -20,6 +20,12 @@ This file records the runs that changed a decision. It is not a complete archive
 
 A p50 or p95 from a small sample is provisional. Until 100 runs or four weeks exist, p50 rows report n, median, and maximum; p95 rows report n and maximum. This record does not claim an accepted percentile.
 
+## 2026-11-24 rejected recorded-time shard experiment
+
+A five-leg matrix (`tui`, `orchestrate`, `git`, `rest`, `integration`) was built from local module wall times. The local union executed all 640 tests and `ci/test-inventory.sh` returned `test_count=640`. The TLA+ admission model was extended with an `inventory` gate and `InventoryNeedsTest`; the real config checked 2,490,965 states and 360,485 distinct states, and the new mutation failed as required.
+
+The end-to-end result regressed. PR run 45359573400 completed in 87 seconds and dispatch run 45359597573 in 70 seconds, against 64 seconds for the previous single Test job. The slowest leg was `integration` at 46 seconds, `inventory` added 18 seconds, and every leg repeated about 28 seconds of setup and cache restore. The experiment branch was closed without merging. The single Test job stays until a shared-artifact or diff-aware selector has measured evidence.
+
 ## Measurement definitions
 
 - PR feedback starts at the workflow run `createdAt` and ends when `verify` completes on a `pull_request` run.

@@ -7477,6 +7477,20 @@ fn handle_command(
             state.notice = Some("new thread, unsaved until you send a message".into());
         }
         "/fork" => {
+            let exists = match store.lock().unwrap().get_thread(&state.thread.id) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(error) => {
+                    state.notice = Some(format!("cannot inspect thread: {error}"));
+                    return;
+                }
+            };
+            if !exists {
+                state.notice = Some(
+                    "nothing to fork yet; send a message first, or use /worktree for a fresh isolated checkout".into(),
+                );
+                return;
+            }
             let mut title_args = args.clone();
             let through_turn = if title_args.first().map(String::as_str) == Some("--turn") {
                 let Some(turn) = title_args
@@ -21751,6 +21765,25 @@ mod tests {
             .get_thread(&source_id)
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn fork_command_refuses_an_unsaved_draft() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/new draft");
+        let draft_id = state.thread.id.clone();
+        let before = store.lock().unwrap().list_threads(None).unwrap().len();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/fork");
+
+        assert_eq!(state.thread.id, draft_id);
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("nothing to fork yet"), "{notice}");
+        let after = store.lock().unwrap().list_threads(None).unwrap().len();
+        assert_eq!(before, after, "a draft fork must not create a thread");
     }
 
     #[test]

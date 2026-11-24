@@ -8,17 +8,49 @@ This file records the runs that changed a decision. It is not a complete archive
 
 | Target | Current evidence | Status |
 |---|---|---|
-| Rust PR feedback p50 under 60 seconds | Historical 16 warm Rust PRs: 52 to 74 seconds, median 63.5. Post-merge feature PR #177: 55 seconds. Main push 45173850895: 51 seconds | Provisional; the recent feature samples are under 60 seconds, but the sample is too small for an accepted p50 |
-| Rust PR feedback p95 under 120 seconds | Sixteen Rust samples, n=16, max 74 seconds | Provisional |
+| Rust PR feedback p50 under 60 seconds | 100 successful PR runs: p50 62.0 seconds. Last 50: 59.0 seconds. Last 20: 59.5 seconds. Last 10: 60.0 seconds | Miss on the 100-run window by 2.0 seconds; met on the last 50 and last 20 windows. The 100-run window starts before the fast classifier and measurement changes, so the next 100 runs after `ba82720` are the acceptance window |
+| Rust PR feedback p95 under 120 seconds | 100 successful PR runs: p95 97.0 seconds, max 150 seconds. Last 50: p95 69.0 seconds, max 83 seconds | Met on the 100-run window |
 | Docs-only PR feedback p50 under 45 seconds | n=2: 44 seconds historical, 38 seconds in run 45077008165; median 41 seconds, max 44 seconds | Provisional met |
-| Queue p50 under 10 seconds | n=26 non-retry attempts, median 0 seconds, max 0 seconds; the one manual retry is excluded | Provisional met |
-| Queue p95 under 20 seconds | n=26 non-retry attempts, max 0 seconds; requires 100 runs before p95 is acceptance-bearing | Not established |
+| Queue p50 under 10 seconds | 100 successful PR runs: p50 0 seconds, p95 0 seconds at the recorded resolution | Met |
+| Queue p95 under 20 seconds | 100 successful PR runs: p95 0 seconds at the recorded resolution | Met |
 | Setup p95 under 15 seconds | Warm Test setup was 16 seconds in PR 45004705055 | Provisional miss, n=1, max 16 seconds |
 | Hidden retries | `ci/check-ci.sh` rejects retry actions and `continue-on-error` | Enforced |
 | Skipped required checks | `verify` requires every selected job | Enforced |
 | Workflow-level false green | `verify` and the formal admission model | Enforced for the workflow and aggregator; adversarial test-process tampering is a recorded residual risk |
 
 A p50 or p95 from a small sample is provisional. Until 100 runs or four weeks exist, p50 rows report n, median, and maximum; p95 rows report n and maximum. This record does not claim an accepted percentile.
+
+The 2026-11-24 sample is the first 100-run window, collected from the GitHub Actions API (`created_at` to `updated_at`, successful `pull_request` runs only). It spans 2026-11-22 to 2026-11-24 and therefore includes runs from before the fast classifier, the base and head SHA fetch, and the measurement repairs landed. Those runs are real and stay in the sample; the p50 miss is recorded rather than explained away. The next acceptance window is the 100 successful PR runs after `ba82720`, when every run uses the current design.
+
+## 2026-11-24 100-run sample and critical path
+
+Sample: 100 successful `pull_request` runs from the Actions API, `created_at` to `updated_at`, 2026-11-22 to 2026-11-24. Cancelled and failed runs are excluded because they do not produce feedback.
+
+| Window | p50 | p95 | Max |
+|---|---|---|---|
+| Last 10 | 60.0 s | 66.0 s | 68 s |
+| Last 20 | 59.5 s | 68.0 s | 70 s |
+| Last 50 | 59.0 s | 69.0 s | 83 s |
+| Last 100 | 62.0 s | 97.0 s | 150 s |
+
+Verdict: p95 meets the 120-second target on the full window. p50 misses the 60-second target by 2.0 seconds on the full window and meets it on the last 50 and last 20. The full window includes runs from before the fast classifier, the base and head SHA fetch, and the measurement repairs, so it measures those changes as well as steady state.
+
+Critical path, run 45428696350 (64 seconds total):
+
+| Segment | Seconds |
+|---|---|
+| Queue and `Changes` | 5 |
+| `Test` job | 51 |
+| `Verify` start gap and run | 6 |
+| Run scheduling | 2 |
+
+Inside the `Test` job: 3 s before checkout, 4 s checkout, 2 s trusted base tools, 6 s Rust toolchain cache restore, 1 s toolchain activation, 11 s Cargo cache restore, 17 s `cargo test`, about 7 s teardown and post steps.
+
+The recorded per-binary timings artifact for `ba82720` shows the test execution itself is 5.7 seconds: the library binary runs 564 tests in 4.62 seconds and every integration binary together takes 1.05 seconds. The other 11 seconds of the test step is incremental compilation of the crate and the test binaries, not test execution. This is why sharding and selection cannot reach the target on their own: they divide at most 5.7 seconds.
+
+The toolchain-cache conditional was rechecked against the current `ubuntu-24.04` image. The image ships rustc 1.100.0 and rustfmt, but not the components `rust-toolchain.toml` requests, so setup without the cache downloads them in about 9 seconds against 6 seconds of restore plus 1 second of activation (run [45108914603](https://github.com/billy-enrizky/baton/actions/runs/45108914603)). Skipping the restore whenever the image has the toolchain would take the slower path in the common case, so it is rejected.
+
+Remaining levers, in measured order: a remote object cache such as sccache for the 11-second compile, a larger runner (spend), or splitting the crate so incremental compilation touches less. Diff-aware selection addresses at most the 5.7 seconds of execution.
 
 ## 2026-11-24 stale merge-ref classification failure
 

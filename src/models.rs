@@ -1,4 +1,20 @@
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
 use crate::types::ProviderId;
+
+pub const MAX_CACHED_MODELS: usize = 200;
+const MAX_MODEL_CACHE_BYTES: u64 = 64 * 1024;
+
+/// One loaded catalog and where each part came from, so a notice can say
+/// whether the listing was live, cached, or both.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCatalog {
+    pub models: Vec<String>,
+    pub live: usize,
+    pub cached: usize,
+    pub error: Option<String>,
+}
 
 pub fn catalog(provider: ProviderId) -> &'static [&'static str] {
     match provider {
@@ -26,11 +42,17 @@ pub fn default_model(provider: ProviderId) -> &'static str {
 /// omitted. A short or degraded listing must not hide a model the picker
 /// already knew.
 pub fn merge_live_catalog(provider: ProviderId, live: Vec<String>) -> Vec<String> {
-    let mut merged: Vec<String> = Vec::new();
-    for model in live {
-        let model = model.trim();
-        if !model.is_empty() && !merged.iter().any(|existing| existing == model) {
-            merged.push(model.to_string());
+    merge_catalogs(provider, live, &[])
+}
+
+/// Keep the live order, then the last cached full list, then the known
+/// catalog. A short or degraded live probe must not hide a model the picker
+/// saw before, and the static list must not hide a newer cached one.
+pub fn merge_catalogs(provider: ProviderId, live: Vec<String>, cached: &[String]) -> Vec<String> {
+    let mut merged = cleaned_models(live);
+    for model in cleaned_models(cached.iter().cloned()) {
+        if !merged.contains(&model) {
+            merged.push(model);
         }
     }
     for known in catalog(provider) {
@@ -39,6 +61,103 @@ pub fn merge_live_catalog(provider: ProviderId, live: Vec<String>) -> Vec<String
         }
     }
     merged
+}
+
+fn cleaned_models(models: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut cleaned: Vec<String> = Vec::new();
+    for model in models {
+        let model = model.trim();
+        if model.is_empty() || model.chars().any(char::is_control) {
+            continue;
+        }
+        if !cleaned.iter().any(|existing| existing == model) {
+            cleaned.push(model.to_string());
+        }
+        if cleaned.len() == MAX_CACHED_MODELS {
+            break;
+        }
+    }
+    cleaned
+}
+
+pub fn model_cache_path(home: &Path, provider: ProviderId) -> PathBuf {
+    home.join("model-cache")
+        .join(format!("{}.json", provider.as_str()))
+}
+
+/// The last full live listing for this provider. A symlink, a directory, an
+/// oversized file, or invalid JSON yields an empty cache instead of an error:
+/// the picker still opens with the static catalog.
+pub fn read_cached_catalog(home: &Path, provider: ProviderId) -> Vec<String> {
+    let path = model_cache_path(home, provider);
+    let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+        return Vec::new();
+    };
+    if !metadata.file_type().is_file() || metadata.len() > MAX_MODEL_CACHE_BYTES {
+        return Vec::new();
+    }
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let models = value
+        .get("models")
+        .and_then(|models| models.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    cleaned_models(models)
+}
+
+/// Replace the cache with a live listing. The caller decides when a listing is
+/// full enough to replace the previous one; this function only writes.
+pub fn write_cached_catalog(home: &Path, provider: ProviderId, models: &[String]) -> Result<()> {
+    let cleaned = cleaned_models(models.iter().cloned());
+    if cleaned.is_empty() {
+        return Ok(());
+    }
+    let directory = home.join("model-cache");
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("cannot create {}", directory.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let path = model_cache_path(home, provider);
+    let temp = directory.join(format!(".{}.{}.tmp", provider.as_str(), std::process::id()));
+    let payload = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&serde_json::json!({ "models": cleaned }))?
+    );
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        use std::io::Write as _;
+        let mut handle = options
+            .open(&temp)
+            .with_context(|| format!("cannot write {}", temp.display()))?;
+        handle.write_all(payload.as_bytes())?;
+        handle.sync_all()?;
+        std::fs::rename(&temp, &path)
+            .with_context(|| format!("cannot replace {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// The environment variable the harness itself reads for the API key. A
@@ -134,6 +253,82 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn merge_catalogs_keeps_live_then_cached_then_known() {
+        let merged = merge_catalogs(
+            ProviderId::Codex,
+            vec!["live-only".to_string(), "shared".to_string()],
+            &["cached-only".to_string(), "shared".to_string()],
+        );
+        assert_eq!(merged[0], "live-only");
+        assert_eq!(merged[1], "shared");
+        assert_eq!(merged[2], "cached-only");
+        assert!(merged.contains(&"gpt-6.2-sol".to_string()));
+        assert_eq!(merged.iter().filter(|model| *model == "shared").count(), 1);
+    }
+
+    #[test]
+    fn model_cache_round_trips_and_rejects_unsafe_files() {
+        let home = tempfile::tempdir().unwrap();
+        assert!(read_cached_catalog(home.path(), ProviderId::Codex).is_empty());
+
+        write_cached_catalog(
+            home.path(),
+            ProviderId::Codex,
+            &[
+                " gpt-6.1-sol ".to_string(),
+                "new-model".to_string(),
+                "new-model".to_string(),
+                "bad\nmodel".to_string(),
+                String::new(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            read_cached_catalog(home.path(), ProviderId::Codex),
+            vec!["gpt-6.1-sol".to_string(), "new-model".to_string()]
+        );
+
+        let path = model_cache_path(home.path(), ProviderId::Codex);
+        std::fs::write(&path, vec![b'x'; (MAX_MODEL_CACHE_BYTES + 1) as usize]).unwrap();
+        assert!(
+            read_cached_catalog(home.path(), ProviderId::Codex).is_empty(),
+            "an oversized file is ignored"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        let target = home.path().join("target.json");
+        std::fs::write(&target, r#"{"models":["from-a-symlink"]}"#).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(
+                read_cached_catalog(home.path(), ProviderId::Codex).is_empty(),
+                "a symlink is ignored"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn model_cache_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        write_cached_catalog(home.path(), ProviderId::Codex, &["gpt-6.1-sol".to_string()]).unwrap();
+        let directory = std::fs::metadata(home.path().join("model-cache"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file = std::fs::metadata(model_cache_path(home.path(), ProviderId::Codex))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory, 0o700);
+        assert_eq!(file, 0o600);
     }
 
     #[test]

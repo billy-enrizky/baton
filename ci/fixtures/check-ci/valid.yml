@@ -57,7 +57,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - run: base/ci/budget.sh 180 cargo test --locked
+      - run: base/ci/budget.sh 180 cargo test --locked --lib tui::tests
+  inventory:
+    needs: [changes, test]
+    if: needs.changes.outputs.test_needed == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - run: base/ci/budget.sh 120 base/ci/test-inventory.sh . base/ci/test-inventory-floor.txt combined.log
   debt:
     needs: changes
     if: needs.changes.outputs.debt_needed == 'true'
@@ -70,7 +77,7 @@ jobs:
           base/ci/budget.sh 60 base/ci/debt-selftest.sh
   verify:
     if: always()
-    needs: [changes, selection, check, build, test, debt]
+    needs: [changes, selection, check, build, test, debt, inventory]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:

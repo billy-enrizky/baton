@@ -189,6 +189,7 @@ required_commands = {
   "check" => ["cargo check --locked"],
   "build" => ["cargo build --locked"],
   "test" => ["cargo test --locked"],
+  "inventory" => ["test-inventory.sh"],
   "debt" => ["fmt-debt.sh", "clippy-debt.sh", "debt-selftest.sh"],
   "verify" => ["check_gate"],
 }

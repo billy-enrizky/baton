@@ -1,0 +1,8 @@
+# shard	local_seconds	cargo test args
+# Local debug-build wall times on Darwin arm64, 2026-11-24. The split keeps
+# the three long modules in their own shards and leaves the remainder together.
+tui	29.4	--lib tui::tests
+orchestrate	54.4	--lib orchestrate::tests
+git	48.1	--lib git_workflow::tests
+rest	19.0	--lib -- --skip tui::tests --skip orchestrate::tests --skip git_workflow::tests
+integration	5.1	--test acp_adapter --test claude_adapter --test cli_bench --test codex_adapter --test core --test files_cli --test grep_cli --test harness --test opencode_adapter

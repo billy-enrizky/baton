@@ -84,6 +84,8 @@ if [[ -f "$repo_root/.github/workflows/ci.yml" ]]; then
   fi
 fi
 
+bash "$root/test-shards-selftest.sh"
+
 if [[ "$quick" == true ]]; then
     echo "ci quick selftest passed"
     exit 0

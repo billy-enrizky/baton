@@ -20,6 +20,22 @@ This file records the runs that changed a decision. It is not a complete archive
 
 A p50 or p95 from a small sample is provisional. Until 100 runs or four weeks exist, p50 rows report n, median, and maximum; p95 rows report n and maximum. This record does not claim an accepted percentile.
 
+## 2026-11-24 recorded-time test shards
+
+The lib binary was split into four module shards and the nine integration binaries into a fifth. The plan is in `ci/test-shards.tsv`; the workflow matrix carries the five commands, and `ci/test-shards-selftest.sh` checks the matrix against the plan and checks integration coverage. Local debug wall times on Darwin arm64:
+
+| Shard | Real time | Test time | Tests |
+|---|---:|---:|---:|
+| `tui` | 58.2s (includes one compile) | 29.3s | 224 |
+| `orchestrate` | 58.5s | 58.0s | 44 |
+| `git` | 57.9s | 57.3s | 30 |
+| `rest` | 23.8s | 23.3s | 241 |
+| `integration` | 22.0s | 3.1s | 101 |
+
+The five logs were concatenated and `ci/test-inventory.sh` returned `test_count=640`. The formal admission model adds the `inventory` gate and the `InventoryNeedsTest` property; the real config checks 2,490,965 states and 360,485 distinct states, and the new mutation `BatonCiAdmissionInventoryWithoutTest.cfg` fails with `InventoryNeedsTest`.
+
+The CI measurement is pending the first sharded PR run. It will replace this paragraph with the run id, job durations, and the new PR p50 sample.
+
 ## Measurement definitions
 
 - PR feedback starts at the workflow run `createdAt` and ends when `verify` completes on a `pull_request` run.

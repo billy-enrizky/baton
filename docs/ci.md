@@ -2,7 +2,7 @@
 
 This document defines the GitHub Actions system for Baton, the measurements that justify it, and the acceptance record for rollout. The parity scope is in [parity.md](../.agents/parity.md). The recorded measurement rules are in [ci-acceptance.md](ci-acceptance.md).
 
-The design is staged. Phase 1 creates one honest full-suite gate with hard budgets and real CI data. Sharding and diff-aware selection arrive only after that data exists, because a shard plan built from macOS timings would be a guess. Formatting and Clippy ratchets prevent new debt while the full lint baseline is cleaned.
+The design is staged. Phase 1 created one honest full-suite gate with hard budgets and real CI data. Phase 3 now splits the lib binary and integration tests into five recorded-time shards and sums their inventory. Diff-aware selection remains open. Formatting and Clippy ratchets prevent new debt while the full lint baseline is cleaned.
 
 ## Problem and scope
 
@@ -16,7 +16,7 @@ The scope is the GitHub Actions workflow for the public Baton repository, the tr
 - Moving the required x64 runtime gate to ARM or a paid runner without matched evidence.
 - Enabling the official merge queue before the repository has an eligible organization owner.
 - Running the TLA+ formal gate inside GitHub Actions before the JDK and jar are pinned artifacts.
-- Per-test sharding before recorded per-test durations show that test execution, not setup or compile, is the bottleneck.
+- Per-test sharding before recorded per-test durations show which individual tests dominate a shard.
 - A full adversarial sandbox for test code in this slice. The manifest and log checks remain detection controls, not a security boundary.
 
 ## Goals
@@ -51,7 +51,8 @@ Budget rule, applied at every phase: Phase 1 uses three times a conservative col
 | Move classification into every gate job | Each job would repeat GitHub API or git work and would still need a trusted cross-check. One fast `Changes` job plus a `Selection` recomputation gives one shared result and one place to fail closed. |
 | Remove the Rust toolchain cache | Measured against a retained cache, Setup Rust took about 9 seconds instead of about 6 seconds of restore plus 1 second of activation. The removed-cache runs were 57 and 69 seconds against 69 and 71 seconds retained. No gain was proven. |
 | Keep full debuginfo in the test profile | Line tables keep readable backtraces and cut the warm compile from 18.94 to 14.13 seconds on the measured run. The cache key includes `Cargo.toml`, so the profile change cannot silently reuse incompatible artifacts. |
-| Shard tests immediately | Execution is about 2.5 seconds across all binaries. Sharding would duplicate the 30-second setup and cache path. The existing nextest count-shard experiment was unbalanced and is retained as a rejected experiment. |
+| Shard by test count | The nextest count-shard experiment was unbalanced: one shard took 33 seconds and the other 61 because a single test dominated. Shards are assigned from recorded module wall times instead. |
+| Shard immediately before measuring setup | Earlier runs spent about 24 seconds on setup and cache restore against an 18-second Test step. The later compile and test data showed the lib binary is dominated by three modules, so five recorded-time shards now run in parallel and an inventory job sums their logs. |
 | Replace the x64 Test job with the free ARM runner | The ARM run was faster, but it would remove pre-merge Linux x64 runtime coverage while the official merge queue is unavailable. The x64 job stays required. |
 | Move to a self-hosted or paid larger runner | No matched measurement or approved spend exists. The plan records this as an owner decision after 100 runs or four weeks of data. |
 | Configure the official merge queue now | The repository is public but user-owned. Merge queue requires an organization owner; that is an ownership action, not a workflow change. |
@@ -192,7 +193,7 @@ This is visible in the PR, the merge API, and the next main run. It is not silen
 | 1B | Trusted helpers, skills, and formal model | Create `ci/*.sh`, `ci/fixtures/**`, `ci/fmt-baseline.txt`, `ci/clippy-baseline.txt`, `ci/test-inventory-floor.txt`, `ci/formal/ci-admission/**`, `rust-toolchain.toml`, `.agents/skills/verify-baton-ci/**`, `.agents/skills/verify-baton-ci-formal/**` | `ci/selftest.sh` passes; a budget overrun exits 124; the formal gate passes locally; `cargo check`, `cargo build`, `cargo test`, and `ci/test-inventory.sh` pass |
 | 1C | Full-suite workflow | Create `.github/workflows/ci.yml`; modify `docs/ci.md` | Done: run 44982816103 executed every job with `verify` green, and run 44983114852 is the first green `main` push |
 | 2 | Record real timings and choose the test runner | `ci/test-timings.sh` records per-binary times; `docs/ci-acceptance.md` records the warm path and rejected runners | In progress: `cargo test` and the x64 runner retained; nextest count shards and the free ARM runner were rejected; the p50 miss remains |
-| 3 | Diff-aware selection and recorded-time shards | Extend `ci/test-timings.sh` to emit per-test durations; create `ci/select-tests.sh`, `ci/plan-shards.sh`, `ci/test-groups.json`; modify `.github/workflows/ci.yml`, `ci/check-ci.sh`, `docs/ci.md` | Not started: per-test timings, selector fixtures, and shard union proof still required |
+| 3 | Diff-aware selection and recorded-time shards | `ci/test-shards.tsv`, `ci/test-shards-selftest.sh`, the test matrix and inventory job in `.github/workflows/ci.yml`, `ci/check-ci.sh`, `docs/ci.md` | Shards active: five parallel jobs, inventory sums to 640, and the shard-plan selftest passes. Diff-aware selection and per-test timing remain open |
 | 4 | Full format and lint plus local hooks | Create `.githooks/pre-commit`, `.githooks/pre-push`, `ci/install-hooks.sh`; modify `.github/workflows/ci.yml`, `docs/ci.md` | Format and Clippy baselines are zero and both are required; hooks run under budget |
 | 5 | Last-100-run audit and runner decision | Modify `docs/ci-acceptance.md` | PR p50/p95, queue p50/p95, cache hit rate, and a paid-runner decision, all from recorded runs |
 
@@ -208,9 +209,10 @@ Triggers: `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review
 | `selection` | `changes` | 5 | Gate integrity, full tool self-test, baseline ratchets, recomputes the classifier and compares outputs, compares `rust-toolchain.toml`, runs the workflow guard |
 | `check` | `changes` | 10 | `cargo check --locked --all-targets` under a 120-second budget |
 | `build` | `changes` | 10 | `cargo build --locked --bin baton` under a 150-second budget, then `--version` |
-| `test` | `changes` | 15 | `cargo test --locked` under a 300-second budget, then `ci/test-inventory.sh` |
+| `test` | `changes` | 15 | Five shards from `ci/test-shards.tsv` under a 300-second budget each: `tui`, `orchestrate`, `git`, `rest`, and `integration` |
+| `inventory` | `changes`, `test` | 5 | Downloads every shard log, concatenates them, and runs `ci/test-inventory.sh` under a 120-second budget |
 | `debt` | `changes` | 15 | Format ratchet under 60 seconds, Clippy ratchet under 300 seconds |
-| `verify` | all six | 2 | The required branch-protection check; strict up-to-date, with an owner-only `ci-repair` bypass |
+| `verify` | all seven | 2 | The required branch-protection check; strict up-to-date, with an owner-only `ci-repair` bypass |
 
 `changes` outputs: `check_needed`, `build_needed`, `test_needed`, `debt_needed`, `full_suite_reason`, `has_tests`, `docs_only`. `full_suite_reason` records the selection class (`code`, `meta`, `unknown`, `empty`, `docs`, or the event name for non-PR events); it is not a claim that the full suite ran.
 
@@ -218,6 +220,7 @@ Triggers: `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review
 
 - `changes` or `selection` did not succeed.
 - A selected gate did not succeed, or an unselected gate is not `skipped`.
+- `test` succeeded but `inventory` did not, or the inventory count is missing.
 - `test_needed` is true and `has_tests` is not true.
 - `test_needed` is true and the discovered test count is missing, not numeric, or zero.
 - A non-PR event did not select all four gates, or reports `docs_only`.
@@ -256,24 +259,34 @@ Fixtures required before Phase 3 lands: transitive importer, `lib.rs`, unmapped 
 
 ## Sharding (Phase 3)
 
-Shards are not active. The current lib binary runs 412 tests and the nine integration binaries run 97 tests. At the cited runs the lib binary ran 326 tests in 1.73 seconds and the seven integration binaries ran 75 tests in 0.39 seconds. Sharding would duplicate the 16-second Test setup and the 13-second compile for no gain.
+Five shards are active. The plan lives in `ci/test-shards.tsv`; the workflow matrix carries the five commands, and `ci/test-shards-selftest.sh` checks the matrix against the plan and checks integration coverage. The workflow runs the five rows as a fail-fast-false matrix and an `inventory` job concatenates every shard log before applying the test floor.
 
-If a gate ceiling is missed, shards are filled from recorded per-test times, never from a count:
+| Shard | Local debug wall time | Filter |
+|---|---:|---|
+| `tui` | 29.4s test, 58.2s including one compile | `cargo test --locked --lib tui::tests` |
+| `orchestrate` | 58.0s | `cargo test --locked --lib orchestrate::tests` |
+| `git` | 57.3s | `cargo test --locked --lib git_workflow::tests` |
+| `rest` | 23.3s | `cargo test --locked --lib -- --skip tui::tests --skip orchestrate::tests --skip git_workflow::tests` |
+| `integration` | 3.1s | all nine `tests/*.rs` binaries with repeated `--test` |
 
-- Record per-test durations before designing a shard plan.
+The times are Darwin arm64 debug measurements from 2026-11-24. The three long modules get their own shard because they dominate the full lib binary. `rest` is the catch-all for every other lib module, including `tui::markdown` and `tui::diff_render`. `integration` runs the nine test binaries once each. The union was executed locally: 224 + 44 + 30 + 241 + 16 + 5 = 640 tests, and `ci/test-inventory.sh` returned `test_count=640`.
+
+Rules for changing the plan:
+
+- Fill shards from recorded wall times, never from a test count.
 - Balance on maximum and p95, not p50.
 - Give a test that is longer than the other shard work its own group until it is fixed or split.
-- The catch-all group has its own budget. If it overflows, the job fails instead of stretching the budget.
-- The shard count is the smallest count that meets the gate ceiling on the target runner.
-- The union check from the selection section also applies to shards.
+- A shard that exceeds its 300-second budget fails instead of stretching the budget.
+- The `inventory` job fails when the summed `running N tests` lines do not match the summed `passed + ignored` lines, when any shard skipped a test, or when the total is below the floor.
+- The shard-plan selftest must pass before the workflow guard accepts the change.
 
-Count-based nextest shards were rejected in run 45002437721: one shard took 33 seconds and the other 61 seconds. The 61-second shard contained a single 30-second test.
+Count-based nextest shards were rejected in run 45002437721: one shard took 33 seconds and the other 61 seconds because a single 30-second test dominated. The module plan avoids that by giving the three measured long modules their own shards.
 
 ## Formal CI admission model
 
-`ci/formal/ci-admission/BatonCiAdmission.tla` models gate admission, not test correctness. `Gates` holds the six jobs plus the workflow-guard step (`changes`, `selection`, `workflow_guard`, `check`, `build`, `test`, `debt`); `verify` is modeled as the aggregator that reads them, because it never runs a check itself.
+`ci/formal/ci-admission/BatonCiAdmission.tla` models gate admission, not test correctness. `Gates` holds the seven jobs plus the workflow-guard step (`changes`, `selection`, `workflow_guard`, `check`, `build`, `test`, `inventory`, `debt`); `verify` is modeled as the aggregator that reads them, because it never runs a check itself.
 
-The real configuration, `BatonCiAdmission.cfg`, runs 583,175 states and 92,855 distinct states. Six mutation configs must each fail with a named invariant:
+The real configuration, `BatonCiAdmission.cfg`, runs 2,490,965 states and 360,485 distinct states. Seven mutation configs must each fail with a named invariant:
 
 | Config | Invariant that must break |
 |---|---|
@@ -283,10 +296,11 @@ The real configuration, `BatonCiAdmission.cfg`, runs 583,175 states and 92,855 d
 | `BatonCiAdmissionUnknownSelection.cfg` | `ChangesFailOpen` |
 | `BatonCiAdmissionCommandDrift.cfg` | `CommandsMatch` |
 | `BatonCiAdmissionReportWithoutStart.cfg` | `NoFalseGreen` |
+| `BatonCiAdmissionInventoryWithoutTest.cfg` | `InventoryNeedsTest` |
 
-What the model proves, with `CommandDriftAllowed = FALSE`: a selected gate cannot be skipped and reported green, an unselected gate cannot report success, merge events cannot use a subset, a retry cannot convert a failure, an unknown selection cannot select nothing, and a command edit cannot pass `CommandsMatch`. The one config that sets `CommandDriftAllowed = TRUE` exists only to show that `CommandsMatch` depends on that constant. The model models the rule, not the shell implementation, so `ci/selftest.sh` remains the executable proof.
+What the model proves, with `CommandDriftAllowed = FALSE`: a selected gate cannot be skipped and reported green, an unselected gate cannot report success, merge events cannot use a subset, a retry cannot convert a failure, an unknown selection cannot select nothing, inventory cannot be selected while test is unselected, and a command edit cannot pass `CommandsMatch`. The one config that sets `CommandDriftAllowed = TRUE` exists only to show that `CommandsMatch` depends on that constant. The model models the rule, not the shell implementation, so `ci/selftest.sh` remains the executable proof.
 
-What it does not prove: test inventory completeness, shard union coverage, or that the selector's dependency map is correct. Those are Phase 3 work and will be covered by the selection union check and its fixtures; they are not covered today.
+What it does not prove: per-test identity inside a shard, or that the selector's dependency map is correct. The shard-plan selftest checks the module filters and integration list, and the inventory job checks the summed floor, but a per-test union check and the diff-aware selector remain open.
 
 `ci/formal/ci-admission/run.sh` needs a JDK and downloads `tla2tools.jar` 1.7.4 to `TLA2TOOLS_JAR` when the file is absent. That download is why the gate is local and recorded in `docs/ci-acceptance.md`, not a required PR job: a hosted job that fetches a jar from the internet is a supply-chain and flakiness risk that Phase 1 does not need. Pinning the jar as a committed artifact plus a pinned JDK action is the Phase 3 follow-up.
 
@@ -301,7 +315,7 @@ What it does not prove: test inventory completeness, shard union coverage, or th
 | Gate integrity | 60 seconds | 30 seconds |
 | `cargo check --locked --all-targets` | 120 seconds | 90 seconds |
 | `cargo build --locked --bin baton` | 150 seconds | 90 seconds |
-| `cargo test --locked` | 300 seconds | 90 seconds per shard |
+| `cargo test --locked <shard args>` | 300 seconds | 90 seconds per shard |
 | Test inventory | 120 seconds | 60 seconds |
 | Format ratchet | 60 seconds | 30 seconds |
 | Clippy ratchet | 300 seconds | 300 seconds |
@@ -358,7 +372,7 @@ Merge-candidate proof without a merge queue: when branch protection requires bra
 | Decision | Current state |
 |---|---|
 | Runner size | `ubuntu-24.04` hosted. No paid runner is approved; the free ARM runner was rejected for removing pre-merge x64 runtime coverage |
-| Test runner | `cargo test`; nextest count shards were rejected as unbalanced |
+| Test runner | `cargo test` with five recorded-time module shards; nextest count shards were rejected as unbalanced |
 | Merge queue | Blocked on repository ownership or plan |
 | Formal gate in CI | Local and recorded until the jar and JDK are pinned as artifacts |
 | Monthly cap | Not applicable unless a paid runner is approved |

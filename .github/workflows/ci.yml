@@ -333,13 +333,25 @@ jobs:
           (cd "$RUNNER_TEMP/trusted-ci" && sha256sum -c "$RUNNER_TEMP/trusted-ci.sha256" --quiet)
 
   test:
-    name: Test
+    name: Test (${{ matrix.shard }})
     needs: changes
     if: needs.changes.outputs.test_needed == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    outputs:
-      test_count: ${{ steps.inventory.outputs.test_count }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: tui
+            command: --lib tui::tests
+          - shard: orchestrate
+            command: --lib orchestrate::tests
+          - shard: git
+            command: --lib git_workflow::tests
+          - shard: rest
+            command: --lib -- --skip tui::tests --skip orchestrate::tests --skip git_workflow::tests
+          - shard: integration
+            command: --test acp_adapter --test claude_adapter --test cli_bench --test codex_adapter --test core --test files_cli --test grep_cli --test harness --test opencode_adapter
     steps:
       - name: Checkout head
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
@@ -391,7 +403,7 @@ jobs:
         with:
           toolchain: 1.100.0
       - name: Save Rust toolchain cache
-        if: github.job == 'test' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && steps.rustup-cache.outputs.cache-hit != 'true'
+        if: github.job == 'test' && matrix.shard == 'rest' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && steps.rustup-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
         with:
           path: |
@@ -403,12 +415,12 @@ jobs:
         with:
           shared-key: baton-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
           key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml') }}-${{ hashFiles('rust-toolchain.toml') }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Test
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 'rest' }}
+      - name: Test shard
         run: |
           set -euo pipefail
-          log="$RUNNER_TEMP/test-output.log"
-          if "$RUNNER_TEMP/trusted-ci/budget.sh" 300 cargo test --locked >"$log" 2>&1; then
+          log="$RUNNER_TEMP/test-${{ matrix.shard }}.log"
+          if "$RUNNER_TEMP/trusted-ci/budget.sh" 300 cargo test --locked ${{ matrix.command }} >"$log" 2>&1; then
             status=0
           else
             status=$?
@@ -419,15 +431,95 @@ jobs:
         run: |
           set -euo pipefail
           (cd "$RUNNER_TEMP/trusted-ci" && sha256sum -c "$RUNNER_TEMP/trusted-ci.sha256" --quiet)
+      - name: Record shard timings
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 30 "$RUNNER_TEMP/trusted-ci/test-timings.sh" "$RUNNER_TEMP/test-${{ matrix.shard }}.log" "$RUNNER_TEMP/test-${{ matrix.shard }}.tsv"
+      - name: Upload shard log
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: test-log-${{ matrix.shard }}
+          path: ${{ runner.temp }}/test-${{ matrix.shard }}.log
+          if-no-files-found: error
+          retention-days: 1
+      - name: Upload shard timings
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: test-timings-${{ matrix.shard }}
+          path: ${{ runner.temp }}/test-${{ matrix.shard }}.tsv
+          if-no-files-found: error
+          retention-days: 1
+
+  inventory:
+    name: Test inventory
+    needs: [changes, test]
+    if: needs.changes.outputs.test_needed == 'true' && needs.test.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      test_count: ${{ steps.inventory.outputs.test_count }}
+    steps:
+      - name: Checkout head
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Resolve trusted base ref
+        id: base
+        run: |
+          set -euo pipefail
+          ref='${{ github.event.pull_request.base.sha }}'
+          if [ -z "$ref" ]; then ref='${{ github.event.merge_group.base_sha }}'; fi
+          if [ -z "$ref" ]; then ref='${{ github.event.before }}'; fi
+          if [ -z "$ref" ] || [ "$ref" = "0000000000000000000000000000000000000000" ]; then
+            ref=$(git rev-parse HEAD~1)
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - name: Checkout trusted base tools
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          ref: ${{ steps.base.outputs.ref }}
+          fetch-depth: 1
+          path: base
+          persist-credentials: false
+          sparse-checkout: /ci/
+          sparse-checkout-cone-mode: false
+      - name: Stage trusted tools
+        run: |
+          set -euo pipefail
+          dest="$RUNNER_TEMP/trusted-ci"
+          rm -rf "$dest"
+          if [ '${{ github.event_name }}' = "push" ] || [ '${{ github.event_name }}' = "workflow_dispatch" ]; then
+            cp -R ci "$dest"
+          else
+            cp -R base/ci "$dest"
+          fi
+          chmod -R a-w "$dest"
+          (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
+      - name: Download shard logs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: test-log-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/shard-logs
+      - name: Download shard timings
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: test-timings-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/shard-timings
       - name: Test inventory
         id: inventory
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 120 "$RUNNER_TEMP/trusted-ci/test-inventory.sh" . "$RUNNER_TEMP/trusted-ci/test-inventory-floor.txt" "$RUNNER_TEMP/test-output.log" | tee -a "$GITHUB_OUTPUT"
-      - name: Record test timings
+          cat "$RUNNER_TEMP"/shard-logs/*.log > "$RUNNER_TEMP/combined-test.log"
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 120 "$RUNNER_TEMP/trusted-ci/test-inventory.sh" . "$RUNNER_TEMP/trusted-ci/test-inventory-floor.txt" "$RUNNER_TEMP/combined-test.log" | tee -a "$GITHUB_OUTPUT"
+      - name: Combine shard timings
         run: |
           set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 30 "$RUNNER_TEMP/trusted-ci/test-timings.sh" "$RUNNER_TEMP/test-output.log" "$RUNNER_TEMP/test-timings.tsv"
+          cat "$RUNNER_TEMP"/shard-timings/*.tsv > "$RUNNER_TEMP/test-timings.tsv"
+          cat "$RUNNER_TEMP/test-timings.tsv"
       - name: Upload test timings
         if: github.ref == 'refs/heads/main'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
@@ -435,6 +527,10 @@ jobs:
           name: test-timings-${{ github.sha }}
           path: ${{ runner.temp }}/test-timings.tsv
           retention-days: 30
+      - name: Verify trusted tools are unchanged
+        run: |
+          set -euo pipefail
+          (cd "$RUNNER_TEMP/trusted-ci" && sha256sum -c "$RUNNER_TEMP/trusted-ci.sha256" --quiet)
 
   debt:
     name: Debt ratchet
@@ -527,7 +623,7 @@ jobs:
   verify:
     name: Verify
     if: always()
-    needs: [changes, selection, check, build, test, debt]
+    needs: [changes, selection, check, build, test, debt, inventory]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -555,10 +651,11 @@ jobs:
           check_gate check '${{ needs.changes.outputs.check_needed }}' '${{ needs.check.result }}'
           check_gate build '${{ needs.changes.outputs.build_needed }}' '${{ needs.build.result }}'
           check_gate test '${{ needs.changes.outputs.test_needed }}' '${{ needs.test.result }}'
+          check_gate inventory '${{ needs.changes.outputs.test_needed }}' '${{ needs.inventory.result }}'
           check_gate debt '${{ needs.changes.outputs.debt_needed }}' '${{ needs.debt.result }}'
           if [ '${{ needs.changes.outputs.test_needed }}' = "true" ]; then
             [ '${{ needs.changes.outputs.has_tests }}' = "true" ] || fail "test was selected but the classifier reported no tests"
-            count='${{ needs.test.outputs.test_count }}'
+            count='${{ needs.inventory.outputs.test_count }}'
             case "$count" in
               ''|*[!0-9]*) fail "test inventory output is missing or not a number: $count" ;;
             esac

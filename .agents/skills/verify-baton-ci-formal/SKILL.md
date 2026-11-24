@@ -7,7 +7,7 @@ description: "Model-check Baton's CI admission rules. Use when changing ci/class
 
 The CI gate is a state machine: a path classifier selects gates, each selected gate either runs or is skipped, the workflow guard checks command identity, and `verify` decides whether the run is green. A bug here can merge a broken change while every job reports success.
 
-In the workflow, `changes` is an untrusted fast path that only classifies, and `selection` owns the trusted guard and the recomputation check. Pull requests and merge groups stage base tools; main pushes and dispatches stage head tools as a post-merge proof. The model's gate names and admission rules are unchanged; `selection` is the gate that must succeed for the workflow guard to count.
+In the workflow, `changes` is an untrusted fast path that only classifies, and `selection` owns the trusted guard and the recomputation check. Pull requests and merge groups stage base tools; main pushes and dispatches stage head tools as a post-merge proof. `test` is a five-shard matrix and `inventory` sums their logs; inventory cannot run without test. `selection` is the gate that must succeed for the workflow guard to count.
 
 The model is committed at `ci/formal/ci-admission/`.
 
@@ -15,7 +15,7 @@ The model is committed at `ci/formal/ci-admission/`.
 
 - `ci/classify-paths.sh`: selected gates for push, merge group, dispatch, pull request, and unknown paths.
 - `ci/check-ci.sh`: command identity and workflow guard.
-- `.github/workflows/ci.yml`: `changes`, `selection`, `check`, `build`, `test`, `debt`, and `verify` gate names and relationships. `changes` has no checkout and no pass/fail guards; `selection` runs them.
+- `.github/workflows/ci.yml`: `changes`, `selection`, `check`, `build`, `test`, `inventory`, `debt`, and `verify` gate names and relationships. `changes` has no checkout and no pass/fail guards; `selection` runs them.
 
 The model covers selection, start, result, skip cause, command identity, a `CommandDriftAllowed` constant, and the `verify` verdict. The real configuration sets `CommandDriftAllowed = FALSE`; there is no label override in the workflow. It does not cover test inventory completeness, shard union, the shallow-fetch implementation, or the shell implementation inside a gate command beyond its identity.
 
@@ -25,6 +25,7 @@ The model covers selection, start, result, skip cause, command identity, a `Comm
 - `FullSelection`: push, merge group, and workflow dispatch select every gate.
 - `NoRetryMasking`: a failure never becomes a green run.
 - `ChangesFailOpen`: an unknown diff selects every gate.
+- `InventoryNeedsTest`: inventory cannot be selected while test is unselected.
 - `CommandsMatch`: with `CommandDriftAllowed = FALSE`, a green run uses the base workflow commands. The one mutation config that sets the constant to TRUE exists only to prove the property depends on it.
 
 ## Run
@@ -48,6 +49,7 @@ Read every failing trace with the pstack `/statechart` skill. It presents the sh
 - `BatonCiAdmissionRetryMask.cfg`: failure becomes success. Catches `NoRetryMasking`.
 - `BatonCiAdmissionUnknownSelection.cfg`: unknown path selects nothing. Catches `ChangesFailOpen`.
 - `BatonCiAdmissionCommandDrift.cfg`: sets `CommandDriftAllowed = TRUE` so changed commands pass. Catches `CommandsMatch`.
+- `BatonCiAdmissionInventoryWithoutTest.cfg`: selects inventory without test on a partial merge group. Catches `InventoryNeedsTest`.
 - `BatonCiAdmissionReportWithoutStart.cfg`: a gate reports success without starting. Catches `NoFalseGreen`.
 
 ## When to update

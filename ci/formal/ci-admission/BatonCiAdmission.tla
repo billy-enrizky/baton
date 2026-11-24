@@ -8,7 +8,8 @@ CONSTANTS Gates,
           UnknownSelectsNone,
           CommandDriftAllowed,
           ReportWithoutStart,
-          CommandsDrifted
+          CommandsDrifted,
+          InventoryWithoutTest
 
 Events == {"pull_request", "push", "merge_group", "workflow_dispatch", "unknown"}
 Results == {"pending", "success", "failure", "skipped"}
@@ -19,10 +20,14 @@ VARIABLES event, selected, started, result, skipCause, verify, commandsMatch
 vars == <<event, selected, started, result, skipCause, verify, commandsMatch>>
 
 SelectedFor(e) ==
-  [g \in Gates |->
-    CASE e = "unknown" -> ~UnknownSelectsNone
-      [] e = "merge_group" -> ~MergeUsesSelection
-      [] OTHER -> TRUE]
+  LET base == [g \in Gates |->
+        CASE e = "unknown" -> ~UnknownSelectsNone
+          [] e = "merge_group" -> ~MergeUsesSelection
+          [] OTHER -> TRUE]
+  IN [g \in Gates |->
+        IF g = "inventory"
+        THEN IF InventoryWithoutTest THEN TRUE ELSE base["test"]
+        ELSE base[g]]
 
 TypeOK ==
   /\ event \in Events
@@ -106,6 +111,9 @@ NoRetryMasking ==
 
 ChangesFailOpen ==
   event = "unknown" => \A g \in Gates: selected[g]
+
+InventoryNeedsTest ==
+  selected["inventory"] => selected["test"]
 
 CommandsMatch ==
   verify = "success" => commandsMatch

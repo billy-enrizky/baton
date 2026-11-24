@@ -49,5 +49,6 @@ check_bug BatonCiAdmissionRetryMask.cfg NoRetryMasking
 check_bug BatonCiAdmissionUnknownSelection.cfg ChangesFailOpen
 check_bug BatonCiAdmissionCommandDrift.cfg CommandsMatch
 check_bug BatonCiAdmissionReportWithoutStart.cfg NoFalseGreen
+check_bug BatonCiAdmissionInventoryWithoutTest.cfg InventoryNeedsTest
 
 printf '\nall CI admission checks passed\n'

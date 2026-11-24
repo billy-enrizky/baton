@@ -250,12 +250,15 @@ fn parse_issue(value: &serde_json::Value) -> Option<Issue> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn fake_gh(root: &Path, body: &str) -> PathBuf {
         let path = root.join("fake-gh-task");
         std::fs::write(&path, format!("#!/bin/sh\nset -eu\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         path
     }
 

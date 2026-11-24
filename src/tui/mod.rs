@@ -22791,8 +22791,11 @@ exit 1
 "#,
         )
         .unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
         (repo, gh)
     }
 
@@ -22807,6 +22810,7 @@ exit 1
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn task_command_creates_a_worktree_thread_and_prompt() {
         let (repo, gh) = task_repo();
@@ -22831,6 +22835,7 @@ exit 1
         assert!(notice.contains("task #12 ready"), "{notice}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn issue_picker_enter_starts_the_selected_task() {
         let (repo, _gh) = task_repo();
@@ -22897,6 +22902,7 @@ exit 1
         assert!(matches!(state.overlay, Overlay::None));
     }
 
+    #[cfg(unix)]
     #[test]
     fn task_command_refuses_a_running_turn_and_a_bad_number() {
         let (repo, gh) = task_repo();

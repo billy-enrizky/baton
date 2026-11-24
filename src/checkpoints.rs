@@ -122,8 +122,26 @@ pub fn capture_checkpoint_at(cwd: &Path, reference: &str, message: &str) -> Resu
     result
 }
 
+/// A plain `git diff <ref>` ignores untracked files, so a new file that is
+/// still on disk looks deleted. Stage the worktree into a temporary index and
+/// diff the reference against that, which matches what a checkpoint captures.
 pub fn diff_checkpoint_against_worktree(cwd: &Path, reference: &str) -> Result<String> {
-    Ok(git(cwd, &["--no-pager", "diff", reference], &[])?)
+    let index_dir = std::env::temp_dir().join(format!("baton-diff-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&index_dir)?;
+    let index_path = index_dir.join("index");
+    let index_file = index_path.to_string_lossy().to_string();
+    let env: Vec<(&str, &str)> = vec![("GIT_INDEX_FILE", index_file.as_str())];
+    let result = (|| -> Result<String> {
+        git(cwd, &["add", "-A", "--", "."], &env)?;
+        git(cwd, &["--no-pager", "diff", "--cached", reference], &env)
+    })();
+    let _ = std::fs::remove_dir_all(&index_dir);
+    match result {
+        Ok(diff) => Ok(diff),
+        // A worktree that cannot be staged still gets the tracked comparison,
+        // which is what this call returned before untracked files were covered.
+        Err(_) => Ok(git(cwd, &["--no-pager", "diff", reference], &[])?),
+    }
 }
 
 pub fn diff_checkpoints(cwd: &Path, ref_a: &str, ref_b: &str) -> Result<String> {

@@ -92,7 +92,7 @@ baton fork [-t id] [--turn n] [--native] [--json] [title]  # branch a thread; Co
 baton import [--dry-run] # import recent native sessions as threads
 baton usage              # token usage and cache hit rates
 baton auth [provider] [subscription|api]
-baton diff <id> [turn]   # checkpoint diff against the working tree
+baton diff <id> [turn]   # checkpoint diff against the working tree, including untracked files
 baton restore <id> <turn>
 baton rewind [-t id] --turn N [--native] [--json]  # remove a turn and later turns; Codex and OpenCode can revert natively, with durable recovery
 baton orchestrate [--max-tasks N] [--plan-file path] [--plan-only] [--progress | --stream-json | --json] "goal"  # coordinator + workers in worktrees

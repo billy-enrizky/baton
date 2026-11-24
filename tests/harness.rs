@@ -50,6 +50,36 @@ fn checkpoints_capture_diff_restore() {
 }
 
 #[test]
+fn checkpoint_diff_includes_untracked_files() {
+    let repo = tempfile::tempdir().unwrap();
+    git(repo.path(), &["init", "-q"]);
+    git(repo.path(), &["config", "user.email", "test@test"]);
+    git(repo.path(), &["config", "user.name", "test"]);
+    std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
+    git(repo.path(), &["add", "."]);
+    git(repo.path(), &["commit", "-q", "-m", "init"]);
+
+    std::fs::write(repo.path().join("b.txt"), "untracked\n").unwrap();
+    let reference = capture_checkpoint(repo.path(), "thread-diff", 1).unwrap();
+
+    let diff = diff_checkpoint_against_worktree(repo.path(), &reference).unwrap();
+    assert!(
+        !diff.contains("b.txt"),
+        "a present untracked file must not read as a deletion: {diff}"
+    );
+
+    std::fs::write(repo.path().join("c.txt"), "new\n").unwrap();
+    let diff = diff_checkpoint_against_worktree(repo.path(), &reference).unwrap();
+    assert!(diff.contains("c.txt"), "a new untracked file is an addition: {diff}");
+    assert!(diff.contains("+new"), "{diff}");
+
+    std::fs::remove_file(repo.path().join("b.txt")).unwrap();
+    let diff = diff_checkpoint_against_worktree(repo.path(), &reference).unwrap();
+    assert!(diff.contains("b.txt"), "a removed file is a deletion: {diff}");
+    assert!(diff.contains("-untracked"), "{diff}");
+}
+
+#[test]
 fn checkpoints_work_in_repo_without_commits() {
     let repo = tempfile::tempdir().unwrap();
     git(repo.path(), &["init", "-q"]);

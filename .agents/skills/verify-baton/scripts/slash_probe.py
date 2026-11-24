@@ -74,6 +74,25 @@ def main() -> int:
         "exit 0\n"
     )
     editor.chmod(0o755)
+    gh = editor_bin / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"view\" ]; then\n"
+        "  cat <<'JSON'\n"
+        '{"number":42,"title":"Add checks","url":"https://github.com/example/repo/pull/42","state":"OPEN","mergeable":"MERGEABLE","headRefName":"feat/checks","isDraft":false}\n'
+        "JSON\n"
+        "  exit 0\n"
+        "fi\n"
+        "if [ \"$1\" = \"pr\" ] && [ \"$2\" = \"checks\" ]; then\n"
+        "  cat <<'JSON'\n"
+        '[{"name":"Test","state":"SUCCESS","bucket":"pass","description":"","link":"https://example/check"},{"name":"Lint","state":"PENDING","bucket":"pending","description":"waiting","link":""}]\n'
+        "JSON\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 1\n"
+    )
+    gh.chmod(0o755)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=workdir, check=True)
     no_hooks = Path(home) / "no-hooks"
     no_hooks.mkdir()
@@ -169,6 +188,7 @@ def main() -> int:
         env["BATON_EDITOR_CAPTURE"] = str(editor_capture)
         env["BATON_EDITOR_FAIL"] = str(editor_fail)
         env["EDITOR"] = "code --wait"
+        env["BATON_GH_BIN"] = str(gh)
         env["PATH"] = f"{editor_bin}{os.pathsep}{env.get('PATH', '')}"
         env["CLAUDE_CONFIG_DIR"] = str(claude_config)
         env["CODEX_HOME"] = str(codex_config)
@@ -529,6 +549,7 @@ def main() -> int:
             "Commit all changes",
             "Commit staged changes",
             "Push current branch",
+            "Checks",
             "Cancel",
         ]
         missing.extend(value for value in git_required if value not in git_picker)
@@ -627,6 +648,25 @@ def main() -> int:
             missing.append("git push remote missing")
         elif local_head.stdout.strip() != remote_head.stdout.strip():
             missing.append("git push remote head")
+
+        os.write(master, b"/git\r")
+        if not wait_for(master, "Git ·", 10.0, transcript):
+            missing.append("git checks picker")
+        pump(master, 0.2, transcript)
+        for _ in range(4):
+            os.write(master, b"\x1b[B")
+            pump(master, 0.15, transcript)
+        os.write(master, b"\r")
+        pump(master, 1.0, transcript)
+        git_checks = screen_text(transcript, args.width, args.height)
+        if "Git checks · #42" not in git_checks:
+            missing.append("git checks screen")
+        for value in ["Add checks", "Test · SUCCESS", "Lint · PENDING"]:
+            if value not in git_checks:
+                missing.append(f"git checks row: {value}")
+        (evidence / "git-checks-screen.txt").write_text(git_checks + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
 
         os.write(master, b"/files ")
         pump(master, 0.5, transcript)

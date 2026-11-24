@@ -512,6 +512,10 @@ enum Overlay {
     GitPushConfirm {
         plan: Box<crate::git_workflow::PushPlan>,
     },
+    GitChecks {
+        report: Box<crate::git_workflow::PullRequestChecks>,
+        scroll: usize,
+    },
     CopyPicker {
         selected: usize,
         replies: Vec<ReplyChoice>,
@@ -3566,7 +3570,22 @@ fn apply_git_picker(
             open_git_confirm(state, store, mode, None);
         }
         3 => open_git_push_picker(state, store),
+        4 => open_git_checks(state),
         _ => state.overlay = Overlay::None,
+    }
+}
+
+fn open_git_checks(state: &mut TuiState) {
+    match crate::git_workflow::checks(std::path::Path::new(&state.thread.cwd)) {
+        Ok(report) => {
+            state.overlay = Overlay::GitChecks {
+                report: Box::new(report),
+                scroll: 0,
+            };
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git checks: {error}")));
+        }
     }
 }
 
@@ -4406,7 +4425,7 @@ fn handle_key(
                 state.overlay = Overlay::None;
             }
             KeyCode::Up => {
-                selected = (selected + 4) % 5;
+                selected = (selected + 5) % 6;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4414,7 +4433,7 @@ fn handle_key(
                 };
             }
             KeyCode::Down => {
-                selected = (selected + 1) % 5;
+                selected = (selected + 1) % 6;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4430,7 +4449,7 @@ fn handle_key(
             }
             KeyCode::End => {
                 state.overlay = Overlay::GitPicker {
-                    selected: 4,
+                    selected: 5,
                     status,
                     blocked,
                 };
@@ -4508,6 +4527,18 @@ fn handle_key(
                 state.overlay = Overlay::GitPushConfirm { plan };
             }
         },
+        Overlay::GitChecks { report, mut scroll } => {
+            let max = report.checks.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc => state.overlay = Overlay::None,
+                code => {
+                    if let Some(next) = git_scroll_key(code, scroll, max) {
+                        scroll = next;
+                    }
+                    state.overlay = Overlay::GitChecks { report, scroll };
+                }
+            }
+        }
         Overlay::ModePicker { mut selected } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
@@ -8937,7 +8968,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitPicker {
                 status, blocked, ..
             } => {
-                8 + usize::from(blocked.is_some())
+                9 + usize::from(blocked.is_some())
                     + usize::from(status.operation.is_some())
                     + usize::from(status.conflicts)
             }
@@ -8949,6 +8980,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitConfirm { plan, .. } => plan.files.len().min(12) + 8,
             Overlay::GitPushPicker { targets, .. } => targets.len().min(8) + 4,
             Overlay::GitPushConfirm { .. } => 8,
+            Overlay::GitChecks { report, .. } => report.checks.len().min(12) + 5,
             Overlay::RolesPicker { roles, .. } => roles.len() + 6,
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
@@ -9068,6 +9100,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 draw_git_push_picker(frame, chunks[1], targets, *selected)
             }
             Overlay::GitPushConfirm { plan } => draw_git_push_confirm(frame, chunks[1], plan),
+            Overlay::GitChecks { report, scroll } => {
+                draw_git_checks(frame, chunks[1], report, *scroll)
+            }
             Overlay::ModePicker { selected } => {
                 draw_mode_picker(frame, chunks[1], state, *selected)
             }
@@ -10037,6 +10072,10 @@ fn draw_git_picker(
                 None => "choose a remote".to_string(),
             },
         ),
+        (
+            "Checks".to_string(),
+            "GitHub pull request checks".to_string(),
+        ),
         ("Cancel".to_string(), "esc".to_string()),
     ];
     let mut lines = vec![Line::styled(
@@ -10537,6 +10576,84 @@ fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
             format!(
                 "{cursor} {marker} {} {mode_label} · {detail}",
                 provider_label(provider)
+            ),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_git_checks(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    report: &crate::git_workflow::PullRequestChecks,
+    scroll: usize,
+) {
+    let pr = &report.pr;
+    let visible = report.checks.len().min(12);
+    let start = if report.checks.len() <= visible {
+        0
+    } else {
+        scroll.min(report.checks.len() - visible)
+    };
+    let position = if report.checks.len() > visible {
+        format!(" · {}/{}", start + 1, report.checks.len())
+    } else {
+        String::new()
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "Git checks · #{} {} · {}{position} · ↑↓ scroll · esc close",
+                pr.number,
+                git_line(&pr.title),
+                git_line(&pr.state)
+            ),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            format!(
+                "{} · mergeable {} · {}",
+                git_line(&pr.head_ref),
+                git_line(&pr.mergeable),
+                git_line(&pr.url)
+            ),
+            Style::default().fg(COLORS.secondary),
+        ),
+    ];
+    if report.checks.is_empty() {
+        lines.push(Line::styled(
+            "no checks reported for this pull request",
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    for check in report.checks.iter().skip(start).take(visible) {
+        let (marker, style) = match check.bucket.as_str() {
+            "pass" => ("✓", Style::default().fg(COLORS.success)),
+            "fail" => ("✗", Style::default().fg(COLORS.error)),
+            "pending" => ("·", Style::default().fg(COLORS.warning)),
+            "skipping" => ("↷", Style::default().fg(COLORS.muted)),
+            "cancel" => ("✕", Style::default().fg(COLORS.warning)),
+            _ => ("·", Style::default().fg(COLORS.text)),
+        };
+        let state = if check.state.is_empty() {
+            check.bucket.as_str()
+        } else {
+            check.state.as_str()
+        };
+        let detail = if check.description.is_empty() {
+            String::new()
+        } else {
+            format!(" · {}", git_line(&check.description))
+        };
+        lines.push(Line::styled(
+            format!(
+                "{marker} {} · {}{detail}",
+                git_line(&check.name),
+                git_line(state)
             ),
             style,
         ));
@@ -21295,6 +21412,77 @@ mod tests {
         assert!(text.contains("file-23.txt"), "{text}");
         assert!(text.contains("a merge in progress"), "{text}");
         assert!(text.contains("unresolved conflicts"), "{text}");
+    }
+
+    #[test]
+    fn git_checks_picker_shows_the_current_pr_and_checks() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        let gh = repo.path().join("fake-gh");
+        std::fs::write(
+            &gh,
+            r#"#!/bin/sh
+set -eu
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  cat <<'JSON'
+{"number":42,"title":"Add checks","url":"https://github.com/example/repo/pull/42","state":"OPEN","mergeable":"MERGEABLE","headRefName":"feat/checks","isDraft":false}
+JSON
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "checks" ]; then
+  cat <<'JSON'
+[{"name":"Test","state":"SUCCESS","bucket":"pass","description":"","link":"https://example/check"},{"name":"Lint","state":"PENDING","bucket":"pending","description":"waiting","link":""}]
+JSON
+  exit 0
+fi
+exit 1
+"#,
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("BATON_GH_BIN", &gh);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/git");
+        for _ in 0..4 {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Down),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        std::env::remove_var("BATON_GH_BIN");
+
+        let Overlay::GitChecks { report, .. } = &state.overlay else {
+            panic!("expected git checks overlay");
+        };
+        assert_eq!(report.pr.number, 42);
+        assert_eq!(report.checks.len(), 2);
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("Git checks · #42"), "{text}");
+        assert!(text.contains("✓ Test · SUCCESS"), "{text}");
+        assert!(text.contains("· Lint · PENDING · waiting"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
     }
 
     #[test]

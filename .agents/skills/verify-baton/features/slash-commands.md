@@ -46,4 +46,4 @@ Installed-binary proof: the same slash probe passed against the v0.4.0 default c
 - Turn-number choices for `/review`, `/commands`, and `/fork --turn` come from the current thread history.
 - `/mcp remove`, `/runs`, and `/copy` choices come from the MCP registry, current store, and conversation.
 - `/pin move ` offers both directions only for pinned threads in the current project. The probe enters the full ID from the picker row because the move notice, refreshed order, and boundary result are part of the proof.
-- `/git` completes status, commit, commit --staged, and push. The probe commits the isolated repository, checks the real git subject and exact file list, then pushes to a local bare remote and checks its head.
+- `/git` completes status, commit, commit --staged, and push. The probe commits the isolated repository, checks the real git subject and exact file list, pushes to a local bare remote, checks its head, then opens Checks against a fake `gh` and requires the PR header and the pass/pending rows.

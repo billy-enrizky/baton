@@ -643,8 +643,6 @@ const PROVIDERS: [ProviderId; 6] = [
     ProviderId::Antigravity,
 ];
 
-const AUTH_PICKER_ROWS: usize = 8;
-
 pub struct TuiState {
     /// Terminal bell on turn end, opt-in through config.json.
     bell_enabled: bool,
@@ -2660,6 +2658,18 @@ fn is_exact_retry_turn(input: &str) -> bool {
     !turn.is_empty() && !turn.contains(char::is_whitespace) && turn.parse::<i64>().is_ok()
 }
 
+/// True when the typed line already names something a handler acts on. Enter
+/// must run such a line instead of rewriting it into the first completion:
+/// `/auth codex` is a billing query, and completing it to
+/// `/auth codex subscription` would change state on the next Enter.
+fn is_complete_command(input: &str) -> bool {
+    let mut parts = input.split_whitespace();
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("/auth" | "/switch"), Some(value), None) => ProviderId::parse(value).is_some(),
+        _ => false,
+    }
+}
+
 fn assistant_reply_count(state: &TuiState) -> usize {
     state
         .history
@@ -2705,6 +2715,24 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/mcp", _) => Some("mcp list|add|remove|sync"),
         ("/copy", _) => Some("copy [reply number, 1 = latest]"),
         ("/help", _) => Some("help [all]"),
+        ("/status", _) => Some("status (no arguments)"),
+        ("/activity", _) => Some("activity (no arguments)"),
+        ("/roles", _) => Some("roles (no arguments)"),
+        ("/threads", _) => Some("threads (no arguments)"),
+        ("/inbox", _) => Some("inbox (no arguments)"),
+        ("/usage", _) => Some("usage (no arguments)"),
+        ("/checkpoints", _) => Some("checkpoints (no arguments)"),
+        ("/turns", _) => Some("turns (no arguments)"),
+        ("/memory", _) => Some("memory (no arguments)"),
+        ("/compact", _) => Some("compact (no arguments)"),
+        ("/context", _) => Some("context (no arguments)"),
+        ("/init", _) => Some("init (no arguments)"),
+        ("/export", _) => Some("export (no arguments)"),
+        ("/settings", _) => Some("settings (no arguments)"),
+        ("/skills", _) => Some("skills (no arguments)"),
+        ("/clear", _) => Some("clear (no arguments)"),
+        ("/quit", _) => Some("quit (no arguments)"),
+        ("/exit", _) => Some("exit (no arguments)"),
         _ => None,
     }
 }
@@ -6070,10 +6098,10 @@ fn handle_composer_key(
                 return;
             }
             KeyCode::Enter => {
-                if suggestions
+                let exact = suggestions
                     .iter()
-                    .any(|suggestion| suggestion.insert == typed)
-                {
+                    .any(|suggestion| suggestion.insert == typed);
+                if exact || is_complete_command(&typed) {
                     state.set_input(String::new());
                     handle_command(state, store, engine_command_sender, &typed);
                 } else if let Some(suggestion) = suggestions.get(clamped) {
@@ -7569,7 +7597,10 @@ fn handle_command(
                 }
                 (Some(provider), None) => match ProviderId::parse(provider) {
                     Some(parsed) => {
-                        state.notice = Some(describe_auth(resolved.for_provider(parsed)));
+                        state.notice = Some(format!(
+                            "{parsed} billing: {}",
+                            describe_auth(resolved.for_provider(parsed))
+                        ));
                     }
                     None => state.notice = Some("unknown provider".into()),
                 },
@@ -9083,7 +9114,11 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
             Overlay::ModePicker { .. } => 7,
-            Overlay::AuthPicker { .. } => AUTH_PICKER_ROWS + 3,
+            Overlay::AuthPicker { .. } => {
+                let wanted = PROVIDERS.len() * 2 + 3;
+                let reserved = 3 + notice_rows + composer_rows as usize + 1;
+                wanted.min((area.height as usize).saturating_sub(reserved).max(4))
+            }
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
             Overlay::InboxPicker { items, .. } => items.len().min(8) + 4,
             Overlay::GrepPicker {
@@ -10639,17 +10674,13 @@ fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
     let count = PROVIDERS.len() * 2;
     let selected = selected.min(count.saturating_sub(1));
-    let visible = count.min(AUTH_PICKER_ROWS);
+    let visible = count.min((area.height as usize).saturating_sub(3)).max(1);
     let start = if count <= visible {
         0
     } else {
         selected.saturating_sub(visible / 2).min(count - visible)
     };
-    let position = if count > visible {
-        format!(" · {}/{}", selected + 1, count)
-    } else {
-        String::new()
-    };
+    let position = format!(" · {}/{}", selected + 1, count);
     let mut lines: Vec<Line> = vec![Line::styled(
         format!("billing mode{position} · ↑↓ select · enter apply · esc close"),
         Style::default().fg(COLORS.muted),
@@ -11967,9 +11998,12 @@ fn composer_hint(state: &TuiState) -> Option<String> {
             state.queued_messages.len()
         ))
     } else if let Some(usage) = command_usage(&state.input) {
-        Some(format!(
-            "/{usage} · tab or enter completes the selected choice"
-        ))
+        let suffix = if suggestions_for(state).is_empty() {
+            "enter runs it"
+        } else {
+            "tab or enter completes the selected choice"
+        };
+        Some(format!("/{usage} · {suffix}"))
     } else {
         None
     }
@@ -12738,48 +12772,6 @@ mod tests {
                     "{command} must offer {provider}"
                 );
             }
-        }
-    }
-
-    #[test]
-    fn every_argument_command_has_choices_or_a_usage_hint() {
-        let home = tempfile::tempdir().unwrap();
-        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
-        let mut state = test_state(home.path(), &store, Vec::new());
-        for command in [
-            "/switch",
-            "/model",
-            "/effort",
-            "/mode",
-            "/auth",
-            "/new",
-            "/fork",
-            "/worktree",
-            "/open",
-            "/files",
-            "/grep",
-            "/pin",
-            "/review",
-            "/diff",
-            "/rewind",
-            "/retry",
-            "/goal",
-            "/find",
-            "/multi",
-            "/orchestrate",
-            "/runs",
-            "/commands",
-            "/git",
-            "/queue",
-            "/mcp",
-            "/copy",
-            "/help",
-        ] {
-            state.input = format!("{command} ");
-            assert!(
-                !suggestions_for(&state).is_empty() || command_usage(&state.input).is_some(),
-                "{command} must expose choices or usage after its trailing space"
-            );
         }
     }
 
@@ -14351,14 +14343,13 @@ mod tests {
         state.input = "/find ".to_string();
         assert_eq!(
             composer_hint(&state).as_deref(),
-            Some("/find <text> · tab or enter completes the selected choice")
+            Some("/find <text> · enter runs it"),
+            "a free-form command has no choice to complete"
         );
         state.input = "/mcp add ".to_string();
         assert_eq!(
             composer_hint(&state).as_deref(),
-            Some(
-                "/mcp add <name> <command> [args...] · tab or enter completes the selected choice"
-            )
+            Some("/mcp add <name> <command> [args...] · enter runs it")
         );
     }
 
@@ -20748,7 +20739,11 @@ mod tests {
         assert!(first.contains("billing mode · 1/12"), "{first}");
         assert!(first.contains("claude subscription"), "{first}");
         assert!(first.contains("cursor api"), "{first}");
-        assert!(!first.contains("antigravity api"), "{first}");
+        assert!(
+            first.contains("antigravity api"),
+            "a tall terminal shows every choice: {first}"
+        );
+        assert!(first.contains("opencode api"), "{first}");
         let selected = first
             .lines()
             .filter(|line| {
@@ -20768,6 +20763,81 @@ mod tests {
             })
             .count();
         assert_eq!(selected, 1, "{last}");
+    }
+
+    #[test]
+    fn auth_picker_scrolls_within_a_short_terminal() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::AuthPicker { selected: 11 };
+        let text = buffer_lines(&render_state(&state, 120, 16)).join("\n");
+        assert!(text.contains("billing mode · 12/12"), "{text}");
+        assert!(text.contains("antigravity api"), "{text}");
+        assert!(!text.contains("claude subscription"), "{text}");
+        let selected = text
+            .lines()
+            .filter(|line| {
+                line.contains('❯') && (line.contains(" subscription") || line.contains(" api ·"))
+            })
+            .count();
+        assert_eq!(selected, 1, "{text}");
+    }
+
+    #[test]
+    fn auth_query_describes_billing_instead_of_completing_to_a_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.json");
+        std::fs::write(&path, r#"{"codex":{"mode":"subscription"}}"#).unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/auth codex".to_string();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(
+            state.input.is_empty(),
+            "Enter must run the query, not complete it: {}",
+            state.input
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("codex billing:"), "{notice}");
+        assert!(notice.contains("subscription"), "{notice}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"codex":{"mode":"subscription"}}"#,
+            "a billing query must not rewrite config.json"
+        );
+    }
+
+    #[test]
+    fn switch_query_runs_instead_of_completing_to_a_model() {
+        ensure_fake_harnesses();
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/switch codex".to_string();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(
+            state.input.is_empty(),
+            "Enter must run the switch, not complete it to a model: {}",
+            state.input
+        );
+        assert_eq!(state.thread.current_provider, ProviderId::Codex);
+        assert_eq!(state.thread.current_model, None);
     }
 
     #[test]
@@ -22123,6 +22193,39 @@ exit 1
         assert!(
             text.contains("enter on an empty composer sends the next queued message"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn every_slash_command_has_choices_or_a_usage_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        for (command, _) in SLASH_COMMANDS {
+            state.input = format!("{command} ");
+            let suggestions = suggestions_for(&state);
+            let hint = composer_hint(&state);
+            assert!(
+                !suggestions.is_empty() || hint.is_some(),
+                "{command} shows no completion and no usage hint after a space"
+            );
+        }
+        state.input = "/auth ".to_string();
+        assert!(
+            composer_hint(&state)
+                .unwrap()
+                .contains("tab or enter completes the selected choice"),
+            "a command with choices advertises completion"
+        );
+        state.input = "/status ".to_string();
+        assert!(
+            composer_hint(&state).unwrap().contains("enter runs it"),
+            "a command without arguments says Enter runs it"
+        );
+        state.input = "/status".to_string();
+        assert!(
+            composer_hint(&state).is_none(),
+            "an unfinished command without a space stays quiet"
         );
     }
 

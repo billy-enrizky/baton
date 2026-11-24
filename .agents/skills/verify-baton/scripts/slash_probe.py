@@ -390,6 +390,7 @@ def main() -> int:
             "billing mode · 1/12",
             "claude subscription",
             "codex api · key CODEX_ICA_API_KEY",
+            "antigravity api",
             "enter apply",
             "esc close",
         ]:
@@ -416,6 +417,16 @@ def main() -> int:
         if config.get("codex", {}).get("mode") != "api":
             missing.append("auth persisted codex api mode")
         (evidence / "auth-set-screen.txt").write_text(auth_set + "\n")
+
+        os.write(master, b"/auth codex\r")
+        pump(master, 0.6, transcript)
+        auth_query = screen_text(transcript, args.width, args.height)
+        if "codex billing:" not in auth_query:
+            missing.append("auth query notice names the provider")
+        queried = json.loads(config_path.read_text())
+        if queried.get("codex", {}).get("mode") != "api":
+            missing.append("auth query mutated the codex billing mode")
+        (evidence / "auth-query-screen.txt").write_text(auth_query + "\n")
 
         os.write(master, b"/auth\r")
         pump(master, 0.6, transcript)

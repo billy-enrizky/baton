@@ -31,6 +31,7 @@ COMMANDS = [
     ("/effort", ["reasoning effort", "xhigh", "max"]),
     ("/mode", ["permission mode", "acceptEdits", "plan"]),
     ("/auth", ["billing mode", "1/12", "enter apply"]),
+    ("/auth codex", ["codex billing:"]),
     ("/roles", ["roles (4)", "orchestrator", "reviewer"]),
     ("/settings", ["+ global", "default session mode", "enter apply"]),
     ("/mcp", ["MCP servers", "add server", "sync to all harnesses"]),
@@ -70,6 +71,12 @@ COMMANDS = [
     ("/fork", ["nothing to fork yet"]),
     ("/worktree", ["source checkout has uncommitted changes"]),
     ("/exit", []),
+]
+
+HINT_MARKERS = [
+    "tab/enter complete",
+    "completes the selected choice",
+    "enter runs it",
 ]
 
 FORBIDDEN = [
@@ -149,6 +156,14 @@ def main() -> int:
             raise RuntimeError("TUI did not show its composer")
         pump(master, 3.0, transcript)
         for index, (command, required) in enumerate(COMMANDS):
+            base = command.split()[0]
+            os.write(master, (base + " ").encode())
+            pump(master, 0.5, transcript)
+            hint = screen_text(transcript, args.width, args.height)
+            if not any(marker in hint for marker in HINT_MARKERS):
+                missing.append(f"{base}: no completion or usage hint after a space")
+            os.write(master, b"\x7f" * (len(base) + 1))
+            pump(master, 0.3, transcript)
             os.write(master, command.encode())
             pump(master, 0.6, transcript)
             os.write(master, b"\r")

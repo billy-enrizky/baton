@@ -23,7 +23,7 @@ The product problem is: a terminal user should be able to start, supervise, reco
 | Goal | Measurable acceptance |
 |---|---|
 | Terminal-native parity | Every row in Release 1 has a working TUI or CLI path, a code path, and a `unit`, `CI`, `local`, or recorded `local bench` proof |
-| No memorized slash syntax | Every slash command with finite arguments exposes choices; every free-form command shows usage. PR #86 covers the current set. Every new slash command ships its choices or usage hint in its own slice. |
+| No memorized slash syntax | Every slash command answers after a space with choices, an argument usage line, or a no-arguments line, and Enter runs a line that is already a complete command. `every_slash_command_has_choices_or_a_usage_hint` and the sweep enforce it for every registered command. Every new slash command ships its choices or usage hint in its own slice. |
 | Thread continuity | Switching away and back to a provider shows the exact delta, redacts configured secrets, offers no-handoff, and sends only after confirmation. No handoff state machine exists yet; today's builder and its defects are recorded in the handoff row. |
 | Recoverable work | A closed TUI reopens without losing visibility of queued, running, or needs-input work. A running turn is reconciled to failed or unverified and can be retried; local-only Baton does not promise background continuation. |
 | Fast interaction | Warm startup p50 under 250 ms and p95 under 500 ms; keystroke-to-render p95 under 50 ms; idle RSS under 200 MB. The baseline is recorded before the first optimization PR. |
@@ -388,7 +388,7 @@ Each row is one small PR. A row with a letter suffix is the smallest unit that c
 
 Deferred rows: agent hibernation, guest access, themes and plugin host, voice, and bots. They are not scheduled until their decision owner signs off.
 
-Every new slash command introduced by D6 to D24 must ship its argument choices or a usage hint in the same slice. The completion contract is defined in PR #86 and enforced by the `every_argument_command_has_choices_or_a_usage_hint` test.
+Every new slash command introduced by D6 to D24 must ship its argument choices or a usage hint in the same slice. The completion contract is enforced by the `every_slash_command_has_choices_or_a_usage_hint` test, which iterates the registered command list, and by the sweep, which types every command and a space before running it.
 
 ## Deferred: durable thread archive
 

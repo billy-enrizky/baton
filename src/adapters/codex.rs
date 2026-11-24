@@ -393,6 +393,87 @@ impl CodexAdapter {
                             }
                         }
                     }
+                    "collabAgentToolCall" => {
+                        let tool = item.get("tool").and_then(Value::as_str).unwrap_or("");
+                        if tool == "spawnAgent" {
+                            let call_id = item
+                                .get("id")
+                                .and_then(Value::as_str)
+                                .filter(|id| !id.is_empty())
+                                .map(str::to_string);
+                            let name = item
+                                .get("model")
+                                .and_then(Value::as_str)
+                                .filter(|model| !model.is_empty())
+                                .unwrap_or("spawnAgent")
+                                .to_string();
+                            let detail = item
+                                .get("prompt")
+                                .and_then(Value::as_str)
+                                .map(|prompt| prompt.chars().take(200).collect::<String>());
+                            if completed {
+                                let status = item
+                                    .get("status")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("completed");
+                                let status = match status {
+                                    "failed" => "failed",
+                                    "interrupted" => "interrupted",
+                                    _ => "done",
+                                };
+                                let _ = emit.send(TurnEvent::SubagentFinished {
+                                    id: call_id,
+                                    name,
+                                    status: status.to_string(),
+                                    detail,
+                                });
+                            } else {
+                                let _ = emit.send(TurnEvent::SubagentStarted {
+                                    id: call_id,
+                                    name,
+                                    detail,
+                                });
+                            }
+                        }
+                    }
+                    "subAgentActivity" => {
+                        let id = item
+                            .get("agentThreadId")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(str::to_string);
+                        let name = item
+                            .get("agentPath")
+                            .and_then(Value::as_str)
+                            .filter(|path| !path.is_empty())
+                            .unwrap_or("subagent")
+                            .to_string();
+                        match item.get("kind").and_then(Value::as_str).unwrap_or("") {
+                            "started" => {
+                                let _ = emit.send(TurnEvent::SubagentStarted {
+                                    id,
+                                    name,
+                                    detail: None,
+                                });
+                            }
+                            "completed" | "interrupted" => {
+                                let status = if item.get("kind").and_then(Value::as_str)
+                                    == Some("interrupted")
+                                {
+                                    "interrupted"
+                                } else {
+                                    "done"
+                                };
+                                let _ = emit.send(TurnEvent::SubagentFinished {
+                                    id,
+                                    name,
+                                    status: status.to_string(),
+                                    detail: None,
+                                });
+                            }
+                            _ => {}
+                        }
+                    }
                     "fileChange" => {
                         let paths = item
                             .get("changes")

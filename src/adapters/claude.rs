@@ -290,7 +290,8 @@ impl BatonAdapter for ClaudeAdapter {
         let mut result: Result<()> = Ok(());
         // Claude starts a tool with `tool_use.id` and finishes it with a
         // `tool_result.tool_use_id`. Keep the label so both events match.
-        let mut tool_calls: HashMap<String, (String, Option<String>)> = HashMap::new();
+        let mut tool_calls: HashMap<String, (String, Option<String>, Option<String>)> =
+            HashMap::new();
 
         loop {
             let line = tokio::select! {
@@ -358,17 +359,58 @@ impl BatonAdapter for ClaudeAdapter {
                                         }
                                     }
                                 } else if block_type == "tool_use" {
-                                    let tool = block.get("name").and_then(Value::as_str).unwrap_or("tool").to_string();
+                                    let tool = block
+                                        .get("name")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("tool")
+                                        .to_string();
                                     let detail = block.get("input").and_then(tool_input_summary);
+                                    let subagent_detail = block
+                                        .get("input")
+                                        .and_then(|input| input.get("description"))
+                                        .and_then(Value::as_str)
+                                        .filter(|detail| !detail.is_empty())
+                                        .map(str::to_string);
+                                    let subagent =
+                                        matches!(tool.as_str(), "Task" | "Agent").then(|| {
+                                            block
+                                                .get("input")
+                                                .and_then(|input| {
+                                                    input
+                                                        .get("subagent_type")
+                                                        .or_else(|| input.get("description"))
+                                                        .or_else(|| input.get("prompt"))
+                                                })
+                                                .and_then(Value::as_str)
+                                                .filter(|name| !name.is_empty())
+                                                .map(|name| {
+                                                    name.chars().take(80).collect::<String>()
+                                                })
+                                                .unwrap_or_else(|| tool.clone())
+                                        });
                                     let call_id = block
                                         .get("id")
                                         .and_then(Value::as_str)
                                         .filter(|id| !id.is_empty())
                                         .map(str::to_string);
                                     if let Some(id) = call_id.as_ref() {
-                                        tool_calls.insert(id.clone(), (tool.clone(), detail.clone()));
+                                        tool_calls.insert(
+                                            id.clone(),
+                                            (tool.clone(), detail.clone(), subagent.clone()),
+                                        );
                                     }
-                                    let _ = emit.send(TurnEvent::ToolStarted { id: call_id, tool, detail });
+                                    if let Some(name) = subagent {
+                                        let _ = emit.send(TurnEvent::SubagentStarted {
+                                            id: call_id.clone(),
+                                            name,
+                                            detail: subagent_detail.clone(),
+                                        });
+                                    }
+                                    let _ = emit.send(TurnEvent::ToolStarted {
+                                        id: call_id,
+                                        tool,
+                                        detail,
+                                    });
                                 }
                             }
                         }
@@ -389,7 +431,16 @@ impl BatonAdapter for ClaudeAdapter {
                                 }
                                 let id = block.get("tool_use_id").and_then(Value::as_str).unwrap_or("");
                                 let is_error = block.get("is_error").and_then(Value::as_bool).unwrap_or(false);
-                                if let Some((tool, detail)) = tool_calls.remove(id) {
+                                if let Some((tool, detail, subagent)) = tool_calls.remove(id) {
+                                    if let Some(name) = subagent {
+                                        let _ = emit.send(TurnEvent::SubagentFinished {
+                                            id: (!id.is_empty()).then_some(id.to_string()),
+                                            name,
+                                            status: if is_error { "failed" } else { "done" }
+                                                .to_string(),
+                                            detail: detail.clone(),
+                                        });
+                                    }
                                     let _ = emit.send(TurnEvent::ToolCompleted {
                                         id: (!id.is_empty()).then_some(id.to_string()),
                                         tool,

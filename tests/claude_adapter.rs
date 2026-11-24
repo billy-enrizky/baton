@@ -352,3 +352,114 @@ async fn claude_steer_writes_a_user_message_into_the_live_turn() {
         "steering after completion is rejected"
     );
 }
+
+async fn fake_claude_subagent(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+        return;
+    }
+    send(
+        &mut write,
+        json!({
+            "type": "assistant",
+            "message": {
+                "content": [{
+                    "type": "tool_use",
+                    "id": "toolu_task_1",
+                    "name": "Task",
+                    "input": {
+                        "subagent_type": "Explore",
+                        "description": "Find the parser"
+                    }
+                }]
+            }
+        }),
+    )
+    .await;
+    send(
+        &mut write,
+        json!({
+            "type": "user",
+            "message": {
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_task_1",
+                    "is_error": false
+                }]
+            }
+        }),
+    )
+    .await;
+    send(
+        &mut write,
+        json!({ "type": "assistant", "message": { "content": [{ "type": "text", "text": "done" }] } }),
+    )
+    .await;
+    send(
+        &mut write,
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "done",
+            "session_id": "claude-session-subagent"
+        }),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_adapter_reports_task_subagents() {
+    let spawner: baton::adapters::claude::ClaudeSpawner = Arc::new(
+        |_input: &baton::adapters::TurnStartInput,
+         _session: Option<&baton::types::NativeSessionRef>| {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_claude_subagent(server_read, server_write));
+            Ok(halves)
+        },
+    );
+    let mut adapter = ClaudeAdapter::new(spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_turn(
+            baton::adapters::TurnStartInput {
+                turn: 1,
+                thread_id: "baton-thread".into(),
+                cwd: "/work".into(),
+                model: "claude-sonnet-4-5".into(),
+                effort: None,
+                prompt: "delegate this".into(),
+                permission_mode: PermissionMode::Default,
+                auth_env: vec![],
+            },
+            None,
+            event_sender,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    let started = events.iter().find_map(|event| match event {
+        baton::adapters::TurnEvent::SubagentStarted { id, name, detail } => {
+            Some((id.clone(), name.clone(), detail.clone()))
+        }
+        _ => None,
+    });
+    let started = started.expect("Task emits a subagent start");
+    assert_eq!(started.0.as_deref(), Some("toolu_task_1"));
+    assert_eq!(started.1, "Explore");
+    assert_eq!(started.2.as_deref(), Some("Find the parser"));
+    let finished = events.iter().find_map(|event| match event {
+        baton::adapters::TurnEvent::SubagentFinished {
+            id, name, status, ..
+        } => Some((id.clone(), name.clone(), status.clone())),
+        _ => None,
+    });
+    let finished = finished.expect("the tool result emits a subagent finish");
+    assert_eq!(finished.0.as_deref(), Some("toolu_task_1"));
+    assert_eq!(finished.1, "Explore");
+    assert_eq!(finished.2, "done");
+}

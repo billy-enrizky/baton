@@ -1074,3 +1074,227 @@ async fn codex_steer_injects_into_the_active_turn() {
         "a steer scoped to another baton turn is rejected"
     );
 }
+
+async fn fake_server_subagents(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                )
+                .await;
+            }
+            "thread/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "thread": { "id": "native-t1", "path": "/rollout.jsonl" } }
+                    }),
+                )
+                .await;
+            }
+            "turn/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "turn": { "id": "turn-1", "status": "inProgress" } }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "native-t1",
+                            "item": {
+                                "type": "collabAgentToolCall",
+                                "id": "collab-1",
+                                "tool": "spawnAgent",
+                                "status": "inProgress",
+                                "model": "gpt-6.2-sol",
+                                "prompt": "Audit the parser",
+                                "senderThreadId": "native-t1",
+                                "receiverThreadIds": ["child-1"],
+                                "agentsStates": {}
+                            }
+                        }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "native-t1",
+                            "item": {
+                                "type": "collabAgentToolCall",
+                                "id": "collab-1",
+                                "tool": "spawnAgent",
+                                "status": "completed",
+                                "model": "gpt-6.2-sol",
+                                "prompt": "Audit the parser",
+                                "senderThreadId": "native-t1",
+                                "receiverThreadIds": ["child-1"],
+                                "agentsStates": {}
+                            }
+                        }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "item/started",
+                        "params": {
+                            "threadId": "native-t1",
+                            "item": {
+                                "type": "subAgentActivity",
+                                "id": "act-1",
+                                "agentPath": "review",
+                                "agentThreadId": "child-2",
+                                "kind": "started"
+                            }
+                        }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "item/completed",
+                        "params": {
+                            "threadId": "native-t1",
+                            "item": {
+                                "type": "subAgentActivity",
+                                "id": "act-1",
+                                "agentPath": "review",
+                                "agentThreadId": "child-2",
+                                "kind": "completed"
+                            }
+                        }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "native-t1",
+                            "turn": {
+                                "id": "turn-1",
+                                "status": "completed",
+                                "items": [ { "type": "agentMessage", "text": "done" } ]
+                            }
+                        }
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_adapter_reports_collab_and_subagent_activity() {
+    let spawner = Arc::new(
+        |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_server_subagents(server_read, server_write));
+            Ok(halves)
+        },
+    );
+    let mut adapter = CodexAdapter::new(spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_turn(
+            baton::adapters::TurnStartInput {
+                turn: 1,
+                thread_id: "baton-thread".into(),
+                cwd: "/work".into(),
+                model: "gpt-6.2-sol".into(),
+                effort: None,
+                prompt: "delegate".into(),
+                permission_mode: PermissionMode::Default,
+                auth_env: vec![],
+            },
+            None,
+            event_sender,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    let started: Vec<(Option<String>, String, Option<String>)> = events
+        .iter()
+        .filter_map(|event| match event {
+            baton::adapters::TurnEvent::SubagentStarted { id, name, detail } => {
+                Some((id.clone(), name.clone(), detail.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(
+        started.iter().any(|(id, name, detail)| {
+            id.as_deref() == Some("collab-1")
+                && name == "gpt-6.2-sol"
+                && detail.as_deref() == Some("Audit the parser")
+        }),
+        "spawnAgent start: {started:?}"
+    );
+    assert!(
+        started
+            .iter()
+            .any(|(id, name, _)| id.as_deref() == Some("child-2") && name == "review"),
+        "subAgentActivity start: {started:?}"
+    );
+    let finished: Vec<(Option<String>, String, String)> = events
+        .iter()
+        .filter_map(|event| match event {
+            baton::adapters::TurnEvent::SubagentFinished {
+                id, name, status, ..
+            } => Some((id.clone(), name.clone(), status.clone())),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        finished
+            .iter()
+            .any(|(id, _, status)| id.as_deref() == Some("collab-1") && status == "done"),
+        "spawnAgent finish: {finished:?}"
+    );
+    assert!(
+        finished
+            .iter()
+            .any(|(id, _, status)| id.as_deref() == Some("child-2") && status == "done"),
+        "subAgentActivity finish: {finished:?}"
+    );
+}

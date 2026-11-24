@@ -2572,7 +2572,9 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
         }
         TurnEvent::ProviderTurnId { .. }
         | TurnEvent::ProviderSession { .. }
-        | TurnEvent::Usage { .. } => {}
+        | TurnEvent::Usage { .. }
+        | TurnEvent::SubagentStarted { .. }
+        | TurnEvent::SubagentFinished { .. } => {}
         // Approval requests need their thread id, so the run loop routes them
         // through apply_turn_event_for_thread before calling this function.
         TurnEvent::ApprovalRequest { .. } => {}
@@ -8237,7 +8239,27 @@ fn handle_command(
             }
         }
         "/agents" => {
-            let entries = agent_entries(state);
+            let stored = store
+                .lock()
+                .unwrap()
+                .list_subagents(&state.thread.id)
+                .unwrap_or_default();
+            let mut entries = stored
+                .iter()
+                .map(|row| AgentEntry {
+                    label: match row.detail.as_deref() {
+                        Some(detail) if !detail.is_empty() => {
+                            format!("{} · {detail}", row.name)
+                        }
+                        _ => row.name.clone(),
+                    },
+                    status: row.status.clone(),
+                    turn: row.turn,
+                })
+                .collect::<Vec<_>>();
+            if entries.is_empty() {
+                entries = agent_entries(state);
+            }
             if entries.is_empty() {
                 state.notice = Some(
                     "no subagent tool calls in this thread; Claude Task calls appear here"
@@ -26662,6 +26684,40 @@ exit 1
         );
         handle_key(&mut state, &store, &sender, key(KeyCode::Esc));
         assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn agents_command_prefers_persisted_subagent_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        store
+            .lock()
+            .unwrap()
+            .add_subagent(
+                &state.thread.id,
+                3,
+                "claude",
+                Some("toolu_1"),
+                "Explore",
+                Some("Find the parser"),
+                "done",
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            )
+            .unwrap();
+        handle_command(&mut state, &store, &sender, "/agents");
+        let Overlay::AgentsPicker { entries, .. } = &state.overlay else {
+            panic!("expected the agents picker");
+        };
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "Explore · Find the parser");
+        assert_eq!(entries[0].status, "done");
+        assert_eq!(entries[0].turn, 3);
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("Explore · Find the parser"), "{text}");
+        assert!(text.contains("turn 3"), "{text}");
     }
 
     #[test]

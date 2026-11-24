@@ -333,6 +333,110 @@ fn record_tool_event(records: &mut Vec<ToolRecord>, event: &TurnEvent) {
     }
 }
 
+struct SubagentRecord {
+    call_id: Option<String>,
+    name: String,
+    detail: Option<String>,
+    status: String,
+    started_at: String,
+    finished_at: Option<String>,
+}
+
+fn subagent_stamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
+fn record_subagent_event(records: &mut Vec<SubagentRecord>, event: &TurnEvent) {
+    match event {
+        TurnEvent::SubagentStarted { id, name, detail } => {
+            if let Some(id) = id.as_deref() {
+                if let Some(record) = records.iter_mut().rev().find(|record| {
+                    record.status == "running" && record.call_id.as_deref() == Some(id)
+                }) {
+                    record.name = name.clone();
+                    record.detail = detail.clone();
+                    return;
+                }
+            }
+            records.push(SubagentRecord {
+                call_id: id.clone(),
+                name: name.clone(),
+                detail: detail.clone(),
+                status: "running".to_string(),
+                started_at: subagent_stamp(),
+                finished_at: None,
+            });
+        }
+        TurnEvent::SubagentFinished {
+            id,
+            name,
+            status,
+            detail,
+        } => {
+            let matched = match id.as_deref() {
+                Some(id) => records.iter_mut().rev().find(|record| {
+                    record.status == "running" && record.call_id.as_deref() == Some(id)
+                }),
+                None => records
+                    .iter_mut()
+                    .rev()
+                    .find(|record| record.status == "running" && record.name == *name),
+            };
+            match matched {
+                Some(record) => {
+                    record.status = status.clone();
+                    record.finished_at = Some(subagent_stamp());
+                    if detail.is_some() {
+                        record.detail = detail.clone();
+                    }
+                }
+                None => {
+                    let now = subagent_stamp();
+                    records.push(SubagentRecord {
+                        call_id: id.clone(),
+                        name: name.clone(),
+                        detail: detail.clone(),
+                        status: status.clone(),
+                        started_at: now.clone(),
+                        finished_at: Some(now),
+                    });
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn persist_subagent_records(
+    store: &BatonStore,
+    thread_id: &str,
+    turn: i64,
+    provider: ProviderId,
+    records: &[SubagentRecord],
+) -> Result<()> {
+    for record in records {
+        // A turn that ends with a child still running leaves an honest
+        // `unknown` row instead of a stale `running` that never updates.
+        let status = if record.status == "running" {
+            "unknown"
+        } else {
+            record.status.as_str()
+        };
+        store.add_subagent(
+            thread_id,
+            turn,
+            provider.as_str(),
+            record.call_id.as_deref(),
+            &record.name,
+            record.detail.as_deref(),
+            status,
+            &record.started_at,
+            record.finished_at.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
 fn persist_tool_records(
     store: &BatonStore,
     thread_id: &str,
@@ -1026,10 +1130,12 @@ async fn execute_turn(
     let failure_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let interrupted_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let tools_slot: Arc<Mutex<Vec<ToolRecord>>> = Arc::new(Mutex::new(Vec::new()));
+    let subagents_slot: Arc<Mutex<Vec<SubagentRecord>>> = Arc::new(Mutex::new(Vec::new()));
     let outcome_for_thread = outcome_slot.clone();
     let failure_for_thread = failure_slot.clone();
     let interrupted_for_thread = interrupted_slot.clone();
     let tools_for_thread = tools_slot.clone();
+    let subagents_for_thread = subagents_slot.clone();
     let store_for_forwarder = store.clone();
     let model_for_forwarder = model.clone();
     let forwarder = std::thread::spawn(move || {
@@ -1081,6 +1187,10 @@ async fn execute_turn(
                     let _ = tui_sender.send((event_thread_id.clone(), event));
                     break;
                 }
+                TurnEvent::SubagentStarted { .. } | TurnEvent::SubagentFinished { .. } => {
+                    record_subagent_event(&mut subagents_for_thread.lock().unwrap(), &event);
+                    let _ = tui_sender.send((event_thread_id.clone(), event));
+                }
                 _ => {
                     record_tool_event(&mut tools_for_thread.lock().unwrap(), &event);
                     let _ = tui_sender.send((event_thread_id.clone(), event));
@@ -1101,6 +1211,18 @@ async fn execute_turn(
         let result = {
             let store = store.lock().unwrap();
             persist_tool_records(&store, thread_id, turn, provider, &tool_records)
+        };
+        if let Err(error) = result {
+            turn_ledger.settle(TurnPhase::Failed, Some(&error.to_string()));
+            return Err(error);
+        }
+    }
+
+    let subagent_records = subagents_slot.lock().unwrap().drain(..).collect::<Vec<_>>();
+    if !subagent_records.is_empty() {
+        let result = {
+            let store = store.lock().unwrap();
+            persist_subagent_records(&store, thread_id, turn, provider, &subagent_records)
         };
         if let Err(error) = result {
             turn_ledger.settle(TurnPhase::Failed, Some(&error.to_string()));
@@ -1353,6 +1475,7 @@ mod tests {
         Interrupt,
         Slow,
         Panic,
+        Subagents,
     }
 
     struct ScriptAdapter {
@@ -1406,6 +1529,30 @@ mod tests {
                     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     let _ = emit.send(TurnEvent::TurnCompleted {
                         final_text: "slow done".into(),
+                        usage: None,
+                        native_session_id: None,
+                        rollout_path: None,
+                    });
+                }
+                AdapterMode::Subagents => {
+                    let _ = emit.send(TurnEvent::SubagentStarted {
+                        id: Some("s1".into()),
+                        name: "Explore".into(),
+                        detail: Some("parser".into()),
+                    });
+                    let _ = emit.send(TurnEvent::SubagentFinished {
+                        id: Some("s1".into()),
+                        name: "Explore".into(),
+                        status: "done".into(),
+                        detail: Some("found the parser".into()),
+                    });
+                    let _ = emit.send(TurnEvent::SubagentStarted {
+                        id: Some("s2".into()),
+                        name: "review".into(),
+                        detail: None,
+                    });
+                    let _ = emit.send(TurnEvent::TurnCompleted {
+                        final_text: "delegated".into(),
                         usage: None,
                         native_session_id: None,
                         rollout_path: None,
@@ -3078,6 +3225,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subagent_events_are_persisted_with_the_turn() {
+        let (store, thread_id, result) = run_scripted_turn(AdapterMode::Subagents).await;
+        result.expect("scripted subagent turn completes");
+        let rows = store.lock().unwrap().list_subagents(&thread_id).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].name, "Explore");
+        assert_eq!(rows[0].status, "done");
+        assert_eq!(rows[0].detail.as_deref(), Some("found the parser"));
+        assert!(rows[0].finished_at.is_some());
+        assert_eq!(rows[1].name, "review");
+        assert_eq!(
+            rows[1].status, "unknown",
+            "a child still running at turn end is not reported as running forever"
+        );
+        assert!(rows[1].finished_at.is_none());
+    }
+
+    #[tokio::test]
     async fn a_provider_session_is_persisted_even_when_the_turn_fails() {
         let (store, thread_id, result) = run_scripted_turn(AdapterMode::Fail).await;
         assert!(result.is_err());
@@ -3148,6 +3313,59 @@ mod tests {
         assert_eq!(records.len(), 3);
         assert_eq!(records[2].label, "shell ls");
         assert_eq!(records[2].ok, Some(true));
+    }
+
+    #[test]
+    fn subagent_events_pair_into_records() {
+        let mut records = Vec::new();
+        record_subagent_event(
+            &mut records,
+            &TurnEvent::SubagentStarted {
+                id: Some("s1".into()),
+                name: "Explore".into(),
+                detail: Some("parser".into()),
+            },
+        );
+        record_subagent_event(
+            &mut records,
+            &TurnEvent::SubagentStarted {
+                id: Some("s1".into()),
+                name: "Explore".into(),
+                detail: Some("parser".into()),
+            },
+        );
+        assert_eq!(records.len(), 1, "a repeated start updates the same child");
+        assert_eq!(records[0].status, "running");
+        assert!(records[0].finished_at.is_none());
+        record_subagent_event(
+            &mut records,
+            &TurnEvent::SubagentFinished {
+                id: Some("s1".into()),
+                name: "Explore".into(),
+                status: "done".into(),
+                detail: Some("found the parser".into()),
+            },
+        );
+        assert_eq!(records[0].status, "done");
+        assert_eq!(records[0].detail.as_deref(), Some("found the parser"));
+        assert!(records[0].finished_at.is_some());
+
+        record_subagent_event(
+            &mut records,
+            &TurnEvent::SubagentFinished {
+                id: None,
+                name: "review".into(),
+                status: "interrupted".into(),
+                detail: None,
+            },
+        );
+        assert_eq!(
+            records.len(),
+            2,
+            "a finish without a start becomes its own record"
+        );
+        assert_eq!(records[1].status, "interrupted");
+        assert!(records[1].finished_at.is_some());
     }
 
     #[test]

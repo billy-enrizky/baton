@@ -422,6 +422,8 @@ enum OrchestrationEvent {
     IntegrateFailed(String),
     Shipped(Box<ShipReport>),
     ShipFailed(String),
+    Reviewed(Box<RunReport>),
+    ReviewFailed(String),
 }
 
 enum GrepPickerEvent {
@@ -791,6 +793,8 @@ pub struct TuiState {
     orchestration_shipping: bool,
     orchestration_confirm_ship: bool,
     orchestration_ship_report: Option<ShipReport>,
+    orchestration_reviewing: bool,
+    orchestration_confirm_review: bool,
     orchestration_sender: std::sync::mpsc::Sender<OrchestrationEvent>,
     native_rewind_sender: std::sync::mpsc::Sender<NativeRewindEvent>,
     native_rewind_running: bool,
@@ -914,6 +918,8 @@ pub fn run_tui(
         orchestration_shipping: false,
         orchestration_confirm_ship: false,
         orchestration_ship_report: None,
+        orchestration_reviewing: false,
+        orchestration_confirm_review: false,
         orchestration_sender,
         native_rewind_sender,
         native_rewind_running: false,
@@ -1890,6 +1896,36 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             record_orchestration_message(state, format!("ship failed · {error}"));
             state.notice = Some(format!("ship failed: {error}"));
         }
+        OrchestrationEvent::Reviewed(report) => {
+            state.orchestration_reviewing = false;
+            state.orchestration_confirm_review = false;
+            let approved = report
+                .tasks
+                .iter()
+                .filter(|task| task.review_status.as_deref() == Some(orchestrate::REVIEW_APPROVE))
+                .count();
+            let blocked = report
+                .tasks
+                .iter()
+                .filter(|task| {
+                    matches!(
+                        task.review_status.as_deref(),
+                        Some(orchestrate::REVIEW_PENDING)
+                            | Some(orchestrate::REVIEW_REQUEST_CHANGES)
+                            | Some(orchestrate::REVIEW_FAILED)
+                    )
+                })
+                .count();
+            let notice = format!("review done: {approved} approved, {blocked} blocked");
+            record_orchestration_message(state, format!("review · {notice}"));
+            state.notice = Some(notice);
+            state.orchestration_report = Some(*report);
+        }
+        OrchestrationEvent::ReviewFailed(error) => {
+            state.orchestration_reviewing = false;
+            record_orchestration_message(state, format!("review failed · {error}"));
+            state.notice = Some(format!("review failed: {error}"));
+        }
     }
 }
 
@@ -1971,6 +2007,36 @@ fn start_shipping(state: &mut TuiState) {
         let event = match result {
             Ok(report) => OrchestrationEvent::Shipped(Box::new(report)),
             Err(error) => OrchestrationEvent::ShipFailed(error.to_string()),
+        };
+        let _ = sender.send(event);
+    });
+}
+
+fn start_review(state: &mut TuiState) {
+    let Some(report) = state.orchestration_report.as_ref() else {
+        return;
+    };
+    if state.orchestration_reviewing {
+        return;
+    }
+    let run_id = report.run_id.clone();
+    let cwd = report
+        .repo_root
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from(&state.thread.cwd));
+    let home = state.home.clone();
+    let permission_override = Some(state.permission_mode);
+    state.orchestration_reviewing = true;
+    state.orchestration_confirm_review = false;
+    state.notice = Some("reviewing completed worker commits...".into());
+    let sender = state.orchestration_sender.clone();
+    std::thread::spawn(move || {
+        let result = BatonStore::open(&home.join("baton.sqlite")).and_then(|store| {
+            orchestrate::review_run(&store, &home, &cwd, &run_id, &[], permission_override)
+        });
+        let event = match result {
+            Ok(report) => OrchestrationEvent::Reviewed(Box::new(report)),
+            Err(error) => OrchestrationEvent::ReviewFailed(error.to_string()),
         };
         let _ = sender.send(event);
     });
@@ -6410,7 +6476,10 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
     else {
         return;
     };
-    if state.orchestration_integrating || state.orchestration_shipping {
+    if state.orchestration_integrating
+        || state.orchestration_shipping
+        || state.orchestration_reviewing
+    {
         return;
     }
     if state.orchestration_confirm_integrate {
@@ -6435,6 +6504,17 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
         }
         return;
     }
+    if state.orchestration_confirm_review {
+        match key.code {
+            KeyCode::Enter => start_review(state),
+            KeyCode::Esc => {
+                state.orchestration_confirm_review = false;
+                state.notice = Some("review cancelled".into());
+            }
+            _ => {}
+        }
+        return;
+    }
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => {
             state.orchestration_report = None;
@@ -6442,6 +6522,7 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
             state.orchestration_selected = 0;
             state.orchestration_confirm_integrate = false;
             state.orchestration_confirm_ship = false;
+            state.orchestration_confirm_review = false;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.orchestration_selected = state.orchestration_selected.saturating_sub(1);
@@ -6479,6 +6560,27 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
                 ));
             }
         }
+        KeyCode::Char('r') => {
+            let reviewable = state
+                .orchestration_report
+                .as_ref()
+                .map(|report| {
+                    report
+                        .tasks
+                        .iter()
+                        .filter(|task| task.status == "completed" && task.commit.is_some())
+                        .count()
+                })
+                .unwrap_or(0);
+            if reviewable == 0 {
+                state.notice = Some("no completed worker commits to review".into());
+            } else {
+                state.orchestration_confirm_review = true;
+                state.notice = Some(format!(
+                    "run the reviewer over {reviewable} completed commit(s)?"
+                ));
+            }
+        }
         KeyCode::Char('a') => {
             let Some(run_id) = state
                 .orchestration_report
@@ -6506,6 +6608,7 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
                     state.orchestration_selected = 0;
                     state.orchestration_confirm_integrate = false;
                     state.orchestration_confirm_ship = false;
+                    state.orchestration_confirm_review = false;
                 }
                 Err(error) => state.notice = Some(format!("cannot archive run: {error}")),
             }
@@ -9210,7 +9313,7 @@ fn draw_orchestration_report(
             )
         } else {
             Line::styled(
-                "↑↓ select · enter open · i merge · p PRs · a archive · PgUp/PgDn scroll · esc closes",
+                "↑↓ select · enter open · r review · i merge · p PRs · a archive · PgUp/PgDn scroll · esc closes",
                 Style::default().fg(COLORS.muted),
             )
         },
@@ -13525,6 +13628,8 @@ mod tests {
             orchestration_shipping: false,
             orchestration_confirm_ship: false,
             orchestration_ship_report: None,
+            orchestration_reviewing: false,
+            orchestration_confirm_review: false,
             orchestration_sender: std::sync::mpsc::channel().0,
             native_rewind_sender: std::sync::mpsc::channel().0,
             native_rewind_running: false,
@@ -16859,6 +16964,11 @@ mod tests {
         assert!(task.merged_at.is_none(), "new work clears the merge marker");
         assert!(task.pr_url.is_none(), "new work must be shipped again");
         assert_eq!(
+            task.review_status.as_deref(),
+            Some(crate::orchestrate::REVIEW_PENDING),
+            "new work must be reviewed again"
+        );
+        assert_eq!(
             store
                 .lock()
                 .unwrap()
@@ -16868,8 +16978,8 @@ mod tests {
                 .find(|run| run.id == "run-followup")
                 .unwrap()
                 .status,
-            "completed",
-            "answering the question resolves the run"
+            "needs_review",
+            "a new commit waits for a fresh review"
         );
         assert!(
             state
@@ -16882,7 +16992,7 @@ mod tests {
         );
         assert_eq!(
             store.lock().unwrap().list_orchestration_runs(10).unwrap()[0].status,
-            "completed"
+            "needs_review"
         );
 
         {
@@ -25203,6 +25313,36 @@ exit 1
         assert!(
             text.contains("question: approve the worker change?"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn orchestration_report_r_asks_before_running_the_reviewer() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.orchestration_report = Some(sample_report(None));
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Char('r')));
+        assert!(state.orchestration_confirm_review);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("run the reviewer over 1"),
+            "{:?}",
+            state.notice
+        );
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Esc));
+        assert!(!state.orchestration_confirm_review);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("review cancelled"),
+            "{:?}",
+            state.notice
         );
     }
 

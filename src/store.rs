@@ -2398,7 +2398,7 @@ impl BatonStore {
             |row| row.get(0),
         )?;
         let blocked_reviews: i64 = tx.query_row(
-            "SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ? AND review_status IN ('request_changes', 'failed')",
+            "SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ? AND review_status IN ('pending', 'request_changes', 'failed')",
             params![run_id],
             |row| row.get(0),
         )?;
@@ -2601,7 +2601,7 @@ impl BatonStore {
         let finished_at = now_iso();
         if clear_markers {
             self.db.execute(
-                "UPDATE orchestration_tasks SET status = 'completed', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ?, merged_at = NULL, pr_url = NULL WHERE id = ?",
+                "UPDATE orchestration_tasks SET status = 'completed', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ?, merged_at = NULL, pr_url = NULL, review_status = 'pending', review_text = NULL, reviewed_at = NULL WHERE id = ?",
                 params![text, commit_sha, finished_at, id],
             )?;
         } else {
@@ -2623,7 +2623,7 @@ impl BatonStore {
         let finished_at = now_iso();
         if clear_markers {
             self.db.execute(
-                "UPDATE orchestration_tasks SET status = 'needs_input', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ?, merged_at = NULL, pr_url = NULL WHERE id = ?",
+                "UPDATE orchestration_tasks SET status = 'needs_input', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ?, merged_at = NULL, pr_url = NULL, review_status = 'pending', review_text = NULL, reviewed_at = NULL WHERE id = ?",
                 params![text, commit_sha, finished_at, id],
             )?;
         } else {
@@ -2647,7 +2647,7 @@ impl BatonStore {
         let blocked_reviews = tasks.iter().any(|task| {
             matches!(
                 task.review_status.as_deref(),
-                Some("request_changes") | Some("failed")
+                Some("pending") | Some("request_changes") | Some("failed")
             )
         });
         let status = if running {

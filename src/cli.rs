@@ -182,13 +182,16 @@ pub enum Commands {
         /// Hide a completed run from the default run lists without deleting it
         #[arg(long, value_name = "run-id", conflicts_with_all = ["list", "run", "integrate", "open_prs"])]
         archive: Option<String>,
+        /// Re-run the reviewer over completed worker commits
+        #[arg(long, value_name = "run-id", conflicts_with_all = ["list", "run", "archive", "integrate", "open_prs", "plan_only"])]
+        review: Option<String>,
         /// Merge completed worker branches into the current repository
         #[arg(long, value_name = "run-id", conflicts_with_all = ["list", "run", "open_prs"])]
         integrate: Option<String>,
         /// Push completed worker branches and open one pull request per worker
         #[arg(long = "open-prs", value_name = "run-id", conflicts_with_all = ["list", "run", "integrate"])]
         open_prs: Option<String>,
-        /// Worker number to integrate or ship (repeatable, 1-based; default all eligible)
+        /// Worker number to review, integrate, or ship (repeatable, 1-based; default all eligible)
         #[arg(long = "task", value_name = "N")]
         tasks: Vec<usize>,
         /// Print worker progress lines to stderr

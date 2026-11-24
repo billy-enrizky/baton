@@ -138,6 +138,16 @@ def main() -> int:
         )
         + "\n"
     )
+    (Path(home) / "config.json").write_text(
+        json.dumps(
+            {
+                "defaultProvider": "claude",
+                "codex": {"apiKeyEnv": "CODEX_ICA_API_KEY"},
+                "grok": {"mode": "subscription", "apiKeyEnv": "XAI_API_KEY"},
+            }
+        )
+        + "\n"
+    )
     (claude_config / "CLAUDE.md").write_text("# user memory\n")
     (claude_config / "rules").mkdir(parents=True)
     (claude_config / "rules" / "one.md").write_text("# user rule\n")
@@ -163,6 +173,8 @@ def main() -> int:
         env["CLAUDE_CONFIG_DIR"] = str(claude_config)
         env["CODEX_HOME"] = str(codex_config)
         env["CLAUDE_CODE_PROJECT_DIR_NAME"] = "probe-project"
+        env["CODEX_ICA_API_KEY"] = "baton-probe-key"
+        env.pop("XAI_API_KEY", None)
         for name in (
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
             "CLAUDE_CODE_REMOTE",
@@ -297,6 +309,81 @@ def main() -> int:
         (evidence / "roles-detail-screen.txt").write_text(roles_detail + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
+
+        os.write(master, b"/auth antigravity ")
+        pump(master, 0.8, transcript)
+        auth_completion = screen_text(transcript, args.width, args.height)
+        for value in [
+            "/auth antigravity subscription",
+            "/auth antigravity api",
+            "antigravity billing",
+        ]:
+            if value not in auth_completion:
+                missing.append(f"auth completion: {value}")
+        (evidence / "auth-completion-screen.txt").write_text(auth_completion + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/auth\r")
+        pump(master, 0.8, transcript)
+        auth_picker = screen_text(transcript, args.width, args.height)
+        for value in [
+            "billing mode · 1/12",
+            "claude subscription",
+            "codex api · key CODEX_ICA_API_KEY",
+            "enter apply",
+            "esc close",
+        ]:
+            if value not in auth_picker:
+                missing.append(f"auth picker: {value}")
+        (evidence / "auth-picker-screen.txt").write_text(auth_picker + "\n")
+        os.write(master, b"\x1b[A")
+        pump(master, 0.3, transcript)
+        auth_last = screen_text(transcript, args.width, args.height)
+        for value in ["billing mode · 12/12", "antigravity api"]:
+            if value not in auth_last:
+                missing.append(f"auth picker scroll: {value}")
+        (evidence / "auth-last-row-screen.txt").write_text(auth_last + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/auth codex api\r")
+        pump(master, 0.6, transcript)
+        auth_set = screen_text(transcript, args.width, args.height)
+        if "codex billing set to api" not in auth_set:
+            missing.append("auth codex api notice")
+        config_path = Path(home) / "config.json"
+        config = json.loads(config_path.read_text())
+        if config.get("codex", {}).get("mode") != "api":
+            missing.append("auth persisted codex api mode")
+        (evidence / "auth-set-screen.txt").write_text(auth_set + "\n")
+
+        os.write(master, b"/auth\r")
+        pump(master, 0.6, transcript)
+        for _ in range(7):
+            os.write(master, b"\x1b[B")
+            pump(master, 0.1, transcript)
+        auth_grok = screen_text(transcript, args.width, args.height)
+        for value in ["billing mode · 8/12", "grok api · missing XAI_API_KEY"]:
+            if value not in auth_grok:
+                missing.append(f"auth missing key row: {value}")
+        (evidence / "auth-grok-row-screen.txt").write_text(auth_grok + "\n")
+        os.write(master, b"\r")
+        pump(master, 0.5, transcript)
+        auth_missing = screen_text(transcript, args.width, args.height)
+        for value in ["no API key for grok", "billing mode · 8/12"]:
+            if value not in auth_missing:
+                missing.append(f"auth missing key result: {value}")
+        (evidence / "auth-missing-key-screen.txt").write_text(auth_missing + "\n")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/auth codex subscription\r")
+        pump(master, 0.6, transcript)
+        if "codex billing set to subscription" not in screen_text(
+            transcript, args.width, args.height
+        ):
+            missing.append("auth codex subscription notice")
 
         os.write(master, b"/settings\r")
         pump(master, 0.8, transcript)

@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 
 use crate::adapters::{AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
-use crate::config::{
-    describe_auth, load_config_file, load_config_file_strict, resolve_config, save_config_file,
-};
+use crate::config::{describe_auth, load_config_file_strict, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
 use crate::inbox::{self, InboxItem};
 use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
@@ -635,6 +633,8 @@ const PROVIDERS: [ProviderId; 6] = [
     ProviderId::OpenCode,
     ProviderId::Antigravity,
 ];
+
+const AUTH_PICKER_ROWS: usize = 8;
 
 pub struct TuiState {
     /// Terminal bell on turn end, opt-in through config.json.
@@ -4600,35 +4600,12 @@ fn handle_key(
                 state.overlay = Overlay::AuthPicker { selected };
             }
             KeyCode::Enter => {
-                let provider_index = selected / 2;
-                let is_api = selected % 2 == 1;
-                if let Some(provider) = PROVIDERS.get(provider_index).copied() {
-                    let mode = if is_api {
-                        crate::config::AuthMode::Api
-                    } else {
-                        crate::config::AuthMode::Subscription
-                    };
-                    let resolved =
-                        resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
-                    let provider_config = resolved.for_provider(provider);
-                    if mode == crate::config::AuthMode::Api && provider_config.api_key.is_none() {
-                        state.notice = Some(format!(
-                            "no API key for {provider}. Set {} in the environment, the harness config, or config.json.",
-                            provider_config.api_key_env_name
-                        ));
-                        return;
-                    }
-                    let mut file = load_config_file(&state.home).unwrap_or_default();
-                    file.providers
-                        .entry(provider.as_str().to_string())
-                        .or_default()
-                        .mode = Some(mode);
-                    if let Err(error) = save_config_file(&state.home, &file) {
-                        state.notice = Some(format!("cannot save config: {error}"));
-                        return;
-                    }
-                    state.banner_cache.borrow_mut().take();
-                    state.notice = Some(format!("{provider} billing set to {}", mode.as_str()));
+                let applied = auth_choices()
+                    .nth(selected)
+                    .map(|(provider, mode)| apply_auth_mode(state, provider, mode))
+                    .unwrap_or(false);
+                if !applied {
+                    state.overlay = Overlay::AuthPicker { selected };
                 }
             }
             _ => {
@@ -7449,38 +7426,18 @@ fn handle_command(
                     let provider = match ProviderId::parse(provider) {
                         Some(provider) => provider,
                         None => {
-                            state.notice =
-                                Some("usage: /auth <claude|codex> <subscription|api>".into());
+                            state.notice = Some(format!("usage: /{}", auth_usage()));
                             return;
                         }
                     };
                     let mode = match crate::config::AuthMode::parse(mode) {
                         Some(mode) => mode,
                         None => {
-                            state.notice =
-                                Some("usage: /auth <claude|codex> <subscription|api>".into());
+                            state.notice = Some(format!("usage: /{}", auth_usage()));
                             return;
                         }
                     };
-                    let provider_config = resolved.for_provider(provider);
-                    if mode == crate::config::AuthMode::Api && provider_config.api_key.is_none() {
-                        state.notice = Some(format!(
-                            "no API key for {provider}. Set {} in the environment, the harness config, or config.json.",
-                            provider_config.api_key_env_name
-                        ));
-                        return;
-                    }
-                    let mut file = load_config_file(&state.home).unwrap_or_default();
-                    file.providers
-                        .entry(provider.as_str().to_string())
-                        .or_default()
-                        .mode = Some(mode);
-                    if let Err(error) = save_config_file(&state.home, &file) {
-                        state.notice = Some(format!("cannot save config: {error}"));
-                        return;
-                    }
-                    state.banner_cache.borrow_mut().take();
-                    state.notice = Some(format!("{provider} billing set to {}", mode.as_str()));
+                    apply_auth_mode(state, provider, mode);
                 }
                 (Some(provider), None) => match ProviderId::parse(provider) {
                     Some(parsed) => {
@@ -8982,7 +8939,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
             Overlay::ModePicker { .. } => 7,
-            Overlay::AuthPicker { .. } => 9,
+            Overlay::AuthPicker { .. } => AUTH_PICKER_ROWS + 3,
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
             Overlay::InboxPicker { items, .. } => items.len().min(8) + 4,
             Overlay::GrepPicker {
@@ -10468,31 +10425,107 @@ fn draw_command_list(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn auth_choices() -> impl Iterator<Item = (ProviderId, crate::config::AuthMode)> {
+    PROVIDERS.into_iter().flat_map(|provider| {
+        [
+            (provider, crate::config::AuthMode::Subscription),
+            (provider, crate::config::AuthMode::Api),
+        ]
+    })
+}
+
+fn auth_usage() -> String {
+    let providers = PROVIDERS
+        .iter()
+        .map(|provider| provider.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("auth <{providers}> subscription|api")
+}
+
+fn apply_auth_mode(
+    state: &mut TuiState,
+    provider: ProviderId,
+    mode: crate::config::AuthMode,
+) -> bool {
+    let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let provider_config = resolved.for_provider(provider);
+    if mode == crate::config::AuthMode::Api && provider_config.api_key.is_none() {
+        state.notice = Some(format!(
+            "no API key for {provider}. Set {} in the environment, the harness config, or config.json.",
+            provider_config.api_key_env_name
+        ));
+        return false;
+    }
+    let mut file = match load_config_file_strict(&state.home) {
+        Ok(file) => file.unwrap_or_default(),
+        Err(error) => {
+            state.notice = Some(format!("cannot read config: {error}"));
+            return false;
+        }
+    };
+    file.providers
+        .entry(provider.as_str().to_string())
+        .or_default()
+        .mode = Some(mode);
+    if let Err(error) = save_config_file(&state.home, &file) {
+        state.notice = Some(format!("cannot save config: {error}"));
+        return false;
+    }
+    state.banner_cache.borrow_mut().take();
+    state.notice = Some(format!("{provider} billing set to {}", mode.as_str()));
+    true
+}
+
 fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+    let count = PROVIDERS.len() * 2;
+    let selected = selected.min(count.saturating_sub(1));
+    let visible = count.min(AUTH_PICKER_ROWS);
+    let start = if count <= visible {
+        0
+    } else {
+        selected.saturating_sub(visible / 2).min(count - visible)
+    };
+    let position = if count > visible {
+        format!(" · {}/{}", selected + 1, count)
+    } else {
+        String::new()
+    };
     let mut lines: Vec<Line> = vec![Line::styled(
-        "billing mode · enter select · esc close",
+        format!("billing mode{position} · ↑↓ select · enter apply · esc close"),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, provider) in PROVIDERS.iter().enumerate() {
-        let config = resolved.for_provider(*provider);
-        for (mode_index, mode) in [0usize, 1usize].iter().zip(["subscription", "api"]) {
-            let flat_index = index * 2 + mode_index;
-            let is_api = *mode_index == 1;
-            let is_current = (config.mode == crate::config::AuthMode::Api) == is_api;
-            let marker = if is_current { "●" } else { " " };
-            let style = if flat_index == selected {
-                Style::default()
-                    .fg(COLORS.accent)
-                    .add_modifier(Modifier::BOLD)
+    for (index, (provider, mode)) in auth_choices().enumerate().skip(start).take(visible) {
+        let config = resolved.for_provider(provider);
+        let is_api = mode == crate::config::AuthMode::Api;
+        let marker = if config.mode == mode { "●" } else { " " };
+        let detail = if is_api {
+            let env_name = crate::sanitize::sanitize_terminal_text(&config.api_key_env_name);
+            if config.api_key.is_some() {
+                format!("key {env_name}")
             } else {
-                Style::default().fg(COLORS.muted)
-            };
-            lines.push(Line::styled(
-                format!("❯ {marker} {} {mode}", provider_label(*provider)),
-                style,
-            ));
-        }
+                format!("missing {env_name}")
+            }
+        } else {
+            "harness login".to_string()
+        };
+        let mode_label = if is_api { "api" } else { "subscription" };
+        let cursor = if index == selected { "❯" } else { " " };
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(
+            format!(
+                "{cursor} {marker} {} {mode_label} · {detail}",
+                provider_label(provider)
+            ),
+            style,
+        ));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -20363,6 +20396,116 @@ mod tests {
         assert_eq!(state.thread.reasoning_effort.as_deref(), Some("high"));
         let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
         assert!(text.contains("effort high"), "{text}");
+    }
+
+    #[test]
+    fn auth_picker_scrolls_to_every_provider_and_shows_one_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::AuthPicker { selected: 0 };
+        let first = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(first.contains("billing mode · 1/12"), "{first}");
+        assert!(first.contains("claude subscription"), "{first}");
+        assert!(first.contains("cursor api"), "{first}");
+        assert!(!first.contains("antigravity api"), "{first}");
+        let selected = first
+            .lines()
+            .filter(|line| {
+                line.contains('❯') && (line.contains(" subscription") || line.contains(" api ·"))
+            })
+            .count();
+        assert_eq!(selected, 1, "{first}");
+
+        state.overlay = Overlay::AuthPicker { selected: 11 };
+        let last = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(last.contains("billing mode · 12/12"), "{last}");
+        assert!(last.contains("antigravity api"), "{last}");
+        let selected = last
+            .lines()
+            .filter(|line| {
+                line.contains('❯') && (line.contains(" subscription") || line.contains(" api ·"))
+            })
+            .count();
+        assert_eq!(selected, 1, "{last}");
+    }
+
+    #[test]
+    fn auth_picker_applies_a_keyed_api_mode_and_closes() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::env::set_var("BATON_TEST_GROK_KEY", "probe-key");
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"grok":{"apiKeyEnv":"BATON_TEST_GROK_KEY"}}"#,
+        )
+        .unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::AuthPicker { selected: 7 };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        std::env::remove_var("BATON_TEST_GROK_KEY");
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("grok billing set to api"), "{notice}");
+        let file = crate::config::load_config_file(home.path()).unwrap();
+        assert_eq!(
+            file.providers["grok"].mode,
+            Some(crate::config::AuthMode::Api)
+        );
+    }
+
+    #[test]
+    fn auth_picker_keeps_open_and_names_a_missing_key() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"grok":{"mode":"subscription","apiKeyEnv":"BATON_TEST_MISSING_GROK_KEY"}}"#,
+        )
+        .unwrap();
+        std::env::remove_var("BATON_TEST_MISSING_GROK_KEY");
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::AuthPicker { selected: 7 };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(matches!(state.overlay, Overlay::AuthPicker { selected: 7 }));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("no API key for grok"), "{notice}");
+        assert!(notice.contains("BATON_TEST_MISSING_GROK_KEY"), "{notice}");
+    }
+
+    #[test]
+    fn auth_picker_refuses_to_overwrite_a_malformed_config() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.json");
+        std::fs::write(&path, "{broken").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::AuthPicker { selected: 0 };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(matches!(state.overlay, Overlay::AuthPicker { selected: 0 }));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("cannot read config"), "{notice}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
     }
 
     #[test]

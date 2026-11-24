@@ -763,6 +763,14 @@ mod tests {
     fn repo() -> tempfile::TempDir {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-q"]).unwrap();
+        let hooks = std::env::temp_dir().join("baton-test-no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        git(
+            root.path(),
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        )
+        .unwrap();
+        git(root.path(), &["config", "commit.gpgsign", "false"]).unwrap();
         git(root.path(), &["config", "user.email", "test@test"]).unwrap();
         git(root.path(), &["config", "user.name", "test"]).unwrap();
         std::fs::write(root.path().join("a.txt"), "base\n").unwrap();

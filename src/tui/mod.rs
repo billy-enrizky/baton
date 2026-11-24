@@ -141,6 +141,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/status",
         "show thread phase, goal, queue, and adapter states",
     ),
+    (
+        "/git",
+        "inspect the repository and commit the current thread's changes",
+    ),
     ("/compact", "compact the conversation to free context"),
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),
@@ -181,6 +185,7 @@ Common
   /pin                        pin or unpin; /pin move <id> up or down
   /inbox                      failed, unverified, needs-input, or queued work
   /status                     what is happening now
+  /git                        inspect changes and commit
   /activity                   every turn, tool call, diff, and usage
   /commands                   every command this thread ran
   /memory                     memory files and auto-memory
@@ -491,6 +496,19 @@ enum Overlay {
     MemoryPicker {
         selected: usize,
         listing: Box<crate::memory_files::MemoryListing>,
+    },
+    GitPicker {
+        selected: usize,
+        status: Box<crate::git_workflow::GitStatus>,
+        blocked: Option<String>,
+    },
+    GitStatus {
+        status: Box<crate::git_workflow::GitStatus>,
+        scroll: usize,
+    },
+    GitConfirm {
+        plan: Box<crate::git_workflow::CommitPlan>,
+        scroll: usize,
     },
     CopyPicker {
         selected: usize,
@@ -2496,7 +2514,7 @@ fn compute_suggestions(state: &TuiState) -> Vec<CommandSuggestion> {
         let mut suggestions = argument_suggestions(state, command);
         suggestions.retain(|suggestion| suggestion.insert.starts_with(prefix));
         if prefix != command {
-            if command == "/retry" {
+            if matches!(command, "/retry" | "/git") {
                 if let Some(index) = suggestions
                     .iter()
                     .position(|suggestion| suggestion.insert == prefix)
@@ -2665,6 +2683,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/orchestrate", _) => Some("orchestrate on|off|--plan-only|<goal>"),
         ("/runs", _) => Some("runs --all|<run id>"),
         ("/commands", _) => Some("commands [turn]"),
+        ("/git", _) => Some("git status|commit [--staged] [message]"),
         ("/queue", _) => Some("queue [send <n> | edit <n> <text> | move <from> <to> | clear]"),
         ("/mcp", "add") => Some("mcp add <name> <command> [args...]"),
         ("/mcp", "remove") => Some("mcp remove <name>"),
@@ -2825,6 +2844,15 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                     &id,
                     format!("open {} run: {}{archived}", run.status, run.goal),
                 );
+            }
+        }
+        "/git" => {
+            for (action, description) in [
+                ("status", "show branch, upstream, and changed files"),
+                ("commit", "commit all changes in the repository"),
+                ("commit --staged", "commit only staged changes"),
+            ] {
+                push_suggestion(&mut suggestions, command, action, description);
             }
         }
         "/queue" => {
@@ -3405,6 +3433,160 @@ fn apply_memory_action(
             state.notice = Some(format!("opening {}", open.label));
             state.pending_editor_open = Some(open);
             state.overlay = Overlay::None;
+        }
+    }
+}
+
+fn git_open_work(
+    state: &TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    root: &std::path::Path,
+) -> Option<String> {
+    if state.orchestration_pending {
+        return Some("orchestration is starting".to_string());
+    }
+    let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let threads = match store.lock().unwrap().list_threads(None) {
+        Ok(threads) => threads,
+        Err(error) => return Some(format!("cannot inspect threads: {error}")),
+    };
+    for thread in threads {
+        let cwd = std::path::Path::new(&thread.cwd);
+        let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+        if !cwd.starts_with(&root) {
+            continue;
+        }
+        let work = match store.lock().unwrap().thread_open_work(&thread.id) {
+            Ok(work) => work,
+            Err(error) => {
+                return Some(format!("cannot inspect thread {}: {error}", thread.id));
+            }
+        };
+        if let Some(work) = work {
+            return Some(format!("thread {} has {work:?} open", thread.id));
+        }
+    }
+    None
+}
+
+fn open_git_picker(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
+    match crate::git_workflow::inspect(std::path::Path::new(&state.thread.cwd)) {
+        Ok(status) => {
+            let blocked = git_open_work(state, store, &status.root);
+            state.overlay = Overlay::GitPicker {
+                selected: 0,
+                status: Box::new(status),
+                blocked,
+            };
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git: {error}")));
+        }
+    }
+}
+
+fn open_git_confirm(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    mode: crate::git_workflow::CommitMode,
+    message: Option<&str>,
+) {
+    let cwd = std::path::Path::new(&state.thread.cwd);
+    let root = match crate::git_workflow::inspect(cwd) {
+        Ok(status) => status.root,
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git: {error}")));
+            return;
+        }
+    };
+    if let Some(reason) = git_open_work(state, store, &root) {
+        state.notice = Some(git_line(&format!(
+            "git: {reason}; wait for it before committing"
+        )));
+        return;
+    }
+    match crate::git_workflow::plan_commit(cwd, mode, message) {
+        Ok(plan) => {
+            state.overlay = Overlay::GitConfirm {
+                plan: Box::new(plan),
+                scroll: 0,
+            };
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git: {error}")));
+            open_git_picker(state, store);
+        }
+    }
+}
+
+fn open_git_status(state: &mut TuiState) {
+    match crate::git_workflow::inspect(std::path::Path::new(&state.thread.cwd)) {
+        Ok(status) => {
+            state.overlay = Overlay::GitStatus {
+                status: Box::new(status),
+                scroll: 0,
+            };
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git: {error}")));
+        }
+    }
+}
+
+fn apply_git_picker(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    selected: usize,
+    status: crate::git_workflow::GitStatus,
+) {
+    match selected {
+        0 => open_git_status(state),
+        1 | 2 => {
+            if let Some(reason) = git_open_work(state, store, &status.root) {
+                state.notice = Some(git_line(&format!(
+                    "git: {reason}; wait for it before committing"
+                )));
+                state.overlay = Overlay::GitPicker {
+                    selected,
+                    status: Box::new(status),
+                    blocked: Some(reason),
+                };
+                return;
+            }
+            let mode = if selected == 1 {
+                crate::git_workflow::CommitMode::All
+            } else {
+                crate::git_workflow::CommitMode::Staged
+            };
+            open_git_confirm(state, store, mode, None);
+        }
+        _ => state.overlay = Overlay::None,
+    }
+}
+
+fn commit_git_plan(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    plan: crate::git_workflow::CommitPlan,
+) {
+    if let Some(reason) = git_open_work(state, store, &plan.root) {
+        state.notice = Some(git_line(&format!(
+            "git: {reason}; wait for it before committing"
+        )));
+        open_git_picker(state, store);
+        return;
+    }
+    match crate::git_workflow::commit(&plan) {
+        Ok(outcome) => {
+            state.notice = Some(git_line(&format!(
+                "committed {} · {} file(s) · {}",
+                outcome.sha, outcome.files, outcome.message
+            )));
+            state.overlay = Overlay::None;
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git commit failed: {error}")));
+            open_git_picker(state, store);
         }
     }
 }
@@ -4125,6 +4307,78 @@ fn handle_key(
                 state.overlay = Overlay::MemoryPicker { selected, listing };
             }
         },
+        Overlay::GitPicker {
+            mut selected,
+            status,
+            blocked,
+        } => match key.code {
+            KeyCode::Esc => {
+                state.overlay = Overlay::None;
+            }
+            KeyCode::Up => {
+                selected = (selected + 3) % 4;
+                state.overlay = Overlay::GitPicker {
+                    selected,
+                    status,
+                    blocked,
+                };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % 4;
+                state.overlay = Overlay::GitPicker {
+                    selected,
+                    status,
+                    blocked,
+                };
+            }
+            KeyCode::Home => {
+                state.overlay = Overlay::GitPicker {
+                    selected: 0,
+                    status,
+                    blocked,
+                };
+            }
+            KeyCode::End => {
+                state.overlay = Overlay::GitPicker {
+                    selected: 3,
+                    status,
+                    blocked,
+                };
+            }
+            KeyCode::Enter => apply_git_picker(state, store, selected, *status),
+            _ => {
+                state.overlay = Overlay::GitPicker {
+                    selected,
+                    status,
+                    blocked,
+                };
+            }
+        },
+        Overlay::GitStatus { status, mut scroll } => {
+            let max = status.display_changes().len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc => state.overlay = Overlay::None,
+                code => {
+                    if let Some(next) = git_scroll_key(code, scroll, max) {
+                        scroll = next;
+                    }
+                    state.overlay = Overlay::GitStatus { status, scroll };
+                }
+            }
+        }
+        Overlay::GitConfirm { plan, mut scroll } => {
+            let max = plan.files.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc => open_git_picker(state, store),
+                KeyCode::Enter => commit_git_plan(state, store, *plan),
+                code => {
+                    if let Some(next) = git_scroll_key(code, scroll, max) {
+                        scroll = next;
+                    }
+                    state.overlay = Overlay::GitConfirm { plan, scroll };
+                }
+            }
+        }
         Overlay::ModePicker { mut selected } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
@@ -6793,6 +7047,36 @@ fn handle_command(
                 _ => state.notice = Some("usage: /queue · /queue send <n> · /queue edit <n> <text> · /queue move <from> <to> · /queue clear".into()),
             }
         }
+        "/git" => match args.first().map(String::as_str) {
+            None => open_git_picker(state, store),
+            Some("status") => open_git_status(state),
+            Some("commit") => {
+                let mut rest = args[1..].to_vec();
+                let mode = if rest.first().map(String::as_str) == Some("--staged") {
+                    rest.remove(0);
+                    crate::git_workflow::CommitMode::Staged
+                } else {
+                    crate::git_workflow::CommitMode::All
+                };
+                if rest.first().map(String::as_str) == Some("--") {
+                    rest.remove(0);
+                }
+                if let Some(position) = rest.iter().position(|arg| arg == "--") {
+                    rest = rest[position + 1..].to_vec();
+                }
+                let message = if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.join(" "))
+                };
+                open_git_confirm(state, store, mode, message.as_deref());
+            }
+            Some(other) => {
+                state.notice = Some(git_line(&format!(
+                    "unknown /git action: {other} · usage: /git status|commit [--staged] [--] [message]"
+                )));
+            }
+        },
         "/compact" => {
             let messages: Vec<(String, String)> = state
                 .history
@@ -8549,6 +8833,19 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                     listing.warnings.len().min(3) + usize::from(listing.warnings.len() > 3);
                 listing.row_count().min(10) + 6 + warning_lines
             }
+            Overlay::GitPicker {
+                status, blocked, ..
+            } => {
+                7 + usize::from(blocked.is_some())
+                    + usize::from(status.operation.is_some())
+                    + usize::from(status.conflicts)
+            }
+            Overlay::GitStatus { status, .. } => {
+                let warnings =
+                    usize::from(status.operation.is_some()) + usize::from(status.conflicts);
+                status.display_changes().len().min(12) + 5 + warnings
+            }
+            Overlay::GitConfirm { plan, .. } => plan.files.len().min(12) + 8,
             Overlay::RolesPicker { roles, .. } => roles.len() + 6,
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
@@ -8652,6 +8949,17 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::MemoryPicker { selected, listing } => {
                 draw_memory_picker(frame, chunks[1], listing, *selected)
+            }
+            Overlay::GitPicker {
+                selected,
+                status,
+                blocked,
+            } => draw_git_picker(frame, chunks[1], status, *selected, blocked.as_deref()),
+            Overlay::GitStatus { status, scroll } => {
+                draw_git_status(frame, chunks[1], status, *scroll)
+            }
+            Overlay::GitConfirm { plan, scroll } => {
+                draw_git_confirm(frame, chunks[1], plan, *scroll)
             }
             Overlay::ModePicker { selected } => {
                 draw_mode_picker(frame, chunks[1], state, *selected)
@@ -9542,6 +9850,247 @@ fn memory_picker_window(
         }
         visible -= 1;
     }
+}
+
+fn git_line(value: &str) -> String {
+    let flattened = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    crate::sanitize::sanitize_terminal_text(&flattened).into_owned()
+}
+
+fn git_scroll_key(code: KeyCode, scroll: usize, max: usize) -> Option<usize> {
+    match code {
+        KeyCode::Up => Some(scroll.saturating_sub(1)),
+        KeyCode::Down => Some((scroll + 1).min(max)),
+        KeyCode::PageUp => Some(scroll.saturating_sub(8)),
+        KeyCode::PageDown => Some((scroll + 8).min(max)),
+        KeyCode::Home => Some(0),
+        KeyCode::End => Some(max),
+        _ => None,
+    }
+}
+
+fn draw_git_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    status: &crate::git_workflow::GitStatus,
+    selected: usize,
+    blocked: Option<&str>,
+) {
+    let files = status.changed_files();
+    let staged = status.staged_files();
+    let upstream = match status.upstream.as_deref() {
+        Some(upstream) => format!(
+            "{upstream} · ahead {} · behind {}",
+            status.ahead, status.behind
+        ),
+        None => "no upstream".to_string(),
+    };
+    let rows = [
+        (
+            "Status".to_string(),
+            format!(
+                "{} · {} changed · {upstream}",
+                git_line(&status.branch),
+                files.len()
+            ),
+        ),
+        (
+            "Commit all changes".to_string(),
+            if files.is_empty() {
+                "nothing to commit".to_string()
+            } else {
+                format!(
+                    "whole repo · {} · {} file(s)",
+                    git_line(&crate::git_workflow::generate_message(&files)),
+                    files.len()
+                )
+            },
+        ),
+        (
+            "Commit staged changes".to_string(),
+            if staged.is_empty() {
+                "nothing staged".to_string()
+            } else {
+                format!("staged index only · {} file(s)", staged.len())
+            },
+        ),
+        ("Cancel".to_string(), "esc".to_string()),
+    ];
+    let mut lines = vec![Line::styled(
+        "Git · whole repository · ↑↓ select · enter · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (label, detail)) in rows.iter().enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        let label = git_line(label);
+        let detail = git_line(detail);
+        lines.push(Line::styled(format!("{cursor} {label}  {detail}"), style));
+    }
+    if let Some(reason) = blocked {
+        lines.push(Line::styled(
+            format!("! commit blocked: {reason}"),
+            Style::default().fg(COLORS.warning),
+        ));
+    }
+    if let Some(operation) = status.operation.as_deref() {
+        lines.push(Line::styled(
+            format!("! {operation} in progress"),
+            Style::default().fg(COLORS.warning),
+        ));
+    }
+    if status.conflicts {
+        lines.push(Line::styled(
+            "! unresolved conflicts; commit is blocked",
+            Style::default().fg(COLORS.warning),
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_git_status(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    status: &crate::git_workflow::GitStatus,
+    scroll: usize,
+) {
+    let changes = status.display_changes();
+    let upstream = match status.upstream.as_deref() {
+        Some(upstream) => format!(
+            "upstream {} · ahead {} · behind {}",
+            git_line(upstream),
+            status.ahead,
+            status.behind
+        ),
+        None => "no upstream".to_string(),
+    };
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "Git status · {} · {} changed · ↑↓ scroll · esc close",
+                git_line(&status.branch),
+                changes.len()
+            ),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(upstream, Style::default().fg(COLORS.secondary)),
+    ];
+    if let Some(operation) = status.operation.as_deref() {
+        lines.push(Line::styled(
+            format!("! {operation} in progress"),
+            Style::default().fg(COLORS.warning),
+        ));
+    }
+    if status.conflicts {
+        lines.push(Line::styled(
+            "! unresolved conflicts; commit is blocked",
+            Style::default().fg(COLORS.warning),
+        ));
+    }
+    if changes.is_empty() {
+        lines.push(Line::styled(
+            "working tree clean",
+            Style::default().fg(COLORS.muted),
+        ));
+    } else {
+        let warning_rows = usize::from(status.operation.is_some()) + usize::from(status.conflicts);
+        let visible = (area.height.saturating_sub(5 + warning_rows as u16) as usize).max(1);
+        let start = scroll.min(changes.len().saturating_sub(visible));
+        let end = (start + visible).min(changes.len());
+        for change in &changes[start..end] {
+            lines.push(Line::styled(
+                format!("  {}", git_line(change)),
+                Style::default().fg(COLORS.muted),
+            ));
+        }
+        if end < changes.len() {
+            lines.push(Line::styled(
+                format!("  ... {} more below", changes.len() - end),
+                Style::default().fg(COLORS.muted),
+            ));
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_git_confirm(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    plan: &crate::git_workflow::CommitPlan,
+    scroll: usize,
+) {
+    let visible = (area.height.saturating_sub(7) as usize).max(1);
+    let start = scroll.min(plan.files.len().saturating_sub(visible));
+    let end = (start + visible).min(plan.files.len());
+    let range = if plan.files.is_empty() {
+        String::new()
+    } else {
+        format!(" · files {}-{}/{}", start + 1, end, plan.files.len())
+    };
+    let warning = match plan.mode {
+        crate::git_workflow::CommitMode::All => {
+            "! stages all changes in this worktree; untracked ignored files stay out; force-added ignored files are included · no push or PR"
+        }
+        crate::git_workflow::CommitMode::Staged => {
+            "! commits only the staged index; force-added ignored files are included · no push or PR"
+        }
+    };
+    let mut lines = vec![
+        Line::styled(
+            "Commit · enter confirm · esc cancel",
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            format!(
+                "branch {} · {}{range}",
+                git_line(&plan.branch),
+                plan.mode.label(),
+            ),
+            Style::default().fg(COLORS.secondary),
+        ),
+        Line::styled(
+            format!("message: {}", git_line(&plan.message)),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(warning, Style::default().fg(COLORS.warning)),
+    ];
+    for file in &plan.files[start..end] {
+        lines.push(Line::styled(
+            format!("  {}", git_line(file)),
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    if end < plan.files.len() {
+        lines.push(Line::styled(
+            format!("  ... {} more below", plan.files.len() - end),
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_mode_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
@@ -19989,6 +20538,400 @@ mod tests {
             .contains("auto-memory is read-only"));
         assert!(!home.path().join("claude").join("settings.json").exists());
         assert!(matches!(state.overlay, Overlay::MemoryPicker { .. }));
+    }
+
+    fn git_repo(root: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        run(&["init", "-q", "-b", "main"]);
+        let hooks = std::env::temp_dir().join("baton-test-no-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        run(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "status.showUntrackedFiles", "all"]);
+        let excludes = std::env::temp_dir().join("baton-test-empty-excludes");
+        std::fs::write(&excludes, "").unwrap();
+        run(&["config", "core.excludesFile", excludes.to_str().unwrap()]);
+        run(&["config", "user.email", "test@test"]);
+        run(&["config", "user.name", "test"]);
+        std::fs::write(root.join("base.txt"), "base\n").unwrap();
+        run(&["add", "."]);
+        run(&["commit", "-q", "-m", "init"]);
+    }
+
+    fn git_commit_count(root: &std::path::Path) -> usize {
+        let output = std::process::Command::new("git")
+            .args(["rev-list", "--count", "HEAD"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn git_command_flow() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        std::fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git");
+        let Overlay::GitPicker {
+            selected, status, ..
+        } = &state.overlay
+        else {
+            panic!("expected git picker");
+        };
+        assert_eq!(*selected, 0);
+        assert_eq!(status.changed_files(), vec!["dirty.txt".to_string()]);
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("Git ·"), "{text}");
+        assert!(text.contains("Commit all changes"), "{text}");
+        assert!(text.contains("Commit staged changes"), "{text}");
+        assert!(text.contains("nothing staged"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("nothing staged"));
+        assert!(matches!(state.overlay, Overlay::GitPicker { .. }));
+
+        let before = git_commit_count(repo.path());
+        handle_command(&mut state, &store, &engine_command_sender, "/git commit");
+        let Overlay::GitConfirm { plan, .. } = &state.overlay else {
+            panic!("expected git confirm");
+        };
+        assert_eq!(plan.mode, crate::git_workflow::CommitMode::All);
+        assert_eq!(plan.files, vec!["dirty.txt".to_string()]);
+        assert!(plan.message.starts_with("baton: update"));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("Commit ·"), "{text}");
+        assert!(text.contains("message: baton: update"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert_eq!(git_commit_count(repo.path()), before);
+        assert!(!crate::git_workflow::inspect(repo.path())
+            .unwrap()
+            .is_clean());
+        assert!(matches!(state.overlay, Overlay::GitPicker { .. }));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git commit");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(git_commit_count(repo.path()), before + 1);
+        assert!(state.notice.as_deref().unwrap_or("").contains("committed"));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(crate::git_workflow::inspect(repo.path())
+            .unwrap()
+            .is_clean());
+
+        std::fs::write(repo.path().join("base.txt"), "staged\n").unwrap();
+        let status = std::process::Command::new("git")
+            .args(["add", "base.txt"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        std::fs::write(repo.path().join("other.txt"), "other\n").unwrap();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/git commit --staged",
+        );
+        let Overlay::GitConfirm { plan, .. } = &state.overlay else {
+            panic!("expected git confirm for staged changes");
+        };
+        assert_eq!(plan.mode, crate::git_workflow::CommitMode::Staged);
+        assert_eq!(plan.files, vec!["base.txt".to_string()]);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/git commit fix --staged parsing",
+        );
+        let Overlay::GitConfirm { plan, .. } = &state.overlay else {
+            panic!("expected git confirm for a free-form message");
+        };
+        assert_eq!(plan.mode, crate::git_workflow::CommitMode::All);
+        assert_eq!(plan.message, "fix --staged parsing");
+    }
+
+    #[test]
+    fn git_command_outside_a_repository_shows_a_notice() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/git");
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("not inside a git repository"));
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn git_commit_is_blocked_by_open_work_in_the_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        std::fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let sibling = repo.path().join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "sibling".to_string(),
+                cwd: sibling.to_string_lossy().to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .start_turn_record(&other.id, 1, ProviderId::Claude, None)
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git commit");
+        assert!(state.notice.as_deref().unwrap_or("").contains("open"));
+        assert!(matches!(state.overlay, Overlay::None));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git");
+        let Overlay::GitPicker { blocked, .. } = &state.overlay else {
+            panic!("expected git picker");
+        };
+        assert!(blocked.as_deref().unwrap_or("").contains("open"));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("commit blocked"), "{text}");
+
+        store
+            .lock()
+            .unwrap()
+            .finish_turn_record(&other.id, 1, TurnPhase::Completed, None)
+            .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::GitConfirm { .. }));
+    }
+
+    #[test]
+    fn git_status_uses_the_repository_root_and_closes_with_escape() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        let subdirectory = repo.path().join("sub");
+        std::fs::create_dir_all(&subdirectory).unwrap();
+        std::fs::write(repo.path().join("root.txt"), "root\n").unwrap();
+        std::fs::write(subdirectory.join("file.txt"), "sub\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        state.thread.cwd = subdirectory.to_string_lossy().to_string();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git");
+        assert!(matches!(state.overlay, Overlay::GitPicker { .. }));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git status");
+        let Overlay::GitStatus { status, scroll } = &state.overlay else {
+            panic!("expected git status");
+        };
+        assert_eq!(*scroll, 0);
+        let rows = status.display_changes();
+        assert!(rows.iter().any(|row| row.ends_with("root.txt")), "{rows:?}");
+        assert!(
+            rows.iter().any(|row| row.ends_with("sub/file.txt")),
+            "{rows:?}"
+        );
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("Git status"), "{text}");
+        assert!(text.contains("main"), "{text}");
+        assert!(text.contains("no upstream"), "{text}");
+        assert!(text.contains("root.txt"), "{text}");
+        assert!(text.contains("sub/file.txt"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+
+        std::fs::write(repo.path().join(".git").join("MERGE_HEAD"), "deadbeef\n").unwrap();
+        handle_command(&mut state, &store, &engine_command_sender, "/git status");
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("a merge in progress"), "{text}");
+        std::fs::remove_file(repo.path().join(".git").join("MERGE_HEAD")).unwrap();
+    }
+
+    #[test]
+    fn git_confirmation_scrolls_past_the_visible_window() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        for index in 0..24 {
+            std::fs::write(
+                repo.path().join(format!("file-{index:02}.txt")),
+                format!("{index}\n"),
+            )
+            .unwrap();
+        }
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git commit");
+        let Overlay::GitConfirm { plan, scroll } = &state.overlay else {
+            panic!("expected git confirm");
+        };
+        assert_eq!(plan.files.len(), 24);
+        assert_eq!(*scroll, 0);
+        let text = buffer_lines(&render_state(&state, 120, 20)).join("\n");
+        assert!(text.contains("more below"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::End),
+        );
+        let text = buffer_lines(&render_state(&state, 120, 20)).join("\n");
+        assert!(text.contains("file-23.txt"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::GitPicker { .. }));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git status");
+        let Overlay::GitStatus { status, .. } = &mut state.overlay else {
+            panic!("expected git status");
+        };
+        status.operation = Some("a merge".to_string());
+        status.conflicts = true;
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::End),
+        );
+        let text = buffer_lines(&render_state(&state, 120, 20)).join("\n");
+        assert!(text.contains("file-23.txt"), "{text}");
+        assert!(text.contains("a merge in progress"), "{text}");
+        assert!(text.contains("unresolved conflicts"), "{text}");
+    }
+
+    #[test]
+    fn git_completion_lists_status_and_commit_actions() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "/git ".to_string();
+        let suggestions = suggestions_for(&state)
+            .into_iter()
+            .map(|suggestion| suggestion.insert)
+            .collect::<Vec<_>>();
+        assert!(
+            suggestions.contains(&"/git status".to_string()),
+            "{suggestions:?}"
+        );
+        assert!(
+            suggestions.contains(&"/git commit".to_string()),
+            "{suggestions:?}"
+        );
+        assert!(
+            suggestions.contains(&"/git commit --staged".to_string()),
+            "{suggestions:?}"
+        );
+    }
+
+    #[test]
+    fn git_exact_commit_completion_runs_all_mode() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        std::fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/git commit".to_string();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(state.input.is_empty());
+        let Overlay::GitConfirm { plan, .. } = &state.overlay else {
+            panic!("exact /git commit should open the confirmation");
+        };
+        assert_eq!(plan.mode, crate::git_workflow::CommitMode::All);
     }
 
     #[test]

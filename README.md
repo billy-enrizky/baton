@@ -176,6 +176,7 @@ Tools:
 - `baton_status`: provider, model, reasoning effort, mode, goal, latest turn, queue, usage, stale warning
 - `baton_threads`: durable threads for the current project, or every project with `all=true`
 - `baton_turns`: turn phases, timestamps, provider turn ids, errors
+- `baton_agents`: subagent calls recorded for a thread, with turn, provider, call id, name, detail, and status
 - `baton_messages`: newest conversation rows, including tool and diff rows
 - `baton_queue`: inspect queued follow-ups, or clear them explicitly
 - `baton_search`: search thread titles and conversation text in the project, or every project with `all=true`

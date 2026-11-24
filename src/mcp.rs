@@ -44,7 +44,7 @@ impl McpServer {
                     "version": env!("CARGO_PKG_VERSION"),
                     "title": "Baton thread state"
                 },
-                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. baton_fork creates a new thread from an existing conversation; set native=true for a Codex or OpenCode native fork."
+                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_agents, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. baton_fork creates a new thread from an existing conversation; set native=true for a Codex or OpenCode native fork."
             })),
             "ping" => Ok(json!({})),
             "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
@@ -114,6 +114,27 @@ impl McpServer {
                     "title": thread.title,
                     "count": turns.len(),
                     "turns": turns.iter().map(turn_json).collect::<Vec<_>>(),
+                }))
+            }
+            "baton_agents" => {
+                let thread = self.resolve_thread(argument_thread(arguments))?;
+                let rows = self.store.list_subagents(&thread.id)?;
+                Ok(json!({
+                    "schema_version": status::SCHEMA_VERSION,
+                    "thread_id": thread.id,
+                    "title": thread.title,
+                    "count": rows.len(),
+                    "subagents": rows.iter().map(|row| json!({
+                        "id": row.id,
+                        "turn": row.turn,
+                        "provider": row.provider,
+                        "call_id": row.call_id,
+                        "name": row.name,
+                        "detail": row.detail,
+                        "status": row.status,
+                        "started_at": row.started_at,
+                        "finished_at": row.finished_at,
+                    })).collect::<Vec<_>>(),
                 }))
             }
             "baton_activity" => {
@@ -573,6 +594,12 @@ fn tool_descriptors() -> Vec<Value> {
             "annotations": { "readOnlyHint": true }
         }),
         json!({
+            "name": "baton_agents",
+            "description": "List the subagent calls recorded for a thread, with turn, provider, call id, name, detail, and status.",
+            "inputSchema": thread_schema(),
+            "annotations": { "readOnlyHint": true }
+        }),
+        json!({
             "name": "baton_activity",
             "description": "Inspect every turn's provider, model, phase, tool calls, diff presence, and usage. Imported message-only turns are marked imported.",
             "inputSchema": thread_schema(),
@@ -801,6 +828,7 @@ mod tests {
         assert!(names.contains(&"baton_orchestration_runs"));
         assert!(names.contains(&"baton_orchestration_report"));
         assert!(names.contains(&"baton_fork"));
+        assert!(names.contains(&"baton_agents"));
         assert!(names.contains(&"baton_activity"));
         assert!(names.contains(&"baton_memories"));
         let fork_tool = listed["result"]["tools"]
@@ -810,6 +838,31 @@ mod tests {
             .find(|tool| tool["name"] == "baton_fork")
             .unwrap();
         assert!(fork_tool["inputSchema"]["properties"]["native"].is_object());
+    }
+
+    #[test]
+    fn agents_are_a_read_only_view() {
+        let server = server();
+        server
+            .store
+            .add_subagent(
+                &server.store.list_threads_for_path(&server.cwd).unwrap()[0].id,
+                1,
+                "claude",
+                Some("toolu_1"),
+                "Explore",
+                Some("Find the parser"),
+                "done",
+                "2026-01-01T00:00:00Z",
+                Some("2026-01-01T00:01:00Z"),
+            )
+            .unwrap();
+        let agents = tool_json(&server, "baton_agents", json!({}));
+        assert_eq!(agents["schema_version"], status::SCHEMA_VERSION);
+        assert_eq!(agents["count"], 1);
+        assert_eq!(agents["subagents"][0]["name"], "Explore");
+        assert_eq!(agents["subagents"][0]["status"], "done");
+        assert_eq!(agents["subagents"][0]["call_id"], "toolu_1");
     }
 
     #[test]

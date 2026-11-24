@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Live MCP stdio probe: initialize, list tools, and call the read-only tools.
 
-Seeds one failed OpenCode turn (the 401 records a native id without model
-tokens), then talks to `baton mcp` over newline-delimited JSON-RPC. Uses a
-throwaway BATON_HOME and never touches the real store.
+Seeds one empty thread with `baton new`, then talks to `baton mcp` over
+newline-delimited JSON-RPC. It needs no provider turn or external account.
+Uses a throwaway BATON_HOME and never touches the real store.
 """
 
 import argparse
@@ -46,23 +46,37 @@ class Rpc:
 
 
 def run(binary: str, evidence: Path) -> dict:
-    if shutil.which("opencode") is None:
-        raise SystemExit("opencode is not installed; the MCP probe needs its 401 seed")
     home = tempfile.mkdtemp(prefix="baton-mcp-home-")
     cwd = tempfile.mkdtemp(prefix="baton-mcp-cwd-")
     env = os.environ.copy()
     env["BATON_HOME"] = home
     try:
         seed = subprocess.run(
-            [binary, "-C", cwd, "exec", "-p", "opencode", "--json", "mcp seed"],
+            [binary, "-C", cwd, "new", "mcp seed"],
             env=env,
             capture_output=True,
             text=True,
         )
-        seed_json = json.loads(seed.stdout)
-        thread_id = seed_json["thread_id"]
-        if seed_json.get("phase") != "failed" or "401" not in (seed_json.get("error") or ""):
-            raise RuntimeError("the OpenCode seed did not fail with the expected 401")
+        if seed.returncode != 0:
+            raise RuntimeError(
+                "baton new failed: " + (seed.stderr.strip() or seed.stdout.strip())
+            )
+        listed = subprocess.run(
+            [binary, "-C", cwd, "threads", "--json"],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if listed.returncode != 0:
+            raise RuntimeError(
+                "baton threads failed: " + (listed.stderr.strip() or listed.stdout.strip())
+            )
+        threads_json = json.loads(listed.stdout)
+        if not threads_json:
+            raise RuntimeError("baton new created no thread")
+        seed_thread = threads_json[0]
+        thread_id = seed_thread["thread_id"]
+        provider = seed_thread["provider"]
 
         process = subprocess.Popen(
             [binary, "mcp"],
@@ -79,13 +93,15 @@ def run(binary: str, evidence: Path) -> dict:
         listed = rpc.call("tools/list")
         tools = [tool["name"] for tool in listed["result"]["tools"]]
         required = {
-            "baton_status", "baton_threads", "baton_turns", "baton_queue",
+            "baton_status", "baton_threads", "baton_turns", "baton_agents", "baton_queue",
             "baton_messages", "baton_search", "baton_latest_diff", "baton_doctor",
             "baton_processes", "baton_orchestration_runs",
-            "baton_orchestration_report", "baton_fork",
+            "baton_orchestration_report", "baton_fork", "baton_activity",
+            "baton_memories",
         }
         status_error, status = rpc.tool("baton_status")
         turns_error, turns = rpc.tool("baton_turns")
+        agents_error, agents = rpc.tool("baton_agents")
         threads_error, threads = rpc.tool("baton_threads")
         doctor_error, doctor = rpc.tool("baton_doctor")
         unknown_error, unknown = rpc.tool("baton_not_a_tool")
@@ -107,6 +123,8 @@ def run(binary: str, evidence: Path) -> dict:
                 "phase": (status.get("latest_turn") or {}).get("phase"),
                 "queue_count": status.get("queue_count"),
             },
+            "agents_error": agents_error,
+            "agents_count": agents.get("count"),
             "turns_error": turns_error,
             "turn_count": turns.get("count"),
             "provider_turn_id": (turns.get("turns") or [{}])[0].get("provider_turn_id"),
@@ -127,17 +145,17 @@ def run(binary: str, evidence: Path) -> dict:
             and result["tool_count"] == len(required)
             and not status_error
             and status.get("thread_id") == thread_id
-            and status.get("provider") == "opencode"
-            and (status.get("latest_turn") or {}).get("phase") == "failed"
+            and status.get("provider") == provider
+            and (status.get("latest_turn") or {}).get("phase") is None
             and status.get("queue_count") == 0
+            and not agents_error
+            and agents.get("count") == 0
             and not turns_error
-            and turns.get("count") == 1
-            and str((turns.get("turns") or [{}])[0].get("provider_turn_id") or "").startswith("msg_")
+            and turns.get("count") == 0
             and not threads_error
             and threads.get("count") == 1
             and not doctor_error
             and doctor.get("next_action")
-            and "opencode" in (doctor.get("ready") or [])
             and unknown_error
             and "unknown baton tool" in json.dumps(unknown)
             and exit_code == 0

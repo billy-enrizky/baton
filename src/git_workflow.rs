@@ -139,6 +139,7 @@ pub struct PullRequestPlan {
     pub root: PathBuf,
     pub branch: String,
     pub head: String,
+    pub base_head: String,
     pub remote: String,
     pub repo: String,
     pub base: String,
@@ -724,6 +725,10 @@ fn plan_pr_with(cwd: &Path, title: Option<&str>, gh: &Path) -> Result<PullReques
         .filter(|value| !value.is_empty())
         .context("gh repo view did not return a default branch")?
         .to_string();
+    let base_head = git_text(&root, &["rev-parse", "--verify", &format!("origin/{base}")])
+        .with_context(|| {
+            format!("cannot resolve origin/{base}; fetch before opening a pull request")
+        })?;
     if let Some(existing) = run_gh_allow_no_pr(
         &root,
         gh,
@@ -778,12 +783,23 @@ fn plan_pr_with(cwd: &Path, title: Option<&str>, gh: &Path) -> Result<PullReques
             status.branch
         );
     }
-    let log = git_text(&root, &["log", "--format=%s", "--reverse", &range])?;
-    let (title, body, commits) = pull_request_text(&log, title);
+    let log = git_text(
+        &root,
+        &[
+            "log",
+            "-n",
+            &MAX_PR_COMMITS.to_string(),
+            "--format=%s",
+            &range,
+        ],
+    )?;
+    let head_subject = git_text(&root, &["log", "-1", "--format=%s", "HEAD"])?;
+    let (title, body, commits) = pull_request_text(&log, ahead, title, Some(&head_subject));
     Ok(PullRequestPlan {
         root,
         branch: status.branch,
         head,
+        base_head,
         remote: "origin".to_string(),
         repo,
         base,
@@ -816,7 +832,23 @@ fn create_pr_with(plan: &PullRequestPlan, gh: &Path) -> Result<PullRequestOutcom
     if current_head(&plan.root)?.as_deref() != Some(plan.head.as_str()) {
         bail!("HEAD moved since the confirmation; review the pull request again");
     }
-    let remote_head = live_remote_head(&plan.root, &plan.remote, &plan.branch)?;
+    let live_heads = live_remote_heads(&plan.root, &plan.remote, &[&plan.base, &plan.branch])?;
+    let remote_base = live_heads
+        .iter()
+        .find(|(branch, _)| branch == &plan.base)
+        .map(|(_, head)| head.as_str())
+        .context("the live base branch is missing from the remote")?;
+    if remote_base != plan.base_head {
+        bail!(
+            "the remote base branch {} moved since the confirmation; review the pull request again",
+            plan.base
+        );
+    }
+    let remote_head = live_heads
+        .iter()
+        .find(|(branch, _)| branch == &plan.branch)
+        .map(|(_, head)| head.as_str())
+        .context("the live source branch is missing from the remote")?;
     if remote_head != plan.head {
         bail!(
             "the remote branch {} moved since the confirmation; review the pull request again",
@@ -854,70 +886,102 @@ fn create_pr_with(plan: &PullRequestPlan, gh: &Path) -> Result<PullRequestOutcom
     Ok(PullRequestOutcome { url, number })
 }
 
-fn pull_request_text(log: &str, supplied: Option<&str>) -> (String, String, Vec<String>) {
+fn pull_request_text(
+    log: &str,
+    total_commits: usize,
+    supplied: Option<&str>,
+    head_subject: Option<&str>,
+) -> (String, String, Vec<String>) {
     let mut subjects = log
         .lines()
         .map(sanitize_pr_text)
         .filter(|subject| !subject.is_empty())
         .collect::<Vec<_>>();
-    let last_subject = subjects.last().cloned();
-    let total_commits = subjects.len();
     subjects.truncate(MAX_PR_COMMITS);
     let title = supplied
         .map(sanitize_pr_text)
         .filter(|title| !title.is_empty())
-        .or(last_subject)
+        .or_else(|| {
+            head_subject
+                .map(sanitize_pr_text)
+                .filter(|title| !title.is_empty())
+        })
         .unwrap_or_else(|| "Baton changes".to_string())
         .chars()
         .take(MAX_PR_TITLE_CHARS)
         .collect();
-    let mut body_lines = vec!["## Summary".to_string(), String::new()];
-    body_lines.extend(subjects.iter().map(|subject| format!("- {subject}")));
-    if total_commits > subjects.len() {
-        let remaining = total_commits - subjects.len();
-        body_lines.push(if remaining == 1 {
-            "- and 1 more commit".to_string()
-        } else {
-            format!("- and {remaining} more commits")
-        });
-    }
-    let body = body_lines
-        .join("\n")
-        .chars()
-        .take(MAX_PR_BODY_CHARS)
-        .collect();
+    let body = loop {
+        let omitted = total_commits.saturating_sub(subjects.len());
+        let mut body_lines = vec!["## Summary".to_string(), String::new()];
+        body_lines.extend(subjects.iter().map(|subject| format!("- {subject}")));
+        if omitted > 0 {
+            body_lines.push(if omitted == 1 {
+                "- and 1 earlier commit".to_string()
+            } else {
+                format!("- and {omitted} earlier commits")
+            });
+        }
+        let body = body_lines.join("\n");
+        if body.chars().count() <= MAX_PR_BODY_CHARS {
+            break body;
+        }
+        if subjects.is_empty() {
+            break body.chars().take(MAX_PR_BODY_CHARS).collect();
+        }
+        subjects.pop();
+    };
     (title, body, subjects)
 }
 
-fn live_remote_head(root: &Path, remote: &str, branch: &str) -> Result<String> {
-    let reference = format!("refs/heads/{branch}");
+fn live_remote_heads(
+    root: &Path,
+    remote: &str,
+    branches: &[&str],
+) -> Result<Vec<(String, String)>> {
+    let references = branches
+        .iter()
+        .map(|branch| format!("refs/heads/{branch}"))
+        .collect::<Vec<_>>();
     let mut command = Command::new("git");
     command
-        .args(["ls-remote", "--exit-code", "--heads", remote, &reference])
+        .args(["ls-remote", "--heads", remote])
+        .args(&references)
         .current_dir(root)
         .env("GIT_TERMINAL_PROMPT", "0");
     let output = run_command_with_timeout(
         command,
-        &format!("git ls-remote {remote}/{branch}"),
+        &format!("git ls-remote {remote}/{}", branches.join(",")),
         GIT_REMOTE_TIMEOUT,
     )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!(
-            "cannot read {remote}/{branch}: {}",
+            "cannot read {remote}/{}: {}",
+            branches.join(","),
             if stderr.is_empty() {
-                "the branch is missing from the remote"
+                "git ls-remote failed"
             } else {
                 &stderr
             }
         );
     }
     let output = String::from_utf8_lossy(&output.stdout);
-    output
+    let heads = output
         .lines()
-        .find_map(|line| line.split_whitespace().next())
-        .map(str::to_string)
-        .context("git ls-remote returned no branch head")
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let head = parts.next()?;
+            let reference = parts.next()?;
+            let branch = reference.strip_prefix("refs/heads/")?;
+            Some((branch.to_string(), head.to_string()))
+        })
+        .collect::<Vec<_>>();
+    for branch in branches {
+        if !heads.iter().any(|(name, _)| name == branch) {
+            bail!("cannot read {remote}/{branch}: the branch is missing from the remote");
+        }
+    }
+    Ok(heads)
 }
 
 fn run_command_with_timeout(
@@ -1042,13 +1106,16 @@ fn kill_process_group(pid: u32) {
 fn kill_process_group(_pid: u32) {}
 
 fn remote_url_for_gh(url: &str) -> String {
+    let lower = url.to_ascii_lowercase();
     for scheme in ["https://", "http://"] {
-        if let Some(rest) = url.strip_prefix(scheme) {
+        if lower.starts_with(scheme) {
+            let rest = &url[scheme.len()..];
             if let Some(at) = rest.find('@') {
                 if !rest[..at].contains('/') {
                     return format!("{scheme}{}", &rest[at + 1..]);
                 }
             }
+            return format!("{scheme}{rest}");
         }
     }
     url.to_string()
@@ -2216,6 +2283,22 @@ exit 1"#,
             remote_url_for_gh("https://token@github.com/example/repo.git"),
             "https://github.com/example/repo.git"
         );
+        assert_eq!(
+            remote_url_for_gh("HTTPS://token@github.com/example/repo.git"),
+            "https://github.com/example/repo.git"
+        );
+        assert_eq!(
+            remote_url_for_gh("http://user:pass@github.com/example/repo.git"),
+            "http://github.com/example/repo.git"
+        );
+        assert_eq!(
+            remote_url_for_gh("ssh://git@github.com/example/repo.git"),
+            "ssh://git@github.com/example/repo.git"
+        );
+        assert_eq!(
+            remote_url_for_gh("git@github.com:example/repo.git"),
+            "git@github.com:example/repo.git"
+        );
         assert_eq!(plan.title, "Custom title");
         assert_eq!(plan.body, "## Summary\n\n- Add feature");
         assert_eq!(plan.commit_count, 1);
@@ -2223,6 +2306,10 @@ exit 1"#,
         assert_eq!(
             plan.head,
             git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap()
+        );
+        assert_eq!(
+            plan.base_head,
+            git_text(repo.path(), &["rev-parse", "origin/main"]).unwrap()
         );
 
         let generated = plan_pr_with(repo.path(), None, &gh).unwrap();
@@ -2340,7 +2427,7 @@ exit 1"#,
         );
         let error = create_pr_with(&plan, &gh).unwrap_err();
         assert!(
-            error.to_string().contains("cannot read origin/feat/pr"),
+            error.to_string().contains("is missing from the remote"),
             "{error}"
         );
 
@@ -2352,16 +2439,136 @@ exit 1"#,
     }
 
     #[test]
-    fn pull_request_text_uses_the_last_subject_after_body_truncation() {
-        let log = (1..=21)
+    fn create_pr_refuses_remote_branches_that_moved_after_the_preview() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        git(repo.path(), &["push", "-q", "origin", "main"]);
+        let base = git_text(repo.path(), &["rev-parse", "main"]).unwrap();
+        git(repo.path(), &["checkout", "-q", "-b", "feat/pr"]);
+        std::fs::write(repo.path().join("feature.txt"), "feature\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "Add feature"]);
+        git(repo.path(), &["push", "-q", "origin", "feat/pr"]);
+
+        let log = repo.path().join("gh.log");
+        let gh = fake_gh(
+            repo.path(),
+            "fake-gh-remote-move",
+            &format!(
+                r#"if [ "$1" = "repo" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{{"defaultBranchRef":{{"name":"main"}},"nameWithOwner":"example/repo"}}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf 'no pull requests found for branch\n' >&2
+  exit 1
+fi
+if [ "$1" = "pr" ] && [ "$2" = "create" ]; then
+  printf 'created\n' >> '{}'
+  printf 'https://github.com/example/repo/pull/7\n'
+  exit 0
+fi
+exit 1"#,
+                log.display()
+            ),
+        );
+
+        let plan = plan_pr_with(repo.path(), Some("Remote move"), &gh).unwrap();
+        assert_eq!(plan.base_head, base);
+
+        git(repo.path(), &["checkout", "-q", "-b", "remote-move"]);
+        std::fs::write(repo.path().join("remote.txt"), "remote\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "Remote only move"]);
+        git(
+            repo.path(),
+            &["push", "-q", "origin", "remote-move:refs/heads/feat/pr"],
+        );
+        git(repo.path(), &["checkout", "-q", "feat/pr"]);
+        let error = create_pr_with(&plan, &gh).unwrap_err();
+        assert!(
+            error.to_string().contains("remote branch feat/pr moved"),
+            "{error}"
+        );
+        assert!(
+            !log.exists(),
+            "gh pr create must not run after a remote move"
+        );
+
+        git(repo.path(), &["push", "-q", "origin", "+feat/pr:feat/pr"]);
+        git(repo.path(), &["checkout", "-q", "main"]);
+        std::fs::write(repo.path().join("base-moves.txt"), "base\n").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-q", "-m", "Base moves"]);
+        git(repo.path(), &["push", "-q", "origin", "main"]);
+        git(repo.path(), &["checkout", "-q", "feat/pr"]);
+        let error = create_pr_with(&plan, &gh).unwrap_err();
+        assert!(
+            error.to_string().contains("base branch main moved"),
+            "{error}"
+        );
+        assert!(!log.exists(), "gh pr create must not run after a base move");
+    }
+
+    fn newest_first_subjects(count: usize) -> String {
+        (1..=count)
+            .rev()
             .map(|index| format!("commit {index}"))
             .collect::<Vec<_>>()
-            .join("\n");
-        let (title, body, commits) = pull_request_text(&log, None);
+            .join("\n")
+    }
+
+    #[test]
+    fn pull_request_text_lists_newest_first_and_counts_earlier_commits() {
+        let log = newest_first_subjects(21);
+        let (title, body, commits) = pull_request_text(&log, 21, None, Some("commit 21"));
         assert_eq!(title, "commit 21");
         assert_eq!(commits.len(), MAX_PR_COMMITS);
-        assert_eq!(commits.last().map(String::as_str), Some("commit 20"));
-        assert!(body.contains("- and 1 more commit"), "{body}");
+        assert_eq!(commits.first().map(String::as_str), Some("commit 21"));
+        assert_eq!(commits.last().map(String::as_str), Some("commit 2"));
+        assert!(body.contains("- and 1 earlier commit"), "{body}");
+        assert!(!body.contains("earlier commits"), "{body}");
+        assert!(
+            body.find("commit 21") < body.find("commit 2\n"),
+            "newest subjects come first: {body}"
+        );
+    }
+
+    #[test]
+    fn pull_request_text_drops_the_oldest_listed_subject_to_fit_the_body_cap() {
+        let filler = "x".repeat(400);
+        let log = (1..=12)
+            .rev()
+            .map(|index| format!("commit {index} {filler}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let head = format!("commit 12 {filler}");
+        let (_, body, commits) = pull_request_text(&log, 30, None, Some(&head));
+        assert!(body.chars().count() <= MAX_PR_BODY_CHARS, "{body}");
+        assert!(commits.len() < MAX_PR_COMMITS, "{}", commits.len());
+        assert_eq!(commits.first(), Some(&head));
+        let omitted = 30 - commits.len();
+        assert!(
+            body.contains(&format!("- and {omitted} earlier commits")),
+            "{body}"
+        );
+        assert!(!body.contains("- and 30 earlier"), "{body}");
+    }
+
+    #[test]
+    fn pull_request_text_prefers_the_supplied_title_then_the_head_subject() {
+        let (title, _, _) = pull_request_text("earlier", 2, Some("supplied"), Some("head"));
+        assert_eq!(title, "supplied");
+        let (title, _, _) = pull_request_text("earlier", 2, None, Some("  head  "));
+        assert_eq!(title, "head");
+        let (title, _, _) = pull_request_text("earlier", 2, None, Some("   "));
+        assert_eq!(
+            title, "Baton changes",
+            "an empty HEAD subject must not borrow an earlier commit subject"
+        );
+        let (title, _, _) = pull_request_text("", 0, None, None);
+        assert_eq!(title, "Baton changes");
     }
 
     #[test]
@@ -2417,14 +2624,17 @@ exit 1"#,
         command
             .args(["-c", "sleep 5 & echo $! > \"$BATON_CHILD_PID\""])
             .env("BATON_CHILD_PID", &pid_path);
+        // The direct child exits immediately while the backgrounded sleep keeps
+        // the pipe open. The budget is generous so that a loaded machine cannot
+        // make shell startup look like a child that never exited.
         let started = Instant::now();
-        let error = run_command_with_timeout(command, "pipe fixture", Duration::from_millis(100))
-            .unwrap_err();
+        let error =
+            run_command_with_timeout(command, "pipe fixture", Duration::from_secs(1)).unwrap_err();
         assert!(
             error.to_string().contains("output did not close"),
             "{error}"
         );
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
         let pid = std::fs::read_to_string(&pid_path)
             .unwrap()
             .trim()

@@ -28,6 +28,7 @@ COMMANDS = [
     ("/queue", ["queue: empty"]),
     ("/activity", ["no turns yet"]),
     ("/commands", ["no tool calls recorded yet"]),
+    ("/agents", ["no subagent tool calls in this thread"]),
     ("/find zzz", ["no matches for"]),
     ("/switch", ["switch harness", "antigravity"]),
     ("/model", ["models ·", "enter", "esc"]),

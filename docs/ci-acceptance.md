@@ -20,6 +20,23 @@ This file records the runs that changed a decision. It is not a complete archive
 
 A p50 or p95 from a small sample is provisional. Until 100 runs or four weeks exist, p50 rows report n, median, and maximum; p95 rows report n and maximum. This record does not claim an accepted percentile.
 
+## 2026-11-24 stale merge-ref classification failure
+
+Run 45403231197 failed `Selection guard` with `selection changed between jobs` on a docs-only pull request. The `Changes` job reported `full_suite_reason=code` and selected every gate; the guard recomputed `full_suite_reason=docs`.
+
+Cause: `Changes` fetched `refs/pull/<number>/merge`. GitHub refreshes that ref asynchronously, so after a force-push it still described the previous head, which had been rebased away. The job diffed the new base SHA against the stale merge tree, so the merged code commit from the new base appeared as a deletion and the file list contained `src/feature.rs` as well as the docs file.
+
+Reproduction (`/tmp` fixture, base-owned `classify-paths.sh`):
+
+| Diff pair | Files | Selection |
+|---|---|---|
+| new base to stale merge ref (old command) | `notes.md`, `src_feature.rs` | `full_suite_reason=code`, every gate |
+| new base to event head SHA (new command) | `notes.md` | `docs_only=true`, `full_suite_reason=docs` |
+
+Fix: `Changes` now fetches `github.event.pull_request.base.sha` and `github.event.pull_request.head.sha` and diffs that pair, the same base-to-HEAD diff the guard recomputes. Both values are fixed in the event payload for the run. `ci/check-ci.sh` rule `CI018` rejects a `--files` classification that does not read the head SHA or that reads `refs/pull/`, with the fixture `ci/fixtures/check-ci/invalid-stale-merge-ref.yml`.
+
+Cost: one extra shallow commit object per run, measured in the next pull request sample. No gate changes: every code and meta pull request still runs the full suite.
+
 ## 2026-11-24 rejected recorded-time shard experiment
 
 A five-leg matrix (`tui`, `orchestrate`, `git`, `rest`, `integration`) was built from local module wall times. The local union executed all 640 tests and `ci/test-inventory.sh` returned `test_count=640`. The TLA+ admission model was extended with an `inventory` gate and `InventoryNeedsTest`; the real config checked 2,490,965 states and 360,485 distinct states, and the new mutation failed as required.

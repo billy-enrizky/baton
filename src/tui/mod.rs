@@ -141,10 +141,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/status",
         "show thread phase, goal, queue, and adapter states",
     ),
-    (
-        "/git",
-        "inspect the repository and commit the current thread's changes",
-    ),
+    ("/git", "inspect, commit, or push the repository"),
     ("/compact", "compact the conversation to free context"),
     ("/context", "show context usage"),
     ("/init", "create a CLAUDE.md memory file"),
@@ -185,7 +182,7 @@ Common
   /pin                        pin or unpin; /pin move <id> up or down
   /inbox                      failed, unverified, needs-input, or queued work
   /status                     what is happening now
-  /git                        inspect changes and commit
+  /git                        inspect, commit, or push
   /activity                   every turn, tool call, diff, and usage
   /commands                   every command this thread ran
   /memory                     memory files and auto-memory
@@ -509,6 +506,13 @@ enum Overlay {
     GitConfirm {
         plan: Box<crate::git_workflow::CommitPlan>,
         scroll: usize,
+    },
+    GitPushPicker {
+        selected: usize,
+        targets: Vec<crate::git_workflow::PushTarget>,
+    },
+    GitPushConfirm {
+        plan: Box<crate::git_workflow::PushPlan>,
     },
     CopyPicker {
         selected: usize,
@@ -2683,7 +2687,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/orchestrate", _) => Some("orchestrate on|off|--plan-only|<goal>"),
         ("/runs", _) => Some("runs --all|<run id>"),
         ("/commands", _) => Some("commands [turn]"),
-        ("/git", _) => Some("git status|commit [--staged] [message]"),
+        ("/git", _) => Some("git status|commit [--staged] [message]|push"),
         ("/queue", _) => Some("queue [send <n> | edit <n> <text> | move <from> <to> | clear]"),
         ("/mcp", "add") => Some("mcp add <name> <command> [args...]"),
         ("/mcp", "remove") => Some("mcp remove <name>"),
@@ -2851,6 +2855,7 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 ("status", "show branch, upstream, and changed files"),
                 ("commit", "commit all changes in the repository"),
                 ("commit --staged", "commit only staged changes"),
+                ("push", "push the current branch to a remote"),
             ] {
                 push_suggestion(&mut suggestions, command, action, description);
             }
@@ -3560,6 +3565,7 @@ fn apply_git_picker(
             };
             open_git_confirm(state, store, mode, None);
         }
+        3 => open_git_push_picker(state, store),
         _ => state.overlay = Overlay::None,
     }
 }
@@ -3587,6 +3593,90 @@ fn commit_git_plan(
         Err(error) => {
             state.notice = Some(git_line(&format!("git commit failed: {error}")));
             open_git_picker(state, store);
+        }
+    }
+}
+
+fn open_git_push_picker(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
+    state.overlay = Overlay::None;
+    let cwd = std::path::Path::new(&state.thread.cwd);
+    let status = match crate::git_workflow::inspect(cwd) {
+        Ok(status) => status,
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git: {error}")));
+            return;
+        }
+    };
+    if let Some(reason) = git_open_work(state, store, &status.root) {
+        state.notice = Some(git_line(&format!(
+            "git: {reason}; wait for it before pushing"
+        )));
+        return;
+    }
+    match crate::git_workflow::list_push_targets(cwd) {
+        Ok(targets) => {
+            state.overlay = Overlay::GitPushPicker {
+                selected: 0,
+                targets,
+            };
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git: {error}")));
+        }
+    }
+}
+
+fn apply_git_push_picker(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    selected: usize,
+    targets: Vec<crate::git_workflow::PushTarget>,
+) {
+    let Some(target) = targets.get(selected) else {
+        state.overlay = Overlay::None;
+        return;
+    };
+    match crate::git_workflow::plan_push(std::path::Path::new(&state.thread.cwd), &target.remote) {
+        Ok(plan) => {
+            state.overlay = Overlay::GitPushConfirm {
+                plan: Box::new(plan),
+            };
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git: {error}")));
+            open_git_push_picker(state, store);
+        }
+    }
+}
+
+fn push_git_plan(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    plan: crate::git_workflow::PushPlan,
+) {
+    if let Some(reason) = git_open_work(state, store, &plan.root) {
+        state.notice = Some(git_line(&format!(
+            "git: {reason}; wait for it before pushing"
+        )));
+        open_git_push_picker(state, store);
+        return;
+    }
+    match crate::git_workflow::push(&plan) {
+        Ok(outcome) => {
+            let upstream = if outcome.upstream {
+                String::new()
+            } else {
+                " · upstream unchanged".to_string()
+            };
+            state.notice = Some(git_line(&format!(
+                "pushed {} to {}/{}{upstream}",
+                plan.branch, outcome.remote, outcome.remote_branch
+            )));
+            state.overlay = Overlay::None;
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git push failed: {error}")));
+            open_git_push_picker(state, store);
         }
     }
 }
@@ -4316,7 +4406,7 @@ fn handle_key(
                 state.overlay = Overlay::None;
             }
             KeyCode::Up => {
-                selected = (selected + 3) % 4;
+                selected = (selected + 4) % 5;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4324,7 +4414,7 @@ fn handle_key(
                 };
             }
             KeyCode::Down => {
-                selected = (selected + 1) % 4;
+                selected = (selected + 1) % 5;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4340,7 +4430,7 @@ fn handle_key(
             }
             KeyCode::End => {
                 state.overlay = Overlay::GitPicker {
-                    selected: 3,
+                    selected: 4,
                     status,
                     blocked,
                 };
@@ -4379,6 +4469,45 @@ fn handle_key(
                 }
             }
         }
+        Overlay::GitPushPicker {
+            mut selected,
+            targets,
+        } => match key.code {
+            KeyCode::Esc => state.overlay = Overlay::None,
+            KeyCode::Up => {
+                let count = targets.len() + 1;
+                selected = (selected + count - 1) % count;
+                state.overlay = Overlay::GitPushPicker { selected, targets };
+            }
+            KeyCode::Down => {
+                let count = targets.len() + 1;
+                selected = (selected + 1) % count;
+                state.overlay = Overlay::GitPushPicker { selected, targets };
+            }
+            KeyCode::Home => {
+                state.overlay = Overlay::GitPushPicker {
+                    selected: 0,
+                    targets,
+                };
+            }
+            KeyCode::End => {
+                state.overlay = Overlay::GitPushPicker {
+                    selected: targets.len(),
+                    targets,
+                };
+            }
+            KeyCode::Enter => apply_git_push_picker(state, store, selected, targets),
+            _ => {
+                state.overlay = Overlay::GitPushPicker { selected, targets };
+            }
+        },
+        Overlay::GitPushConfirm { plan } => match key.code {
+            KeyCode::Esc => open_git_push_picker(state, store),
+            KeyCode::Enter => push_git_plan(state, store, *plan),
+            _ => {
+                state.overlay = Overlay::GitPushConfirm { plan };
+            }
+        },
         Overlay::ModePicker { mut selected } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
@@ -7071,9 +7200,10 @@ fn handle_command(
                 };
                 open_git_confirm(state, store, mode, message.as_deref());
             }
+            Some("push") => open_git_push_picker(state, store),
             Some(other) => {
                 state.notice = Some(git_line(&format!(
-                    "unknown /git action: {other} · usage: /git status|commit [--staged] [--] [message]"
+                    "unknown /git action: {other} · usage: /git status|commit [--staged] [--] [message]|push"
                 )));
             }
         },
@@ -8836,7 +8966,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitPicker {
                 status, blocked, ..
             } => {
-                7 + usize::from(blocked.is_some())
+                8 + usize::from(blocked.is_some())
                     + usize::from(status.operation.is_some())
                     + usize::from(status.conflicts)
             }
@@ -8846,6 +8976,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 status.display_changes().len().min(12) + 5 + warnings
             }
             Overlay::GitConfirm { plan, .. } => plan.files.len().min(12) + 8,
+            Overlay::GitPushPicker { targets, .. } => targets.len().min(8) + 4,
+            Overlay::GitPushConfirm { .. } => 8,
             Overlay::RolesPicker { roles, .. } => roles.len() + 6,
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
@@ -8961,6 +9093,10 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitConfirm { plan, scroll } => {
                 draw_git_confirm(frame, chunks[1], plan, *scroll)
             }
+            Overlay::GitPushPicker { selected, targets } => {
+                draw_git_push_picker(frame, chunks[1], targets, *selected)
+            }
+            Overlay::GitPushConfirm { plan } => draw_git_push_confirm(frame, chunks[1], plan),
             Overlay::ModePicker { selected } => {
                 draw_mode_picker(frame, chunks[1], state, *selected)
             }
@@ -9923,6 +10059,13 @@ fn draw_git_picker(
                 format!("staged index only · {} file(s)", staged.len())
             },
         ),
+        (
+            "Push current branch".to_string(),
+            match status.upstream.as_deref() {
+                Some(upstream) => format!("upstream {}", git_line(upstream)),
+                None => "choose a remote".to_string(),
+            },
+        ),
         ("Cancel".to_string(), "esc".to_string()),
     ];
     let mut lines = vec![Line::styled(
@@ -9944,7 +10087,7 @@ fn draw_git_picker(
     }
     if let Some(reason) = blocked {
         lines.push(Line::styled(
-            format!("! commit blocked: {reason}"),
+            format!("! commit blocked: {}", git_line(reason)),
             Style::default().fg(COLORS.warning),
         ));
     }
@@ -10087,6 +10230,94 @@ fn draw_git_confirm(
             Style::default().fg(COLORS.muted),
         ));
     }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_git_push_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    targets: &[crate::git_workflow::PushTarget],
+    selected: usize,
+) {
+    let count = targets.len() + 1;
+    let visible = (area.height.saturating_sub(3) as usize).min(8).min(count);
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(count.saturating_sub(visible));
+    let mut lines = vec![Line::styled(
+        "Git push · ↑↓ select · enter confirm · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for index in start..(start + visible).min(count) {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        if let Some(target) = targets.get(index) {
+            let detail = if target.upstream {
+                format!(
+                    "upstream · ahead {} · behind {}",
+                    target.ahead, target.behind
+                )
+            } else {
+                "same-name branch · not tracked".to_string()
+            };
+            lines.push(Line::styled(
+                format!(
+                    "{cursor} {}/{}  {}",
+                    git_line(&target.remote),
+                    git_line(&target.remote_branch),
+                    git_line(&detail)
+                ),
+                style,
+            ));
+        } else {
+            lines.push(Line::styled(format!("{cursor} Cancel  esc"), style));
+        }
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_git_push_confirm(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    plan: &crate::git_workflow::PushPlan,
+) {
+    let tracking = if plan.upstream {
+        format!("ahead {} · behind {}", plan.ahead, plan.behind)
+    } else {
+        "not tracked · same-name branch · upstream unchanged".to_string()
+    };
+    let lines = vec![
+        Line::styled(
+            "Push · enter confirm · esc cancel",
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            format!(
+                "branch {} -> {}/{}",
+                git_line(&plan.branch),
+                git_line(&plan.remote),
+                git_line(&plan.remote_branch)
+            ),
+            Style::default().fg(COLORS.secondary),
+        ),
+        Line::styled(git_line(&tracking), Style::default().fg(COLORS.muted)),
+        Line::styled(
+            "! never force · no pull or merge · terminal prompt disabled; helper or SSH may prompt",
+            Style::default().fg(COLORS.warning),
+        ),
+    ];
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.border));
@@ -20554,6 +20785,7 @@ mod tests {
         std::fs::create_dir_all(&hooks).unwrap();
         run(&["config", "core.hooksPath", hooks.to_str().unwrap()]);
         run(&["config", "commit.gpgsign", "false"]);
+        run(&["config", "push.autoSetupRemote", "false"]);
         run(&["config", "status.showUntrackedFiles", "all"]);
         let excludes = std::env::temp_dir().join("baton-test-empty-excludes");
         std::fs::write(&excludes, "").unwrap();
@@ -20575,6 +20807,26 @@ mod tests {
             .trim()
             .parse()
             .unwrap()
+    }
+
+    fn git_bare_remote() -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--bare", "-q", "-b", "main"])
+            .current_dir(root.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        root
+    }
+
+    fn git_add_remote(repo: &std::path::Path, name: &str, remote: &std::path::Path) {
+        let status = std::process::Command::new("git")
+            .args(["remote", "add", name, remote.to_str().unwrap()])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 
     #[test]
@@ -20599,6 +20851,7 @@ mod tests {
         assert!(text.contains("Git ·"), "{text}");
         assert!(text.contains("Commit all changes"), "{text}");
         assert!(text.contains("Commit staged changes"), "{text}");
+        assert!(text.contains("Push current branch"), "{text}");
         assert!(text.contains("nothing staged"), "{text}");
 
         handle_key(
@@ -20888,6 +21141,207 @@ mod tests {
     }
 
     #[test]
+    fn git_push_picker_and_push_to_a_local_remote() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        let remote = git_bare_remote();
+        git_add_remote(repo.path(), "origin", remote.path());
+        std::fs::write(repo.path().join("pushed.txt"), "pushed\n").unwrap();
+        let add = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(add.success());
+        let commit = std::process::Command::new("git")
+            .args(["commit", "-q", "-m", "pushed"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(commit.success());
+        let base = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD~1"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let tracking = std::process::Command::new("git")
+            .args([
+                "update-ref",
+                "refs/remotes/origin/main",
+                String::from_utf8_lossy(&base.stdout).trim(),
+            ])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(tracking.success());
+        let upstream = std::process::Command::new("git")
+            .args(["branch", "--set-upstream-to=origin/main", "main"])
+            .current_dir(repo.path())
+            .status()
+            .unwrap();
+        assert!(upstream.success());
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git push");
+        let Overlay::GitPushPicker { selected, targets } = &state.overlay else {
+            panic!("expected push picker");
+        };
+        assert_eq!(*selected, 0);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].remote, "origin");
+        assert_eq!(targets[0].remote_branch, "main");
+        assert!(targets[0].upstream);
+        assert_eq!(targets[0].ahead, 1);
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("Git push"), "{text}");
+        assert!(text.contains("origin/main"), "{text}");
+        assert!(text.contains("ahead 1"), "{text}");
+        assert!(text.contains("Cancel"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("Push ·"), "{text}");
+        assert!(text.contains("branch main -> origin/main"), "{text}");
+        assert!(text.contains("never force"), "{text}");
+        assert!(text.contains("ahead 1"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("pushed main to origin/main"));
+        assert!(!state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("upstream unchanged"));
+        assert!(matches!(state.overlay, Overlay::None));
+        let local = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let remote_head = std::process::Command::new("git")
+            .args(["rev-parse", "refs/heads/main"])
+            .current_dir(remote.path())
+            .output()
+            .unwrap();
+        assert_eq!(local.stdout, remote_head.stdout);
+    }
+
+    #[test]
+    fn git_push_escape_and_no_remote_are_explicit() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git push");
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("no git remote"));
+        assert!(matches!(state.overlay, Overlay::None));
+
+        let remote = git_bare_remote();
+        git_add_remote(repo.path(), "origin", remote.path());
+        handle_command(&mut state, &store, &engine_command_sender, "/git push");
+        assert!(matches!(state.overlay, Overlay::GitPushPicker { .. }));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::GitPushConfirm { .. }));
+        state.orchestration_pending = true;
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        state.orchestration_pending = false;
+    }
+
+    #[test]
+    fn git_picker_commit_all_confirms_and_commits() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        std::fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let before = git_commit_count(repo.path());
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::GitConfirm { .. }));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(git_commit_count(repo.path()), before + 1);
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn git_commands_block_while_orchestration_starts() {
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        std::fs::write(repo.path().join("dirty.txt"), "dirty\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        state.orchestration_pending = true;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git commit");
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("orchestration is starting"));
+        assert!(matches!(state.overlay, Overlay::None));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/git push");
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("orchestration is starting"));
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
     fn git_completion_lists_status_and_commit_actions() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -20907,6 +21361,10 @@ mod tests {
         );
         assert!(
             suggestions.contains(&"/git commit --staged".to_string()),
+            "{suggestions:?}"
+        );
+        assert!(
+            suggestions.contains(&"/git push".to_string()),
             "{suggestions:?}"
         );
     }

@@ -84,7 +84,19 @@ def main() -> int:
         ["git", "config", "commit.gpgsign", "false"], cwd=workdir, check=True
     )
     subprocess.run(
+        ["git", "config", "push.autoSetupRemote", "false"],
+        cwd=workdir,
+        check=True,
+    )
+    subprocess.run(
         ["git", "config", "status.showUntrackedFiles", "all"],
+        cwd=workdir,
+        check=True,
+    )
+    empty_excludes = Path(home) / "empty-excludes"
+    empty_excludes.write_text("")
+    subprocess.run(
+        ["git", "config", "core.excludesFile", str(empty_excludes)],
         cwd=workdir,
         check=True,
     )
@@ -92,6 +104,14 @@ def main() -> int:
         ["git", "config", "user.email", "probe@example.com"], cwd=workdir, check=True
     )
     subprocess.run(["git", "config", "user.name", "probe"], cwd=workdir, check=True)
+    remote_path = Path(home) / "remote.git"
+    remote_path.mkdir()
+    subprocess.run(
+        ["git", "init", "--bare", "-q", "-b", "main"], cwd=remote_path, check=True
+    )
+    subprocess.run(
+        ["git", "remote", "add", "origin", str(remote_path)], cwd=workdir, check=True
+    )
     (Path(workdir) / ".git" / "info" / "exclude").write_text(".env\n")
     (Path(workdir) / ".env").write_text("IGNORED_MARKER=present\n")
     claude_config = Path(home) / "claude-config"
@@ -409,21 +429,25 @@ def main() -> int:
                 missing.append("memory editor target")
 
         os.write(master, b"/git\r")
-        pump(master, 0.8, transcript)
+        if not wait_for(master, "Git ·", 10.0, transcript):
+            missing.append("git picker")
+        pump(master, 0.2, transcript)
         git_picker = screen_text(transcript, args.width, args.height)
         git_required = [
             "Git ·",
             "Status",
             "Commit all changes",
             "Commit staged changes",
+            "Push current branch",
             "Cancel",
         ]
         missing.extend(value for value in git_required if value not in git_picker)
         (evidence / "git-picker-screen.txt").write_text(git_picker + "\n")
         os.write(master, b"\x1b[B")
-        pump(master, 0.1, transcript)
+        if not wait_for(master, "❯ Commit all changes", 5.0, transcript):
+            missing.append("git commit row selection")
         os.write(master, b"\r")
-        if not wait_for(master, "message: baton:", 5.0, transcript):
+        if not wait_for(master, "message: baton:", 10.0, transcript):
             missing.append("git confirm screen")
         pump(master, 0.2, transcript)
         git_confirm = screen_text(transcript, args.width, args.height)
@@ -439,7 +463,7 @@ def main() -> int:
         )
         (evidence / "git-confirm-screen.txt").write_text(git_confirm + "\n")
         os.write(master, b"\r")
-        if not wait_for(master, "committed ", 5.0, transcript):
+        if not wait_for(master, "committed ", 20.0, transcript):
             missing.append("git commit notice")
         pump(master, 0.4, transcript)
         (evidence / "git-committed-screen.txt").write_text(
@@ -449,25 +473,70 @@ def main() -> int:
             ["git", "-C", workdir, "log", "-1", "--format=%s"],
             capture_output=True,
             text=True,
-            check=True,
-        ).stdout.strip()
-        (evidence / "git-log-subject.txt").write_text(committed + "\n")
-        if committed != "baton: update 4 files":
-            missing.append("git generated commit message")
-        committed_names = subprocess.run(
-            ["git", "-C", workdir, "show", "--name-only", "--format=", "HEAD"],
+        )
+        if committed.returncode != 0:
+            missing.append("git commit missing")
+        else:
+            committed_subject = committed.stdout.strip()
+            (evidence / "git-log-subject.txt").write_text(committed_subject + "\n")
+            if committed_subject != "baton: update 4 files":
+                missing.append("git generated commit message")
+            committed_names = subprocess.run(
+                ["git", "-C", workdir, "show", "--name-only", "--format=", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            (evidence / "git-committed-files.txt").write_text(committed_names)
+            expected_names = sorted(
+                ["AGENTS.md", "CLAUDE.md", "README.md", "src/parser/mod.rs"]
+            )
+            if sorted(committed_names.splitlines()) != expected_names:
+                missing.append("git committed file set")
+            if ".env" in committed_names.splitlines():
+                missing.append("git committed an ignored file")
+
+        os.write(master, b"/git push\r")
+        if not wait_for(master, "Git push", 10.0, transcript):
+            missing.append("git push picker")
+        pump(master, 0.2, transcript)
+        push_picker = screen_text(transcript, args.width, args.height)
+        push_required = ["Git push", "origin/main", "Cancel"]
+        missing.extend(value for value in push_required if value not in push_picker)
+        if not any("❯ origin/main" in line for line in push_picker.splitlines()):
+            missing.append("git push target selection")
+        (evidence / "git-push-picker-screen.txt").write_text(push_picker + "\n")
+        os.write(master, b"\r")
+        if not wait_for(master, "Push ·", 10.0, transcript):
+            missing.append("git push confirm")
+        pump(master, 0.2, transcript)
+        push_confirm = screen_text(transcript, args.width, args.height)
+        push_confirm_required = ["Push ·", "branch main -> origin/main", "never force"]
+        missing.extend(
+            value for value in push_confirm_required if value not in push_confirm
+        )
+        (evidence / "git-push-confirm-screen.txt").write_text(push_confirm + "\n")
+        os.write(master, b"\r")
+        if not wait_for(master, "pushed main to origin/main", 20.0, transcript):
+            missing.append("git push notice")
+        pump(master, 0.3, transcript)
+        (evidence / "git-pushed-screen.txt").write_text(
+            screen_text(transcript, args.width, args.height) + "\n"
+        )
+        local_head = subprocess.run(
+            ["git", "-C", workdir, "rev-parse", "HEAD"],
             capture_output=True,
             text=True,
-            check=True,
-        ).stdout
-        (evidence / "git-committed-files.txt").write_text(committed_names)
-        expected_names = sorted(
-            ["AGENTS.md", "CLAUDE.md", "README.md", "src/parser/mod.rs"]
         )
-        if sorted(committed_names.splitlines()) != expected_names:
-            missing.append("git committed file set")
-        if ".env" in committed_names.splitlines():
-            missing.append("git committed an ignored file")
+        remote_head = subprocess.run(
+            ["git", "-C", str(remote_path), "rev-parse", "refs/heads/main"],
+            capture_output=True,
+            text=True,
+        )
+        if local_head.returncode != 0 or remote_head.returncode != 0:
+            missing.append("git push remote missing")
+        elif local_head.stdout.strip() != remote_head.stdout.strip():
+            missing.append("git push remote head")
 
         os.write(master, b"/files ")
         pump(master, 0.5, transcript)

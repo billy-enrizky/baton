@@ -52,6 +52,23 @@ The toolchain-cache conditional was rechecked against the current `ubuntu-24.04`
 
 Remaining levers, in measured order: a remote object cache such as sccache for the 11-second compile, a larger runner (spend), or splitting the crate so incremental compilation touches less. Diff-aware selection addresses at most the 5.7 seconds of execution.
 
+## 2026-11-24 post-`ba82720` window
+
+Sample: 21 successful `pull_request` runs after `ba82720` (2026-11-24T15:51:12Z), collected from the Actions API by `created_at` to `updated_at`. This is the start of the acceptance window that uses the fast classifier, the immutable base/head SHAs, and the current test profile. It is not yet 100 runs.
+
+| Window | n | p50 | p95 | Max |
+|---|---|---|---|---|
+| All successful PR runs after `ba82720` | 21 | 63.0 s | 79.0 s | 83 s |
+
+Verdict: p95 is under the 120-second target. p50 misses the 60-second target by 3.0 seconds. The sample includes a 31-second docs run and a 34-second workflow-only run; the code runs cluster at 53 to 83 seconds. The run's fixed cost is about 11 seconds from creation to the first job start, and the `Test` job still spends about 26 seconds in setup, toolchain restore, and Cargo cache restore before its 11-second compile and 6 seconds of test execution. Cutting the miss needs a shorter setup/restore path, not more test sharding or selection.
+
+Owner decisions with cost, not silently enabled:
+- A larger runner for the `Test` job can shorten the setup/restore path, but it requires spend and is not approved.
+- A remote object cache needs an additional service or cache tier; the measured compile is only about 11 seconds, so the expected gain does not justify the added dependency yet.
+- Splitting the crate so the test link touches less is a larger refactor and has no measurement yet.
+
+The next acceptance window is the first 100 successful PR runs after the current design; this 21-run sample stays in the record as an interim miss.
+
 ## 2026-11-24 stale merge-ref classification failure
 
 Run 45403231197 failed `Selection guard` with `selection changed between jobs` on a docs-only pull request. The `Changes` job reported `full_suite_reason=code` and selected every gate; the guard recomputed `full_suite_reason=docs`.

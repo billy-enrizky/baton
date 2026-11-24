@@ -57,7 +57,7 @@ Budget rule, applied at every phase: Phase 1 uses three times a conservative col
 | Keep full debuginfo in the test profile | Line tables keep readable backtraces and cut the warm compile from 18.94 to 14.13 seconds on the measured run. The cache key includes `Cargo.toml`, so the profile change cannot silently reuse incompatible artifacts. |
 | Shard the lib binary into five matrix legs | Tried on 2026-11-24 from recorded module times. The PR run took 87 seconds and the branch dispatch 70 seconds, against 64 seconds for the single Test job. Each leg repeated about 28 seconds of setup and cache restore, the slowest leg took 46 seconds, and the inventory job added 18 seconds. Rejected until a shared-artifact or diff-aware design has measured evidence. |
 | Replace the x64 Test job with the free ARM runner | The ARM run was faster, but it would remove pre-merge Linux x64 runtime coverage while the official merge queue is unavailable. The x64 job stays required. |
-| Move to a self-hosted or paid larger runner | No matched measurement or approved spend exists. The plan records this as an owner decision after 100 runs or four weeks of data. |
+| Move to a self-hosted or paid larger runner | The 21-run post-`ba82720` window is p50 63.0 s and p95 79.0 s. The fixed ~11 s run start plus ~26 s setup and cache restore in `Test` is the gap to 60 s; a larger runner is the remaining measured lever, but no spend is approved. |
 | Configure the official merge queue now | The repository is public but user-owned. Merge queue requires an organization owner; that is an ownership action, not a workflow change. |
 
 ## Current baseline

@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tui_probe import Screen, pump, set_size, wait_for
+from tui_probe import Screen, binary_identity, pump, set_size, wait_for
 
 COMMANDS = [
     ("/help", ["Type what you want to do"]),
@@ -76,6 +76,7 @@ FORBIDDEN = [
     "thread 'main' panicked",
     "panicked at",
     "unknown command",
+    "unknown /git action",
     "cannot fork: thread not found",
 ]
 
@@ -190,6 +191,7 @@ def main() -> int:
 
     summary = {
         "passed": not missing and not forbidden and exit_code == 0,
+        "binary": binary_identity(binary),
         "commands": len(COMMANDS),
         "missing": missing,
         "forbidden": forbidden,

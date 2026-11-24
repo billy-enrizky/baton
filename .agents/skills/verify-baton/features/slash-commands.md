@@ -23,6 +23,8 @@ The probe filters `/auth antigravity ` and requires both billing choices. It ope
 
 The probe opens `/git`, selects Checks against a fake `gh`, requires the PR header and pass/pending rows, then creates and pushes `feat/pr`, runs `/git pr`, requires the confirmation with `example/repo`, `feat/pr -> origin/main`, the generated title and body row, presses Enter, and requires the `opened pull request #43` notice with the fake URL. The fake `gh` rejects a pull request lookup or creation that omits the repository binding.
 
+The probe executes `/git checks` and `/git status` directly from the composer, requiring each overlay and its close hint. The single-cursor `/auth` invariant is covered by the TUI unit test; the PTY proof covers the 12-row window, key readiness, missing-key refusal, and persistence.
+
 The full sweep runs every command in one isolated session and requires each
 command's stable surface, no panic or unknown-command text, and a clean `/exit`:
 
@@ -33,6 +35,8 @@ uv run --no-project python .agents/skills/verify-baton/scripts/slash_sweep.py \
 ```
 
 `/quit` is covered by the slash probe.
+
+Both the probe and the sweep record the absolute binary path, its SHA-256, `baton --version`, and the repository source commit in `summary.json`, so an installed-binary claim identifies the exact artifact that ran.
 
 The retry probe owns `/retry ` completion because it needs failed turns. It
 requires `/retry 1` and `/retry 10` with their failed-turn descriptions, then
@@ -49,3 +53,4 @@ Installed-binary proof: the same slash probe passed against the v0.4.0 default c
 - `/mcp remove`, `/runs`, and `/copy` choices come from the MCP registry, current store, and conversation.
 - `/pin move ` offers both directions only for pinned threads in the current project. The probe enters the full ID from the picker row because the move notice, refreshed order, and boundary result are part of the proof.
 - `/git` completes status, commit, commit --staged, push, checks, and pr. The unit tests execute both the picker Checks row and exact `/git checks`. The probe commits the isolated repository, checks the real git subject and exact file list, pushes to a local bare remote, checks its head, opens Checks against a fake `gh`, and requires the PR header and the pass/pending rows. It then pushes `feat/pr`; `/git pr` requires the repository, base, title, body, and HEAD preview, and Enter requires the created PR notice and URL.
+- The sweep forbids `unknown /git action`, so the nested-command regression that produced it cannot pass unnoticed.

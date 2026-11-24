@@ -11,6 +11,7 @@ use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthChar;
 
 use crate::adapters::{AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
@@ -10839,13 +10840,19 @@ fn wrap_text_rows(text: &str, width: usize) -> Vec<String> {
     let mut row = String::new();
     let mut used = 0;
     for character in text.chars() {
-        if used == width {
+        let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if used + character_width > width && !row.is_empty() {
             rows.push(row);
             row = String::new();
             used = 0;
         }
         row.push(character);
-        used += 1;
+        used += character_width;
+        if used >= width {
+            rows.push(row);
+            row = String::new();
+            used = 0;
+        }
     }
     if !row.is_empty() || rows.is_empty() {
         rows.push(row);
@@ -12476,6 +12483,17 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| draw(frame, state, 0)).unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    #[test]
+    fn wrap_text_rows_counts_display_width_not_characters() {
+        assert_eq!(wrap_text_rows("abcdef", 3), vec!["abc", "def"]);
+        assert_eq!(wrap_text_rows("abcd", 3), vec!["abc", "d"]);
+        assert_eq!(wrap_text_rows("浙江大学", 4), vec!["浙江", "大学"]);
+        assert_eq!(wrap_text_rows("浙江大学", 2), vec!["浙", "江", "大", "学"]);
+        assert_eq!(wrap_text_rows("a浙b", 2), vec!["a", "浙", "b"]);
+        assert_eq!(wrap_text_rows("", 4), vec![""]);
+        assert_eq!(wrap_text_rows("x", 0), vec!["x"]);
     }
 
     fn buffer_lines(buffer: &ratatui::buffer::Buffer) -> Vec<String> {

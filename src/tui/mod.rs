@@ -161,6 +161,29 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/exit", "exit baton; alias for /quit"),
 ];
 
+const HELP_VIEW_ROWS: usize = 15;
+
+fn help_all_text() -> String {
+    let mut help = SLASH_COMMANDS
+        .iter()
+        .map(|(name, description)| format!("{name:<14} {description}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    help.push_str(
+        "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · esc: clear · drag transcript to copy",
+    );
+    help.push_str(
+        "\npaste a multi-line prompt: it stays in the composer · typing during a turn steers it · enter on an empty composer sends the next queued message",
+    );
+    help
+}
+
+/// The full help is built once; every frame only slices it.
+fn help_lines() -> &'static [String] {
+    static LINES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    LINES.get_or_init(|| help_all_text().lines().map(str::to_string).collect())
+}
+
 const EFFORT_VALUES: [&str; 6] = ["default", "low", "medium", "high", "xhigh", "max"];
 const PERMISSION_MODE_VALUES: [&str; 4] = ["default", "acceptEdits", "bypassPermissions", "plan"];
 
@@ -491,6 +514,9 @@ struct TranscriptPoint {
 
 enum Overlay {
     None,
+    Help {
+        scroll: usize,
+    },
     RewindPicker {
         selected: usize,
         native: bool,
@@ -4142,6 +4168,23 @@ fn handle_key(
     }
 
     match std::mem::replace(&mut state.overlay, Overlay::None) {
+        Overlay::Help { mut scroll } => {
+            let max = help_lines().len().saturating_sub(HELP_VIEW_ROWS);
+            let mut keep = true;
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => keep = false,
+                KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => scroll = (scroll + 1).min(max),
+                KeyCode::PageUp => scroll = scroll.saturating_sub(HELP_VIEW_ROWS),
+                KeyCode::PageDown => scroll = (scroll + HELP_VIEW_ROWS).min(max),
+                KeyCode::Home => scroll = 0,
+                KeyCode::End => scroll = max,
+                _ => {}
+            }
+            if keep {
+                state.overlay = Overlay::Help { scroll };
+            }
+        }
         Overlay::RewindPicker {
             mut selected,
             native,
@@ -7088,23 +7131,12 @@ fn handle_command(
     match command {
         "/quit" | "/exit" => state.quit = true,
         "/help" => {
-            let all = args.first().map(String::as_str) == Some("all");
-            state.notice = Some(if all {
-                let mut help = SLASH_COMMANDS
-                    .iter()
-                    .map(|(name, description)| format!("{name:<14} {description}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                help.push_str(
-                    "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · esc: clear · drag transcript to copy",
-                );
-                help.push_str(
-                    "\npaste a multi-line prompt: it stays in the composer · typing during a turn steers it · enter on an empty composer sends the next queued message",
-                );
-                help
+            if args.first().map(String::as_str) == Some("all") {
+                state.notice = None;
+                state.overlay = Overlay::Help { scroll: 0 };
             } else {
-                HELP_SUMMARY.to_string()
-            });
+                state.notice = Some(HELP_SUMMARY.to_string());
+            }
         }
         "/clear" => {
             state.diff_output = None;
@@ -9462,6 +9494,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     } else {
         match &state.overlay {
             Overlay::None => 0,
+            Overlay::Help { .. } => HELP_VIEW_ROWS + 3,
             Overlay::RewindPicker { .. } => {
                 state
                     .history
@@ -9742,6 +9775,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 draw_orchestration_preview(frame, chunks[1], state, preview)
             }
             Overlay::HandoffPreview { pending } => draw_handoff_preview(frame, chunks[1], pending),
+            Overlay::Help { scroll } => draw_help(frame, chunks[1], *scroll),
             Overlay::None => {}
         }
     }
@@ -11505,6 +11539,30 @@ struct FilesPickerView<'a> {
     truncated: bool,
     loading: bool,
     spinner: usize,
+}
+
+fn draw_help(frame: &mut ratatui::Frame, area: Rect, scroll: usize) {
+    let lines = help_lines();
+    let visible = (area.height as usize)
+        .saturating_sub(3)
+        .clamp(1, HELP_VIEW_ROWS);
+    let max = lines.len().saturating_sub(visible);
+    let scroll = scroll.min(max);
+    let mut rendered: Vec<Line> = vec![Line::styled(
+        format!(
+            "help · {} commands · {} lines · ↑↓ scroll · esc close",
+            SLASH_COMMANDS.len(),
+            lines.len()
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    for line in lines.iter().skip(scroll).take(visible) {
+        rendered.push(Line::raw(line.clone()));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(rendered).block(block), area);
 }
 
 fn draw_issue_picker(
@@ -22743,7 +22801,12 @@ exit 1
         assert!(!text.contains("/compact"), "the default help stays short");
 
         handle_command(&mut state, &store, &engine_command_sender, "/help all");
-        let text = state.notice.as_deref().unwrap_or("");
+        assert!(
+            matches!(state.overlay, Overlay::Help { scroll: 0 }),
+            "the full help is a scrollable overlay, not a notice"
+        );
+        assert!(state.notice.is_none());
+        let text = help_all_text();
         for (name, _) in SLASH_COMMANDS {
             assert!(text.contains(name), "missing {name} from /help all");
         }
@@ -22753,6 +22816,40 @@ exit 1
             text.contains("enter on an empty composer sends the next queued message"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn help_all_scrolls_to_the_last_line_and_closes() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/help all");
+        let first = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(first.contains("help ·"), "{first}");
+        assert!(first.contains("/help"), "{first}");
+        assert!(
+            !first.contains("/exit"),
+            "the first page does not reach the last command: {first}"
+        );
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::End),
+        );
+        let last = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(last.contains("/exit"), "{last}");
+        assert!(last.contains("shift+enter or alt+enter"), "{last}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
     }
 
     fn task_repo() -> (tempfile::TempDir, std::path::PathBuf) {

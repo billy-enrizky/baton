@@ -86,6 +86,9 @@ pub struct RoleSpec {
 pub struct RoleRegistry {
     pub roles: Vec<RoleSpec>,
     pub hooks: BTreeMap<String, Vec<HookSpec>>,
+    /// Whether orchestration runs the reviewer over each completed worker.
+    /// Defaults to true; `"review": false` in roles.json disables it.
+    pub review: bool,
     pub config_path: PathBuf,
 }
 
@@ -110,7 +113,7 @@ fn default_hook_timeout() -> u64 {
     30
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RolesFile {
     #[serde(default)]
@@ -119,6 +122,23 @@ struct RolesFile {
     roles: BTreeMap<String, RoleOverride>,
     #[serde(default)]
     hooks: BTreeMap<String, Vec<HookSpec>>,
+    #[serde(default = "default_review")]
+    review: bool,
+}
+
+impl Default for RolesFile {
+    fn default() -> Self {
+        Self {
+            schema_version: None,
+            roles: BTreeMap::new(),
+            hooks: BTreeMap::new(),
+            review: true,
+        }
+    }
+}
+
+fn default_review() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -373,6 +393,7 @@ pub fn load(home: &Path) -> Result<RoleRegistry> {
     Ok(RoleRegistry {
         roles,
         hooks: file.hooks,
+        review: file.review,
         config_path: config_path(home),
     })
 }

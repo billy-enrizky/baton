@@ -11,7 +11,6 @@ const MAX_MESSAGE_CHARS: usize = 200;
 pub struct GitStatus {
     pub root: PathBuf,
     pub branch: String,
-    pub head_ref: Option<String>,
     pub upstream: Option<String>,
     pub ahead: usize,
     pub behind: usize,
@@ -73,7 +72,6 @@ pub struct CommitOutcome {
 pub struct PushTarget {
     pub remote: String,
     pub local_branch: String,
-    pub local_ref: String,
     pub remote_branch: String,
     pub remote_ref: String,
     pub upstream: bool,
@@ -86,7 +84,6 @@ pub struct PushPlan {
     pub root: PathBuf,
     pub branch: String,
     pub head: String,
-    pub local_ref: String,
     pub remote: String,
     pub remote_branch: String,
     pub remote_ref: String,
@@ -189,7 +186,6 @@ pub fn inspect(cwd: &Path) -> Result<GitStatus> {
     Ok(GitStatus {
         root,
         branch,
-        head_ref,
         upstream,
         ahead,
         behind,
@@ -327,10 +323,6 @@ pub fn list_push_targets(cwd: &Path) -> Result<Vec<PushTarget>> {
     if status.conflicts {
         bail!("unresolved conflicts; resolve them before pushing");
     }
-    let head_ref = status
-        .head_ref
-        .clone()
-        .context("detached HEAD; check out a branch before pushing")?;
     let remotes = git_text(&status.root, &["remote"])?
         .lines()
         .map(str::trim)
@@ -357,11 +349,7 @@ pub fn list_push_targets(cwd: &Path) -> Result<Vec<PushTarget>> {
             } else {
                 status.branch.clone()
             };
-            let remote_ref = if remote_branch.starts_with("refs/heads/") {
-                remote_branch.clone()
-            } else {
-                format!("refs/heads/{remote_branch}")
-            };
+            let remote_ref = format!("refs/heads/{remote_branch}");
             let remote_branch = remote_ref
                 .strip_prefix("refs/heads/")
                 .unwrap_or(&remote_ref)
@@ -369,7 +357,6 @@ pub fn list_push_targets(cwd: &Path) -> Result<Vec<PushTarget>> {
             PushTarget {
                 remote,
                 local_branch: status.branch.clone(),
-                local_ref: head_ref.clone(),
                 remote_branch,
                 remote_ref,
                 upstream,
@@ -432,7 +419,6 @@ pub fn plan_push(cwd: &Path, remote: &str) -> Result<PushPlan> {
         root,
         branch: target.local_branch,
         head,
-        local_ref: target.local_ref,
         remote: target.remote,
         remote_branch: target.remote_branch,
         remote_ref: target.remote_ref,
@@ -487,11 +473,14 @@ fn push_arguments(plan: &PushPlan) -> Vec<String> {
     vec![
         "-c".to_string(),
         "push.autoSetupRemote=false".to_string(),
+        "-c".to_string(),
+        "push.recurseSubmodules=check".to_string(),
         "push".to_string(),
         "--porcelain".to_string(),
+        "--no-follow-tags".to_string(),
         "--".to_string(),
         plan.remote.clone(),
-        format!("{}:{}", plan.local_ref, plan.remote_ref),
+        format!("{}:{}", plan.head, plan.remote_ref),
     ]
 }
 
@@ -1274,6 +1263,9 @@ mod tests {
         std::fs::write(repo.path().join("pushed.txt"), "pushed\n").unwrap();
         git(repo.path(), &["add", "."]);
         git(repo.path(), &["commit", "-q", "-m", "pushed"]);
+        git(repo.path(), &["config", "push.recurseSubmodules", "only"]);
+        git(repo.path(), &["config", "push.followTags", "true"]);
+        git(repo.path(), &["tag", "-a", "v-test", "-m", "tag"]);
 
         let plan = plan_push(repo.path(), "origin").unwrap();
         let arguments = push_arguments(&plan);
@@ -1283,11 +1275,14 @@ mod tests {
             vec![
                 "-c",
                 "push.autoSetupRemote=false",
+                "-c",
+                "push.recurseSubmodules=check",
                 "push",
                 "--porcelain",
+                "--no-follow-tags",
                 "--",
                 "origin",
-                "refs/heads/main:refs/heads/main"
+                &format!("{}:refs/heads/main", plan.head)
             ]
         );
         push(&plan).unwrap();
@@ -1309,6 +1304,12 @@ mod tests {
         let local = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
         let remote = git_text(bare.path(), &["rev-parse", "refs/heads/main"]).unwrap();
         assert_eq!(local, remote);
+        let tags = Command::new("git")
+            .args(["show-ref", "--tags"])
+            .current_dir(bare.path())
+            .output()
+            .unwrap();
+        assert!(!tags.status.success(), "push must not follow tags");
     }
 
     #[test]
@@ -1394,12 +1395,32 @@ mod tests {
         assert!(targets.iter().any(|target| target.remote == "--force"));
         let plan = plan_push(repo.path(), "--force").unwrap();
         let arguments = push_arguments(&plan);
-        assert_eq!(arguments[4], "--");
-        assert_eq!(arguments[5], "--force");
+        assert_eq!(arguments[7], "--");
+        assert_eq!(arguments[8], "--force");
+        assert_eq!(arguments[9], format!("{}:refs/heads/main", plan.head));
         push(&plan).unwrap();
         let local = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
         let remote = git_text(bare.path(), &["rev-parse", "refs/heads/main"]).unwrap();
         assert_eq!(local, remote);
+    }
+
+    #[test]
+    fn push_preserves_a_branch_name_that_starts_with_refs_heads() {
+        let repo = repo();
+        let bare = bare_remote();
+        add_remote(repo.path(), "origin", bare.path());
+        git(repo.path(), &["checkout", "-q", "-b", "refs/heads/topic"]);
+        let targets = list_push_targets(repo.path()).unwrap();
+        assert_eq!(targets[0].remote_branch, "refs/heads/topic");
+        assert_eq!(targets[0].remote_ref, "refs/heads/refs/heads/topic");
+        let plan = plan_push(repo.path(), "origin").unwrap();
+        let arguments = push_arguments(&plan);
+        assert_eq!(
+            arguments.last().unwrap(),
+            &format!("{}:refs/heads/refs/heads/topic", plan.head)
+        );
+        push(&plan).unwrap();
+        assert!(git_text(bare.path(), &["rev-parse", "refs/heads/refs/heads/topic"]).is_ok());
     }
 
     #[test]

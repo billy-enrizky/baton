@@ -40,7 +40,7 @@ The entry point isolates each provider runner and converts a timeout, malformed 
 
 ```sh
 export CODEX_ICA_API_KEY=...
-.agents/skills/verify-baton/scripts/harness_matrix_probe.py \
+uv run --no-project python .agents/skills/verify-baton/scripts/harness_matrix_probe.py \
   --binary target/debug/baton \
   --evidence-dir local_docs/verification/evidence
 ```
@@ -50,14 +50,14 @@ The default run performs four small ICA turns and no live Claude turn. Add `--in
 ## Driving it with the PTY/CLI harness
 
 ```sh
-.agents/skills/verify-baton/scripts/harness_matrix_probe.py \
+uv run --no-project python .agents/skills/verify-baton/scripts/harness_matrix_probe.py \
   --binary target/debug/baton \
   --key-env CODEX_ICA_API_KEY \
   --base-url https://api.servicesessentials.ibm.com \
   --model gemini-3.7-flash \
   --evidence-dir local_docs/verification/evidence
 
-.agents/skills/verify-baton/scripts/harness_matrix_probe.py \
+uv run --no-project python .agents/skills/verify-baton/scripts/harness_matrix_probe.py \
   --binary target/debug/baton \
   --include-claude \
   --evidence-dir local_docs/verification/evidence
@@ -97,3 +97,4 @@ A live pass requires turn exit 0, the expected exact text, no provider error, an
 - OpenCode accepts a custom OpenAI-compatible provider through its own config; Baton does not map a custom base URL for OpenCode.
 - Codex Gemini requests fail at ICA with an unsupported `prompt_cache_key` parameter. Keep the known Codex ICA model or add a harness-specific request option before changing the matrix default.
 - Never print the API key. The script records the source variable name only and redacts the value from captured output.
+- Python 3.10 or newer is required. Use `uv run --no-project python`; a bare `python3` on macOS 3.9 exits with a version message before any harness starts.

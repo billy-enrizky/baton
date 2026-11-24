@@ -588,6 +588,13 @@ enum Overlay {
         plan: Box<crate::git_workflow::PullRequestPlan>,
         scroll: usize,
     },
+    GitReviewPicker {
+        selected: usize,
+    },
+    GitReviewConfirm {
+        plan: Box<crate::git_workflow::PrReviewPlan>,
+        scroll: usize,
+    },
     CopyPicker {
         selected: usize,
         replies: Vec<ReplyChoice>,
@@ -3008,7 +3015,10 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/orchestrate", _) => Some("orchestrate on|off|--plan-only|<goal>"),
         ("/runs", _) => Some("runs --all|<run id>"),
         ("/commands", _) => Some("commands [turn]"),
-        ("/git", _) => Some("git status|commit [--staged] [message]|push|checks|pr [title]"),
+        ("/git", "review") => Some("git review approve|request-changes|comment [body]"),
+        ("/git", _) => Some(
+            "git status|commit [--staged] [message]|push|checks|pr [title]|review [action] [body]",
+        ),
         ("/queue", _) => Some("queue [send <n> | edit <n> <text> | move <from> <to> | clear]"),
         ("/mcp", "add") => Some("mcp add <name> <command> [args...]"),
         ("/mcp", "remove") => Some("mcp remove <name>"),
@@ -3189,6 +3199,15 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 );
             }
         }
+        "/git" if state.input.starts_with("/git review ") => {
+            for (action, description) in [
+                ("approve", "approve the current pull request"),
+                ("request-changes", "request changes with a body"),
+                ("comment", "leave a comment with a body"),
+            ] {
+                push_suggestion(&mut suggestions, command, action, description);
+            }
+        }
         "/git" => {
             for (action, description) in [
                 ("status", "show branch, upstream, and changed files"),
@@ -3199,6 +3218,10 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 (
                     "pr",
                     "open a pull request with a generated or supplied title",
+                ),
+                (
+                    "review",
+                    "approve, request changes on, or comment on the current pull request",
                 ),
             ] {
                 push_suggestion(&mut suggestions, command, action, description);
@@ -3911,7 +3934,10 @@ fn apply_git_picker(
         }
         3 => open_git_push_picker(state, store),
         4 => open_git_checks(state),
-        5 => open_git_pr_confirm(state, store, None),
+        5 => {
+            state.overlay = Overlay::GitReviewPicker { selected: 0 };
+        }
+        6 => open_git_pr_confirm(state, store, None),
         _ => state.overlay = Overlay::None,
     }
 }
@@ -3955,6 +3981,55 @@ fn open_git_pr_confirm(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, tit
         }
         Err(error) => {
             state.notice = Some(git_line(&format!("git: {error}")));
+            open_git_picker(state, store);
+        }
+    }
+}
+
+fn open_git_review_confirm(
+    state: &mut TuiState,
+    action: crate::git_workflow::PrReviewAction,
+    body: Option<&str>,
+) {
+    match crate::git_workflow::plan_review(std::path::Path::new(&state.thread.cwd), action, body) {
+        Ok(plan) => {
+            state.overlay = Overlay::GitReviewConfirm {
+                plan: Box::new(plan),
+                scroll: 0,
+            };
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git review: {error}")));
+            if !matches!(state.overlay, Overlay::GitReviewPicker { .. }) {
+                state.overlay = Overlay::GitReviewPicker { selected: 0 };
+            }
+        }
+    }
+}
+
+fn create_git_review(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    plan: crate::git_workflow::PrReviewPlan,
+) {
+    match crate::git_workflow::review(&plan) {
+        Ok(()) => {
+            let notice = match plan.action {
+                crate::git_workflow::PrReviewAction::Approve => {
+                    format!("approved pull request #{}", plan.number)
+                }
+                crate::git_workflow::PrReviewAction::RequestChanges => {
+                    format!("requested changes on pull request #{}", plan.number)
+                }
+                crate::git_workflow::PrReviewAction::Comment => {
+                    format!("commented on pull request #{}", plan.number)
+                }
+            };
+            state.notice = Some(git_line(&format!("{notice} · {}", plan.url)));
+            state.overlay = Overlay::None;
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git review failed: {error}")));
             open_git_picker(state, store);
         }
     }
@@ -4844,7 +4919,7 @@ fn handle_key(
                 state.overlay = Overlay::None;
             }
             KeyCode::Up => {
-                selected = (selected + 6) % 7;
+                selected = (selected + 7) % 8;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4852,7 +4927,7 @@ fn handle_key(
                 };
             }
             KeyCode::Down => {
-                selected = (selected + 1) % 7;
+                selected = (selected + 1) % 8;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4868,7 +4943,7 @@ fn handle_key(
             }
             KeyCode::End => {
                 state.overlay = Overlay::GitPicker {
-                    selected: 6,
+                    selected: 7,
                     status,
                     blocked,
                 };
@@ -4955,6 +5030,50 @@ fn handle_key(
                         scroll = next;
                     }
                     state.overlay = Overlay::GitChecks { report, scroll };
+                }
+            }
+        }
+        Overlay::GitReviewPicker { mut selected } => match key.code {
+            KeyCode::Esc => state.overlay = Overlay::None,
+            KeyCode::Up => {
+                selected = (selected + 3) % 4;
+                state.overlay = Overlay::GitReviewPicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % 4;
+                state.overlay = Overlay::GitReviewPicker { selected };
+            }
+            KeyCode::Enter => match selected {
+                0..=2 => {
+                    let action = match selected {
+                        0 => crate::git_workflow::PrReviewAction::Approve,
+                        1 => crate::git_workflow::PrReviewAction::RequestChanges,
+                        _ => crate::git_workflow::PrReviewAction::Comment,
+                    };
+                    if action == crate::git_workflow::PrReviewAction::Approve {
+                        open_git_review_confirm(state, action, None);
+                    } else {
+                        state.input = format!("/git review {} ", action.as_str());
+                        state.overlay = Overlay::None;
+                    }
+                }
+                _ => open_git_picker(state, store),
+            },
+            _ => {
+                state.overlay = Overlay::GitReviewPicker { selected };
+            }
+        },
+        Overlay::GitReviewConfirm { plan, mut scroll } => {
+            let max = state.git_pr_scroll_max.get();
+            scroll = scroll.min(max);
+            match key.code {
+                KeyCode::Esc => open_git_picker(state, store),
+                KeyCode::Enter => create_git_review(state, store, *plan),
+                code => {
+                    if let Some(next) = git_scroll_key(code, scroll, max) {
+                        scroll = next;
+                    }
+                    state.overlay = Overlay::GitReviewConfirm { plan, scroll };
                 }
             }
         }
@@ -8080,6 +8199,21 @@ fn handle_command(
                 };
                 open_git_pr_confirm(state, store, title.as_deref());
             }
+            Some("review") => {
+                let Some(action) = args
+                    .get(1)
+                    .and_then(|value| crate::git_workflow::PrReviewAction::parse(value))
+                else {
+                    state.overlay = Overlay::GitReviewPicker { selected: 0 };
+                    return;
+                };
+                let body = if args.len() > 2 {
+                    Some(args[2..].join(" "))
+                } else {
+                    None
+                };
+                open_git_review_confirm(state, action, body.as_deref());
+            }
             Some(other) => {
                 state.notice = Some(git_line(&format!(
                     "unknown /git action: {other} · usage: /git status|commit [--staged] [--] [message]|push|checks|pr [title]"
@@ -9894,7 +10028,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitPicker {
                 status, blocked, ..
             } => {
-                10 + usize::from(blocked.is_some())
+                11 + usize::from(blocked.is_some())
                     + usize::from(status.operation.is_some())
                     + usize::from(status.conflicts)
             }
@@ -9908,6 +10042,14 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitPushConfirm { .. } => 8,
             Overlay::GitChecks { report, .. } => report.checks.len().min(12) + 5,
             Overlay::GitPrConfirm { plan, .. } => plan.body.lines().count().min(10) + 7,
+            Overlay::GitReviewPicker { .. } => 6,
+            Overlay::GitReviewConfirm { plan, .. } => {
+                plan.body
+                    .as_deref()
+                    .map(|body| body.lines().count().min(10))
+                    .unwrap_or(0)
+                    + 8
+            }
             Overlay::RolesPicker { roles, .. } => roles.len() + 6,
             Overlay::CopyPicker { replies, .. } => replies.len().min(8) + 4,
             Overlay::RunPicker { runs, .. } => runs.len().min(8) + 4,
@@ -10049,6 +10191,12 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::GitPrConfirm { plan, scroll } => {
                 draw_git_pr_confirm(frame, chunks[1], state, plan, *scroll)
+            }
+            Overlay::GitReviewPicker { selected } => {
+                draw_git_review_picker(frame, chunks[1], *selected)
+            }
+            Overlay::GitReviewConfirm { plan, scroll } => {
+                draw_git_review_confirm(frame, chunks[1], state, plan, *scroll)
             }
             Overlay::ModePicker { selected } => {
                 draw_mode_picker(frame, chunks[1], state, *selected)
@@ -10997,6 +11145,101 @@ fn git_scroll_key(code: KeyCode, scroll: usize, max: usize) -> Option<usize> {
     }
 }
 
+fn draw_git_review_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
+    let rows = [
+        ("Approve", "approve the current pull request"),
+        ("Request changes", "return the composer for a reason"),
+        ("Comment", "return the composer for a comment"),
+        ("Cancel", "esc"),
+    ];
+    let mut lines = vec![Line::styled(
+        "Review pull request · ↑↓ select · enter · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (label, detail)) in rows.iter().enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(format!("{cursor} {label}  {detail}"), style));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_git_review_confirm(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    plan: &crate::git_workflow::PrReviewPlan,
+    scroll: usize,
+) {
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines = vec![
+        Line::styled(
+            format!(
+                "Review pull request #{} · {} · enter confirms · esc cancels",
+                plan.number,
+                plan.action.label()
+            ),
+            Style::default()
+                .fg(COLORS.secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            truncate_chars(&format!("repo: {}", plan.root.display()), width),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            truncate_chars(
+                &format!(
+                    "branch: {} · head: {}",
+                    plan.branch,
+                    &plan.head_oid[..8.min(plan.head_oid.len())]
+                ),
+                width,
+            ),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            truncate_chars(&format!("title: {}", git_line(&plan.title)), width),
+            Style::default().fg(COLORS.text),
+        ),
+        Line::styled(
+            truncate_chars(&format!("url: {}", git_line(&plan.url)), width),
+            Style::default().fg(COLORS.muted),
+        ),
+    ];
+    if let Some(body) = plan.body.as_deref() {
+        lines.push(Line::styled(
+            "body:".to_string(),
+            Style::default().fg(COLORS.muted),
+        ));
+        let visible = body.lines().count().min(10);
+        state
+            .git_pr_scroll_max
+            .set(body.lines().count().saturating_sub(visible));
+        for line in body.lines().skip(scroll).take(visible) {
+            lines.push(Line::styled(
+                truncate_chars(&format!("  {line}"), width),
+                Style::default().fg(COLORS.text),
+            ));
+        }
+    } else {
+        state.git_pr_scroll_max.set(0);
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_git_picker(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -11056,6 +11299,10 @@ fn draw_git_picker(
         (
             "Open pull request".to_string(),
             "gh pr create with a title and body confirmation".to_string(),
+        ),
+        (
+            "Review pull request".to_string(),
+            "approve, request changes, or comment".to_string(),
         ),
         ("Cancel".to_string(), "esc".to_string()),
     ];
@@ -23120,6 +23367,116 @@ mod tests {
     }
 
     #[test]
+    fn git_review_picker_and_approve_confirmation() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let gh = repo.path().join("fake-gh-review");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+set -eu
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{{"number":42,"title":"Add review","url":"https://github.com/example/repo/pull/42","state":"OPEN","headRefName":"main","headRefOid":"{head}","isDraft":false}}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "review" ]; then
+  printf '%s\n' "$@" >> review-args.txt
+  exit 0
+fi
+exit 1
+"#
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("BATON_GH_BIN", &gh);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &sender, "/git review");
+        assert!(matches!(
+            state.overlay,
+            Overlay::GitReviewPicker { selected: 0 }
+        ));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        for value in [
+            "Review pull request",
+            "Approve",
+            "Request changes",
+            "Comment",
+        ] {
+            assert!(text.contains(value), "{value} missing: {text}");
+        }
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        let Overlay::GitReviewConfirm { plan, .. } = &state.overlay else {
+            panic!("expected review confirmation");
+        };
+        assert_eq!(plan.number, 42);
+        assert_eq!(plan.action, crate::git_workflow::PrReviewAction::Approve);
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("Review pull request #42 · Approve"), "{text}");
+        assert!(text.contains("head:"), "{text}");
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("approved pull request #42"),
+            "{:?}",
+            state.notice
+        );
+        let args = std::fs::read_to_string(repo.path().join("review-args.txt")).unwrap();
+        assert!(args.contains("review\n42\n--approve"), "{args}");
+
+        handle_command(&mut state, &store, &sender, "/git review");
+        handle_key(&mut state, &store, &sender, key(KeyCode::Down));
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.input, "/git review request-changes ");
+
+        handle_command(
+            &mut state,
+            &store,
+            &sender,
+            "/git review comment please explain",
+        );
+        let Overlay::GitReviewConfirm { plan, .. } = &state.overlay else {
+            panic!("expected review confirmation");
+        };
+        assert_eq!(plan.body.as_deref(), Some("please explain"));
+        handle_key(&mut state, &store, &sender, key(KeyCode::Esc));
+        assert!(matches!(state.overlay, Overlay::GitPicker { .. }));
+
+        handle_command(&mut state, &store, &sender, "/git review comment");
+        assert!(!matches!(state.overlay, Overlay::GitReviewConfirm { .. }));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("needs a body"),
+            "{:?}",
+            state.notice
+        );
+        std::env::remove_var("BATON_GH_BIN");
+    }
+
+    #[test]
     fn git_checks_picker_shows_the_current_pr_and_checks() {
         let _guard = EDITOR_ENV_LOCK.lock().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -23263,7 +23620,7 @@ exit 1
         let mut state = test_state(repo.path(), &store, Vec::new());
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &engine_command_sender, "/git");
-        for _ in 0..5 {
+        for _ in 0..6 {
             handle_key(
                 &mut state,
                 &store,

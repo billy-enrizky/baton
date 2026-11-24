@@ -13,6 +13,7 @@ const MAX_PR_TITLE_CHARS: usize = 200;
 const MAX_PR_BODY_CHARS: usize = 4000;
 const MAX_PR_COMMITS: usize = 20;
 const GH_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_REVIEW_BODY_CHARS: usize = 20_000;
 const GIT_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
@@ -147,6 +148,64 @@ pub struct PullRequestPlan {
     pub body: String,
     pub commit_count: usize,
     pub commits: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrReviewAction {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl PrReviewAction {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "approve" | "approved" | "lgtm" => Some(Self::Approve),
+            "request-changes" | "request_changes" | "changes" => Some(Self::RequestChanges),
+            "comment" => Some(Self::Comment),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::RequestChanges => "request-changes",
+            Self::Comment => "comment",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Approve => "Approve",
+            Self::RequestChanges => "Request changes",
+            Self::Comment => "Comment",
+        }
+    }
+
+    fn gh_flag(self) -> &'static str {
+        match self {
+            Self::Approve => "--approve",
+            Self::RequestChanges => "--request-changes",
+            Self::Comment => "--comment",
+        }
+    }
+
+    fn needs_body(self) -> bool {
+        !matches!(self, Self::Approve)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrReviewPlan {
+    pub root: PathBuf,
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub action: PrReviewAction,
+    pub body: Option<String>,
+    pub branch: String,
+    pub head_oid: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -625,6 +684,134 @@ fn string_field(value: &Value, key: &str) -> String {
         .unwrap_or_default()
         .trim()
         .to_string()
+}
+
+pub fn plan_review(cwd: &Path, action: PrReviewAction, body: Option<&str>) -> Result<PrReviewPlan> {
+    plan_review_with(cwd, action, body, &gh_binary())
+}
+
+fn plan_review_with(
+    cwd: &Path,
+    action: PrReviewAction,
+    body: Option<&str>,
+    gh: &Path,
+) -> Result<PrReviewPlan> {
+    let status = inspect(cwd)?;
+    if status.branch.starts_with("detached at ") {
+        bail!("detached HEAD; check out the pull request branch before reviewing");
+    }
+    if let Some(operation) = status.operation.as_deref() {
+        bail!("{operation} is in progress; finish it before reviewing");
+    }
+    if status.conflicts {
+        bail!("unresolved conflicts; resolve them before reviewing");
+    }
+    let root = status.root;
+    let head = git_text(&root, &["rev-parse", "HEAD"])?.trim().to_string();
+    let view = pull_request_view(&root, gh)?;
+    let number = view
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("gh pr view did not return a pull request number")?;
+    let state = string_field(&view, "state");
+    if !state.eq_ignore_ascii_case("OPEN") {
+        bail!("pull request #{number} is {state}; only an open pull request can be reviewed");
+    }
+    let draft = view
+        .get("isDraft")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if draft && action == PrReviewAction::Approve {
+        bail!("pull request #{number} is a draft; mark it ready before approving");
+    }
+    let head_ref = string_field(&view, "headRefName");
+    if head_ref != status.branch {
+        bail!(
+            "current branch {} is not the pull request head {head_ref}; check out the PR branch",
+            status.branch
+        );
+    }
+    let head_oid = string_field(&view, "headRefOid");
+    if head_oid != head {
+        bail!(
+            "local HEAD {} has moved from pull request head {}; push before reviewing",
+            short_oid(&head),
+            short_oid(&head_oid)
+        );
+    }
+    let body = body.map(str::trim).filter(|body| !body.is_empty());
+    if action.needs_body() && body.is_none() {
+        bail!(
+            "{} needs a body; use `/git review {} <text>`",
+            action.label(),
+            action.as_str()
+        );
+    }
+    if let Some(body) = body {
+        if body.chars().count() > MAX_REVIEW_BODY_CHARS {
+            bail!("review body exceeds {MAX_REVIEW_BODY_CHARS} characters");
+        }
+    }
+    Ok(PrReviewPlan {
+        root,
+        number,
+        url: string_field(&view, "url"),
+        title: string_field(&view, "title"),
+        action,
+        body: body.map(str::to_string),
+        branch: status.branch,
+        head_oid,
+    })
+}
+
+pub fn review(plan: &PrReviewPlan) -> Result<()> {
+    review_with(plan, &gh_binary())
+}
+
+fn review_with(plan: &PrReviewPlan, gh: &Path) -> Result<()> {
+    let view = pull_request_view(&plan.root, gh)?;
+    let number = view
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("gh pr view did not return a pull request number")?;
+    let state = string_field(&view, "state");
+    if number != plan.number {
+        bail!("the current pull request changed; reopen the review preview");
+    }
+    if !state.eq_ignore_ascii_case("OPEN") {
+        bail!("pull request #{} is {state}", plan.number);
+    }
+    let head_oid = string_field(&view, "headRefOid");
+    if head_oid != plan.head_oid {
+        bail!("pull request head moved; reopen the review preview");
+    }
+    let number = plan.number.to_string();
+    let mut args = vec!["pr", "review", number.as_str(), plan.action.gh_flag()];
+    if let Some(body) = plan.body.as_deref() {
+        args.push("--body");
+        args.push(body);
+    }
+    run_gh(&plan.root, gh, &args, false)?;
+    Ok(())
+}
+
+fn pull_request_view(root: &Path, gh: &Path) -> Result<Value> {
+    let view = run_gh(
+        root,
+        gh,
+        &[
+            "pr",
+            "view",
+            "--json",
+            "number,title,url,state,headRefName,headRefOid,isDraft",
+        ],
+        false,
+    )?;
+    serde_json::from_slice(&view).context("gh pr view returned invalid JSON")
+}
+
+fn short_oid(oid: &str) -> &str {
+    &oid[..8.min(oid.len())]
 }
 
 fn run_gh(root: &Path, gh: &Path, args: &[&str], allow_pending: bool) -> Result<Vec<u8>> {
@@ -2268,6 +2455,110 @@ if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
 fi
 exit 1"#,
         )
+    }
+
+    fn review_gh(repo: &Path, head_oid: &str, state: &str, draft: bool) -> PathBuf {
+        let script = r#"if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"number":42,"title":"Add review","url":"https://github.com/example/repo/pull/42","state":"__STATE__","headRefName":"feat/pr","headRefOid":"__HEAD__","isDraft":__DRAFT__}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "review" ]; then
+  printf '%s\n' "$@" >> review-args.txt
+  exit 0
+fi
+exit 1"#
+            .replace("__STATE__", state)
+            .replace("__HEAD__", head_oid)
+            .replace("__DRAFT__", if draft { "true" } else { "false" });
+        fake_gh(repo, "fake-gh-review", &script)
+    }
+
+    #[test]
+    fn plan_review_validates_the_pull_request_and_body() {
+        let repo = pr_repo();
+        let head = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let gh = review_gh(repo.path(), &head, "OPEN", false);
+
+        let plan = plan_review_with(repo.path(), PrReviewAction::Approve, None, &gh).unwrap();
+        assert_eq!(plan.number, 42);
+        assert_eq!(plan.action, PrReviewAction::Approve);
+        assert_eq!(plan.body, None);
+        assert_eq!(plan.branch, "feat/pr");
+        assert_eq!(plan.head_oid, head);
+        assert_eq!(plan.title, "Add review");
+
+        let error =
+            plan_review_with(repo.path(), PrReviewAction::Comment, Some("   "), &gh).unwrap_err();
+        assert!(error.to_string().contains("needs a body"), "{error}");
+        let commented = plan_review_with(
+            repo.path(),
+            PrReviewAction::Comment,
+            Some("  looks good  "),
+            &gh,
+        )
+        .unwrap();
+        assert_eq!(commented.body.as_deref(), Some("looks good"));
+
+        let draft = review_gh(repo.path(), &head, "OPEN", true);
+        let error =
+            plan_review_with(repo.path(), PrReviewAction::Approve, None, &draft).unwrap_err();
+        assert!(error.to_string().contains("draft"), "{error}");
+
+        let moved = review_gh(
+            repo.path(),
+            "0000000000000000000000000000000000000000",
+            "OPEN",
+            false,
+        );
+        let error =
+            plan_review_with(repo.path(), PrReviewAction::Approve, None, &moved).unwrap_err();
+        assert!(error.to_string().contains("has moved"), "{error}");
+
+        let merged = review_gh(repo.path(), &head, "MERGED", false);
+        let error =
+            plan_review_with(repo.path(), PrReviewAction::Approve, None, &merged).unwrap_err();
+        assert!(
+            error.to_string().contains("only an open pull request"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn review_rechecks_the_head_and_runs_the_gh_action() {
+        let repo = pr_repo();
+        let head = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let gh = review_gh(repo.path(), &head, "OPEN", false);
+        let plan = plan_review_with(repo.path(), PrReviewAction::Approve, None, &gh).unwrap();
+        review_with(&plan, &gh).unwrap();
+        let args = std::fs::read_to_string(repo.path().join("review-args.txt")).unwrap();
+        assert!(args.contains("review\n42\n--approve"), "{args}");
+
+        std::fs::remove_file(repo.path().join("review-args.txt")).unwrap();
+        let moved = review_gh(
+            repo.path(),
+            "0000000000000000000000000000000000000000",
+            "OPEN",
+            false,
+        );
+        let error = review_with(&plan, &moved).unwrap_err();
+        assert!(error.to_string().contains("head moved"), "{error}");
+        assert!(
+            !repo.path().join("review-args.txt").exists(),
+            "a moved head must not reach gh pr review"
+        );
+
+        let with_body = review_gh(repo.path(), &head, "OPEN", false);
+        let plan = plan_review_with(
+            repo.path(),
+            PrReviewAction::RequestChanges,
+            Some("Please add a test."),
+            &with_body,
+        )
+        .unwrap();
+        review_with(&plan, &with_body).unwrap();
+        let args = std::fs::read_to_string(repo.path().join("review-args.txt")).unwrap();
+        assert!(args.contains("--request-changes"), "{args}");
+        assert!(args.contains("Please add a test."), "{args}");
     }
 
     #[test]

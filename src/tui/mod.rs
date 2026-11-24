@@ -595,6 +595,12 @@ enum Overlay {
         plan: Box<crate::git_workflow::PrReviewPlan>,
         scroll: usize,
     },
+    GitMergePicker {
+        selected: usize,
+    },
+    GitMergeConfirm {
+        plan: Box<crate::git_workflow::PrMergePlan>,
+    },
     CopyPicker {
         selected: usize,
         replies: Vec<ReplyChoice>,
@@ -3016,8 +3022,9 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/runs", _) => Some("runs --all|<run id>"),
         ("/commands", _) => Some("commands [turn]"),
         ("/git", "review") => Some("git review approve|request-changes|comment [body]"),
+        ("/git", "merge") => Some("git merge squash|merge|rebase"),
         ("/git", _) => Some(
-            "git status|commit [--staged] [message]|push|checks|pr [title]|review [action] [body]",
+            "git status|commit [--staged] [message]|push|checks|pr [title]|review [action] [body]|merge [method]",
         ),
         ("/queue", _) => Some("queue [send <n> | edit <n> <text> | move <from> <to> | clear]"),
         ("/mcp", "add") => Some("mcp add <name> <command> [args...]"),
@@ -3199,6 +3206,15 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 );
             }
         }
+        "/git" if state.input.starts_with("/git merge ") => {
+            for (method, description) in [
+                ("squash", "squash the pull request commits into one"),
+                ("merge", "create a merge commit"),
+                ("rebase", "rebase the pull request commits onto the base"),
+            ] {
+                push_suggestion(&mut suggestions, command, method, description);
+            }
+        }
         "/git" if state.input.starts_with("/git review ") => {
             for (action, description) in [
                 ("approve", "approve the current pull request"),
@@ -3222,6 +3238,10 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 (
                     "review",
                     "approve, request changes on, or comment on the current pull request",
+                ),
+                (
+                    "merge",
+                    "merge the current pull request with a chosen method",
                 ),
             ] {
                 push_suggestion(&mut suggestions, command, action, description);
@@ -3934,10 +3954,13 @@ fn apply_git_picker(
         }
         3 => open_git_push_picker(state, store),
         4 => open_git_checks(state),
-        5 => {
+        5 => open_git_pr_confirm(state, store, None),
+        6 => {
             state.overlay = Overlay::GitReviewPicker { selected: 0 };
         }
-        6 => open_git_pr_confirm(state, store, None),
+        7 => {
+            state.overlay = Overlay::GitMergePicker { selected: 0 };
+        }
         _ => state.overlay = Overlay::None,
     }
 }
@@ -3981,6 +4004,44 @@ fn open_git_pr_confirm(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, tit
         }
         Err(error) => {
             state.notice = Some(git_line(&format!("git: {error}")));
+            open_git_picker(state, store);
+        }
+    }
+}
+
+fn open_git_merge_confirm(state: &mut TuiState, method: crate::git_workflow::PrMergeMethod) {
+    match crate::git_workflow::plan_merge(std::path::Path::new(&state.thread.cwd), method) {
+        Ok(plan) => {
+            state.overlay = Overlay::GitMergeConfirm {
+                plan: Box::new(plan),
+            };
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git merge: {error}")));
+            if !matches!(state.overlay, Overlay::GitMergePicker { .. }) {
+                state.overlay = Overlay::GitMergePicker { selected: 0 };
+            }
+        }
+    }
+}
+
+fn create_git_merge(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    plan: crate::git_workflow::PrMergePlan,
+) {
+    match crate::git_workflow::merge(&plan) {
+        Ok(()) => {
+            state.notice = Some(git_line(&format!(
+                "merged pull request #{} ({} method) · {}",
+                plan.number,
+                plan.method.as_str(),
+                plan.url
+            )));
+            state.overlay = Overlay::None;
+        }
+        Err(error) => {
+            state.notice = Some(git_line(&format!("git merge failed: {error}")));
             open_git_picker(state, store);
         }
     }
@@ -4919,7 +4980,7 @@ fn handle_key(
                 state.overlay = Overlay::None;
             }
             KeyCode::Up => {
-                selected = (selected + 7) % 8;
+                selected = (selected + 8) % 9;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4927,7 +4988,7 @@ fn handle_key(
                 };
             }
             KeyCode::Down => {
-                selected = (selected + 1) % 8;
+                selected = (selected + 1) % 9;
                 state.overlay = Overlay::GitPicker {
                     selected,
                     status,
@@ -4943,7 +5004,7 @@ fn handle_key(
             }
             KeyCode::End => {
                 state.overlay = Overlay::GitPicker {
-                    selected: 7,
+                    selected: 8,
                     status,
                     blocked,
                 };
@@ -5033,6 +5094,38 @@ fn handle_key(
                 }
             }
         }
+        Overlay::GitMergePicker { mut selected } => match key.code {
+            KeyCode::Esc => state.overlay = Overlay::None,
+            KeyCode::Up => {
+                selected = (selected + 3) % 4;
+                state.overlay = Overlay::GitMergePicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % 4;
+                state.overlay = Overlay::GitMergePicker { selected };
+            }
+            KeyCode::Enter => match selected {
+                0..=2 => {
+                    let method = match selected {
+                        0 => crate::git_workflow::PrMergeMethod::Squash,
+                        1 => crate::git_workflow::PrMergeMethod::Merge,
+                        _ => crate::git_workflow::PrMergeMethod::Rebase,
+                    };
+                    open_git_merge_confirm(state, method);
+                }
+                _ => state.overlay = Overlay::None,
+            },
+            _ => {
+                state.overlay = Overlay::GitMergePicker { selected };
+            }
+        },
+        Overlay::GitMergeConfirm { plan } => match key.code {
+            KeyCode::Esc => open_git_picker(state, store),
+            KeyCode::Enter => create_git_merge(state, store, *plan),
+            _ => {
+                state.overlay = Overlay::GitMergeConfirm { plan };
+            }
+        },
         Overlay::GitReviewPicker { mut selected } => match key.code {
             KeyCode::Esc => state.overlay = Overlay::None,
             KeyCode::Up => {
@@ -8214,6 +8307,16 @@ fn handle_command(
                 };
                 open_git_review_confirm(state, action, body.as_deref());
             }
+            Some("merge") => {
+                let Some(method) = args
+                    .get(1)
+                    .and_then(|value| crate::git_workflow::PrMergeMethod::parse(value))
+                else {
+                    state.overlay = Overlay::GitMergePicker { selected: 0 };
+                    return;
+                };
+                open_git_merge_confirm(state, method);
+            }
             Some(other) => {
                 state.notice = Some(git_line(&format!(
                     "unknown /git action: {other} · usage: /git status|commit [--staged] [--] [message]|push|checks|pr [title]"
@@ -10028,7 +10131,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitPicker {
                 status, blocked, ..
             } => {
-                11 + usize::from(blocked.is_some())
+                12 + usize::from(blocked.is_some())
                     + usize::from(status.operation.is_some())
                     + usize::from(status.conflicts)
             }
@@ -10043,6 +10146,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitChecks { report, .. } => report.checks.len().min(12) + 5,
             Overlay::GitPrConfirm { plan, .. } => plan.body.lines().count().min(10) + 7,
             Overlay::GitReviewPicker { .. } => 6,
+            Overlay::GitMergePicker { .. } => 6,
+            Overlay::GitMergeConfirm { .. } => 8,
             Overlay::GitReviewConfirm { plan, .. } => {
                 plan.body
                     .as_deref()
@@ -10198,6 +10303,10 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::GitReviewConfirm { plan, scroll } => {
                 draw_git_review_confirm(frame, chunks[1], state, plan, *scroll)
             }
+            Overlay::GitMergePicker { selected } => {
+                draw_git_merge_picker(frame, chunks[1], *selected)
+            }
+            Overlay::GitMergeConfirm { plan } => draw_git_merge_confirm(frame, chunks[1], plan),
             Overlay::ModePicker { selected } => {
                 draw_mode_picker(frame, chunks[1], state, *selected)
             }
@@ -11145,6 +11254,85 @@ fn git_scroll_key(code: KeyCode, scroll: usize, max: usize) -> Option<usize> {
     }
 }
 
+fn draw_git_merge_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
+    let rows = [
+        ("Squash and merge", "one commit on the base branch"),
+        ("Create a merge commit", "keep the branch history"),
+        ("Rebase and merge", "replay the commits onto the base"),
+        ("Cancel", "esc"),
+    ];
+    let mut lines = vec![Line::styled(
+        "Merge pull request · ↑↓ select · enter · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (label, detail)) in rows.iter().enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(format!("{cursor} {label}  {detail}"), style));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_git_merge_confirm(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    plan: &crate::git_workflow::PrMergePlan,
+) {
+    let width = area.width.saturating_sub(2) as usize;
+    let lines = vec![
+        Line::styled(
+            format!(
+                "Merge pull request #{} · {} · enter confirms · esc cancels",
+                plan.number,
+                plan.method.label()
+            ),
+            Style::default()
+                .fg(COLORS.secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            truncate_chars(&format!("repo: {}", plan.root.display()), width),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            truncate_chars(
+                &format!(
+                    "branch: {} · head: {}",
+                    plan.branch,
+                    &plan.head_oid[..8.min(plan.head_oid.len())]
+                ),
+                width,
+            ),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            truncate_chars(&format!("title: {}", git_line(&plan.title)), width),
+            Style::default().fg(COLORS.text),
+        ),
+        Line::styled(
+            truncate_chars(&format!("url: {}", git_line(&plan.url)), width),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            "the merge runs on the forge; the local branch is not changed".to_string(),
+            Style::default().fg(COLORS.warning),
+        ),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_git_review_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
     let rows = [
         ("Approve", "approve the current pull request"),
@@ -11303,6 +11491,10 @@ fn draw_git_picker(
         (
             "Review pull request".to_string(),
             "approve, request changes, or comment".to_string(),
+        ),
+        (
+            "Merge pull request".to_string(),
+            "squash, merge commit, or rebase after confirmation".to_string(),
         ),
         ("Cancel".to_string(), "esc".to_string()),
     ];
@@ -23367,6 +23559,111 @@ mod tests {
     }
 
     #[test]
+    fn git_merge_picker_and_confirmation() {
+        let _guard = EDITOR_ENV_LOCK.lock().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        git_repo(repo.path());
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        let gh = repo.path().join("fake-gh-merge");
+        std::fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+set -eu
+if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{{"number":42,"title":"Add merge","url":"https://github.com/example/repo/pull/42","state":"OPEN","headRefName":"main","headRefOid":"{head}","isDraft":false,"mergeable":"MERGEABLE"}}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  printf '%s\n' "$@" >> merge-args.txt
+  exit 0
+fi
+exit 1
+"#
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::env::set_var("BATON_GH_BIN", &gh);
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &sender, "/git merge");
+        assert!(matches!(
+            state.overlay,
+            Overlay::GitMergePicker { selected: 0 }
+        ));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        for value in [
+            "Merge pull request",
+            "Squash and merge",
+            "Create a merge commit",
+            "Rebase and merge",
+        ] {
+            assert!(text.contains(value), "{value} missing: {text}");
+        }
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        let Overlay::GitMergeConfirm { plan } = &state.overlay else {
+            panic!("expected merge confirmation");
+        };
+        assert_eq!(plan.method, crate::git_workflow::PrMergeMethod::Squash);
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(
+            text.contains("Merge pull request #42 · Squash and merge"),
+            "{text}"
+        );
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("merged pull request #42 (squash method)"),
+            "{:?}",
+            state.notice
+        );
+        let args = std::fs::read_to_string(repo.path().join("merge-args.txt")).unwrap();
+        assert!(args.contains("merge\n42\n--squash"), "{args}");
+
+        handle_command(&mut state, &store, &sender, "/git merge");
+        handle_key(&mut state, &store, &sender, key(KeyCode::Down));
+        handle_key(&mut state, &store, &sender, key(KeyCode::Down));
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        let Overlay::GitMergeConfirm { plan } = &state.overlay else {
+            panic!("expected rebase confirmation");
+        };
+        assert_eq!(plan.method, crate::git_workflow::PrMergeMethod::Rebase);
+        handle_key(&mut state, &store, &sender, key(KeyCode::Esc));
+        assert!(matches!(state.overlay, Overlay::GitPicker { .. }));
+
+        // `/git` row order: Open pull request 5, Review 6, Merge 7.
+        handle_command(&mut state, &store, &sender, "/git");
+        for _ in 0..6 {
+            handle_key(&mut state, &store, &sender, key(KeyCode::Down));
+        }
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::GitReviewPicker { .. }));
+        handle_command(&mut state, &store, &sender, "/git");
+        for _ in 0..7 {
+            handle_key(&mut state, &store, &sender, key(KeyCode::Down));
+        }
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
+        assert!(matches!(state.overlay, Overlay::GitMergePicker { .. }));
+        std::env::remove_var("BATON_GH_BIN");
+    }
+
+    #[test]
     fn git_review_picker_and_approve_confirmation() {
         let _guard = EDITOR_ENV_LOCK.lock().unwrap();
         let repo = tempfile::tempdir().unwrap();
@@ -23620,7 +23917,7 @@ exit 1
         let mut state = test_state(repo.path(), &store, Vec::new());
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_command(&mut state, &store, &engine_command_sender, "/git");
-        for _ in 0..6 {
+        for _ in 0..5 {
             handle_key(
                 &mut state,
                 &store,

@@ -208,6 +208,59 @@ pub struct PrReviewPlan {
     pub head_oid: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrMergeMethod {
+    Squash,
+    Merge,
+    Rebase,
+}
+
+impl PrMergeMethod {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "squash" => Some(Self::Squash),
+            "merge" => Some(Self::Merge),
+            "rebase" => Some(Self::Rebase),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Squash => "squash",
+            Self::Merge => "merge",
+            Self::Rebase => "rebase",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Squash => "Squash and merge",
+            Self::Merge => "Create a merge commit",
+            Self::Rebase => "Rebase and merge",
+        }
+    }
+
+    fn gh_flag(self) -> &'static str {
+        match self {
+            Self::Squash => "--squash",
+            Self::Merge => "--merge",
+            Self::Rebase => "--rebase",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrMergePlan {
+    pub root: PathBuf,
+    pub number: u64,
+    pub url: String,
+    pub title: String,
+    pub method: PrMergeMethod,
+    pub branch: String,
+    pub head_oid: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PullRequestOutcome {
     pub url: String,
@@ -803,7 +856,7 @@ fn pull_request_view(root: &Path, gh: &Path) -> Result<Value> {
             "pr",
             "view",
             "--json",
-            "number,title,url,state,headRefName,headRefOid,isDraft",
+            "number,title,url,state,headRefName,headRefOid,isDraft,mergeable",
         ],
         false,
     )?;
@@ -812,6 +865,102 @@ fn pull_request_view(root: &Path, gh: &Path) -> Result<Value> {
 
 fn short_oid(oid: &str) -> &str {
     &oid[..8.min(oid.len())]
+}
+
+pub fn plan_merge(cwd: &Path, method: PrMergeMethod) -> Result<PrMergePlan> {
+    plan_merge_with(cwd, method, &gh_binary())
+}
+
+fn plan_merge_with(cwd: &Path, method: PrMergeMethod, gh: &Path) -> Result<PrMergePlan> {
+    let status = inspect(cwd)?;
+    if status.branch.starts_with("detached at ") {
+        bail!("detached HEAD; check out the pull request branch before merging");
+    }
+    if let Some(operation) = status.operation.as_deref() {
+        bail!("{operation} is in progress; finish it before merging");
+    }
+    if status.conflicts {
+        bail!("unresolved conflicts; resolve them before merging");
+    }
+    let root = status.root;
+    let head = git_text(&root, &["rev-parse", "HEAD"])?.trim().to_string();
+    let view = pull_request_view(&root, gh)?;
+    let number = view
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("gh pr view did not return a pull request number")?;
+    let state = string_field(&view, "state");
+    if !state.eq_ignore_ascii_case("OPEN") {
+        bail!("pull request #{number} is {state}; only an open pull request can be merged");
+    }
+    let draft = view
+        .get("isDraft")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if draft {
+        bail!("pull request #{number} is a draft; mark it ready before merging");
+    }
+    let head_ref = string_field(&view, "headRefName");
+    if head_ref != status.branch {
+        bail!(
+            "current branch {} is not the pull request head {head_ref}; check out the PR branch",
+            status.branch
+        );
+    }
+    let head_oid = string_field(&view, "headRefOid");
+    if head_oid != head {
+        bail!(
+            "local HEAD {} has moved from pull request head {}; push before merging",
+            short_oid(&head),
+            short_oid(&head_oid)
+        );
+    }
+    if string_field(&view, "mergeable").eq_ignore_ascii_case("CONFLICTING") {
+        bail!("pull request #{number} has conflicts; resolve them before merging");
+    }
+    Ok(PrMergePlan {
+        root,
+        number,
+        url: string_field(&view, "url"),
+        title: string_field(&view, "title"),
+        method,
+        branch: status.branch,
+        head_oid,
+    })
+}
+
+pub fn merge(plan: &PrMergePlan) -> Result<()> {
+    merge_with(plan, &gh_binary())
+}
+
+fn merge_with(plan: &PrMergePlan, gh: &Path) -> Result<()> {
+    let view = pull_request_view(&plan.root, gh)?;
+    let number = view
+        .get("number")
+        .and_then(Value::as_u64)
+        .context("gh pr view did not return a pull request number")?;
+    let state = string_field(&view, "state");
+    if number != plan.number {
+        bail!("the current pull request changed; reopen the merge preview");
+    }
+    if !state.eq_ignore_ascii_case("OPEN") {
+        bail!("pull request #{} is {state}", plan.number);
+    }
+    if string_field(&view, "mergeable").eq_ignore_ascii_case("CONFLICTING") {
+        bail!("pull request #{} now has conflicts", plan.number);
+    }
+    let head_oid = string_field(&view, "headRefOid");
+    if head_oid != plan.head_oid {
+        bail!("pull request head moved; reopen the merge preview");
+    }
+    let number = plan.number.to_string();
+    run_gh(
+        &plan.root,
+        gh,
+        &["pr", "merge", number.as_str(), plan.method.gh_flag()],
+        false,
+    )?;
+    Ok(())
 }
 
 fn run_gh(root: &Path, gh: &Path, args: &[&str], allow_pending: bool) -> Result<Vec<u8>> {
@@ -2471,6 +2620,93 @@ exit 1"#
             .replace("__HEAD__", head_oid)
             .replace("__DRAFT__", if draft { "true" } else { "false" });
         fake_gh(repo, "fake-gh-review", &script)
+    }
+
+    fn merge_gh(repo: &Path, head_oid: &str, state: &str, draft: bool, mergeable: &str) -> PathBuf {
+        let script = r#"if [ "$1" = "pr" ] && [ "$2" = "view" ]; then
+  printf '%s\n' '{"number":42,"title":"Add merge","url":"https://github.com/example/repo/pull/42","state":"__STATE__","headRefName":"feat/pr","headRefOid":"__HEAD__","isDraft":__DRAFT__,"mergeable":"__MERGEABLE__"}'
+  exit 0
+fi
+if [ "$1" = "pr" ] && [ "$2" = "merge" ]; then
+  printf '%s\n' "$@" >> merge-args.txt
+  exit 0
+fi
+exit 1"#
+            .replace("__STATE__", state)
+            .replace("__HEAD__", head_oid)
+            .replace("__DRAFT__", if draft { "true" } else { "false" })
+            .replace("__MERGEABLE__", mergeable);
+        fake_gh(repo, "fake-gh-merge", &script)
+    }
+
+    #[test]
+    fn plan_merge_validates_the_pull_request() {
+        let repo = pr_repo();
+        let head = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let gh = merge_gh(repo.path(), &head, "OPEN", false, "MERGEABLE");
+        let plan = plan_merge_with(repo.path(), PrMergeMethod::Squash, &gh).unwrap();
+        assert_eq!(plan.number, 42);
+        assert_eq!(plan.method, PrMergeMethod::Squash);
+        assert_eq!(plan.branch, "feat/pr");
+        assert_eq!(plan.head_oid, head);
+        assert_eq!(plan.title, "Add merge");
+
+        let conflicting = merge_gh(repo.path(), &head, "OPEN", false, "CONFLICTING");
+        let error = plan_merge_with(repo.path(), PrMergeMethod::Squash, &conflicting).unwrap_err();
+        assert!(error.to_string().contains("has conflicts"), "{error}");
+
+        let draft = merge_gh(repo.path(), &head, "OPEN", true, "MERGEABLE");
+        let error = plan_merge_with(repo.path(), PrMergeMethod::Squash, &draft).unwrap_err();
+        assert!(error.to_string().contains("draft"), "{error}");
+
+        let moved = merge_gh(
+            repo.path(),
+            "0000000000000000000000000000000000000000",
+            "OPEN",
+            false,
+            "MERGEABLE",
+        );
+        let error = plan_merge_with(repo.path(), PrMergeMethod::Squash, &moved).unwrap_err();
+        assert!(error.to_string().contains("has moved"), "{error}");
+
+        let merged = merge_gh(repo.path(), &head, "MERGED", false, "UNKNOWN");
+        let error = plan_merge_with(repo.path(), PrMergeMethod::Squash, &merged).unwrap_err();
+        assert!(
+            error.to_string().contains("only an open pull request"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn merge_rechecks_the_head_and_runs_the_gh_action() {
+        let repo = pr_repo();
+        let head = git_text(repo.path(), &["rev-parse", "HEAD"]).unwrap();
+        let gh = merge_gh(repo.path(), &head, "OPEN", false, "MERGEABLE");
+        let plan = plan_merge_with(repo.path(), PrMergeMethod::Squash, &gh).unwrap();
+        merge_with(&plan, &gh).unwrap();
+        let args = std::fs::read_to_string(repo.path().join("merge-args.txt")).unwrap();
+        assert!(args.contains("merge\n42\n--squash"), "{args}");
+
+        std::fs::remove_file(repo.path().join("merge-args.txt")).unwrap();
+        let moved = merge_gh(
+            repo.path(),
+            "0000000000000000000000000000000000000000",
+            "OPEN",
+            false,
+            "MERGEABLE",
+        );
+        let error = merge_with(&plan, &moved).unwrap_err();
+        assert!(error.to_string().contains("head moved"), "{error}");
+        assert!(
+            !repo.path().join("merge-args.txt").exists(),
+            "a moved head must not reach gh pr merge"
+        );
+
+        let rebase = merge_gh(repo.path(), &head, "OPEN", false, "MERGEABLE");
+        let plan = plan_merge_with(repo.path(), PrMergeMethod::Rebase, &rebase).unwrap();
+        merge_with(&plan, &rebase).unwrap();
+        let args = std::fs::read_to_string(repo.path().join("merge-args.txt")).unwrap();
+        assert!(args.contains("--rebase"), "{args}");
     }
 
     #[test]

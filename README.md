@@ -58,7 +58,7 @@ Run `baton login <provider>` once for each harness you want to drive, or set the
 
 ## Start here
 
-Run `baton` with no arguments. The workspace opens in the configured default session mode, which is orchestrate until `/settings` or `config.json` changes it. Type what you want to do in plain language and press Enter. Baton picks a harness or splits the work. `/help` shows the common paths, `/help all` lists every command, and `baton doctor` checks what is installed.
+Run `baton` with no arguments. The workspace opens in the configured default session mode, which is orchestrate until `/settings` or `config.json` changes it. Type what you want to do in plain language and press Enter. Baton picks a harness or splits the work. `/help` shows the common paths, `/help all` opens a scrollable list of every command with its syntax, and `baton doctor` checks what is installed.
 
 ## Usage
 

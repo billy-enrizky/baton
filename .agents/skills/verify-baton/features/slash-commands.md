@@ -2,6 +2,7 @@
 
 ## Sub-features
 - Typing `/` lists every command in the completion registry, including `/help` and the `/exit` alias.
+- `/help all` opens a scrollable overlay with every command and its syntax; a short terminal scrolls instead of clipping the last commands.
 - Typing a command followed by a space lists valid argument choices, or its argument syntax when the command takes free-form text.
 - Partial command and argument text filters the same list.
 - Tab completes the selected choice; Enter runs the line when it already names something the handler acts on and completes it otherwise.

@@ -32,4 +32,5 @@ and the TUI exits 0.
 - The composer is prefilled after a rewind. Clear it with Escape before typing a slash command, or the command joins the prompt.
 - Failed turns have no checkpoint, so no code-restore confirmation appears. That is the expected path here.
 - A turn that leaves the worktree clean and HEAD where it started also has no checkpoint: there is nothing to restore or show. A turn that edits files, or commits, still records one.
+- `baton diff` and `/diff` compare the checkpoint with the worktree through a temporary index, so an untracked file that still exists is not shown as deleted and a new untracked file appears as an addition.
 - The provider revert is history-only; files stay as they are.

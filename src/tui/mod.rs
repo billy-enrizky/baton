@@ -164,9 +164,20 @@ const PERMISSION_MODE_VALUES: [&str; 4] = ["default", "acceptEdits", "bypassPerm
 struct CommandSuggestion {
     insert: String,
     description: String,
+    /// Set for a composer token such as an `@` file mention. Accepting the
+    /// suggestion replaces that range instead of the whole prompt.
+    replace: Option<(usize, usize)>,
 }
 
-type SuggestionCacheKey = (String, String, ProviderId, Option<String>, usize);
+type SuggestionCacheKey = (
+    String,
+    String,
+    ProviderId,
+    Option<String>,
+    usize,
+    usize,
+    bool,
+);
 
 const HELP_SUMMARY: &str = "\
 Type what you want to do. Baton picks a harness.
@@ -405,6 +416,23 @@ enum FilesPickerEvent {
     },
 }
 
+enum FileRefEvent {
+    Loaded {
+        root: String,
+        request: u64,
+        result: Result<Vec<String>, String>,
+    },
+}
+
+#[derive(Default)]
+struct FileRefCache {
+    root: Option<String>,
+    entries: Vec<String>,
+    loading: bool,
+    request: u64,
+    error: Option<String>,
+}
+
 enum NativeRewindEvent {
     Done {
         turn: i64,
@@ -632,6 +660,8 @@ struct PendingEditorOpen {
 }
 
 const FILES_PICKER_LIMIT: usize = crate::files::MAX_FILES;
+const FILE_REF_LIMIT: usize = crate::files::MAX_FILES;
+const FILE_REF_SUGGESTIONS: usize = 8;
 const GREP_PICKER_LIMIT: usize = 200;
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -713,6 +743,9 @@ pub struct TuiState {
     files_picker_receiver: std::sync::mpsc::Receiver<FilesPickerEvent>,
     files_picker_request: u64,
     files_picker_include_ignored: bool,
+    file_ref_sender: std::sync::mpsc::Sender<FileRefEvent>,
+    file_ref_receiver: std::sync::mpsc::Receiver<FileRefEvent>,
+    file_ref: FileRefCache,
     pending_editor_open: Option<PendingEditorOpen>,
     grep_picker_sender: std::sync::mpsc::Sender<GrepPickerEvent>,
     grep_picker_receiver: std::sync::mpsc::Receiver<GrepPickerEvent>,
@@ -757,6 +790,7 @@ pub fn run_tui(
     let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
     let (native_rewind_sender, native_rewind_receiver) = std::sync::mpsc::channel();
     let (files_picker_sender, files_picker_receiver) = std::sync::mpsc::channel();
+    let (file_ref_sender, file_ref_receiver) = std::sync::mpsc::channel();
     let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
     let bell_enabled = crate::config::notifications(&home).bell;
     let mut state = TuiState {
@@ -828,6 +862,9 @@ pub fn run_tui(
         files_picker_receiver,
         files_picker_request: 0,
         files_picker_include_ignored: false,
+        file_ref_sender,
+        file_ref_receiver,
+        file_ref: FileRefCache::default(),
         pending_editor_open: None,
         grep_picker_sender,
         grep_picker_receiver,
@@ -926,6 +963,9 @@ pub fn run_tui(
         }
         for event in files_events {
             apply_files_picker_event(&mut state, event);
+        }
+        while let Ok(event) = state.file_ref_receiver.try_recv() {
+            apply_file_ref_event(&mut state, event);
         }
         let mut grep_events = Vec::new();
         while let Ok(event) = state.grep_picker_receiver.try_recv() {
@@ -2488,6 +2528,8 @@ fn suggestions_for(state: &TuiState) -> Vec<CommandSuggestion> {
         state.thread.current_provider,
         state.thread.current_model.clone(),
         state.history.len(),
+        state.file_ref.entries.len(),
+        state.file_ref.loading,
     );
     if let Some((cached_key, suggestions)) = state.suggestion_cache.borrow().as_ref() {
         if cached_key == &key {
@@ -2499,10 +2541,120 @@ fn suggestions_for(state: &TuiState) -> Vec<CommandSuggestion> {
     suggestions
 }
 
+/// The `@` token ending at the caret, when it is a file mention. A mention
+/// must start the token, so an address such as `a@b` never opens the picker.
+fn file_reference_token(input: &str, cursor: usize) -> Option<(usize, usize, String)> {
+    let chars = input.chars().collect::<Vec<_>>();
+    let cursor = cursor.min(chars.len());
+    let mut start = cursor;
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    if chars.get(start) != Some(&'@') || cursor - start < 2 {
+        return None;
+    }
+    Some((start, cursor, chars[start + 1..cursor].iter().collect()))
+}
+
+fn file_reference_suggestions(state: &TuiState) -> Vec<CommandSuggestion> {
+    if state.input.starts_with('/') {
+        return Vec::new();
+    }
+    let Some((start, end, query)) = file_reference_token(&state.input, state.input_cursor) else {
+        return Vec::new();
+    };
+    if state.file_ref.entries.is_empty() {
+        return Vec::new();
+    }
+    crate::files::ranked_indices(&state.file_ref.entries, &query)
+        .into_iter()
+        .take(FILE_REF_SUGGESTIONS)
+        .filter_map(|index| state.file_ref.entries.get(index))
+        .map(|path| CommandSuggestion {
+            insert: path.clone(),
+            description: "project file".to_string(),
+            replace: Some((start, end)),
+        })
+        .collect()
+}
+
+fn ensure_file_reference_index(state: &mut TuiState) {
+    if state.input.starts_with('/') {
+        return;
+    }
+    if file_reference_token(&state.input, state.input_cursor).is_none() {
+        return;
+    }
+    let root = state.thread.cwd.clone();
+    if state.file_ref.root.as_deref() == Some(root.as_str()) {
+        return;
+    }
+    state.file_ref.request += 1;
+    let request = state.file_ref.request;
+    state.file_ref.root = Some(root.clone());
+    state.file_ref.loading = true;
+    state.file_ref.error = None;
+    state.file_ref.entries.clear();
+    state.suggestion_cache.borrow_mut().take();
+    let sender = state.file_ref_sender.clone();
+    std::thread::spawn(move || {
+        let index_root = root.clone();
+        let result = crate::files::list_files(
+            std::path::Path::new(&index_root),
+            crate::files::FileOptions {
+                query: None,
+                limit: FILE_REF_LIMIT,
+                include_ignored: false,
+                recent: &[],
+            },
+        )
+        .map(|listing| listing.files)
+        .map_err(|error| error.to_string());
+        let _ = sender.send(FileRefEvent::Loaded {
+            root,
+            request,
+            result,
+        });
+    });
+}
+
+fn apply_file_ref_event(state: &mut TuiState, event: FileRefEvent) {
+    let FileRefEvent::Loaded {
+        root,
+        request,
+        result,
+    } = event;
+    if request != state.file_ref.request || state.file_ref.root.as_deref() != Some(root.as_str()) {
+        return;
+    }
+    state.file_ref.loading = false;
+    match result {
+        Ok(entries) => {
+            state.file_ref.entries = entries;
+            state.file_ref.error = None;
+        }
+        Err(error) => {
+            state.file_ref.entries.clear();
+            state.file_ref.error = Some(error);
+        }
+    }
+    state.suggestion_cache.borrow_mut().take();
+}
+
+fn apply_suggestion(state: &mut TuiState, suggestion: &CommandSuggestion) {
+    match suggestion.replace {
+        Some((start, end)) => {
+            state.replace_input_range(start, end, &format!("@{} ", suggestion.insert))
+        }
+        None => state.set_input(format!("{} ", suggestion.insert)),
+    }
+    state.suggestion_index = 0;
+}
+
 fn compute_suggestions(state: &TuiState) -> Vec<CommandSuggestion> {
     let input = state.input.as_str();
     if !input.starts_with('/') {
-        return Vec::new();
+        return file_reference_suggestions(state);
     }
     if let Some(space) = input.find(' ') {
         let token = &input[..space];
@@ -2547,6 +2699,7 @@ fn compute_suggestions(state: &TuiState) -> Vec<CommandSuggestion> {
         .map(|(command, description)| CommandSuggestion {
             insert: (*command).to_string(),
             description: (*description).to_string(),
+            replace: None,
         })
         .collect()
 }
@@ -2558,6 +2711,7 @@ fn push_suggestion(
     description: impl Into<String>,
 ) {
     suggestions.push(CommandSuggestion {
+        replace: None,
         insert: format!("{command} {value}"),
         description: description.into(),
     });
@@ -6052,6 +6206,7 @@ fn handle_composer_key(
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     key: KeyEvent,
 ) {
+    ensure_file_reference_index(state);
     let suggestions = suggestions_for(state);
     let clamped = state
         .suggestion_index
@@ -6092,8 +6247,7 @@ fn handle_composer_key(
             }
             KeyCode::Tab => {
                 if let Some(suggestion) = suggestions.get(clamped) {
-                    state.set_input(format!("{} ", suggestion.insert));
-                    state.suggestion_index = 0;
+                    apply_suggestion(state, suggestion);
                 }
                 return;
             }
@@ -6105,8 +6259,7 @@ fn handle_composer_key(
                     state.set_input(String::new());
                     handle_command(state, store, engine_command_sender, &typed);
                 } else if let Some(suggestion) = suggestions.get(clamped) {
-                    state.set_input(format!("{} ", suggestion.insert));
-                    state.suggestion_index = 0;
+                    apply_suggestion(state, suggestion);
                 }
                 return;
             }
@@ -12009,6 +12162,17 @@ fn composer_hint(state: &TuiState) -> Option<String> {
             "enter sends the next queued message ({} waiting) · shift+enter adds a newline",
             state.queued_messages.len()
         ))
+    } else if !state.input.starts_with('/')
+        && file_reference_token(&state.input, state.input_cursor).is_some()
+    {
+        if state.file_ref.loading {
+            return Some("loading project files for this @ mention".to_string());
+        }
+        state
+            .file_ref
+            .error
+            .as_ref()
+            .map(|error| format!("file index unavailable: {error}"))
     } else if let Some(usage) = command_usage(&state.input) {
         let suffix = if suggestions_for(state).is_empty() {
             "enter runs it"
@@ -12438,6 +12602,15 @@ impl TuiState {
         self.selection_anchor = None;
     }
 
+    fn replace_input_range(&mut self, start: usize, end: usize, text: &str) {
+        let start_byte = char_to_byte(&self.input, start);
+        let end_byte = char_to_byte(&self.input, end);
+        self.input.replace_range(start_byte..end_byte, text);
+        self.input_cursor = start + text.chars().count();
+        self.selection = None;
+        self.selection_anchor = None;
+    }
+
     fn insert_input_char(&mut self, character: char) {
         let byte = char_to_byte(&self.input, self.input_cursor);
         self.input.insert(byte, character);
@@ -12605,6 +12778,7 @@ mod tests {
             .list_queued_messages(&thread.id)
             .unwrap_or_default();
         let (files_picker_sender, files_picker_receiver) = std::sync::mpsc::channel();
+        let (file_ref_sender, file_ref_receiver) = std::sync::mpsc::channel();
         let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
         TuiState {
             bell_enabled: crate::config::notifications(home).bell,
@@ -12679,6 +12853,9 @@ mod tests {
             files_picker_receiver,
             files_picker_request: 0,
             files_picker_include_ignored: false,
+            file_ref_sender,
+            file_ref_receiver,
+            file_ref: FileRefCache::default(),
             pending_editor_open: None,
             grep_picker_sender,
             grep_picker_receiver,
@@ -22238,6 +22415,99 @@ exit 1
         assert!(
             text.contains("enter on an empty composer sends the next queued message"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn file_reference_token_detects_a_mention_and_ignores_an_address() {
+        assert_eq!(
+            file_reference_token("explain @src/par", 16),
+            Some((8, 16, "src/par".to_string()))
+        );
+        assert_eq!(
+            file_reference_token("@README", 7),
+            Some((0, 7, "README".to_string()))
+        );
+        assert_eq!(file_reference_token("mail a@b", 8), None);
+        assert_eq!(file_reference_token("bare @", 6), None);
+        assert_eq!(file_reference_token("plain text", 10), None);
+        assert_eq!(
+            file_reference_token("see @浙", 6),
+            Some((4, 6, "浙".to_string()))
+        );
+    }
+
+    #[test]
+    fn file_reference_suggestions_replace_only_the_mention() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.file_ref.root = Some(state.thread.cwd.clone());
+        state.file_ref.entries = vec![
+            "README.md".to_string(),
+            "src/main.rs".to_string(),
+            "src/parser/mod.rs".to_string(),
+        ];
+        state.input = "explain @src/par".to_string();
+        state.input_cursor = state.input.chars().count();
+
+        let suggestions = suggestions_for(&state);
+        let suggestion = suggestions
+            .iter()
+            .find(|suggestion| suggestion.insert == "src/parser/mod.rs")
+            .expect("the ranked mention is offered");
+        assert_eq!(suggestion.replace, Some((8, 16)));
+        state.suggestion_index = suggestions
+            .iter()
+            .position(|suggestion| suggestion.insert == "src/parser/mod.rs")
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Tab),
+        );
+        assert_eq!(state.input, "explain @src/parser/mod.rs ");
+        assert_eq!(state.input_cursor, state.input.chars().count());
+    }
+
+    #[test]
+    fn file_reference_enter_completes_instead_of_sending() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.file_ref.root = Some(state.thread.cwd.clone());
+        state.file_ref.entries = vec!["README.md".to_string()];
+        state.input = "see @READ".to_string();
+        state.input_cursor = state.input.chars().count();
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(state.input, "see @README.md ");
+        assert!(
+            receiver.try_recv().is_err(),
+            "Enter on a mention completes it instead of sending the prompt"
+        );
+    }
+
+    #[test]
+    fn ordinary_text_does_not_start_a_file_index_load() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "just a prompt".to_string();
+        state.input_cursor = state.input.chars().count();
+        ensure_file_reference_index(&mut state);
+        assert!(state.file_ref.root.is_none());
+        assert!(state.file_ref.entries.is_empty());
+        assert!(
+            composer_hint(&state).is_none(),
+            "plain text keeps the composer quiet"
         );
     }
 

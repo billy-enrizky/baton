@@ -2,6 +2,23 @@
 
 Baton drives harness CLIs that you install and authenticate yourself. This guide covers the first run, provider login, API billing, custom endpoints, roles, MCP, skills, memory, and common failures.
 
+## What Baton needs from you
+
+Baton needs no account of its own and sends no telemetry. It runs your harness CLIs with your credentials.
+
+Required for a turn: one harness CLI on `PATH`, either signed in with `baton login <provider>` or pointed at an API key with `/auth <provider> api`. The tables below list the login command and the key variable for each harness.
+
+Optional, only for the features that use them:
+
+| Tool or setting | Needed for |
+|---|---|
+| Authenticated `gh` | `/git checks`, `/git pr`, and pull request creation from an orchestration report. The rest of `/git` works without it. |
+| `rg` | `/files` and `/grep`. Without it Baton falls back to `git grep` inside a repository. |
+| `VISUAL` or `EDITOR` | Opening a file from `/files`, `/grep`, or `/memory`. |
+| An MCP server | Whatever you add with `/mcp`; nothing is configured for you. |
+
+Costs belong to the harness provider: a subscription for the harness login, or usage billed to the API key. A custom endpoint, including an internal gateway, carries that provider's terms. Baton adds no fee, no hosted service, and no background account.
+
 ## First run
 
 ```sh

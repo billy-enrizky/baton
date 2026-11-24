@@ -10,6 +10,8 @@ Baton's pull-request feedback was above the one-minute target even when the test
 
 The scope is the GitHub Actions workflow for the public Baton repository, the trusted `ci/` control plane, path classification, cache and budget policy, the recorded acceptance evidence, and the project-local verification skills. This slice covers Linux x64 pull requests and main pushes.
 
+The workflow requires no repository secrets. It uses the built-in `GITHUB_TOKEN`, and the job-level `secrets` map is rejected by `ci/check-ci.sh`. The only spend option considered is a larger runner, which a user-owned repository cannot use and which is recorded here rather than silently enabled.
+
 ## Non-goals
 
 - Replacing `cargo test` with a new test framework or changing test semantics.

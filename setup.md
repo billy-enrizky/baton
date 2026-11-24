@@ -111,6 +111,22 @@ Override models in `~/.baton/roles.json`:
 
 A role must set `provider` and `model` together. `effort` is accepted only for a provider that supports reasoning effort. Malformed JSON, a partial provider/model pair, an unknown provider, an unknown hook event, an empty hook command, or a timeout outside 1 to 300 seconds fails closed.
 
+To run every role on Codex with DeepSeek V4.1 Flash:
+
+```json
+{
+  "schema_version": 1,
+  "roles": {
+    "orchestrator": { "provider": "codex", "model": "rits/deepseek-v4.1-flash" },
+    "planner": { "provider": "codex", "model": "rits/deepseek-v4.1-flash" },
+    "implementor": { "provider": "codex", "model": "rits/deepseek-v4.1-flash" },
+    "reviewer": { "provider": "codex", "model": "rits/deepseek-v4.1-flash" }
+  }
+}
+```
+
+`/roles` and `baton roles --json` show the resolved rows, so a partial or malformed override is visible before a run.
+
 Override a prompt by creating `~/.baton/roles/orchestrator.md`, `planner.md`, `implementor.md`, or `reviewer.md`. Prompts are capped at 6 KiB. The built-in worker preamble stays first; user role text cannot move it.
 
 Hooks are declared in the same file:

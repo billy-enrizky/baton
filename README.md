@@ -126,7 +126,7 @@ For Codex, `baton fork --native` asks the Codex app-server for a native `thread/
 
 For one task, `baton spawn "task"` skips the coordinator and runs a single worker in an isolated worktree through the same run, task, commit, and report records. `--json` returns the run, task, thread, worktree, branch, commit, text, and question, so an agent can follow up with `baton exec -t <thread>`.
 
-`baton orchestrate` is a small Orca-style multi-agent loop. A coordinator harness receives the goal, splits it into independent tasks, and chooses the best available harness for each task. Baton then creates a real git worktree per worker under `~/.baton/worktrees/<run>/<task>`, runs each worker through the normal `baton exec` path in parallel, and records the run and task results durably. New interactive sessions use this path by default; `--mode single`, `/orchestrate off`, or `"defaultMode": "single"` in `~/.baton/config.json` restores single-harness startup.
+`baton orchestrate` is a small multi-agent loop. A coordinator harness receives the goal, splits it into independent tasks, and chooses the best available harness for each task. Baton then creates a real git worktree per worker under `~/.baton/worktrees/<run>/<task>`, runs each worker through the normal `baton exec` path in parallel, and records the run and task results durably. New interactive sessions use this path by default; `--mode single`, `/orchestrate off`, or `"defaultMode": "single"` in `~/.baton/config.json` restores single-harness startup.
 
 The planner role supplies the coordinator provider, model, and effort. The orchestrator and planner markdown prompts are embedded in the planning request. Matching implementor-provider tasks inherit the implementor model and effort when the plan leaves them unset, and every worker receives the implementor prompt after Baton's fixed worktree preamble. `/roles` shows the reviewer role and global hook declarations, but reviewer gating and hook execution are not active yet. A conversational greeting in the TUI still uses the current thread's single harness, which the banner labels as `thread`. Worker-starting orchestration requires a git repository; `--plan-only` and previews work outside git. `orchestrate` rejects `--provider`, `--model`, and `--effort`; set those values on the roles in `roles.json`.
 
@@ -212,4 +212,4 @@ Contributor and release-engineering records live under `docs/` and `.agents/`.
 
 ## License
 
-MIT. See [NOTICE](NOTICE) for upstream attribution.
+MIT. See [NOTICE](NOTICE) for third-party license terms.

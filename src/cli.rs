@@ -377,6 +377,12 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List subagent calls recorded for a thread
+    Agents {
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The interactive login command for a provider. Antigravity has no CLI

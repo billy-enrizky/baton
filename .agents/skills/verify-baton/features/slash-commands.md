@@ -8,7 +8,7 @@
 - Free-form commands still accept typed text.
 
 ## How to get to it (user POV)
-Open the TUI and type `/mode `, `/model`, `/switch `, `/effort `, `/auth `, `/memories `, `/mcp `, `/orchestrate `, or `/runs `.
+Open the TUI and type `/mode `, `/model`, `/switch `, `/effort `, `/auth `, `/mcp `, `/orchestrate `, or `/runs `.
 
 ## Driving it with the PTY harness
 ```sh
@@ -30,5 +30,5 @@ Installed-binary proof: the same slash probe passed against the v0.4.0 default c
 - The displayed permission banner uses the provider default when the explicit value is `default`. The command notice reports the selected value; the banner reports the effective provider mode.
 - `/open` choices come from the current store. A temporary home has no threads, so it may show no choices until a thread is created.
 - Turn-number choices for `/review`, `/commands`, and `/fork --turn` come from the current thread history.
-- `/memories remove`, `/mcp remove`, `/runs`, and `/copy` choices come from the current store, MCP registry, and conversation.
+- `/mcp remove`, `/runs`, and `/copy` choices come from the MCP registry, current store, and conversation.
 - `/pin move ` offers both directions only for pinned threads in the current project. The probe enters the full ID from the picker row because the move notice, refreshed order, and boundary result are part of the proof.

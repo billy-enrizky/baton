@@ -145,6 +145,23 @@ fn git(cwd: &Path, args: &[&str]) -> Result<String> {
         .to_string())
 }
 
+fn git_with_git_dir(cwd: &Path, git_dir: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("--git-dir")
+        .arg(git_dir)
+        .args(args)
+        .current_dir(cwd)
+        .output()?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 pub fn repo_root(cwd: &Path) -> Result<PathBuf> {
     let root = git(cwd, &["rev-parse", "--show-toplevel"])?;
     if root.is_empty() {
@@ -165,6 +182,50 @@ pub fn project_identity_root(cwd: &Path) -> Option<PathBuf> {
         return Some(common);
     }
     repo_root(cwd).ok()
+}
+
+/// The checkout that owns Claude's auto-memory for `cwd`. Unlike
+/// `project_identity_root`, a submodule resolves to its working tree (shared by
+/// that submodule's worktrees) instead of the metadata directory under the
+/// superproject.
+pub fn auto_memory_identity_root(cwd: &Path) -> Option<PathBuf> {
+    let common = git(
+        cwd,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()?;
+    let common = PathBuf::from(common.trim());
+    if common.file_name().and_then(|name| name.to_str()) == Some(".git") {
+        return common.parent().map(Path::to_path_buf);
+    }
+    if !is_submodule_common_dir(&common) {
+        return Some(common);
+    }
+    if let Ok(worktree) = git_with_git_dir(cwd, &common, &["config", "--get", "core.worktree"]) {
+        let worktree = PathBuf::from(worktree.trim());
+        let resolved = if worktree.is_absolute() {
+            worktree
+        } else {
+            common.join(worktree)
+        };
+        if let Ok(resolved) = std::fs::canonicalize(resolved) {
+            return Some(resolved);
+        }
+    }
+    repo_root(cwd).ok()
+}
+
+fn is_submodule_common_dir(common: &Path) -> bool {
+    let parts = common
+        .components()
+        .map(|component| component.as_os_str())
+        .collect::<Vec<_>>();
+    let dot_git = std::ffi::OsStr::new(".git");
+    let modules = std::ffi::OsStr::new("modules");
+    let Some(git_index) = parts.iter().rposition(|part| *part == dot_git) else {
+        return false;
+    };
+    parts[git_index + 1..].contains(&modules)
 }
 
 pub fn is_dirty(repo_root: &Path) -> Result<bool> {
@@ -1073,5 +1134,55 @@ mod tests {
     fn non_git_directories_are_rejected() {
         let root = tempfile::tempdir().unwrap();
         assert!(repo_root(root.path()).is_err());
+    }
+
+    #[test]
+    fn submodule_auto_memory_identity_uses_the_checkout_and_its_worktrees() {
+        let submodule_source = repo();
+        let parent = repo();
+        git(
+            parent.path(),
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                submodule_source.path().to_str().unwrap(),
+                "deps/sub",
+            ],
+        )
+        .unwrap();
+        git(parent.path(), &["commit", "-q", "-m", "submodule"]).unwrap();
+
+        let submodule = parent.path().join("deps/sub");
+        let identity = auto_memory_identity_root(&submodule).unwrap();
+        assert_eq!(identity, std::fs::canonicalize(&submodule).unwrap());
+
+        let worktree_home = tempfile::tempdir().unwrap();
+        let worktree = worktree_home.path().join("sub-wt");
+        git(
+            &submodule,
+            &["worktree", "add", "-q", worktree.to_str().unwrap()],
+        )
+        .unwrap();
+        assert_eq!(auto_memory_identity_root(&worktree), Some(identity));
+    }
+
+    #[test]
+    fn submodule_common_dir_detection_handles_linked_superproject_worktrees() {
+        assert!(is_submodule_common_dir(Path::new(
+            "/repo/.git/modules/deps/sub"
+        )));
+        assert!(is_submodule_common_dir(Path::new(
+            "/repo/.git/worktrees/super-wt/modules/deps/sub"
+        )));
+        assert!(!is_submodule_common_dir(Path::new("/repo/.git")));
+        assert!(!is_submodule_common_dir(Path::new(
+            "/repo/.git/worktrees/super-wt"
+        )));
+        assert!(!is_submodule_common_dir(Path::new(
+            "/repo/modules/deps/sub"
+        )));
     }
 }

@@ -1,15 +1,20 @@
 //! Local git inspection and commit flow for normal threads. Push, pull
 //! requests, and history rewrites are deliberately out of scope.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde_json::Value;
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 const MAX_MESSAGE_CHARS: usize = 200;
 const MAX_PR_TITLE_CHARS: usize = 200;
 const MAX_PR_BODY_CHARS: usize = 4000;
 const MAX_PR_COMMITS: usize = 20;
+const GH_TIMEOUT: Duration = Duration::from_secs(60);
+const GIT_REMOTE_TIMEOUT: Duration = Duration::from_secs(30);
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitStatus {
@@ -622,9 +627,8 @@ fn string_field(value: &Value, key: &str) -> String {
 }
 
 fn run_gh(root: &Path, gh: &Path, args: &[&str], allow_pending: bool) -> Result<Vec<u8>> {
-    let output = gh_command(root, gh, args)
-        .output()
-        .with_context(|| format!("cannot run {} {}", gh.display(), args.join(" ")))?;
+    let label = format!("{} {}", gh.display(), args.join(" "));
+    let output = run_command_with_timeout(gh_command(root, gh, args), &label, GH_TIMEOUT)?;
     if output.status.success() || (allow_pending && output.status.code() == Some(8)) {
         return Ok(output.stdout);
     }
@@ -654,9 +658,8 @@ fn gh_command(root: &Path, gh: &Path, args: &[&str]) -> Command {
 }
 
 fn run_gh_allow_no_pr(root: &Path, gh: &Path, args: &[&str]) -> Result<Option<Vec<u8>>> {
-    let output = gh_command(root, gh, args)
-        .output()
-        .with_context(|| format!("cannot run {} {}", gh.display(), args.join(" ")))?;
+    let label = format!("{} {}", gh.display(), args.join(" "));
+    let output = run_command_with_timeout(gh_command(root, gh, args), &label, GH_TIMEOUT)?;
     if output.status.success() {
         return Ok(Some(output.stdout));
     }
@@ -888,12 +891,16 @@ fn pull_request_text(log: &str, supplied: Option<&str>) -> (String, String, Vec<
 
 fn live_remote_head(root: &Path, remote: &str, branch: &str) -> Result<String> {
     let reference = format!("refs/heads/{branch}");
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(["ls-remote", "--exit-code", "--heads", remote, &reference])
         .current_dir(root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .output()
-        .with_context(|| format!("cannot run git ls-remote for {remote}/{branch}"))?;
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let output = run_command_with_timeout(
+        command,
+        &format!("git ls-remote {remote}/{branch}"),
+        GIT_REMOTE_TIMEOUT,
+    )?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         bail!(
@@ -911,6 +918,67 @@ fn live_remote_head(root: &Path, remote: &str, branch: &str) -> Result<String> {
         .find_map(|line| line.split_whitespace().next())
         .map(str::to_string)
         .context("git ls-remote returned no branch head")
+}
+
+fn run_command_with_timeout(
+    mut command: Command,
+    label: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("cannot run {label}"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("child stdout was not captured")?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .context("child stderr was not captured")?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = stdout.read_to_end(&mut bytes);
+        (read, bytes)
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let read = stderr.read_to_end(&mut bytes);
+        (read, bytes)
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(CHILD_POLL_INTERVAL);
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!("{label} timed out after {timeout:?}");
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).with_context(|| format!("cannot wait for {label}"));
+            }
+        }
+    };
+    let (stdout_read, stdout) = stdout_reader
+        .join()
+        .map_err(|_| anyhow!("{label} stdout reader panicked"))?;
+    let (stderr_read, stderr) = stderr_reader
+        .join()
+        .map_err(|_| anyhow!("{label} stderr reader panicked"))?;
+    stdout_read.with_context(|| format!("cannot read {label} stdout"))?;
+    stderr_read.with_context(|| format!("cannot read {label} stderr"))?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn remote_url_for_gh(url: &str) -> String {
@@ -2234,5 +2302,53 @@ exit 1"#,
         assert_eq!(commits.len(), MAX_PR_COMMITS);
         assert_eq!(commits.last().map(String::as_str), Some("commit 20"));
         assert!(body.contains("- and 1 more commit"), "{body}");
+    }
+
+    #[test]
+    fn create_pr_refuses_a_changed_branch_operation_and_conflicts() {
+        let repo = pr_repo();
+        let gh = pr_gh(repo.path());
+        let plan = plan_pr_with(repo.path(), Some("Guard test"), &gh).unwrap();
+
+        git(repo.path(), &["checkout", "-q", "-b", "other"]);
+        let error = create_pr_with(&plan, &gh).unwrap_err();
+        assert!(error.to_string().contains("branch changed"), "{error}");
+
+        git(repo.path(), &["checkout", "-q", "feat/pr"]);
+        std::fs::write(repo.path().join(".git").join("MERGE_HEAD"), "deadbeef\n").unwrap();
+        let error = create_pr_with(&plan, &gh).unwrap_err();
+        assert!(
+            error.to_string().contains("merge is in progress"),
+            "{error}"
+        );
+        std::fs::remove_file(repo.path().join(".git").join("MERGE_HEAD")).unwrap();
+
+        std::fs::write(repo.path().join("base.txt"), "stash\n").unwrap();
+        git(repo.path(), &["stash", "push", "-q"]);
+        std::fs::write(repo.path().join("base.txt"), "main\n").unwrap();
+        git(repo.path(), &["commit", "-qam", "main"]);
+        let pop = Command::new("git")
+            .args(["stash", "pop"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert!(!pop.status.success(), "the conflict fixture must fail");
+        let error = create_pr_with(&plan, &gh).unwrap_err();
+        assert!(
+            error.to_string().contains("unresolved conflicts"),
+            "{error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_commands_time_out_and_kill_the_child() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5"]);
+        let started = Instant::now();
+        let error = run_command_with_timeout(command, "sleep fixture", Duration::from_millis(100))
+            .unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

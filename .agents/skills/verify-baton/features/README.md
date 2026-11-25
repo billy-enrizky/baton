@@ -7,7 +7,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Doctor | CLI | `baton doctor` next action, six providers, readiness, database count |
 | TUI status | TUI | `/status` shows thread, phase, queue, and adapter lifecycle |
 | Queued follow-ups | TUI | `/queue` opens the queue; Enter sends, `e` edits, `d` deletes, `c` twice clears, and Ctrl+Up/Ctrl+Down reorder; every action persists through the store |
-| Slash choices | TUI | typing a command argument lists valid choices or its syntax, filters them, and completes with Tab or Enter; `slash_sweep.py` runs every command and requires its stable surface |
+| Slash choices | TUI | typing a command argument lists valid choices or its syntax, filters them, and completes with Tab or Enter; `slash_sweep.py` runs 57 cases across 51 of the 52 registered commands plus argument variants, and `slash_probe.py` covers the remaining `/quit` path |
 | Settings | TUI | `/settings` writes global default mode and bell choices, shows the selected category's options, and labels harness rows read-only |
 | Auth billing | TUI | `/auth` lists every harness with subscription and API rows, marks the current mode, names the key variable or `missing`, applies a keyed choice, and keeps the picker open on a missing key or malformed config |
 | Approval choices | TUI | an approval lists the provider's own choices, arrows and Enter send the selected id, y/a/n keep the standard shortcuts, and a child request names the child thread |
@@ -20,6 +20,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Default provider | CLI and TUI | new work starts on an installed harness, with an explicit override |
 | Recent thread hint | TUI | a new session points at existing threads in the folder |
 | Usage report | TUI | `/usage` picks this thread or all threads, then totals or a day/model/provider grouping, and shows a scrollable report |
+| Plan review | TUI | `/plan` shows the harness-reported steps, explanation, status, and priority in a scrollable read-only overlay; an empty state names why there is no plan |
 | Attention inbox | TUI | `/inbox` lists failed, unverified, interrupted, needs-input, and queued work and opens the selected thread |
 | Thread pins | TUI; CLI read | `/pin` toggles a durable pin, Ctrl+Up/Ctrl+Down or `/pin move` orders pinned threads, pinned rows sort first, and `baton threads --json` exposes `pinned` and `pin_order_key` |
 | File navigation | TUI; CLI | `/files [--ignored]` inserts a selected project path or `path:line` and warns when ignored files are included; Ctrl+O launches that target or a selected `/grep` match in `VISUAL` or `EDITOR`; `/grep` and `baton grep` search file contents with sorted previews; `baton files` ranks project paths with ripgrep or git; and `baton open` launches the editor with `-C`-directory containment |

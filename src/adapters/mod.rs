@@ -6,7 +6,7 @@ use tokio::process::Child;
 use tokio::sync::oneshot;
 
 use crate::types::{
-    ApprovalChoice, ApprovalDecision, NativeSessionRef, PermissionMode, QuestionAnswer,
+    ApprovalChoice, ApprovalDecision, NativeSessionRef, PermissionMode, PlanEntry, QuestionAnswer,
     QuestionPrompt, TurnUsage,
 };
 
@@ -249,6 +249,16 @@ pub enum TurnEvent {
         id: String,
         questions: Vec<QuestionPrompt>,
         respond: oneshot::Sender<Vec<QuestionAnswer>>,
+    },
+    PlanUpdated {
+        provider: crate::types::ProviderId,
+        plan_id: Option<String>,
+        entries: Vec<PlanEntry>,
+        explanation: Option<String>,
+    },
+    PlanRemoved {
+        provider: crate::types::ProviderId,
+        plan_id: String,
     },
     Usage { usage: TurnUsage },
     /// A child agent started. The id is the provider's tool call or child

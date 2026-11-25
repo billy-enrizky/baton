@@ -5,7 +5,7 @@ description: "Drive baton's Rust CLI, TUI, and MCP stdio server through isolated
 
 # Verify baton
 
-Baton is a terminal app, so the proof is a terminal transcript, not a unit test alone. This skill builds the debug binary once, starts each drive in its own PTY with a temporary `BATON_HOME` and working directory, captures a full screen after forcing a redraw, and preserves the evidence. It also runs the 54-command slash sweep, the hermetic MCP probe, and the installed-binary check after a release.
+Baton is a terminal app, so the proof is a terminal transcript, not a unit test alone. This skill builds the debug binary once, starts each drive in its own PTY with a temporary `BATON_HOME` and working directory, captures a full screen after forcing a redraw, and preserves the evidence. It also runs the 57-case slash sweep, the hermetic MCP probe, and the installed-binary check after a release.
 
 ## Launch
 
@@ -94,13 +94,14 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 | Greeting in default orchestrate mode | `scripts/greeting_probe.py` | one small Codex turn |
 | Provider approval choices and Antigravity questions | `scripts/approval_probe.py` | zero, fake ACP agent |
 | Codex user-input questions | `scripts/question_probe.py` | zero, fake Codex app-server |
+| Codex plan and `/plan` overlay | `scripts/plan_probe.py` | zero, fake Codex app-server |
 | MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, seeds an empty thread with `baton new` |
 | Command palette | `scripts/palette_probe.py` | zero |
-| Usage scope and grouping picker | 54-case slash sweep | zero |
+| Usage scope and grouping picker | 57-case slash sweep | zero |
 | One-shot shell command | `scripts/tui_probe.py --command '!printf shell-probe'` | zero |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |
 | Slash argument choices and completion | `scripts/slash_probe.py` | zero |
-| All 54 sweep cases across the registered slash commands | `scripts/slash_sweep.py` | zero |
+| All 57 sweep cases across the registered slash commands and argument variants | `scripts/slash_sweep.py` | zero |
 | All advertised harnesses with ICA or an explicit account block | `scripts/harness_matrix_probe.py` | four small ICA turns; the live Claude turn is opt-in and Cursor is capability-only |
 
 Every probe accepts `--binary` (default `~/.cargo/bin/baton`) and `--evidence-dir`. To run it against a change before merge, pass `--binary target/debug/baton`.

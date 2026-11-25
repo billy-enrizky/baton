@@ -109,6 +109,30 @@ pub fn turn_event_json(thread_id: &str, event: &TurnEvent) -> Value {
             "id": id,
             "questions": questions,
         }),
+        TurnEvent::PlanUpdated {
+            provider,
+            plan_id,
+            entries,
+            explanation,
+        } => json!({
+            "type": "plan_updated",
+            "provider": provider.as_str(),
+            "plan_id": plan_id,
+            "explanation": explanation,
+            "entries": entries
+                .iter()
+                .map(|entry| json!({
+                    "content": entry.content,
+                    "status": entry.status,
+                    "priority": entry.priority,
+                }))
+                .collect::<Vec<_>>(),
+        }),
+        TurnEvent::PlanRemoved { provider, plan_id } => json!({
+            "type": "plan_removed",
+            "provider": provider.as_str(),
+            "plan_id": plan_id,
+        }),
         TurnEvent::Usage { usage } => json!({
             "type": "usage",
             "usage": usage,
@@ -181,7 +205,7 @@ pub fn result_json(result: &ExecResult<'_>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ApprovalChoice, QuestionPrompt, TurnUsage};
+    use crate::types::{ApprovalChoice, PlanEntry, QuestionPrompt, TurnUsage};
 
     fn completed(final_text: &str) -> TurnEvent {
         TurnEvent::TurnCompleted {
@@ -342,6 +366,44 @@ mod tests {
         assert_eq!(value["type"], "question_request");
         assert_eq!(value["questions"][0]["header"], "Fixture");
         assert!(value.get("respond").is_none());
+    }
+
+    #[test]
+    fn plan_events_keep_the_entries_and_explanation() {
+        let value = turn_event_json(
+            "thread-1",
+            &TurnEvent::PlanUpdated {
+                provider: crate::types::ProviderId::Codex,
+                plan_id: Some("plan-1".into()),
+                entries: vec![PlanEntry {
+                    content: "Inspect the parser".into(),
+                    status: "in_progress".into(),
+                    priority: Some("high".into()),
+                }],
+                explanation: Some("One check".into()),
+            },
+        );
+        assert_eq!(value["type"], "plan_updated");
+        assert_eq!(value["provider"], "codex");
+        assert_eq!(value["plan_id"], "plan-1");
+        assert_eq!(value["explanation"], "One check");
+        assert_eq!(value["entries"][0]["content"], "Inspect the parser");
+        assert_eq!(value["entries"][0]["status"], "in_progress");
+        assert_eq!(value["entries"][0]["priority"], "high");
+    }
+
+    #[test]
+    fn plan_removal_keeps_the_plan_id() {
+        let value = turn_event_json(
+            "thread-1",
+            &TurnEvent::PlanRemoved {
+                provider: crate::types::ProviderId::Antigravity,
+                plan_id: "plan-1".into(),
+            },
+        );
+        assert_eq!(value["type"], "plan_removed");
+        assert_eq!(value["provider"], "antigravity");
+        assert_eq!(value["plan_id"], "plan-1");
     }
 
     #[test]

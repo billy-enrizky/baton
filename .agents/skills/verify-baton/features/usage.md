@@ -15,7 +15,7 @@ Type `/usage`, choose a scope and grouping, then Enter.
 - `usage_report_groups_this_thread_by_model`
 - `usage_report_handles_empty_history`
 - `every_remaining_picker_paints_one_cursor`
-- The 54-case slash sweep opens `/usage` and requires the picker.
+- The 57-case slash sweep opens `/usage` and requires the picker.
 
 ## Gotchas
 - The report is a snapshot taken when Enter is pressed. Reopen `/usage` after a turn to refresh.

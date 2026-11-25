@@ -130,6 +130,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/grep", "search project contents and insert path:line"),
     ("/usage", "token usage and cache hit rate; pick a scope and grouping"),
+    ("/plan", "show the plan the harness reported"),
     ("/checkpoints", "list checkpoints for this thread"),
     ("/review", "review the latest turn diff with line notes"),
     ("/diff", "diff a checkpoint against the working tree"),
@@ -417,6 +418,13 @@ struct ReviewSearch {
     matches: Vec<usize>,
 }
 
+#[derive(Debug, Clone)]
+struct PlanSnapshot {
+    plan_id: Option<String>,
+    entries: Vec<crate::types::PlanEntry>,
+    explanation: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PaletteAction {
     Command(&'static str),
@@ -599,6 +607,9 @@ enum Overlay {
     UsageReport {
         title: String,
         lines: Vec<String>,
+        scroll: usize,
+    },
+    PlanView {
         scroll: usize,
     },
     RewindPicker {
@@ -888,6 +899,7 @@ pub struct TuiState {
     approvals: Vec<ApprovalState>,
     questions: Vec<QuestionState>,
     review: Option<ReviewState>,
+    plans: std::collections::HashMap<String, std::collections::HashMap<ProviderId, PlanSnapshot>>,
     activity: Option<ActivityView>,
     multi: Option<MultiView>,
     notice: Option<String>,
@@ -1032,6 +1044,7 @@ pub fn run_tui(
         approvals: Vec::new(),
         questions: Vec::new(),
         review: None,
+        plans: std::collections::HashMap::new(),
         activity: None,
         multi: None,
         notice: None,
@@ -1642,6 +1655,7 @@ fn apply_engine_event(
             state
                 .questions
                 .retain(|question| question.thread_id != thread_id);
+            state.plans.remove(&thread_id);
             if let Some(child) = state.multi.as_mut().and_then(|multi| {
                 multi
                     .children
@@ -2514,6 +2528,7 @@ fn request_orchestration_preview(
         state.notice = Some(ORCHESTRATE_USAGE.into());
         return;
     }
+    state.plans.remove(&state.thread.id);
     start_orchestration_preview(state, goal, max_tasks, plan_file);
 }
 
@@ -2650,6 +2665,7 @@ fn start_orchestration(
         state.notice = Some(ORCHESTRATE_USAGE.into());
         return;
     }
+    state.plans.remove(&state.thread.id);
     let cwd = state.thread.cwd.clone();
     let home = state.home.clone();
     let permission_mode = state.permission_mode;
@@ -2740,6 +2756,37 @@ fn start_orchestration(
 
 fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
     match event {
+        TurnEvent::PlanUpdated {
+            provider,
+            plan_id,
+            entries,
+            explanation,
+        } => {
+            state
+                .plans
+                .entry(state.thread.id.clone())
+                .or_default()
+                .insert(
+                    provider,
+                    PlanSnapshot {
+                        plan_id,
+                        entries,
+                        explanation,
+                    },
+                );
+        }
+        TurnEvent::PlanRemoved { provider, plan_id } => {
+            let remove = state
+                .plans
+                .get(&state.thread.id)
+                .and_then(|plans| plans.get(&provider))
+                .is_some_and(|plan| plan.plan_id.as_deref() == Some(plan_id.as_str()));
+            if remove {
+                if let Some(plans) = state.plans.get_mut(&state.thread.id) {
+                    plans.remove(&provider);
+                }
+            }
+        }
         TurnEvent::TextDelta { text } => {
             state
                 .streaming_text
@@ -2892,6 +2939,33 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
         }
     }
     match event {
+        TurnEvent::PlanUpdated {
+            provider,
+            plan_id,
+            entries,
+            explanation,
+        } => {
+            state.plans.entry(thread_id).or_default().insert(
+                provider,
+                PlanSnapshot {
+                    plan_id,
+                    entries,
+                    explanation,
+                },
+            );
+        }
+        TurnEvent::PlanRemoved { provider, plan_id } => {
+            let remove = state
+                .plans
+                .get(&thread_id)
+                .and_then(|plans| plans.get(&provider))
+                .is_some_and(|plan| plan.plan_id.as_deref() == Some(plan_id.as_str()));
+            if remove {
+                if let Some(plans) = state.plans.get_mut(&thread_id) {
+                    plans.remove(&provider);
+                }
+            }
+        }
         TurnEvent::ApprovalRequest {
             summary,
             choices,
@@ -3396,6 +3470,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/inbox", _) => Some("inbox (no arguments)"),
         ("/questions", _) => Some("questions (no arguments)"),
         ("/usage", _) => Some("usage (no arguments)"),
+        ("/plan", _) => Some("plan (no arguments)"),
         ("/checkpoints", _) => Some("checkpoints (no arguments)"),
         ("/turns", _) => Some("turns (no arguments)"),
         ("/memory", _) => Some("memory (no arguments)"),
@@ -4676,6 +4751,7 @@ fn open_command_palette(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
         ("Inbox", "threads that need attention", "/inbox"),
         ("Worker questions", "answer waiting workers", "/questions"),
         ("Usage", "token and cache totals", "/usage"),
+        ("Plan", "show the harness plan", "/plan"),
         ("Threads", "list threads", "/threads"),
         ("Help", "keyboard and command help", "/help"),
         ("Quit", "exit baton", "/quit"),
@@ -5009,6 +5085,44 @@ fn handle_key(
                         lines,
                         scroll,
                     };
+                }
+            }
+        }
+        Overlay::PlanView { mut scroll } => {
+            let max = current_plan(state)
+                .map(|plan| {
+                    plan.entries
+                        .len()
+                        .saturating_add(usize::from(plan.explanation.is_some()))
+                        .saturating_sub(1)
+                })
+                .unwrap_or(0);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    state.overlay = Overlay::PlanView { scroll };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll = (scroll + 1).min(max);
+                    state.overlay = Overlay::PlanView { scroll };
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(10);
+                    state.overlay = Overlay::PlanView { scroll };
+                }
+                KeyCode::PageDown => {
+                    scroll = (scroll + 10).min(max);
+                    state.overlay = Overlay::PlanView { scroll };
+                }
+                KeyCode::Home => {
+                    state.overlay = Overlay::PlanView { scroll: 0 };
+                }
+                KeyCode::End => {
+                    state.overlay = Overlay::PlanView { scroll: max };
+                }
+                _ => {
+                    state.overlay = Overlay::PlanView { scroll };
                 }
             }
         }
@@ -7209,6 +7323,7 @@ fn apply_native_rewind_event(
                     .get_checkpoint(&state.thread.id, turn - 1)
                     .unwrap_or(None)
             };
+            state.plans.remove(&state.thread.id);
             state.scroll_offset = 0;
             state.set_input(text);
             state.overlay = match checkpoint {
@@ -7246,6 +7361,7 @@ fn apply_rewind(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, turn: i64,
     };
     match result {
         Ok(()) => {
+            state.plans.remove(&state.thread.id);
             {
                 let guard = store.lock().unwrap();
                 state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
@@ -8853,6 +8969,7 @@ fn handle_command(
             }
             let valid_providers = parsed.providers;
             let prompt = parsed.prompt;
+            state.plans.remove(&state.thread.id);
             state.notice = Some(format!(
                 "sending to {} providers in parallel: {}",
                 valid_providers.len(),
@@ -10274,6 +10391,14 @@ fn handle_command(
         "/usage" => {
             state.overlay = Overlay::UsagePicker { selected: 0 };
         }
+        "/plan" => {
+            let has_plan = current_plan(state).is_some_and(|plan| !plan.entries.is_empty());
+            if has_plan {
+                state.overlay = Overlay::PlanView { scroll: 0 };
+            } else {
+                state.notice = Some("no plan available for this thread".into());
+            }
+        }
         "/checkpoints" => {
             let checkpoints: Vec<(i64, String)> = {
                 let guard = store.lock().unwrap();
@@ -11300,6 +11425,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::Help { .. } => HELP_VIEW_ROWS + 3,
             Overlay::UsagePicker { .. } => USAGE_CHOICES.len() + 4,
             Overlay::UsageReport { lines, .. } => lines.len().min(12) + 3,
+            Overlay::PlanView { .. } => current_plan(state)
+                .map(|plan| plan.entries.len().min(12) + 4 + usize::from(plan.explanation.is_some()))
+                .unwrap_or(4),
             Overlay::RewindPicker { .. } => {
                 state
                     .history
@@ -11644,6 +11772,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 lines,
                 scroll,
             } => draw_usage_report(frame, chunks[1], title, lines, *scroll),
+            Overlay::PlanView { scroll } => draw_plan_view(frame, chunks[1], state, *scroll),
             Overlay::None => {}
         }
     }
@@ -14114,6 +14243,71 @@ fn draw_usage_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn current_plan(state: &TuiState) -> Option<&PlanSnapshot> {
+    state
+        .plans
+        .get(&state.thread.id)
+        .and_then(|plans| plans.get(&state.thread.current_provider))
+}
+
+fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scroll: usize) {
+    let Some(plan) = current_plan(state) else {
+        return;
+    };
+    let total = plan.entries.len();
+    let done = plan
+        .entries
+        .iter()
+        .filter(|entry| entry.status == "completed")
+        .count();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let width = inner.width as usize;
+    let mut content: Vec<Line> = Vec::new();
+    if let Some(explanation) = &plan.explanation {
+        let safe = crate::sanitize::sanitize_terminal_text(explanation);
+        content.push(Line::styled(
+            truncate_chars(&safe, width),
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    for entry in &plan.entries {
+        let (marker, color) = match entry.status.as_str() {
+            "completed" => ("✓", COLORS.success),
+            "in_progress" => ("▸", COLORS.accent),
+            _ => ("·", COLORS.muted),
+        };
+        let safe = crate::sanitize::sanitize_terminal_text(&entry.content);
+        let priority = entry
+            .priority
+            .as_deref()
+            .map(|priority| format!(" ({})", crate::sanitize::sanitize_terminal_text(priority)))
+            .unwrap_or_default();
+        content.push(Line::styled(
+            truncate_chars(&format!("{marker} {safe}{priority}"), width),
+            Style::default().fg(color),
+        ));
+    }
+    let visible = inner.height.saturating_sub(1) as usize;
+    let start = if visible == 0 || content.len() <= visible {
+        0
+    } else {
+        scroll.min(content.len() - visible)
+    };
+    let mut lines = vec![Line::styled(
+        format!("plan · {done}/{total} done · ↑↓ scroll · esc close"),
+        Style::default().fg(COLORS.muted),
+    )];
+    for line in content.iter().skip(start).take(visible) {
+        lines.push(line.clone());
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_usage_report(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -16282,6 +16476,7 @@ mod tests {
             approvals: Vec::new(),
             questions: Vec::new(),
             review: None,
+            plans: std::collections::HashMap::new(),
             activity: None,
             multi: None,
             notice: None,
@@ -28913,6 +29108,259 @@ exit 1
             panic!("expected the usage report");
         };
         assert_eq!(lines, &vec!["no usage yet".to_string()]);
+    }
+
+    #[test]
+    fn plan_event_fills_the_view_and_plan_command_opens_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let provider = state.thread.current_provider;
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                entries: vec![
+                    crate::types::PlanEntry {
+                        content: "first".into(),
+                        status: "completed".into(),
+                        priority: None,
+                    },
+                    crate::types::PlanEntry {
+                        content: "second".into(),
+                        status: "in_progress".into(),
+                        priority: Some("high\u{202e}".into()),
+                    },
+                    crate::types::PlanEntry {
+                        content: "third".into(),
+                        status: "pending".into(),
+                        priority: None,
+                    },
+                ],
+                explanation: Some("two steps".into()),
+            },
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        assert!(matches!(state.overlay, Overlay::PlanView { scroll: 0 }));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        for value in [
+            "plan · 1/3 done",
+            "two steps",
+            "✓ first",
+            "▸ second",
+            "· third",
+            "(high\u{fffd})",
+        ] {
+            assert!(text.contains(value), "{value} missing: {text}");
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn plan_command_reports_an_empty_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("no plan available"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn plan_from_another_thread_is_not_shown() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.id = "thread-a".into();
+        let provider = state.thread.current_provider;
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                entries: vec![crate::types::PlanEntry {
+                    content: "private to thread a".into(),
+                    status: "pending".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        state.thread.id = "thread-b".into();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("no plan available"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn plan_from_another_harness_is_not_shown() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = crate::types::ProviderId::Claude;
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider: crate::types::ProviderId::Claude,
+                plan_id: None,
+                entries: vec![crate::types::PlanEntry {
+                    content: "private to claude".into(),
+                    status: "pending".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        state.thread.current_provider = crate::types::ProviderId::Codex;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("no plan available"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn background_plan_is_kept_for_its_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let worker_id = "thread-worker".to_string();
+        let provider = crate::types::ProviderId::Codex;
+        apply_turn_event_for_thread(
+            &mut state,
+            worker_id.clone(),
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                entries: vec![crate::types::PlanEntry {
+                    content: "worker step".into(),
+                    status: "pending".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        state.thread.id = worker_id;
+        state.thread.current_provider = provider;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        assert!(matches!(state.overlay, Overlay::PlanView { scroll: 0 }));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("worker step"), "{text}");
+    }
+
+    #[test]
+    fn plan_removal_matches_the_plan_id() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let provider = ProviderId::Codex;
+        state.thread.current_provider = provider;
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: Some("plan-1".into()),
+                entries: vec![crate::types::PlanEntry {
+                    content: "first plan".into(),
+                    status: "pending".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::PlanRemoved {
+                provider,
+                plan_id: "plan-2".into(),
+            },
+        );
+        assert!(
+            current_plan(&state).is_some(),
+            "another plan id must not clear it"
+        );
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::PlanRemoved {
+                provider,
+                plan_id: "plan-1".into(),
+            },
+        );
+        assert!(
+            current_plan(&state).is_none(),
+            "the matching plan id clears it"
+        );
+    }
+
+    #[test]
+    fn starting_multi_clears_the_visible_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let provider = state.thread.current_provider;
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                entries: vec![crate::types::PlanEntry {
+                    content: "old plan".into(),
+                    status: "pending".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/multi codex compare the parser",
+        );
+        assert!(current_plan(&state).is_none());
+        assert!(
+            receiver.try_recv().is_ok(),
+            "the multi command must still submit its child work"
+        );
     }
 
     #[test]

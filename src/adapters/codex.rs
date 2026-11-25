@@ -482,6 +482,37 @@ impl CodexAdapter {
         if thread_id != active_thread {
             return;
         }
+        if method == "turn/plan/updated" {
+            let entries = params
+                .get("plan")
+                .and_then(Value::as_array)
+                .map(|steps| {
+                    steps
+                        .iter()
+                        .filter_map(|step| {
+                            Some(crate::types::PlanEntry {
+                                content: step.get("step")?.as_str()?.to_string(),
+                                status: crate::types::normalize_plan_status(
+                                    step.get("status")?.as_str()?,
+                                ),
+                                priority: None,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let explanation = params
+                .get("explanation")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let _ = emit.send(TurnEvent::PlanUpdated {
+                provider: crate::types::ProviderId::Codex,
+                plan_id: None,
+                entries,
+                explanation,
+            });
+            return;
+        }
         match method {
             "item/agentMessage/delta" => {
                 if let Some(delta) = params.get("delta").and_then(Value::as_str) {

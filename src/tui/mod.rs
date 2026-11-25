@@ -5099,7 +5099,35 @@ fn handle_key(
             let max = state.plan_scroll_max.get();
             scroll = scroll.min(max);
             match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {}
+                KeyCode::Enter => {
+                    if current_plan(state).is_none() {
+                        state.notice = Some("no plan to accept".into());
+                    } else if state.permission_mode == PermissionMode::Plan {
+                        state.apply_permission_mode(store, PermissionMode::Default);
+                        state.notice = Some(
+                            "plan accepted · permission mode: default · send a prompt to start"
+                                .into(),
+                        );
+                    } else {
+                        state.overlay = Overlay::PlanView { scroll };
+                        state.notice = Some(format!(
+                            "plan is read-only; permission mode is {}",
+                            state.permission_mode.as_str()
+                        ));
+                    }
+                }
+                KeyCode::Esc => {
+                    if state.permission_mode == PermissionMode::Plan
+                        && current_plan(state).is_some()
+                    {
+                        if state.input.trim().is_empty() {
+                            state.input = "revise the plan: ".into();
+                            state.input_cursor = state.input.chars().count();
+                        }
+                        state.notice = Some("plan returned for revision".into());
+                    }
+                }
+                KeyCode::Char('q') => {}
                 KeyCode::Up | KeyCode::Char('k') => {
                     scroll = scroll.saturating_sub(1);
                     state.overlay = Overlay::PlanView { scroll };
@@ -14393,7 +14421,11 @@ fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scro
     if let Some(turn_id) = plan.turn_id.as_deref() {
         header.push_str(&format!(" · turn {}", truncate_chars(turn_id, 12)));
     }
-    header.push_str(" · ↑↓ scroll · esc close");
+    if state.permission_mode == PermissionMode::Plan {
+        header.push_str(" · ↑↓ scroll · enter accept · esc revise");
+    } else {
+        header.push_str(" · ↑↓ scroll · esc close");
+    }
     let mut lines = vec![Line::styled(header, Style::default().fg(COLORS.muted))];
     for line in content.iter().skip(start).take(visible) {
         lines.push(line.clone());
@@ -29696,6 +29728,139 @@ exit 1
         handle_command(&mut state, &store, &engine_command_sender, "/plan");
         let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
         assert!(text.contains("plan · 0/1 done · turn turn-plan"), "{text}");
+    }
+
+    fn sample_plan_event(provider: crate::types::ProviderId) -> TurnEvent {
+        TurnEvent::PlanUpdated {
+            provider,
+            plan_id: None,
+            turn_id: None,
+            entries: vec![crate::types::PlanEntry {
+                content: "one step".into(),
+                status: "pending".into(),
+                priority: None,
+            }],
+            explanation: None,
+        }
+    }
+
+    #[test]
+    fn plan_enter_accepts_in_plan_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.apply_permission_mode(&store, PermissionMode::Plan);
+        let provider = state.thread.current_provider;
+        apply_turn_event(&mut state, sample_plan_event(provider));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("enter accept"), "{text}");
+        assert!(text.contains("esc revise"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.permission_mode, PermissionMode::Default);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("plan accepted"),
+            "{:?}",
+            state.notice
+        );
+        let persisted = store
+            .lock()
+            .unwrap()
+            .get_thread(&state.thread.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.permission_mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn plan_enter_explains_read_only_outside_plan_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let provider = state.thread.current_provider;
+        apply_turn_event(&mut state, sample_plan_event(provider));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(!text.contains("enter accept"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::PlanView { .. }));
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("read-only"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn plan_escape_prefills_revision_in_plan_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.apply_permission_mode(&store, PermissionMode::Plan);
+        let provider = state.thread.current_provider;
+        apply_turn_event(&mut state, sample_plan_event(provider));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        let _ = render_state(&state, 120, 30);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.input, "revise the plan: ");
+        assert_eq!(state.input_cursor, state.input.chars().count());
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("returned for revision"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn plan_escape_keeps_an_existing_draft() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.apply_permission_mode(&store, PermissionMode::Plan);
+        let provider = state.thread.current_provider;
+        apply_turn_event(&mut state, sample_plan_event(provider));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "keep this draft".into();
+        state.input_cursor = state.input.chars().count();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        let _ = render_state(&state, 120, 30);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Esc),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.input, "keep this draft");
+        assert_eq!(state.input_cursor, state.input.chars().count());
     }
 
     #[test]

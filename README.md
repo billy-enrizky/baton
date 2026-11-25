@@ -197,7 +197,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/billy-enrizky/baton/main/install.ps1 | iex
 ```
 
-The installer downloads the release for your OS and checks its SHA-256. If no release asset matches, it falls back to a source build when Cargo is installed.
+The installer downloads the release for your OS and checks its SHA-256. If no release asset matches, it falls back to a source build when Cargo and git are installed.
 
 ### 3.2 Homebrew
 
@@ -220,7 +220,7 @@ baton
 
 - At least one harness CLI on `PATH`.
 - Git, for worktrees and the git commands.
-- `gh`, for pull request checks, creation, review, and merge.
+- `gh`, for pull request checks, creation, review, merge, and `/task`.
 - Optional: `rg` for faster file search, and `VISUAL` or `EDITOR` for opening files.
 - Optional: Node or any other runtime your harness or MCP servers need.
 
@@ -241,7 +241,7 @@ See [Install Baton](install.md) for supported platforms, checksums, upgrades, an
 baton
 ```
 
-The workspace opens in the configured default session mode. Orchestrate is the default until you change it with `/settings`, `/orchestrate off`, or `"defaultMode": "single"` in `config.json`.
+The workspace opens in the configured default session mode. Orchestrate is the default until you change the global default with `/settings` or `"defaultMode": "single"` in `config.json`. `/orchestrate off` changes only the current thread.
 
 ### 4.2 Single-harness mode
 
@@ -590,8 +590,13 @@ It is read-only except for `baton_queue` clear and `baton_fork`, which creates a
 
 ```sh
 baton                              # fresh session
+baton chat                         # interactive workspace (default)
+baton new [title]                  # start a thread
 baton --mode single                # one harness
 baton -t <id>                      # open a thread
+baton login <provider>             # sign in to a provider
+baton default <provider>           # set the default provider
+baton task <number>                # linked worktree for a GitHub issue
 baton threads [--json]
 baton inbox [--json]
 baton status [-t id] [--json]
@@ -636,6 +641,7 @@ baton files [query...] [--ignored] [--json]
 baton open <path[:line]> [--print]
 baton grep <query> [--case-sensitive] [--word] [--regex] [--json]
 baton memories [-C path] [--json]
+baton checkpoints <thread-id>
 baton queue [-t id] [--clear] [--json]
 baton auth [provider] [subscription|api]
 baton roles [--json]
@@ -645,6 +651,7 @@ baton import [--dry-run]
 baton mcp
 baton bench startup [--json] [--repeat N]
 baton completions <shell>
+baton update
 ```
 
 ## 13. Configuration and storage

@@ -13,7 +13,7 @@
 - Free-form commands still accept typed text.
 
 ## How to get to it (user POV)
-Open the TUI and type `/mode `, `/model`, `/switch `, `/effort `, `/auth `, `/mcp `, `/orchestrate `, `/git `, or `/runs `. The `/git` list includes Status, Commit all changes, Commit staged changes, Push current branch, Checks, Open pull request, and Cancel.
+Open the TUI and type `/mode `, `/model`, `/switch `, `/effort `, `/auth `, `/mcp `, `/orchestrate `, `/git `, or `/runs `. The `/git` list includes Status, Commit all changes, Commit staged changes, Push current branch, Checks, Open pull request, Review pull request, Merge pull request, and Cancel.
 
 ## Driving it with the PTY harness
 ```sh
@@ -60,7 +60,7 @@ Installed-binary proof: the slash probe passed against the v0.4.1 Homebrew and c
 - Turn-number choices for `/review`, `/commands`, and `/fork --turn` come from the current thread history.
 - `/mcp remove`, `/runs`, and `/copy` choices come from the MCP registry, current store, and conversation.
 - `/pin move ` offers both directions only for pinned threads in the current project. The probe enters the full ID from the picker row because the move notice, refreshed order, and boundary result are part of the proof.
-- `/git` completes status, commit, commit --staged, push, checks, and pr. The unit tests execute both the picker Checks row and exact `/git checks`. The probe commits the isolated repository, checks the real git subject and exact file list, pushes to a local bare remote, checks its head, opens Checks against a fake `gh`, and requires the PR header and the pass/pending rows. It then pushes `feat/pr`; `/git pr` requires the repository, base, title, body, and HEAD preview, and Enter requires the created PR notice and URL.
+- `/git` completes status, commit, commit --staged, push, checks, pr, review, and merge. The unit tests execute both the picker Checks row and exact `/git checks`. The probe commits the isolated repository, checks the real git subject and exact file list, pushes to a local bare remote, checks its head, opens Checks against a fake `gh`, and requires the PR header and the pass/pending rows. It then pushes `feat/pr`; `/git pr` requires the repository, base, title, body, and HEAD preview, and Enter requires the created PR notice and URL.
 - The sweep forbids `unknown /git action`, so the nested-command regression that produced it cannot pass unnoticed.
 - Enter used to replace any line that was a strict prefix of a completion, which turned the `/auth codex` query into `/auth codex subscription` and changed billing mode on the next Enter. `is_complete_command` now marks `/auth <provider>` and `/switch <provider>` as complete, the unit tests assert that Enter clears the input and opens the scoped picker, and `config.json` stays unchanged.
 - A command whose usage string was missing showed nothing after a space. `command_usage` now covers every entry in `SLASH_COMMANDS`, and `every_slash_command_offers_a_hint_after_a_space` enforces that invariant.

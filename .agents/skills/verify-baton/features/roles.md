@@ -19,7 +19,7 @@ Role behavior was implicit in one coordinator prompt and one worker preamble. Us
 
 Goals: one validated role registry, explicit defaults, user prompt and model overrides, role-driven planning and worker execution, a TUI submenu, a machine-readable CLI, and fail-closed malformed configuration.
 
-Still out of scope: full orchestrator turns for normal conversation, mutating role files from the TUI, project-scoped roles, and automatic re-review after a follow-up turn. A greeting fallback copies only the orchestrator provider, model, and effort.
+Still out of scope: full orchestrator turns for normal conversation, mutating role files from the TUI, and project-scoped roles. A greeting fallback copies only the orchestrator provider, model, and effort.
 
 ## Approach
 
@@ -37,7 +37,7 @@ Still out of scope: full orchestrator turns for normal conversation, mutating ro
 
 ## Risks and mitigations
 
-- Hooks will eventually execute trusted user code. This slice parses only command argv, timeout, and known event names; it does not run them. A later execution slice must define consent, environment clearing, process limits, and failure policy.
+- Hooks run trusted user code with a declared timeout between 1 and 300 seconds. The remaining risk is consent, environment clearing, and process limits; the runner executes the declared argv in order and stops on a failure.
 - Model names can drift. Defaults are explicit and Baton's Codex catalog includes both role models, but the selected provider account can still reject a model it does not entitle.
 - An uninstalled implementor provider no longer traps every plan. The planner prompt defaults to the coordinator when the implementor binary is missing, and planner failure uses the coordinator provider in that case instead of the implementor.
 - If the planner provider is unavailable, planning retries and then falls back to the implementor when installed. If no configured role provider is installed, the fallback worker fails at provider preflight; `baton doctor` lists the missing providers. The failure is visible in the run report, not only in debug logging.

@@ -59,7 +59,7 @@ The resume line must still print a Codex session id after the native rewind.
 - The turn must be terminal and must have a recorded provider turn id. For OpenCode that id is the admitted user message id; turns recorded before Baton captured it cannot be cut natively.
 - Native revert changes provider conversation history, not files. Use the checkpoint restore path for files.
 - If the Baton store rewind fails after the provider revert, a `native_rewinds` marker remains. Retry the same command or TUI action: it skips the provider and finishes only the store rewind, reporting `provider_retry_skipped: true` in JSON. A rewind to a different turn is refused until the pending marker is cleared.
-- The TUI refuses a native rewind while a turn is running or when the thread's current provider is not Codex.
+- The TUI refuses a native rewind while a turn is running or when the thread's current provider is not Codex or OpenCode.
 - `beforeTurnId` is the provider id of the first removed turn, not the previous turn. For OpenCode it is the `messageID` passed to `revert/stage`.
 - OpenCode `revert/commit` leaves the raw message list intact but removes the staged revert state; Baton owns the visible transcript, so the turns table is the source of truth after the rewind.
 - If OpenCode stage or commit fails, Baton sends `revert/clear` so a later prompt cannot commit a half-staged revert.

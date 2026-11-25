@@ -108,6 +108,7 @@ A harness is the coding agent CLI you already use, such as Codex, Claude Code, C
   - 13.3 [Permission modes](#133-permission-modes)
   - 13.4 [Roles](#134-roles)
   - 13.5 [Harness config](#135-harness-config)
+  - 13.6 [Terminal capabilities](#136-terminal-capabilities)
 - 14\. [Safety and recovery](#14-safety-and-recovery)
   - 14.1 [Approvals and permissions](#141-approvals-and-permissions)
   - 14.2 [Processes](#142-processes)
@@ -725,6 +726,10 @@ Roles choose the harness, model, effort, and prompt for planning, implementation
 ### 13.5 Harness config
 
 Baton reads Claude settings, Codex config, and the OpenCode model setting. A key resolves from `~/.baton/config.json` first, then the harness config, then the environment. `baton secret check` names the winning source for every harness without printing the key. `~/.baton/config.json` supplies provider overrides, including API keys and, for Grok or Antigravity, a custom endpoint. Keys can also come from the environment or the Claude or Codex config. An explicit `config.json` value wins. `/auth` shows which key variable Baton will read.
+
+### 13.6 Terminal capabilities
+
+Baton sizes the interface from the terminal and redraws when it resizes. Set `NO_COLOR` to any non-empty value, or run with `TERM=dumb`, to draw without palette colors. Selections and the composer caret switch to reverse video so they stay visible, and bold and underline still work. The interface needs an interactive terminal: when stdin or stdout is not one, Baton exits with a message and points to `baton exec` for scripts and pipes.
 
 ## 14. Safety and recovery
 

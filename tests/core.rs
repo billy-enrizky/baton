@@ -2342,3 +2342,24 @@ fn side_chat_marks_the_source_and_leaves_it_unchanged() {
     assert_eq!(store.list_messages(&side.id).unwrap().len(), 1);
     assert_eq!(side.title, "source (side chat)");
 }
+
+#[test]
+fn tui_refuses_a_non_interactive_terminal() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .arg("-C")
+        .arg(cwd.path())
+        .env("BATON_HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("baton should exit on a non-interactive terminal");
+    assert!(!output.status.success(), "{:?}", output.status);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("interactive terminal"),
+        "stderr did not name the terminal requirement: {stderr}"
+    );
+}

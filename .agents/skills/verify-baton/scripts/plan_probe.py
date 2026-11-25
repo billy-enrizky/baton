@@ -147,6 +147,7 @@ def main() -> int:
     env["BATON_HOME"] = str(home)
     env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
     env["TERM"] = "xterm-256color"
+    env["NO_COLOR"] = "1"
 
     pid, master = pty.fork()
     if pid == 0:
@@ -243,6 +244,18 @@ def main() -> int:
         except OSError:
             pass
         (evidence / "transcript.raw").write_bytes(transcript)
+        palette_colors = (
+            b"\x1b[38;2;",
+            b"\x1b[38;5;",
+            b"\x1b[48;2;",
+            b"\x1b[48;5;",
+        )
+        if any(sequence in transcript for sequence in palette_colors):
+            error = "NO_COLOR still produced palette colors"
+            passed = False
+        elif b"\x1b[7m" not in transcript:
+            error = "NO_COLOR lost the reverse-video caret and selection"
+            passed = False
         shutil.rmtree(root, ignore_errors=True)
 
     summary = {

@@ -34,6 +34,7 @@ use crate::usage::{
 
 pub mod viewport;
 
+mod capability;
 mod diff_render;
 mod markdown;
 
@@ -873,6 +874,8 @@ const PROVIDERS: [ProviderId; 6] = [
 pub struct TuiState {
     /// Terminal bell on turn end, opt-in through config.json.
     bell_enabled: bool,
+    /// Palette colors are stripped; selections use reverse video instead.
+    monochrome: bool,
     bell: crate::notify::BellLimiter,
     store: Arc<Mutex<BatonStore>>,
     prompt_history: Vec<String>,
@@ -978,6 +981,7 @@ pub fn run_tui(
     initial_prompt: Option<String>,
     permission_override: Option<PermissionMode>,
 ) -> Result<()> {
+    capability::require_interactive_terminal()?;
     let history = store.lock().unwrap().list_messages(&thread.id)?;
     let queued_messages = store
         .lock()
@@ -1019,6 +1023,7 @@ pub fn run_tui(
         .map(|source| source.title);
     let mut state = TuiState {
         bell_enabled,
+        monochrome: capability::monochrome_requested(),
         bell: crate::notify::BellLimiter::new(),
         store: store.clone(),
         prompt_history,
@@ -1182,7 +1187,10 @@ pub fn run_tui(
             crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
     );
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    let backend = capability::MonochromeBackend::new(
+        ratatui::backend::CrosstermBackend::new(stdout),
+        capability::monochrome_requested(),
+    );
     let mut terminal = Terminal::new(backend)?;
 
     let mut spinner_frame = 0usize;
@@ -1313,7 +1321,9 @@ pub fn run_tui(
     Ok(())
 }
 
-fn suspend_tui<W: std::io::Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> Result<()> {
+fn suspend_tui<W: std::io::Write>(
+    terminal: &mut Terminal<capability::MonochromeBackend<CrosstermBackend<W>>>,
+) -> Result<()> {
     terminal::disable_raw_mode()?;
     let _ = execute!(
         terminal.backend_mut(),
@@ -1330,7 +1340,9 @@ fn suspend_tui<W: std::io::Write>(terminal: &mut Terminal<CrosstermBackend<W>>) 
     Ok(())
 }
 
-fn resume_tui<W: std::io::Write>(terminal: &mut Terminal<CrosstermBackend<W>>) -> Result<()> {
+fn resume_tui<W: std::io::Write>(
+    terminal: &mut Terminal<capability::MonochromeBackend<CrosstermBackend<W>>>,
+) -> Result<()> {
     terminal::enable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -1559,7 +1571,13 @@ fn hide_transcript_view(state: &TuiState) {
     state.transcript_anchor.set(None);
 }
 
-fn tint_line_range(line: &mut Line<'_>, start: usize, end: usize, background: Color) {
+fn tint_line_range(
+    line: &mut Line<'_>,
+    start: usize,
+    end: usize,
+    background: Color,
+    monochrome: bool,
+) {
     if end <= start {
         return;
     }
@@ -1577,9 +1595,14 @@ fn tint_line_range(line: &mut Line<'_>, start: usize, end: usize, background: Co
             ));
         }
         if local_end > local_start {
+            let style = if monochrome {
+                span.style.add_modifier(Modifier::REVERSED)
+            } else {
+                span.style.bg(background)
+            };
             spans.push(Span::styled(
                 chars[local_start..local_end].iter().collect::<String>(),
-                span.style.bg(background),
+                style,
             ));
         }
         if local_end < length {
@@ -15186,7 +15209,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
                 } else {
                     line_length
                 };
-                tint_line_range(line, from, to, COLORS.selection_bg);
+                tint_line_range(line, from, to, COLORS.selection_bg, state.monochrome);
             }
         }
     }
@@ -16005,6 +16028,11 @@ fn draw_composer(
         rows.push(Line::from(""));
     }
     let input_row_index = rows.len();
+    let highlight = if state.monochrome {
+        Style::default().add_modifier(Modifier::REVERSED)
+    } else {
+        Style::default().fg(Color::Black).bg(COLORS.accent)
+    };
     let input_width = area.width.saturating_sub(2).max(10) as usize;
     let chars: Vec<char> = state.input.chars().collect();
     let line_count = state.input.split('\n').count().max(1);
@@ -16050,11 +16078,11 @@ fn draw_composer(
                             && absolute >= selection_start
                             && absolute < selection_end
                         {
-                            style = style.fg(Color::Black).bg(COLORS.accent);
+                            style = style.patch(highlight);
                         }
                     }
                     if absolute == state.input_cursor && state.selection.is_none() {
-                        style = style.fg(Color::Black).bg(COLORS.accent);
+                        style = style.patch(highlight);
                     }
                     spans.push(Span::styled(chars[absolute].to_string(), style));
                 }
@@ -16062,10 +16090,7 @@ fn draw_composer(
                     && line_index == cursor_line
                     && state.selection.is_none()
                 {
-                    spans.push(Span::styled(
-                        " ",
-                        Style::default().fg(Color::Black).bg(COLORS.accent),
-                    ));
+                    spans.push(Span::styled(" ", highlight));
                 }
             }
             if spans.is_empty() {
@@ -16576,6 +16601,7 @@ mod tests {
         let (shell_sender, shell_receiver) = std::sync::mpsc::channel();
         TuiState {
             bell_enabled: crate::config::notifications(home).bell,
+            monochrome: false,
             bell: crate::notify::BellLimiter::new(),
             store: store.clone(),
             prompt_history: Vec::new(),
@@ -19784,7 +19810,7 @@ mod tests {
     #[test]
     fn transcript_selection_tints_only_the_selected_characters() {
         let mut line = Line::from(vec![Span::raw("abcdef")]);
-        tint_line_range(&mut line, 2, 4, COLORS.selection_bg);
+        tint_line_range(&mut line, 2, 4, COLORS.selection_bg, false);
         assert_eq!(line_plain_text(&line), "abcdef");
         assert_eq!(line.spans.len(), 3);
         assert_eq!(line.spans[0].content.as_ref(), "ab");
@@ -19792,6 +19818,28 @@ mod tests {
         assert_eq!(line.spans[1].style.bg, Some(COLORS.selection_bg));
         assert_eq!(line.spans[2].content.as_ref(), "ef");
         assert_ne!(line.spans[2].style.bg, Some(COLORS.selection_bg));
+    }
+
+    #[test]
+    fn transcript_selection_uses_reverse_video_in_monochrome() {
+        let mut line = Line::from(vec![Span::raw("abcdef")]);
+        tint_line_range(&mut line, 2, 4, COLORS.selection_bg, true);
+        assert_eq!(line_plain_text(&line), "abcdef");
+        assert_eq!(line.spans.len(), 3);
+        assert_eq!(line.spans[1].content.as_ref(), "cd");
+        assert_eq!(line.spans[1].style.bg, None);
+        assert!(line.spans[1]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        assert!(!line.spans[0]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
+        assert!(!line.spans[2]
+            .style
+            .add_modifier
+            .contains(Modifier::REVERSED));
     }
 
     #[test]
@@ -20008,6 +20056,56 @@ mod tests {
             .filter(|&x| buffer.get(x, origin_y).bg == COLORS.accent)
             .count();
         assert_eq!(world_orange, 5, "a later range highlights only that range");
+    }
+
+    #[test]
+    fn monochrome_input_selection_and_caret_use_reverse_video() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.monochrome = true;
+        state.input = "hello world".to_string();
+        state.selection = Some((0, 5));
+
+        let buffer = render_state(&state, 100, 30);
+        let (origin_x, origin_y) = state.input_origin.get();
+        for x in origin_x..origin_x + 5 {
+            let cell = buffer.cell((x, origin_y)).unwrap();
+            assert!(
+                cell.modifier.contains(Modifier::REVERSED),
+                "selected cell at {x} must use reverse video"
+            );
+            assert_eq!(cell.bg, Color::Reset);
+        }
+        assert!(
+            !buffer
+                .cell((origin_x + 6, origin_y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED),
+            "unselected text must not use reverse video"
+        );
+
+        state.selection = None;
+        state.input_cursor = 1;
+        let buffer = render_state(&state, 100, 30);
+        let (origin_x, origin_y) = state.input_origin.get();
+        assert!(
+            buffer
+                .cell((origin_x + 1, origin_y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED),
+            "the caret cell must use reverse video"
+        );
+        assert!(
+            !buffer
+                .cell((origin_x, origin_y))
+                .unwrap()
+                .modifier
+                .contains(Modifier::REVERSED),
+            "a non-caret cell must not use reverse video"
+        );
     }
 
     #[test]

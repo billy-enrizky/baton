@@ -26,6 +26,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Composer file mentions | TUI | typing `@path` offers ranked project files and Tab or Enter replaces only the mention token; ordinary text and addresses never start an index load |
 | Shell completions | CLI | `baton completions <shell>` generates from the clap command graph and handles a broken pipe |
 | Issue tasks | CLI and TUI | `/task [number]` or `baton task <number>` reads an open issue from `origin` and creates a linked worktree; no number opens an issue picker |
+| Side chat | TUI | `/btw` forks the thread, marks it as a side chat of the source, opens it, and prefills an optional prompt; the source is unchanged |
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |
 | Native rewind | CLI | `baton rewind --native` truncates Codex or OpenCode history and keeps the session |

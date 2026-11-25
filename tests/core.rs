@@ -2275,3 +2275,28 @@ fn usage_by_model_reads_recorded_history() {
         String::from_utf8_lossy(&rejected.stderr)
     );
 }
+
+#[test]
+fn side_chat_marks_the_source_and_leaves_it_unchanged() {
+    let store = BatonStore::memory().unwrap();
+    let source = store
+        .create_thread(NewThread {
+            title: "source".to_string(),
+            cwd: "/tmp/side-chat".to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+    store
+        .add_message(&source.id, 1, "user", None, None, "hello")
+        .unwrap();
+    let side = store.fork_thread(&source.id, "source (side chat)").unwrap();
+    store.mark_side_chat(&side.id, &source.id).unwrap();
+
+    let marked = store.side_chat_source(&side.id).unwrap().expect("source");
+    assert_eq!(marked.id, source.id);
+    assert!(store.side_chat_source(&source.id).unwrap().is_none());
+    assert_eq!(store.list_messages(&source.id).unwrap().len(), 1);
+    assert_eq!(store.list_messages(&side.id).unwrap().len(), 1);
+    assert_eq!(side.title, "source (side chat)");
+}

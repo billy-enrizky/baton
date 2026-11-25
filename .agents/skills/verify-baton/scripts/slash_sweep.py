@@ -32,6 +32,7 @@ COMMANDS = [
     ("/find zzz", ["no matches for"]),
     ("/switch", ["switch harness", "antigravity"]),
     ("/model", ["models ·", "enter", "esc"]),
+    ("/btw", ["side chat of"]),
     ("/effort", ["reasoning effort", "xhigh", "max"]),
     ("/mode", ["permission mode", "acceptEdits", "plan"]),
     ("/auth", ["billing mode", "1/12", "enter apply"]),

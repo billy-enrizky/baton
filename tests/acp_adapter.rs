@@ -438,7 +438,11 @@ async fn fake_acp_agent_with_question(
         let id = frame.get("id").cloned();
         match method {
             "initialize" | "session/resume" | "session/load" | "session/set_model" => {
-                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                )
+                .await;
             }
             "session/new" => {
                 send(
@@ -493,6 +497,105 @@ async fn fake_acp_agent_with_question(
                             "method": "session/update",
                             "params": {
                                 "sessionId": "acp-question-1",
+                                "update": {
+                                    "sessionUpdate": "agent_message_chunk",
+                                    "content": { "type": "text", "text": "question answered" }
+                                }
+                            }
+                        }),
+                    )
+                    .await;
+                    if let Some(prompt_id) = prompt_id.take() {
+                        send(
+                            &mut write,
+                            json!({ "jsonrpc": "2.0", "id": prompt_id, "result": { "stopReason": "end_turn" } }),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn fake_acp_agent_with_antigravity_question(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    responses: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    let mut prompt_id: Option<Value> = None;
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" | "session/resume" | "session/load" | "session/set_model" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                )
+                .await;
+            }
+            "session/new" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "sessionId": "acp-question-2" }
+                    }),
+                )
+                .await;
+            }
+            "session/set_mode" | "session/set_config_option" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                )
+                .await;
+            }
+            "session/prompt" => {
+                prompt_id = id;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 93,
+                        "method": "session/request_permission",
+                        "params": {
+                            "sessionId": "acp-question-2",
+                            "toolCall": {
+                                "toolCallId": "interaction_9960062f",
+                                "title": "Which database should the service use?"
+                            },
+                            "options": [
+                                { "optionId": "opt-postgres", "name": "Postgres", "kind": "allow_once" },
+                                { "optionId": "opt-sqlite", "name": "SQLite", "kind": "allow_once" }
+                            ]
+                        }
+                    }),
+                )
+                .await;
+            }
+            _ => {
+                if id == Some(Value::from(93)) {
+                    let _ = responses.send(line.trim().to_string());
+                    send(
+                        &mut write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": {
+                                "sessionId": "acp-question-2",
                                 "update": {
                                     "sessionUpdate": "agent_message_chunk",
                                     "content": { "type": "text", "text": "question answered" }
@@ -656,7 +759,91 @@ async fn acp_adapter_routes_xai_questions_to_the_tui_surface() {
         response.contains("\"Which scope should Grok use?\":[\"Workspace\"]"),
         "{response}"
     );
-    tokio::time::timeout(Duration::from_secs(10), turn)
+    let _ = tokio::time::timeout(Duration::from_secs(10), turn)
+        .await
+        .expect("turn completes")
+        .expect("turn succeeds");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_adapter_routes_antigravity_interactions_to_the_tui_surface() {
+    let (responses, mut response_receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let spawner = Arc::new(
+        move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            let responses = responses.clone();
+            tokio::spawn(fake_acp_agent_with_antigravity_question(
+                server_read,
+                server_write,
+                responses,
+            ));
+            Ok(halves)
+        },
+    );
+    let mut adapter = AcpAdapter::new(ProviderId::Antigravity, spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let turn = tokio::spawn(async move {
+        adapter
+            .start_turn(
+                baton::adapters::TurnStartInput {
+                    turn: 1,
+                    thread_id: "bt".into(),
+                    cwd: "/work".into(),
+                    model: "gemini-3.7-flash".into(),
+                    effort: None,
+                    prompt: "p".into(),
+                    permission_mode: PermissionMode::Default,
+                    auth_env: vec![],
+                },
+                None,
+                event_sender,
+            )
+            .await
+    });
+
+    let question = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            while let Ok(event) = event_receiver.try_recv() {
+                if let baton::adapters::TurnEvent::QuestionRequest {
+                    questions, respond, ..
+                } = event
+                {
+                    return (questions, respond);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("question event");
+    assert_eq!(question.0.len(), 1);
+    assert_eq!(question.0[0].id, "interaction_9960062f");
+    assert_eq!(
+        question.0[0].question,
+        "Which database should the service use?"
+    );
+    assert_eq!(question.0[0].options[1].label, "SQLite");
+    question
+        .1
+        .send(vec![QuestionAnswer {
+            id: "interaction_9960062f".into(),
+            answers: vec!["SQLite".into()],
+        }])
+        .unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(10), response_receiver.recv())
+        .await
+        .expect("server receives question response")
+        .expect("response present");
+    assert!(
+        response.contains("\"id\":93"),
+        "response addressed to request 93: {response}"
+    );
+    assert!(
+        response.contains("\"optionId\":\"opt-sqlite\""),
+        "{response}"
+    );
+    let _ = tokio::time::timeout(Duration::from_secs(10), turn)
         .await
         .expect("turn completes")
         .expect("turn succeeds");

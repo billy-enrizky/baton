@@ -267,6 +267,7 @@ elsif File.file?(base_path)
   added = head_jobs - base_keys
   fail!("CI013", "job added: #{added.join(", ")}") unless added.empty?
   removed = base_keys - head_jobs
+  removed_with_surviving_checks = []
   unless removed.empty?
     surviving = head_jobs.map { |name| job_text[name].to_s }.join("\n")
     removed.each do |name|
@@ -278,6 +279,7 @@ elsif File.file?(base_path)
       unless still_run.empty?
         fail!("CI013", "job #{name} was removed and its commands are gone: #{still_run.join(", ")}")
       end
+      removed_with_surviving_checks << name
       puts "CI013 job #{name} removed; its required commands still run in the head workflow"
     end
   end
@@ -285,7 +287,16 @@ elsif File.file?(base_path)
   changed = []
   head_jobs.each do |name|
     next unless base_jobs.key?(name)
-    unless canonical_job_shell(jobs[name]) == canonical_job_shell(base_jobs[name])
+    # Verify must stop requiring a job that no longer exists, but only for a
+    # removal the rule above already proved. Dropping a job that still exists
+    # from verify.needs stays a wiring change and still fails.
+    base_job = base_jobs[name]
+    if name == "verify" && !removed_with_surviving_checks.empty?
+      base_job = base_job.merge(
+        "needs" => Array(base_job["needs"]).map(&:to_s) - removed_with_surviving_checks,
+      )
+    end
+    unless canonical_job_shell(jobs[name]) == canonical_job_shell(base_job)
       fail!("CI013", "job #{name} wiring changed; job wiring is never allowed to drift")
     end
     next if canonical_job(jobs[name]) == canonical_job(base_jobs[name])

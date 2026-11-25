@@ -438,3 +438,31 @@ fn turn_diff_between_start_and_end_checkpoints() {
     assert!(diff.contains("+new"), "new file shows: {}", diff);
     assert!(diff.contains("b.txt"));
 }
+
+#[test]
+fn auth_cli_keeps_a_malformed_config_and_names_every_provider() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().join("config.json");
+    std::fs::write(&path, "{broken").unwrap();
+    let refused = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .env("BATON_HOME", home.path())
+        .args(["auth", "codex", "subscription"])
+        .output()
+        .unwrap();
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("cannot parse"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+
+    let clean = tempfile::tempdir().unwrap();
+    let unknown = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .env("BATON_HOME", clean.path())
+        .args(["auth", "unknown", "subscription"])
+        .output()
+        .unwrap();
+    assert!(!unknown.status.success());
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    for provider in ["claude", "codex", "cursor", "grok", "opencode", "antigravity"] {
+        assert!(stderr.contains(provider), "{provider} missing: {stderr}");
+    }
+}

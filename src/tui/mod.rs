@@ -8183,6 +8183,14 @@ fn handle_composer_key(
                 return;
             }
             KeyCode::Enter => {
+                if state.suggestion_index != 0 {
+                    if let Some(suggestion) = suggestions.get(clamped) {
+                        if suggestion.insert != typed {
+                            apply_suggestion(state, suggestion);
+                            return;
+                        }
+                    }
+                }
                 let exact = suggestions
                     .iter()
                     .any(|suggestion| suggestion.insert == typed);
@@ -9682,6 +9690,10 @@ fn handle_command(
             }
         }
         "/auth" => {
+            if args.len() > 2 {
+                state.notice = Some(format!("usage: /{}", auth_usage()));
+                return;
+            }
             let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
             match (
                 args.first().map(String::as_str),
@@ -13438,6 +13450,10 @@ fn apply_auth_mode(
     provider: ProviderId,
     mode: crate::config::AuthMode,
 ) -> bool {
+    if state.running || state.orchestration_pending {
+        state.notice = Some("wait for the current work to finish before changing billing".into());
+        return false;
+    }
     let resolved = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
     let provider_config = resolved.for_provider(provider);
     if mode == crate::config::AuthMode::Api && provider_config.api_key.is_none() {
@@ -15840,10 +15856,13 @@ fn composer_hint(state: &TuiState) -> Option<String> {
     } else if command == "/rewind" && !state.thread.current_provider.supports_native_rewind() {
         Some("/rewind [turn] · native rewind is Codex/OpenCode only · enter runs it".to_string())
     } else if let Some(usage) = command_usage(&state.input) {
-        let suffix = if suggestions_for(state).is_empty() {
+        let available = suggestions_for(state);
+        let suffix = if available.is_empty() {
             "enter runs it"
-        } else {
+        } else if state.suggestion_index != 0 || !is_complete_command(state.input.trim()) {
             "tab or enter completes the selected choice"
+        } else {
+            "tab completes · enter runs it"
         };
         Some(format!("/{usage} · {suffix}"))
     } else {
@@ -15881,8 +15900,12 @@ fn draw_composer(
             } else {
                 Style::default().fg(COLORS.muted)
             };
+            let cursor = if actual_index == clamped { "❯" } else { " " };
             rows.push(Line::styled(
-                format!("❯ {:<36} {}", suggestion.insert, suggestion.description),
+                format!(
+                    "{cursor} {:<36} {}",
+                    suggestion.insert, suggestion.description
+                ),
                 style,
             ));
         }
@@ -25917,6 +25940,90 @@ mod tests {
     }
 
     #[test]
+    fn arrow_selected_auth_completion_completes_instead_of_running_bare_auth() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/auth ".to_string();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+
+        assert_eq!(state.input, "/auth claude api ");
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn slash_suggestions_paint_one_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.input = "/auth ".to_string();
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+        assert!(text.contains("/auth claude subscription"), "{text}");
+    }
+
+    #[test]
+    fn auth_refuses_a_running_turn_and_extra_arguments() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.running = true;
+        handle_command(&mut state, &store, &engine_command_sender, "/auth");
+        assert!(matches!(state.overlay, Overlay::AuthPicker { selected: 0 }));
+        state.overlay = Overlay::AuthPicker { selected: 0 };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(matches!(state.overlay, Overlay::AuthPicker { selected: 0 }));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("wait for the current work"),
+            "{:?}",
+            state.notice
+        );
+
+        state.running = false;
+        state.notice = None;
+        state.overlay = Overlay::None;
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/auth codex api junk",
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("usage: /auth"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
     fn auth_scoped_picker_applies_the_other_mode() {
         let _guard = EDITOR_ENV_LOCK.lock().unwrap();
         let home = tempfile::tempdir().unwrap();
@@ -27997,10 +28104,8 @@ exit 1
         }
         state.input = "/auth ".to_string();
         assert!(
-            composer_hint(&state)
-                .unwrap()
-                .contains("tab or enter completes the selected choice"),
-            "a command with choices advertises completion"
+            composer_hint(&state).unwrap().contains("tab completes"),
+            "a complete command advertises completion without claiming Enter runs the choice"
         );
         state.input = "/status ".to_string();
         assert!(
@@ -28070,9 +28175,7 @@ exit 1
         state.thread.current_provider = ProviderId::Codex;
         state.input = "/effort ".to_string();
         assert_eq!(suggestions_for(&state).len(), 6);
-        assert!(composer_hint(&state)
-            .unwrap()
-            .contains("tab or enter completes"));
+        assert!(composer_hint(&state).unwrap().contains("tab completes"));
     }
 
     #[cfg(unix)]

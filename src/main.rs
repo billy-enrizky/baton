@@ -2599,8 +2599,14 @@ fn main_result(started: Instant) -> Result<()> {
                     }
                 }
                 (Some(provider), Some(mode)) => {
-                    let provider = ProviderId::parse(&provider)
-                        .ok_or_else(|| anyhow::anyhow!("unknown provider {provider}, expected claude or codex"))?;
+                    let expected = ProviderId::all()
+                        .iter()
+                        .map(|provider| provider.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let provider = ProviderId::parse(&provider).ok_or_else(|| {
+                        anyhow::anyhow!("unknown provider {provider}, expected one of {expected}")
+                    })?;
                     let mode = config::AuthMode::parse(&mode)
                         .ok_or_else(|| anyhow::anyhow!("unknown auth mode {mode}, expected subscription or api"))?;
                     let provider_config = resolved.for_provider(provider);
@@ -2611,7 +2617,7 @@ fn main_result(started: Instant) -> Result<()> {
                             home.display()
                         );
                     }
-                    let mut file = load_config_file(&home).unwrap_or_default();
+                    let mut file = config::load_config_file_strict(&home)?.unwrap_or_default();
                     file.providers
                         .entry(provider.as_str().to_string())
                         .or_default()

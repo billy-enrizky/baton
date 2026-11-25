@@ -273,6 +273,11 @@ pub enum Commands {
     Login {
         provider: String,
     },
+    /// Inspect where each provider's API key comes from, without printing it
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
     /// Set the default provider (used by exec and new threads)
     Default {
         provider: String,
@@ -402,6 +407,16 @@ pub fn login_command(provider: ProviderId) -> Option<Vec<&'static str>> {
         ProviderId::OpenCode => Some(vec!["opencode", "auth", "login"]),
         ProviderId::Antigravity => None,
     }
+}
+
+#[derive(Subcommand, Clone)]
+pub enum SecretCommand {
+    /// Report each provider's credential source and presence
+    Check {
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Clone)]

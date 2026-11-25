@@ -65,6 +65,40 @@ pub struct EffectiveConfig {
     pub providers: BTreeMap<ProviderId, EffectiveProviderConfig>,
 }
 
+/// Which source supplied the API key that the resolver chose. The resolver
+/// checks the Baton config file first, then the harness's own config, then the
+/// environment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiKeySource {
+    ConfigFile,
+    HarnessConfig,
+    Environment,
+    Missing,
+}
+
+impl ApiKeySource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApiKeySource::ConfigFile => "config-file",
+            ApiKeySource::HarnessConfig => "harness-config",
+            ApiKeySource::Environment => "environment",
+            ApiKeySource::Missing => "missing",
+        }
+    }
+}
+
+/// The credential facts a caller may print. The key itself is reduced to a
+/// boolean so a report cannot leak it.
+#[derive(Debug, Clone)]
+pub struct ProviderSecret {
+    pub provider: ProviderId,
+    pub mode: AuthMode,
+    pub key_source: ApiKeySource,
+    pub key_variable: String,
+    pub key_present: bool,
+    pub base_url_present: bool,
+}
+
 pub fn default_models() -> BTreeMap<String, String> {
     BTreeMap::from([
         ("claude".to_string(), "claude-sonnet-4-5".to_string()),
@@ -172,6 +206,30 @@ pub fn resolve_provider_config(
     codex_home: Option<&Path>,
     opencode_dir: Option<&Path>,
 ) -> EffectiveProviderConfig {
+    resolve_provider_config_with_source(provider, home, cwd, claude_dir, codex_home, opencode_dir).0
+}
+
+pub fn provider_secret(provider: ProviderId, home: &Path, cwd: &Path) -> ProviderSecret {
+    let (config, key_source) =
+        resolve_provider_config_with_source(provider, home, cwd, None, None, None);
+    ProviderSecret {
+        provider,
+        mode: config.mode,
+        key_source,
+        key_variable: config.api_key_env_name,
+        key_present: config.api_key.is_some(),
+        base_url_present: config.api_base_url.is_some(),
+    }
+}
+
+fn resolve_provider_config_with_source(
+    provider: ProviderId,
+    home: &Path,
+    cwd: &Path,
+    claude_dir: Option<&Path>,
+    codex_home: Option<&Path>,
+    opencode_dir: Option<&Path>,
+) -> (EffectiveProviderConfig, ApiKeySource) {
     let file = load_config_file(home);
     let harness = read_harness_config(provider, Some(cwd), claude_dir, codex_home, opencode_dir);
     let file_provider = file
@@ -201,19 +259,30 @@ pub fn resolve_provider_config(
         .or_else(|| if ambient_key { Some(AuthMode::Api) } else { None })
         .unwrap_or(AuthMode::Subscription);
 
-    let api_key = file_provider
+    let file_key = file_provider
         .as_ref()
         .and_then(|auth| auth.api_key.clone())
-        .filter(|key| !key.trim().is_empty())
-        .or(harness.api_key)
-        .or_else(|| std::env::var(&env_key_name).ok().filter(|key| !key.trim().is_empty()));
+        .filter(|key| !key.trim().is_empty());
+    let harness_key = harness.api_key.clone().filter(|key| !key.trim().is_empty());
+    let env_key = std::env::var(&env_key_name)
+        .ok()
+        .filter(|key| !key.trim().is_empty());
+    let (api_key, key_source) = if file_key.is_some() {
+        (file_key, ApiKeySource::ConfigFile)
+    } else if harness_key.is_some() {
+        (harness_key, ApiKeySource::HarnessConfig)
+    } else if env_key.is_some() {
+        (env_key, ApiKeySource::Environment)
+    } else {
+        (None, ApiKeySource::Missing)
+    };
 
     let fallback_model = crate::models::default_model(provider).to_string();
 
-    EffectiveProviderConfig {
+    let effective = EffectiveProviderConfig {
         provider,
         mode,
-        api_key: api_key.filter(|key| !key.trim().is_empty()),
+        api_key,
         api_key_env_name: env_key_name,
         api_base_url: file_provider
             .as_ref()
@@ -221,7 +290,8 @@ pub fn resolve_provider_config(
             .filter(|base| !base.trim().is_empty()),
         model: file_model.or(harness.model).unwrap_or(fallback_model),
         permission_mode: harness.permission_mode.unwrap_or(PermissionMode::Default),
-    }
+    };
+    (effective, key_source)
 }
 
 /// New sessions orchestrate by default. A harness is still used as the
@@ -432,5 +502,39 @@ mod tests {
             pick_default_provider(None, &[], &[]),
             ProviderId::Claude
         );
+    }
+
+    #[test]
+    fn provider_secret_reports_the_winning_source_without_the_key() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"codex":{"mode":"api","api_key":"config-secret-value","api_key_env":"BATON_TEST_SECRET_CONFIG_KEY"}}"#,
+        )
+        .unwrap();
+
+        let secret = provider_secret(ProviderId::Codex, home.path(), home.path());
+        assert_eq!(secret.key_source, ApiKeySource::ConfigFile);
+        assert!(secret.key_present);
+        assert_eq!(secret.key_variable, "BATON_TEST_SECRET_CONFIG_KEY");
+        assert!(!format!("{secret:?}").contains("config-secret-value"));
+
+        std::fs::write(
+            &path,
+            r#"{"cursor":{"mode":"api","apiKeyEnv":"BATON_TEST_SECRET_SOURCE_KEY"}}"#,
+        )
+        .unwrap();
+        std::env::set_var("BATON_TEST_SECRET_SOURCE_KEY", "environment-secret-value");
+        let secret = provider_secret(ProviderId::Cursor, home.path(), home.path());
+        assert_eq!(secret.key_source, ApiKeySource::Environment);
+        assert!(secret.key_present);
+        assert_eq!(secret.key_variable, "BATON_TEST_SECRET_SOURCE_KEY");
+        assert!(!format!("{secret:?}").contains("environment-secret-value"));
+
+        std::env::remove_var("BATON_TEST_SECRET_SOURCE_KEY");
+        let secret = provider_secret(ProviderId::Cursor, home.path(), home.path());
+        assert_eq!(secret.key_source, ApiKeySource::Missing);
+        assert!(!secret.key_present);
     }
 }

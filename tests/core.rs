@@ -2081,3 +2081,48 @@ fn live_orchestration_owner_is_not_reconciled() {
         "an ownerless run cannot be proven abandoned"
     );
 }
+
+#[test]
+fn secret_check_reports_sources_without_printing_values() {
+    let home = tempfile::tempdir().unwrap();
+    let claude = home.path().join("claude");
+    let codex = home.path().join("codex");
+    std::fs::create_dir_all(&claude).unwrap();
+    std::fs::create_dir_all(&codex).unwrap();
+    std::fs::write(
+        home.path().join("config.json"),
+        r#"{"codex":{"mode":"api","api_key":"super-secret-value","api_key_env":"BATON_TEST_SECRET_CLI_KEY"}}"#,
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["secret", "check", "--json"])
+        .env("BATON_HOME", home.path())
+        .env("CLAUDE_CONFIG_DIR", &claude)
+        .env("CODEX_HOME", &codex)
+        .env_remove("BATON_TEST_SECRET_CLI_KEY")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        !stdout.contains("super-secret-value"),
+        "the report must never print the key: {stdout}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    let providers = value["providers"].as_array().unwrap();
+    assert_eq!(providers.len(), 6);
+    let codex = providers
+        .iter()
+        .find(|provider| provider["provider"] == "codex")
+        .expect("codex row");
+    assert_eq!(codex["mode"], "api");
+    assert_eq!(codex["key_source"], "config-file");
+    assert_eq!(codex["key_present"], true);
+    assert_eq!(codex["key_variable"], "BATON_TEST_SECRET_CLI_KEY");
+}

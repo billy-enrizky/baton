@@ -1863,6 +1863,64 @@ fn main_result(started: Instant) -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Secret { command } => match command {
+            cli::SecretCommand::Check { json } => {
+                let rows = ProviderId::all()
+                    .iter()
+                    .map(|provider| config::provider_secret(*provider, &home, &cwd))
+                    .collect::<Vec<_>>();
+                if json {
+                    let providers = rows
+                        .iter()
+                        .map(|row| {
+                            serde_json::json!({
+                                "provider": row.provider.as_str(),
+                                "mode": row.mode.as_str(),
+                                "key_source": row.key_source.as_str(),
+                                "key_variable": row.key_variable,
+                                "key_present": row.key_present,
+                                "base_url_present": row.base_url_present,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": 1,
+                            "providers": providers,
+                        }))?
+                    );
+                } else {
+                    for row in &rows {
+                        if row.mode == config::AuthMode::Subscription {
+                            let extra = if row.key_present {
+                                format!("; key also present from {}", row.key_source.as_str())
+                            } else {
+                                String::new()
+                            };
+                            println!(
+                                "{:<12} subscription · harness login{}",
+                                row.provider.as_str(),
+                                extra
+                            );
+                        } else {
+                            println!(
+                                "{:<12} api · {:<14} · {} · {}",
+                                row.provider.as_str(),
+                                row.key_source.as_str(),
+                                row.key_variable,
+                                if row.key_present {
+                                    "key set"
+                                } else {
+                                    "key missing"
+                                }
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            }
+        },
         cli::Commands::Search { query, all, json } => {
             let query = query.join(" ");
             if query.trim().is_empty() {

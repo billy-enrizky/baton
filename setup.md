@@ -53,7 +53,7 @@ Each provider can run on its harness login or an API key. `/auth` opens a scroll
 | OpenCode | `OPENCODE_API_KEY` |
 | Antigravity | `GEMINI_API_KEY` |
 
-Set the key in the environment or `~/.baton/config.json`; Baton also reads Claude and Codex settings. Then choose the API row. A missing key keeps the picker open with the exact variable name. The CLI form is `baton auth <provider> api`; `/auth <provider>` opens a two-row picker for that harness with the current mode marked, and it writes nothing until you choose a row.
+Set the key in the environment or `~/.baton/config.json`; Baton also reads Claude and Codex settings. A config-file key wins over a harness key, which wins over the environment variable. Run `baton secret check` to see which source supplied each key without printing it; `--json` emits one row per provider. Then choose the API row. A missing key keeps the picker open with the exact variable name. The CLI form is `baton auth <provider> api`; `/auth <provider>` opens a two-row picker for that harness with the current mode marked, and it writes nothing until you choose a row.
 
 Baton reads a provider-neutral variable when you set `apiKeyEnv`. The child still receives the harness-native variable:
 

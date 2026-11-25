@@ -333,6 +333,8 @@ The composer is where prompts, slash commands, and file mentions are typed. `@` 
 
 An approval request shows the provider's own choices. Up and Down select a row, Enter sends it, and y, a, and n keep the standard allow once, allow for session, and deny shortcuts. A request from a child thread names that thread in the header.
 
+Some providers also ask a question before continuing. The same overlay lists the choices, walks multiple questions in order, and allows a custom answer when the provider permits one. A secret answer is masked on screen.
+
 Most commands open a picker instead of requiring memorized syntax. Pickers show their keys, the current selection, and the relevant detail. Remote actions open a preview first and recheck the live state before they run.
 
 ### 6.4 Transcript

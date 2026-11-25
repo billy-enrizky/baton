@@ -1,6 +1,6 @@
 use baton::adapters::{duplex_halves, BatonAdapter, ForkSessionInput, ModelListInput, RevertSessionInput, SteerOutcome, SteerRequest, TransportHalves};
 use baton::adapters::codex::CodexAdapter;
-use baton::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId};
+use baton::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, QuestionAnswer};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -163,6 +163,104 @@ async fn fake_server_resume_with_approval(read: tokio::io::DuplexStream, mut wri
                 .await;
             }
             _ => {}
+        }
+    }
+}
+
+async fn fake_server_with_question(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    responses: tokio::sync::mpsc::UnboundedSender<Value>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    let mut question_sent = false;
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                )
+                .await;
+            }
+            "thread/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "thread": { "id": "native-question", "path": null } }
+                    }),
+                )
+                .await;
+            }
+            "turn/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "turn": { "id": "turn-question", "status": "inProgress" } }
+                    }),
+                )
+                .await;
+                if !question_sent {
+                    question_sent = true;
+                    send(
+                        &mut write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 91,
+                            "method": "item/tool/requestUserInput",
+                            "params": {
+                                "threadId": "native-question",
+                                "turnId": "turn-question",
+                                "itemId": "call-question",
+                                "questions": [{
+                                    "id": "schema_preference",
+                                    "header": "Fixture",
+                                    "question": "Strict schemas or UI flexibility?",
+                                    "isOther": true,
+                                    "isSecret": false,
+                                    "options": [
+                                        { "label": "Strict schemas", "description": "Tight validation" },
+                                        { "label": "UI flexibility", "description": "Looser validation" }
+                                    ]
+                                }]
+                            }
+                        }),
+                    )
+                    .await;
+                }
+            }
+            _ => {
+                if id == Some(Value::from(91)) {
+                    let _ = responses.send(frame);
+                    send(
+                        &mut write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "turn/completed",
+                            "params": {
+                                "threadId": "native-question",
+                                "turn": { "id": "turn-question", "status": "completed", "items": [] }
+                            }
+                        }),
+                    )
+                    .await;
+                }
+            }
         }
     }
 }
@@ -654,6 +752,86 @@ async fn codex_adapter_resumes_sessions_and_maps_approvals() {
 
     tokio::time::timeout(Duration::from_secs(10), turn).await.unwrap().unwrap();
     let _ = ProviderId::Codex;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_adapter_routes_user_input_questions() {
+    let (responses, mut response_receiver) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let spawner = Arc::new(
+        move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            let responses = responses.clone();
+            tokio::spawn(fake_server_with_question(
+                server_read,
+                server_write,
+                responses,
+            ));
+            Ok(halves)
+        },
+    );
+    let mut adapter = CodexAdapter::new(spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let turn = tokio::spawn(async move {
+        adapter
+            .start_turn(
+                baton::adapters::TurnStartInput {
+                    turn: 1,
+                    thread_id: "bt".into(),
+                    cwd: "/work".into(),
+                    model: "m".into(),
+                    effort: None,
+                    prompt: "p".into(),
+                    permission_mode: PermissionMode::Default,
+                    auth_env: vec![],
+                },
+                None,
+                event_sender,
+            )
+            .await
+            .unwrap();
+    });
+
+    let question = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            while let Ok(event) = event_receiver.try_recv() {
+                if let baton::adapters::TurnEvent::QuestionRequest {
+                    questions, respond, ..
+                } = event
+                {
+                    return (questions, respond);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("question event");
+    assert_eq!(question.0.len(), 1);
+    assert_eq!(question.0[0].id, "schema_preference");
+    assert_eq!(question.0[0].question, "Strict schemas or UI flexibility?");
+    assert_eq!(question.0[0].options[0].label, "Strict schemas");
+    assert!(question.0[0].allow_custom);
+    question
+        .1
+        .send(vec![QuestionAnswer {
+            id: "schema_preference".into(),
+            answers: vec!["Strict schemas".into()],
+        }])
+        .unwrap();
+
+    let response = tokio::time::timeout(Duration::from_secs(10), response_receiver.recv())
+        .await
+        .expect("server receives question response")
+        .expect("response present");
+    assert_eq!(response["id"], 91);
+    assert_eq!(
+        response["result"]["answers"]["schema_preference"]["answers"][0],
+        "Strict schemas"
+    );
+    tokio::time::timeout(Duration::from_secs(10), turn)
+        .await
+        .unwrap()
+        .unwrap();
 }
 
 

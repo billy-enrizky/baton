@@ -16,7 +16,10 @@ use crate::adapters::{
 };
 use crate::config::auth_signature;
 use crate::process::ProcessRecorder;
-use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
+use crate::types::{
+    ApprovalDecision, NativeSessionRef, ProviderId, QuestionAnswer, QuestionOption, QuestionPrompt,
+    TurnUsage,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OpenCodeVersion {
@@ -105,7 +108,8 @@ impl OpenCodeAdapter {
             let mut spawned = (self.spawner)(auth_env)?;
             let auth_header = format!(
                 "Basic {}",
-                base64::engine::general_purpose::STANDARD.encode(format!("opencode:{}", spawned.password))
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("opencode:{}", spawned.password))
             );
             let http = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(300))
@@ -245,6 +249,150 @@ fn summarize_tool_input(input: &Value) -> Option<String> {
         }
     }
     None
+}
+
+/// Turns an OpenCode 2 form into the overlay's questions. The field shape comes
+/// from the server's `Form.Info` schema: `key`, optional `title` and
+/// `description`, an optional `options` list, `custom`, and `type`.
+fn form_question_prompts(form: &Value) -> Vec<QuestionPrompt> {
+    let Some(fields) = form.get("fields").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .enumerate()
+        .filter_map(|(index, field)| {
+            let key = field.get("key").and_then(Value::as_str)?.trim();
+            if key.is_empty() {
+                return None;
+            }
+            // An external field opens a URL, and a hidden one is answered by the
+            // client without asking. Neither is answerable here.
+            let field_type = field
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or("string");
+            if matches!(field_type, "external" | "hidden") {
+                return None;
+            }
+            // A field that depends on another cannot be validated without
+            // evaluating `when`, so it is not offered at all.
+            if field
+                .get("when")
+                .and_then(Value::as_array)
+                .is_some_and(|conditions| !conditions.is_empty())
+            {
+                return None;
+            }
+            let header = field
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|title| !title.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("Question {}", index + 1));
+            let question = field
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| header.clone());
+            let options: Vec<QuestionOption> = field
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| {
+                            let label = option
+                                .get("label")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|label| !label.is_empty())
+                                .or_else(|| {
+                                    option
+                                        .get("value")
+                                        .and_then(Value::as_str)
+                                        .map(str::trim)
+                                        .filter(|value| !value.is_empty())
+                                })?;
+                            let description = option
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(str::trim)
+                                .filter(|description| !description.is_empty())
+                                .unwrap_or(label)
+                                .to_string();
+                            Some(QuestionOption {
+                                label: label.to_string(),
+                                description,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            // A boolean field has no options in the schema; Yes and No are the
+            // only answers it accepts.
+            let options = if field_type == "boolean" {
+                vec![
+                    QuestionOption {
+                        label: "Yes".into(),
+                        description: "true".into(),
+                    },
+                    QuestionOption {
+                        label: "No".into(),
+                        description: "false".into(),
+                    },
+                ]
+            } else {
+                options
+            };
+            let multi_select = field_type == "multiselect";
+            Some(QuestionPrompt {
+                id: key.to_string(),
+                header,
+                question,
+                allow_custom: field.get("custom").and_then(Value::as_bool) == Some(true)
+                    || options.is_empty(),
+                options,
+                multi_select,
+                secret: false,
+            })
+        })
+        .collect()
+}
+
+/// Builds the `answer` map for `POST .../form/:formID/reply`. A multi-select
+/// field answers with an array and every other field answers with one string.
+fn form_answer(form: &Value, answers: &[QuestionAnswer]) -> Value {
+    let mut map = serde_json::Map::new();
+    let Some(fields) = form.get("fields").and_then(Value::as_array) else {
+        return Value::Object(map);
+    };
+    for field in fields {
+        let Some(key) = field.get("key").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(answer) = answers.iter().find(|answer| answer.id == key) else {
+            continue;
+        };
+        let values: Vec<Value> = answer
+            .answers
+            .iter()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| json!(value))
+            .collect();
+        if values.is_empty() {
+            continue;
+        }
+        if field.get("type").and_then(Value::as_str) == Some("multiselect") {
+            map.insert(key.to_string(), Value::Array(values));
+        } else if let Some(single) = values.first() {
+            map.insert(key.to_string(), single.clone());
+        }
+    }
+    Value::Object(map)
 }
 
 fn handle_event(
@@ -710,7 +858,11 @@ impl BatonAdapter for OpenCodeAdapter {
                 // opencode >= 2 wraps the prompt text: {"prompt": {"text": ...}}.
                 let prompt_body = json!({ "prompt": { "text": input.prompt } });
                 let admitted = self
-                    .post(&runtime, &format!("/api/session/{session_id}/prompt"), prompt_body)
+                    .post(
+                        &runtime,
+                        &format!("/api/session/{session_id}/prompt"),
+                        prompt_body,
+                    )
                     .await?;
                 // The admitted input id is the user message id; OpenCode's
                 // revert API cuts history at this message.
@@ -733,7 +885,11 @@ impl BatonAdapter for OpenCodeAdapter {
                     "parts": [ { "type": "text", "text": input.prompt } ]
                 });
                 let _ = self
-                    .post(&runtime, &format!("/session/{session_id}/prompt_async"), body)
+                    .post(
+                        &runtime,
+                        &format!("/session/{session_id}/prompt_async"),
+                        body,
+                    )
                     .await;
             }
         }
@@ -793,6 +949,64 @@ impl BatonAdapter for OpenCodeAdapter {
                             .await;
                     });
                     let _ = pending_approvals;
+                    continue;
+                }
+            }
+            if event_type == "form.created" {
+                let form = data.get("form").cloned().unwrap_or(Value::Null);
+                let session_matches =
+                    form.get("sessionID").and_then(Value::as_str) == Some(session_id.as_str());
+                if session_matches {
+                    let questions = form_question_prompts(&form);
+                    let form_id = form
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let runtime_for_reply = runtime.clone();
+                    let session_id_for_reply = session_id.clone();
+                    if questions.is_empty() {
+                        // Nothing here can be answered, and leaving the form
+                        // pending would hold the turn open forever.
+                        tokio::spawn(async move {
+                            let path =
+                                format!("/api/session/{session_id_for_reply}/form/{form_id}");
+                            let _ = runtime_for_reply
+                                .http
+                                .delete(format!("{}{}", runtime_for_reply.base_url, path))
+                                .header("Authorization", &runtime_for_reply.auth_header)
+                                .query(&[("message", "Baton cannot answer this form")])
+                                .send()
+                                .await;
+                        });
+                    } else {
+                        let (respond, receiver_answers) = oneshot::channel::<Vec<QuestionAnswer>>();
+                        let _ = emit.send(TurnEvent::QuestionRequest {
+                            id: format!("opencode:{form_id}"),
+                            questions,
+                            respond,
+                        });
+                        tokio::spawn(async move {
+                            let answers = receiver_answers.await.unwrap_or_default();
+                            let path =
+                                format!("/api/session/{session_id_for_reply}/form/{form_id}");
+                            let request = if answers.iter().all(|answer| answer.answers.is_empty())
+                            {
+                                runtime_for_reply
+                                    .http
+                                    .delete(format!("{}{}", runtime_for_reply.base_url, path))
+                                    .header("Authorization", &runtime_for_reply.auth_header)
+                                    .query(&[("message", "The user dismissed the question")])
+                            } else {
+                                runtime_for_reply
+                                    .http
+                                    .post(format!("{}{}/reply", runtime_for_reply.base_url, path))
+                                    .header("Authorization", &runtime_for_reply.auth_header)
+                                    .json(&json!({ "answer": form_answer(&form, &answers) }))
+                            };
+                            let _ = request.send().await;
+                        });
+                    }
                     continue;
                 }
             }
@@ -868,5 +1082,131 @@ pub async fn wait_for_server_url(child_stdout: tokio::process::ChildStdout) -> R
                 return Ok(url);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn form() -> Value {
+        json!({
+            "id": "frm_1",
+            "sessionID": "ses_test",
+            "title": "Questions",
+            "fields": [
+                {
+                    "key": "q0",
+                    "title": "Color preference",
+                    "description": "Which color do you prefer?",
+                    "type": "multiselect",
+                    "options": [
+                        { "value": "Red", "label": "Red", "description": "Choose the color red" },
+                        { "value": "Blue", "label": "Blue" }
+                    ],
+                    "custom": true
+                },
+                {
+                    "key": "q1",
+                    "title": "Ship now?",
+                    "type": "boolean"
+                },
+                {
+                    "key": "q2",
+                    "type": "string"
+                },
+                {
+                    "key": "q3",
+                    "title": "Depends",
+                    "type": "string",
+                    "when": [{ "key": "q1", "op": "eq", "value": true }]
+                },
+                {
+                    "key": "q4",
+                    "type": "external",
+                    "url": "https://example.com"
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn form_prompts_skip_what_cannot_be_answered_here() {
+        let prompts = form_question_prompts(&form());
+        let ids: Vec<&str> = prompts.iter().map(|prompt| prompt.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["q0", "q1", "q2"],
+            "a conditional field and an external field are not answerable"
+        );
+        assert!(
+            prompts[0].multi_select,
+            "a multiselect field renders checkboxes"
+        );
+        assert_eq!(prompts[0].header, "Color preference");
+        assert_eq!(prompts[0].question, "Which color do you prefer?");
+        assert_eq!(prompts[0].options.len(), 2);
+        assert!(
+            prompts[0].allow_custom,
+            "custom true means the field accepts typed text"
+        );
+        assert_eq!(
+            prompts[1]
+                .options
+                .iter()
+                .map(|o| o.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Yes", "No"],
+            "a boolean field has no options in the schema, so the overlay offers both values"
+        );
+        assert!(!prompts[1].allow_custom);
+        assert!(
+            prompts[2].allow_custom,
+            "a free-text field with no options accepts typing"
+        );
+        assert_eq!(
+            prompts[2].header, "Question 3",
+            "a missing title still names the question"
+        );
+    }
+
+    #[test]
+    fn form_answer_keeps_arrays_for_multiselect_only() {
+        let answers = vec![
+            QuestionAnswer {
+                id: "q0".into(),
+                answers: vec!["Blue".into(), "Red".into()],
+            },
+            QuestionAnswer {
+                id: "q1".into(),
+                answers: vec!["Yes".into()],
+            },
+            QuestionAnswer {
+                id: "q2".into(),
+                answers: vec!["  ".into()],
+            },
+            QuestionAnswer {
+                id: "missing".into(),
+                answers: vec!["dropped".into()],
+            },
+        ];
+        let answer = form_answer(&form(), &answers);
+        assert_eq!(answer["q0"], json!(["Blue", "Red"]));
+        assert_eq!(
+            answer["q1"], "Yes",
+            "a single field answers with one string, not an array"
+        );
+        assert!(
+            answer.get("q2").is_none(),
+            "a blank answer is not sent: {answer}"
+        );
+        assert!(
+            answer.get("missing").is_none(),
+            "a key the form never had is not sent: {answer}"
+        );
+        assert!(
+            answer.get("q3").is_none(),
+            "a skipped field is never answered"
+        );
     }
 }

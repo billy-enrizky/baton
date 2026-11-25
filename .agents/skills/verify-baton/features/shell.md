@@ -17,6 +17,7 @@ Type `!printf 'hello\n'` and press Enter.
 - `shell::tests::control_sequences_are_sanitized`
 - `tui::tests::shell_command_runs_in_the_background_and_renders`
 - `tui::tests::shell_command_needs_a_command`
+- PTY: `.agents/skills/verify-baton/scripts/tui_probe.py --command '!printf shell-probe' --expect 'shell · !printf shell-probe' --expect shell-probe`
 
 ## Gotchas
 - This is not an interactive terminal. Commands that need a TTY, such as editors or pagers, are not supported yet.

@@ -92,12 +92,17 @@ pub fn turn_event_json(thread_id: &str, event: &TurnEvent) -> Value {
             "exit_code": exit_code,
         }),
         TurnEvent::ApprovalRequest {
-            id, kind, summary, ..
+            id,
+            kind,
+            summary,
+            choices,
+            ..
         } => json!({
             "type": "approval_request",
             "id": id,
             "kind": kind,
             "summary": summary,
+            "choices": choices,
         }),
         TurnEvent::Usage { usage } => json!({
             "type": "usage",
@@ -171,7 +176,7 @@ pub fn result_json(result: &ExecResult<'_>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::TurnUsage;
+    use crate::types::{ApprovalChoice, TurnUsage};
 
     fn completed(final_text: &str) -> TurnEvent {
         TurnEvent::TurnCompleted {
@@ -296,11 +301,17 @@ mod tests {
                 id: "approval-1".into(),
                 kind: "command".into(),
                 summary: "rm -rf /tmp/x".into(),
+                choices: vec![ApprovalChoice {
+                    id: "accept".into(),
+                    label: "Allow once".into(),
+                    kind: "allow_once".into(),
+                }],
                 respond,
             },
         );
         assert_eq!(value["type"], "approval_request");
         assert_eq!(value["id"], "approval-1");
+        assert_eq!(value["choices"][0]["label"], "Allow once");
         assert!(value.get("respond").is_none());
     }
 

@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, LineReader, LineWriter, ModelListInput, RevertSessionInput, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{standard_approval_choices, ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, LineReader, LineWriter, ModelListInput, RevertSessionInput, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -134,15 +134,15 @@ fn approval_kind(method: &str) -> Option<ApprovalKind> {
 fn approval_response(method: &str, params: &Value, decision: ApprovalDecision) -> Value {
     match approval_kind(method) {
         Some(ApprovalKind::Command) | Some(ApprovalKind::FileChange) => {
-            let decision = match decision {
+            let decision = match &decision {
                 ApprovalDecision::Accept => "accept",
                 ApprovalDecision::AcceptAlways => "acceptForSession",
-                ApprovalDecision::Deny => "decline",
+                ApprovalDecision::Deny | ApprovalDecision::Choose(_) => "decline",
             };
             json!({ "decision": decision })
         }
         Some(ApprovalKind::Permissions) => {
-            let granted = if matches!(decision, ApprovalDecision::Accept | ApprovalDecision::AcceptAlways) {
+            let granted = if matches!(&decision, ApprovalDecision::Accept | ApprovalDecision::AcceptAlways) {
                 params.get("permissions").cloned().unwrap_or_else(|| json!({}))
             } else {
                 json!({})
@@ -234,6 +234,7 @@ async fn handle_server_request(
                 id: request_id,
                 kind: label.to_string(),
                 summary,
+                choices: standard_approval_choices(),
                 respond,
             });
         }

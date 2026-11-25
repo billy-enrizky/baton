@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineReader, LineWriter, ModelListInput, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{standard_approval_choices, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineReader, LineWriter, ModelListInput, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
-use crate::types::{ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
+use crate::types::{ApprovalChoice, ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
 
 struct AcpRuntime {
     reader: AsyncMutex<Box<dyn LineReader>>,
@@ -136,6 +136,7 @@ async fn handle_server_request(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    let choices = permission_choices(&options);
     let (respond, receiver) = oneshot::channel::<ApprovalDecision>();
     {
         let emit = runtime.current_emit.lock().await;
@@ -144,6 +145,7 @@ async fn handle_server_request(
                 id: format!("acp:{summary}"),
                 kind: "permissions".into(),
                 summary,
+                choices,
                 respond,
             });
         }
@@ -164,12 +166,20 @@ async fn handle_server_request(
 }
 
 fn pick_permission_option(options: &[Value], decision: Option<ApprovalDecision>) -> Option<String> {
-    let wanted_kind = match decision {
+    if let Some(ApprovalDecision::Choose(id)) = &decision {
+        return options
+            .iter()
+            .filter_map(|option| option.get("optionId").and_then(Value::as_str))
+            .any(|candidate| candidate == id)
+            .then(|| id.clone());
+    }
+    let wanted_kind = match &decision {
         Some(ApprovalDecision::Accept) | None => "allow_once",
         Some(ApprovalDecision::AcceptAlways) => "allow_always",
         Some(ApprovalDecision::Deny) => "reject_once",
+        Some(ApprovalDecision::Choose(_)) => return None,
     };
-    let fallback_kind = match decision {
+    let fallback_kind = match &decision {
         Some(ApprovalDecision::Deny) => "reject_always",
         _ => "allow_always",
     };
@@ -182,6 +192,32 @@ fn pick_permission_option(options: &[Value], decision: Option<ApprovalDecision>)
             .map(str::to_string)
     };
     find(wanted_kind).or_else(|| find(fallback_kind))
+}
+
+fn permission_choices(options: &[Value]) -> Vec<ApprovalChoice> {
+    let choices: Vec<ApprovalChoice> = options
+        .iter()
+        .filter_map(|option| {
+            let id = option.get("optionId").and_then(Value::as_str)?.to_string();
+            let kind = option
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let label = option
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| (!kind.is_empty()).then(|| kind.clone()))
+                .unwrap_or_else(|| id.clone());
+            Some(ApprovalChoice { id, label, kind })
+        })
+        .collect();
+    if choices.is_empty() {
+        standard_approval_choices()
+    } else {
+        choices
+    }
 }
 
 fn collect_model_values(value: &Value, models: &mut Vec<String>) {
@@ -265,6 +301,7 @@ fn handle_session_update(update: &Value, emit: &TurnEventSender, final_text: &mu
                 .and_then(Value::as_str)
                 .unwrap_or("");
             if !text.is_empty() {
+                final_text.push_str(text);
                 let _ = emit.send(TurnEvent::TextDelta { text: text.to_string() });
             }
         }
@@ -658,12 +695,55 @@ impl BatonAdapter for AcpAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::antigravity_model_family;
+    use super::{antigravity_model_family, permission_choices, pick_permission_option};
+    use crate::types::ApprovalDecision;
+    use serde_json::json;
 
     #[test]
     fn antigravity_model_families_strip_thinking_suffixes() {
         assert_eq!(antigravity_model_family("gemini-3.8-flash-high"), "gemini-3.8-flash");
         assert_eq!(antigravity_model_family("gemini-4-hydrogen-xhigh"), "gemini-4-hydrogen");
         assert_eq!(antigravity_model_family("gemini-3.7-flash"), "gemini-3.7-flash");
+    }
+
+    #[test]
+    fn permission_choices_keep_the_provider_labels_and_ids() {
+        let options = vec![
+            json!({ "optionId": "opt-allow", "name": "Allow", "kind": "allow_once" }),
+            json!({ "optionId": "opt-always", "name": "Always allow", "kind": "allow_always" }),
+            json!({ "optionId": "opt-reject", "name": "Reject", "kind": "reject_once" }),
+        ];
+        let choices = permission_choices(&options);
+        assert_eq!(choices.len(), 3);
+        assert_eq!(choices[0].id, "opt-allow");
+        assert_eq!(choices[0].label, "Allow");
+        assert_eq!(choices[1].kind, "allow_always");
+        assert_eq!(choices[2].label, "Reject");
+    }
+
+    #[test]
+    fn a_typed_choice_must_be_one_of_the_offered_options() {
+        let options = vec![
+            json!({ "optionId": "opt-allow", "name": "Allow", "kind": "allow_once" }),
+            json!({ "optionId": "opt-reject", "name": "Reject", "kind": "reject_once" }),
+        ];
+        assert_eq!(
+            pick_permission_option(
+                &options,
+                Some(ApprovalDecision::Choose("opt-reject".into()))
+            ),
+            Some("opt-reject".into())
+        );
+        assert_eq!(
+            pick_permission_option(
+                &options,
+                Some(ApprovalDecision::Choose("opt-unknown".into()))
+            ),
+            None
+        );
+        assert_eq!(
+            pick_permission_option(&options, Some(ApprovalDecision::Accept)),
+            Some("opt-allow".into())
+        );
     }
 }

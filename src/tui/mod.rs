@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
-use crate::adapters::{AdapterLifecycle, TurnEvent};
+use crate::adapters::{standard_approval_choices, AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
 use crate::config::{describe_auth, load_config_file_strict, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
@@ -23,8 +23,8 @@ use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::store::{BatonStore, MessageRow, NewThread, PinMoveOutcome, ThreadOpenWork, ThreadRow};
 use crate::sync;
 use crate::types::{
-    normalize_reasoning_effort, ApprovalDecision, PermissionMode, ProviderId, SessionMode,
-    TurnPhase,
+    normalize_reasoning_effort, ApprovalChoice, ApprovalDecision, PermissionMode, ProviderId,
+    SessionMode, TurnPhase,
 };
 use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 
@@ -392,6 +392,8 @@ struct ActivityView {
 struct ApprovalState {
     thread_id: String,
     summary: String,
+    choices: Vec<ApprovalChoice>,
+    selected: usize,
     respond: tokio::sync::oneshot::Sender<ApprovalDecision>,
 }
 
@@ -2737,12 +2739,24 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
     }
     match event {
         TurnEvent::ApprovalRequest {
-            summary, respond, ..
-        } => state.approvals.push(ApprovalState {
-            thread_id,
             summary,
+            choices,
             respond,
-        }),
+            ..
+        } => {
+            let choices = if choices.is_empty() {
+                standard_approval_choices()
+            } else {
+                choices
+            };
+            state.approvals.push(ApprovalState {
+                thread_id,
+                summary,
+                choices,
+                selected: 0,
+                respond,
+            });
+        }
         event if thread_id == state.thread.id => apply_turn_event(state, event),
         _ => {}
     }
@@ -4449,19 +4463,61 @@ fn handle_key(
     }
 
     if !state.approvals.is_empty() {
+        let mut moved = false;
+        if let Some(approval) = state.approvals.last_mut() {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    approval.selected = approval.selected.saturating_sub(1);
+                    moved = true;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    approval.selected =
+                        (approval.selected + 1).min(approval.choices.len().saturating_sub(1));
+                    moved = true;
+                }
+                KeyCode::PageUp => {
+                    approval.selected = approval.selected.saturating_sub(5);
+                    moved = true;
+                }
+                KeyCode::PageDown => {
+                    approval.selected =
+                        (approval.selected + 5).min(approval.choices.len().saturating_sub(1));
+                    moved = true;
+                }
+                KeyCode::Home => {
+                    approval.selected = 0;
+                    moved = true;
+                }
+                KeyCode::End => {
+                    approval.selected = approval.choices.len().saturating_sub(1);
+                    moved = true;
+                }
+                _ => {}
+            }
+        }
+        if moved {
+            return;
+        }
         let decision = match key.code {
-            KeyCode::Char('y') => Some(ApprovalDecision::Accept),
-            KeyCode::Char('a') => Some(ApprovalDecision::AcceptAlways),
-            KeyCode::Char('n') => Some(ApprovalDecision::Deny),
+            KeyCode::Char('y') => Some((ApprovalDecision::Accept, "accepted once".to_string())),
+            KeyCode::Char('a') => Some((
+                ApprovalDecision::AcceptAlways,
+                "accepted for the session".to_string(),
+            )),
+            KeyCode::Char('n') => Some((ApprovalDecision::Deny, "denied".to_string())),
+            KeyCode::Enter => {
+                let selected = state.approvals.last().and_then(|approval| {
+                    approval
+                        .choices
+                        .get(approval.selected)
+                        .map(|choice| (decision_for_choice(choice), choice.label.clone()))
+                });
+                Some(selected.unwrap_or((ApprovalDecision::Deny, "denied".to_string())))
+            }
             _ => None,
         };
-        if let Some(decision) = decision {
+        if let Some((decision, label)) = decision {
             let approval = state.approvals.pop().expect("approval checked above");
-            let label = match decision {
-                ApprovalDecision::Accept => "accepted once",
-                ApprovalDecision::AcceptAlways => "accepted for the session",
-                ApprovalDecision::Deny => "denied",
-            };
             if approval.respond.send(decision).is_err() {
                 state.notice = Some("approval request expired".into());
             } else if state.approvals.is_empty() {
@@ -10283,9 +10339,10 @@ fn draw_floating_approval(frame: &mut ratatui::Frame, area: Rect, state: &TuiSta
     if area.height < 4 {
         return;
     }
+    let height = approval_rows(approval).min(area.height as usize) as u16;
     let approval_area = Rect {
-        y: area.y + area.height.saturating_sub(4),
-        height: 4,
+        y: area.y + area.height.saturating_sub(height),
+        height,
         ..area
     };
     draw_approval(frame, approval_area, state, approval);
@@ -10330,8 +10387,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         .as_ref()
         .map(|notice| wrapped_rows(notice, area.width as usize))
         .unwrap_or(0);
-    let overlay_rows = if !state.approvals.is_empty() {
-        4
+    let overlay_rows = if let Some(approval) = state.approvals.last() {
+        approval_rows(approval)
     } else {
         match &state.overlay {
             Overlay::None => 0,
@@ -13617,6 +13674,19 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
     frame.render_widget(Paragraph::new(render_lines), area);
 }
 
+fn decision_for_choice(choice: &ApprovalChoice) -> ApprovalDecision {
+    match choice.id.as_str() {
+        "accept" => ApprovalDecision::Accept,
+        "accept_always" => ApprovalDecision::AcceptAlways,
+        "deny" => ApprovalDecision::Deny,
+        _ => ApprovalDecision::Choose(choice.id.clone()),
+    }
+}
+
+fn approval_rows(approval: &ApprovalState) -> usize {
+    approval.choices.len().min(8) + 4
+}
+
 fn draw_approval(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -13625,8 +13695,7 @@ fn draw_approval(
 ) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(COLORS.warning))
-        .border_style(Style::default().fg(COLORS.border));
+        .border_style(Style::default().fg(COLORS.warning));
     let target = if approval.thread_id == state.thread.id {
         String::new()
     } else {
@@ -13635,22 +13704,50 @@ fn draw_approval(
             &approval.thread_id[..approval.thread_id.len().min(8)]
         )
     };
-    let lines = vec![
-        Line::styled(
-            format!("approval needed{target}: {}", approval.summary),
-            Style::default().fg(COLORS.warning),
-        ),
-        Line::styled(
-            "[y] allow once · [a] allow for session · [n] deny",
-            Style::default().fg(COLORS.muted),
-        ),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(block),
-        area,
-    );
+    let summary = format!("approval needed{target}: {}", approval.summary);
+    let mut lines = vec![Line::styled(
+        truncate_chars(&summary, area.width.saturating_sub(2) as usize),
+        Style::default().fg(COLORS.warning),
+    )];
+    let visible = 8usize;
+    let start = if approval.choices.len() <= visible {
+        0
+    } else {
+        approval
+            .selected
+            .saturating_sub(visible / 2)
+            .min(approval.choices.len() - visible)
+    };
+    for (index, choice) in approval
+        .choices
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+    {
+        let marker = if index == approval.selected {
+            "❯"
+        } else {
+            " "
+        };
+        let mut text = format!("{marker} {}", choice.label);
+        if !choice.kind.is_empty() {
+            text.push_str(&format!(" · {}", choice.kind));
+        }
+        let style = if index == approval.selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(text, style));
+    }
+    lines.push(Line::styled(
+        "[y] once · [a] session · [n] deny · up/down select · enter choose",
+        Style::default().fg(COLORS.muted),
+    ));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_rewind_picker(
@@ -16427,6 +16524,7 @@ mod tests {
                 id: "first".into(),
                 kind: "permissions".into(),
                 summary: "run first".into(),
+                choices: Vec::new(),
                 respond: first_sender,
             },
         );
@@ -16437,6 +16535,7 @@ mod tests {
                 id: "second".into(),
                 kind: "permissions".into(),
                 summary: "run second".into(),
+                choices: Vec::new(),
                 respond: second_sender,
             },
         );
@@ -16481,6 +16580,115 @@ mod tests {
     }
 
     #[test]
+    fn approval_picker_selects_a_provider_choice_with_arrows_and_enter() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::ApprovalRequest {
+                id: "choice".into(),
+                kind: "permissions".into(),
+                summary: "run a command".into(),
+                choices: vec![
+                    ApprovalChoice {
+                        id: "opt-allow".into(),
+                        label: "Allow".into(),
+                        kind: "allow_once".into(),
+                    },
+                    ApprovalChoice {
+                        id: "opt-always".into(),
+                        label: "Always allow".into(),
+                        kind: "allow_always".into(),
+                    },
+                    ApprovalChoice {
+                        id: "opt-reject".into(),
+                        label: "Reject".into(),
+                        kind: "reject_once".into(),
+                    },
+                ],
+                respond: sender,
+            },
+        );
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        assert_eq!(state.approvals[0].selected, 2);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            ApprovalDecision::Choose("opt-reject".into())
+        );
+        assert!(state.approvals.is_empty());
+        assert!(state.notice.as_deref().unwrap_or("").contains("Reject"));
+    }
+
+    #[test]
+    fn child_approval_overlay_shows_every_choice_and_the_child_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        apply_turn_event_for_thread(
+            &mut state,
+            "child-thread".into(),
+            TurnEvent::ApprovalRequest {
+                id: "child-choice".into(),
+                kind: "permissions".into(),
+                summary: "edit a file".into(),
+                choices: vec![
+                    ApprovalChoice {
+                        id: "opt-allow".into(),
+                        label: "Allow".into(),
+                        kind: "allow_once".into(),
+                    },
+                    ApprovalChoice {
+                        id: "opt-always".into(),
+                        label: "Always allow".into(),
+                        kind: "allow_always".into(),
+                    },
+                    ApprovalChoice {
+                        id: "opt-reject".into(),
+                        label: "Reject".into(),
+                        kind: "reject_once".into(),
+                    },
+                ],
+                respond: sender,
+            },
+        );
+        let screen = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(screen.contains("for thread child-th"), "{screen}");
+        assert!(screen.contains("Allow"), "{screen}");
+        assert!(screen.contains("Always allow"), "{screen}");
+        assert!(screen.contains("Reject"), "{screen}");
+        assert!(screen.contains("[y] once"), "{screen}");
+    }
+
+    #[test]
     fn child_approvals_are_cleared_by_the_child_turn_only() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -16496,6 +16704,7 @@ mod tests {
                 id: "current".into(),
                 kind: "permissions".into(),
                 summary: "current request".into(),
+                choices: Vec::new(),
                 respond: current_sender,
             },
         );
@@ -16506,6 +16715,7 @@ mod tests {
                 id: "child".into(),
                 kind: "permissions".into(),
                 summary: "child request".into(),
+                choices: Vec::new(),
                 respond: child_sender,
             },
         );
@@ -16556,6 +16766,7 @@ mod tests {
                 id: "review-approval".into(),
                 kind: "permissions".into(),
                 summary: "edit file".into(),
+                choices: Vec::new(),
                 respond: sender,
             },
         );

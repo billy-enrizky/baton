@@ -53,7 +53,7 @@ Each provider can run on its harness login or an API key. `/auth` opens a scroll
 | OpenCode | `OPENCODE_API_KEY` |
 | Antigravity | `GEMINI_API_KEY` |
 
-Set the key in the environment or `~/.baton/config.json`; Baton also reads Claude and Codex settings. A config-file key wins over a harness key, which wins over the environment variable. Run `baton secret check` to see which source supplied each key without printing it; `--json` emits one row per provider. Then choose the API row. A missing key keeps the picker open with the exact variable name. The CLI form is `baton auth <provider> api`; `/auth <provider>` opens a two-row picker for that harness with the current mode marked, and it writes nothing until you choose a row.
+Set the key in the environment or `~/.baton/config.json`; Baton also reads Claude and Codex settings. A config-file key wins over a harness key, which wins over the environment variable. Run `baton secret check` to see which source supplied each key without printing it; `--json` emits one row per provider. Then choose the API row. A missing key keeps the picker open with the exact variable name. The CLI form is `baton auth <provider> api`; `/auth <provider>` opens a two-row picker for that harness with the current mode marked, and it writes nothing until you choose a row. `/auth` and `/auth <provider>` remain readable while work is running; changing a mode waits until the turn or orchestration ends.
 
 Baton reads a provider-neutral variable when you set `apiKeyEnv`. The child still receives the harness-native variable:
 
@@ -61,8 +61,8 @@ Baton reads a provider-neutral variable when you set `apiKeyEnv`. The child stil
 {
   "antigravity": {
     "mode": "api",
-    "apiKeyEnv": "CODEX_ICA_API_KEY",
-    "apiBaseUrl": "https://api.servicesessentials.ibm.com"
+    "apiKeyEnv": "MY_GATEWAY_KEY",
+    "apiBaseUrl": "https://your-gateway.example.com"
   },
   "defaultModels": { "antigravity": "gemini-3.7-flash" }
 }
@@ -76,8 +76,8 @@ Grok uses the same shape with the OpenAI-compatible `/v1` base. Baton spawns `gr
 {
   "grok": {
     "mode": "api",
-    "apiKeyEnv": "CODEX_ICA_API_KEY",
-    "apiBaseUrl": "https://api.servicesessentials.ibm.com/v1"
+    "apiKeyEnv": "MY_GATEWAY_KEY",
+    "apiBaseUrl": "https://your-gateway.example.com/v1"
   },
   "defaultModels": { "grok": "gemini-3.7-flash" }
 }
@@ -99,11 +99,11 @@ Useful top-level keys:
   "defaultMode": "single",
   "notifications": { "bell": false },
   "defaultModels": { "claude": "claude-sonnet-5-5" },
-  "codex": { "apiKeyEnv": "CODEX_ICA_API_KEY" },
+  "codex": { "apiKeyEnv": "OPENAI_API_KEY" },
   "antigravity": {
     "mode": "api",
-    "apiKeyEnv": "CODEX_ICA_API_KEY",
-    "apiBaseUrl": "https://api.servicesessentials.ibm.com"
+    "apiKeyEnv": "MY_GATEWAY_KEY",
+    "apiBaseUrl": "https://your-gateway.example.com"
   }
 }
 ```
@@ -180,7 +180,7 @@ uv run --no-project python .agents/skills/verify-baton/scripts/harness_matrix_pr
   --evidence-dir local_docs/verification/evidence
 ```
 
-The probe needs `CODEX_ICA_API_KEY`, or the matching variable named by `--key-env`, and Python 3.10 or newer. `uv run --no-project python` supplies it; a bare `python3` on macOS 3.9 exits with a version message. Add `--include-claude` only when you approve a live Claude subscription turn.
+The probe needs an API key in the variable named by `--key-env`, and Python 3.10 or newer. `uv run --no-project python` supplies Python; a bare `python3` on macOS 3.9 exits with a version message. Add `--include-claude` only when you approve a live Claude subscription turn.
 
 ## Troubleshooting
 

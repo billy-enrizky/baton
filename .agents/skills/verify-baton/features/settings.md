@@ -30,7 +30,7 @@ The picker has global rows first and read-only harness rows after them. A global
 
 - A concurrent external writer can race the save. Baton preserves unknown keys and replaces the file atomically, but a file lease is not implemented yet.
 - Harness rows can look more authoritative than they are. They are labelled read-only, and this guide does not call them current provider state.
-- The bell can ring only when a turn ends, so enabling it has no immediate sound.
+- The bell rings on turn end, an approval request, and a provider question; a two-second limiter mutes a burst.
 - A malformed config blocks the write and leaves the file untouched, with an error notice. Unknown top-level types that cannot satisfy the typed schema also fail closed.
 
 ## How to get to it (user POV)
@@ -48,6 +48,6 @@ The slash probe opens `/settings`, requires the global and Claude rows, the sele
 ## Gotchas
 - The default session mode applies to new sessions and `/new`. It does not rewrite the current thread. `/fork` keeps the source mode and `/worktree` starts a single-harness thread.
 - Harness rows are intentionally read-only until each harness has a writer that preserves that harness's own configuration. Their value column is a set of available choices, not the provider's live state.
-- The bell changes the current TUI immediately, but it can ring only when a turn ends.
+- The bell changes the current TUI immediately. It rings on turn end, an approval request, and a provider question, with a two-second limiter.
 - A malformed existing config refuses the write and stays byte-for-byte unchanged. Fix the JSON, then reopen `/settings`.
 - The read-only row itself does not show a live provider value. The options line shows the available choices with the cursor, and the notice calls the result an option, not the harness's current setting.

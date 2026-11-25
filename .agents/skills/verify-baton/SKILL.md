@@ -113,7 +113,9 @@ Run every formal gate from the repository root. Put a JDK 21 on `PATH` first; th
 ```sh
 export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
 for d in local_docs/verification/*/; do
-  [ -f "$d/run.sh" ] && bash "$d/run.sh" || exit 1
+  if [ -f "$d/run.sh" ]; then
+    bash "$d/run.sh" || exit 1
+  fi
 done
 ```
 

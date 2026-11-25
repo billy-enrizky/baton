@@ -1,6 +1,18 @@
 # Baton CI acceptance record
 
-Status on 2026-11-24: the first 100 successful PR runs record p50 62.0 seconds, p95 97.0 seconds, and max 150 seconds. The last 50 record p50 59.0 seconds, p95 69.0 seconds, and max 83 seconds. The 100-run window spans earlier CI designs, so the next 100 runs after `ba82720` are the current-design acceptance window. The historical 16-sample Rust median was 63.5 seconds. A free ARM runner was rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate; the x64 Test job stays in place.
+Status on 2026-11-25: the first 100 successful PR runs record p50 62.0 seconds, p95 97.0 seconds, and max 150 seconds. The last 50 record p50 59.0 seconds, p95 69.0 seconds, and max 83 seconds. The 100-run window spans earlier CI designs, so the next 100 runs after `ba82720` are the current-design acceptance window. The latest 2026-11-25 six-run sample is 56, 58, 64, 64, 75, and 76 seconds with a 64-second median, so the current design is close to the one-minute target but has not met it at p50. A free ARM runner was rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate; the x64 Test job stays in place.
+
+## 2026-11-25 latest runs
+
+| Run | Event | Whole run | Test job | Note |
+|---|---|---|---|---|
+| [45687797545](https://github.com/billy-enrizky/baton/actions/runs/45687797545) | push `main` | 64 seconds | 45 seconds | Auth completion slice; all selected gates green |
+| [45685900366](https://github.com/billy-enrizky/baton/actions/runs/45685900366) | push `main` | 56 seconds | 43 seconds | Plan review fixes; all selected gates green |
+| [45687300533](https://github.com/billy-enrizky/baton/actions/runs/45687300533) | pull request #296 | 76 seconds | 57 seconds | Auth completion slice; Test remains the critical path |
+| [45684994155](https://github.com/billy-enrizky/baton/actions/runs/45684994155) | pull request #295 | 64 seconds | 50 seconds | Plan review fixes; Verify adds the tail |
+| [45681317020](https://github.com/billy-enrizky/baton/actions/runs/45681317020) | pull request #295 | 58 seconds | 44 seconds | First plan-view run |
+
+The six-run median is 64 seconds. The remaining gap is runner allocation, roughly 29 seconds of setup and cache restore in Test, 23 to 29 seconds of test execution, and the Verify tail. Sharding is the next candidate only after a partition can preserve a complete-set proof.
 
 This file records the runs that changed a decision. It is not a complete archive of every GitHub Actions run. The Actions history remains the raw record, and the collection commands below reproduce these fields.
 

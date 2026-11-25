@@ -40,7 +40,7 @@ Startup is measured by `scripts/bench.py` against `scripts/bench-baseline.json` 
 
 The false-green goal is scoped to the workflow and aggregator. A test process with write access can alter its own log or manifest; that residual risk is listed in Risks and mitigations and is why the manifest check is called detection, not a sandbox.
 
-Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every required command in `check`, `build`, `test`, and `debt` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command. The post-build `--version` smoke check runs outside the budget because the build it checks is already budgeted.
+Phase 1 shipped on 2026-11-22. Every job has `timeout-minutes`, every required command in `check`, `build`, and `test` runs under `ci/budget.sh`, and a budget miss exits 124 and fails the job. `verify` is a pure aggregator with no external command. The post-build `--version` smoke check runs outside the budget because the build it checks is already budgeted.
 
 Phase 2 is in progress from recorded runs. The historical warm Rust PR samples are 52, 55, 56, 58, 60, 61, 62, 63, 64, 65, 65, 68, 68, 69, 70, and 74 seconds. The historical median is 63.5 seconds. The critical-path change in this slice moves path classification to a shallow base and head fetch and moves every trusted guard into `Selection`; the final branch dispatch with a forced Rust rebuild completed in 51 seconds, with `Changes` at 6 seconds and `Test` at 35 seconds. Head-tools branch dispatches completed in 53, 62, and 48 seconds; the 62-second repeat had slower setup and cache restores and skipped no check. The four warm branch runs have a 52-second median. The final head-tools run proved the trusted debt baselines, the debt self-test, and the Clippy count of 61 against the 61 baseline. The first post-merge main push then completed in 59 seconds with Test at 43 seconds, proving the merged tools and seeding the new cache. The first post-merge PR, a meta CI-docs PR with the full suite selected, completed in 52 seconds. Real Rust PR 45123430101 completed in 69 seconds and main push 45124406491 in 68 seconds; later PR 45132308493 completed in 51 seconds and main push 45132776683 in 61 seconds. The harness-matrix PR 45140130989 completed in 62 seconds. The slim toolchain-cache dispatches then recorded 62, 64, 47, and 62 seconds; the 47-second run proves the path can finish under one minute, while the four-sample median of 62 seconds shows that hosted-runner allocation and Cargo restore variance still prevent a robust p50 claim. The next two Rust PRs were 62 seconds for #174 and 53 seconds for #175; their main pushes were 64 and 59 seconds. The latest PR and main push both finished under one minute. The first 100 successful PR runs now record p50 62.0 seconds, p95 97.0 seconds, and max 150 seconds; the last 50 record p50 59.0 seconds, p95 69.0 seconds, and max 83 seconds. The 100-run window spans earlier CI designs, so the next 100 runs after `ba82720` are the current-design acceptance window. A free ARM runner was measured and rejected because it would remove x64 runtime tests from the pre-merge gate. The x64 Test job stays in place. The acceptance record names the runs, the job breakdown, and every rejected experiment.
 
@@ -70,10 +70,10 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 | Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
 | Warm Test job | 33 to 52 seconds; n=16 | Runs 45035044248, 45055995298, 45004705055, 45009466461, 45021604178, 45060299027, 45011836996, 45010710576, 45037001045, 45046974039, 45051808580, 45064707055, 45069517940, 45075059836, 45075683884, and 45080151770 |
 | Main push at `7f22ab5` | Whole run 66 seconds; Test job 51 seconds. Job steps: 17 seconds of checkout and cache restore, 30 seconds of Test, 4 seconds of tail. The run starts the Test job 5 seconds in because it waits only on `changes`, so the remaining lead-in is runner startup | Run 45580109649 |
-| `cargo test --lib` | 1.67 to 3.70 seconds, 331 tests at the cited runs | Runs 45009466461 and 45011836996; the suite now has 663 lib tests on macOS and 664 on Linux |
-| Integration tests | 0.40 to 0.75 seconds, 75 tests across seven binaries at the cited runs | Runs 45009466461 and 45011836996; the suite now has 113 integration tests on macOS and 114 on Linux across nine binaries |
-| Executed test count (`ci/test-inventory.sh`) | 776 macOS, 778 Linux | Current local suite plus one Linux-only library test and one Linux-only non-UTF-8 integration test |
-| `ci/test-inventory-floor.txt` | 776 | Current macOS count and floor |
+| `cargo test --lib` | 1.67 to 3.70 seconds at the cited runs; 719 library tests in the current suite | Runs 45009466461 and 45011836996; current count from the 2026-11-25 full run at `f43df88` |
+| Integration tests | 0.40 to 0.75 seconds at the cited runs; 121 tests across nine binaries in the current suite | Runs 45009466461 and 45011836996; current count from the 2026-11-25 full run at `f43df88` |
+| Executed test count (`ci/test-inventory.sh`) | 840 macOS at `f43df88` | Current source inventory; Linux runs the same suite plus the two platform-specific tests named below |
+| `ci/test-inventory-floor.txt` | 776 | Lower-bound floor; it does not shrink when the current count grows |
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
@@ -322,12 +322,10 @@ What it does not prove: test inventory completeness, shard union coverage, or th
 
 Phase 1 values are three times a conservative local cold estimate. They are caps, not targets: a command that exceeds one fails the job. Phase 2 replaces each value with the measured Linux p95 plus 20 percent. That replacement is the only allowed increase; after it, no value may increase. Clippy is a separate debt ratchet, not a build or test command; its 300-second ceiling is recorded here so the 90-second warm build/test goal is not misread as a Clippy ceiling.
 
-## Debt ratchet job shape
+## Debt ratchet placement
 
-The ratchet runs inside the `check` job. `ci/check-ci.sh` still accepts the older shape, a separate `debt` job,
-and enforces both: a `debt` job must read `debt_needed`, and a `check` job that owns the ratchet must run
-`fmt-debt.sh`, `clippy-debt.sh`, and `debt-selftest.sh` under `ci/budget.sh`. Removing a ratchet command fails
-CI014.
+The ratchet runs inside the `check` job. `ci/check-ci.sh` enforces that the job runs `fmt-debt.sh`,
+`clippy-debt.sh`, and `debt-selftest.sh` under `ci/budget.sh`; removing any of them fails CI014.
 
 The merge was worth doing because the ratchet was the critical path. On run 45599904468 it took 48 seconds
 against Check's 20, and 22 of those 48 were cache restores against ten seconds of fmt and clippy. Two jobs
@@ -368,7 +366,7 @@ The acceptance record is [ci-acceptance.md](ci-acceptance.md). It records the ru
 
 A cache miss changes the time, never the checks: the cold path runs the same commands under the same budgets. If a cold run regularly exceeds a Phase 1 budget, the fix is to correct the budget from measured data in Phase 2, not to skip the gate. Workflow-dispatch cache saves are limited to users with write access and are used only to seed and measure the trusted toolchain cache.
 
-The pinned Rust toolchain uses two shared caches: `rustup-min-1.100.0-<os>-<arch>` for Check, Build, and Test, and `rustup-lint-1.100.0-<os>-<arch>` for the Debt ratchet. Both cache only `~/.rustup/toolchains/1.100.0-*` and its update hash, not the full rustup home. The old full cache was about 390 MB per job; the slim caches are about 190 MB for the minimal toolchain and 199 MB for the lint toolchain. Test saves the minimal cache and Debt saves the lint cache on `main` or an owner-dispatched run; Check and Build only restore. A warm Test job restored the slim toolchain in 2 to 5 seconds on the measured fast runs, against 9 seconds for the old 390 MB archive. Cargo restore variance and hosted-runner allocation still dominate the total, so the total p50 has not yet been proven below 60 seconds.
+The pinned Rust toolchain uses two shared caches: `rustup-min-1.100.0-<os>-<arch>` for Check, Build, and Test, and `rustup-lint-1.100.0-<os>-<arch>` for Check's fmt and Clippy ratchets. Both cache only `~/.rustup/toolchains/1.100.0-*` and its update hash, not the full rustup home. The old full cache was about 390 MB per job; the slim caches are about 190 MB for the minimal toolchain and 199 MB for the lint toolchain. Test saves the minimal cache and Check saves the lint cache on `main` or an owner-dispatched run; Build and the other jobs only restore. A warm Test job restored the slim toolchain in 2 to 5 seconds on the measured fast runs, against 9 seconds for the old 390 MB archive. Cargo restore variance and hosted-runner allocation still dominate the total, so the total p50 has not yet been proven below 60 seconds.
 
 ## Costs and owner actions
 
@@ -385,12 +383,8 @@ Merge-candidate proof without a merge queue: when branch protection requires bra
 
 ## Open decisions
 
-- **Merging the Debt ratchet into Check is ready to land.** It is the measured lever: on run 45599904468 the
-  ratchet was the critical path at 48 seconds, 22 of them cache restores, while Check took 20 with the same shape
-  of setup. `ci/check-ci.sh` allows a job to be removed when every command it was required to run still runs in
-  the head workflow, and `verify` may stop requiring that job, which is the only way a removal can be coherent.
-  Dropping a job that still exists from `verify.needs` remains a hard failure, and `if`, `timeout-minutes`, and
-  `runs-on` drift remain forbidden even with `--allow-change`.
+- **The Debt ratchet merge into Check landed.** The separate job was the critical path at 48 seconds on run 45599904468; after the merge, Check carried the ratchets at 38 seconds and the whole run was 60 seconds. The latest main pushes on 2026-11-25 completed in 56 and 64 seconds, so the one-minute target is met on some runs but is not yet proven at p50.
+- **The Test job remains the critical path.** Its 2026-11-25 samples are 44 to 57 seconds, with 23 to 29 seconds of setup and cache restore before the test command. The next measured lever is a trustworthy two-shard partition; count-based nextest shards remain rejected because their recorded per-test times did not survive parallel scheduling.
 
 | Decision | Current state |
 |---|---|

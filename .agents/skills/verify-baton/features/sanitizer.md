@@ -17,14 +17,10 @@ cargo test --locked --lib transcript_render_never_emits_child_control_sequences
 
 ## Manual check
 
-```sh
-printf 'a\033]0;spoofed\007b' | target/debug/baton exec --stdin
-```
-
-Needs a live provider, so it is not a CI gate. The expected output shows `a`, the replacement character, and `b`, with no terminal retitle.
+Use the unit tests above. A live-provider transcript may echo control lookalike text, but the host terminal never receives the child sequence.
 
 ## Limits
 
-- Shell overlay and PTY output are not wired yet. That is D9 in `.agents/parity.md`.
+- The one-shot `!` shell command sanitizes its captured output in `src/shell.rs`; an interactive PTY surface is not implemented.
 - JSON output is intentionally raw and must not be sanitized.
 - Ratatui already drops C0 at the cell level, so the transcript is defence in depth; the CLI stdout path is the one without a second line of defence.

@@ -8,14 +8,14 @@ Baton ships as a single binary in release archives for x86_64 and aarch64 macOS 
 curl -fsSL https://raw.githubusercontent.com/billy-enrizky/baton/main/install.sh | sh
 ```
 
-The script installs to `~/.local/bin` by default. Set `BATON_INSTALL_DIR` to another bin directory, or `BATON_VERSION` to pin a release:
+The script installs to `~/.local/bin` by default. Set `BATON_INSTALL_DIR` to another directory whose final component is `bin`, or `BATON_VERSION` to pin a release:
 
 ```sh
 BATON_VERSION=v0.4.3 BATON_INSTALL_DIR="$HOME/bin" \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/billy-enrizky/baton/main/install.sh)"
 ```
 
-If `~/.local/bin` is not on `PATH`, the script prints the export line to add. GNU `sha256sum`, `shasum`, or `openssl` is required to verify the archive.
+If `~/.local/bin` is not on `PATH`, the script prints the export line to add. The shell installer needs `tar` or `unzip`, and `sha256sum`, `shasum`, or `openssl` to verify the archive.
 
 ## Windows
 
@@ -23,7 +23,7 @@ If `~/.local/bin` is not on `PATH`, the script prints the export line to add. GN
 irm https://raw.githubusercontent.com/billy-enrizky/baton/main/install.ps1 | iex
 ```
 
-The script installs to `%LOCALAPPDATA%\Baton\bin` by default and adds it to your user `PATH`. Set `BATON_INSTALL_DIR` or `BATON_VERSION` before running it to change the directory or pin a release.
+The script installs to `%LOCALAPPDATA%\Baton\bin` by default and adds it to your user `PATH`. Set `BATON_INSTALL_DIR` or `BATON_VERSION` before running it to change the directory or pin a release. It uses the built-in `Expand-Archive` command, available in PowerShell 5 and newer.
 
 Windows on ARM is not published yet. Use an x64 Windows machine, or build from a source checkout with `cargo install --path . --locked`.
 
@@ -88,7 +88,7 @@ Remove the binary from the install location:
 
 ```sh
 rm ~/.local/bin/baton    # curl installer
-brew uninstall baton     # Homebrew
+brew uninstall billy-enrizky/baton/baton     # Homebrew
 cargo uninstall baton    # source install
 ```
 

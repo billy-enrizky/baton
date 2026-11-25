@@ -274,7 +274,7 @@ Type what you want in plain language. Examples:
 - "Audit the billing settings, add the missing tests, and update the docs."
 - "Explain how the cache invalidation works."
 
-The harness choice and task split are visible before work starts. Press Enter to accept a preview or Esc to edit.
+In orchestrate mode the planner runs first and the run report shows the task split as workers start. Use `/orchestrate --plan-only <goal>` to review a plan before anything runs; Enter starts it, and Esc returns the goal to the composer.
 
 ### 4.6 Help inside the app
 
@@ -459,11 +459,11 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 
 ### 8.1 Plan
 
-A coordinator receives the goal and returns a small set of independent tasks. Each task has a title, a provider, an optional model, an optional effort, and a self-contained prompt. Plans are capped at 16 tasks. If the coordinator cannot produce valid JSON, Baton retries once and then falls back to one direct worker.
+A coordinator receives the goal and returns tasks. Each task has a title, a provider, an optional model, an optional `id`, an optional `effort`, a `dependsOn` list of task ids or 1-based positions, and a self-contained prompt. Plans are capped at 16 tasks; a duplicate id, an unknown dependency, a self-dependency, or a cycle is rejected before any worker starts. If the coordinator cannot produce valid JSON, Baton retries once and then falls back to one direct worker.
 
 ### 8.2 Workers
 
-A worker starts in its own git worktree under `$BATON_HOME/worktrees/<short-run>/<task-slug>` on branch `baton/<short-run>/<task-slug>`. Workers run in parallel through the normal `baton exec` path. A worker that changes files commits as `baton worker: <title>`.
+A worker starts in its own git worktree under `$BATON_HOME/worktrees/<short-run>/<task-slug>` on branch `baton/<short-run>/<task-slug>`. Workers run through the normal `baton exec` path. Tasks with no unmet dependency run in parallel; a task starts only after every dependency completes, and a failed or skipped dependency skips its dependents and leaves the run `partial` or `failed`. A worker that changes files commits as `baton worker: <title>`.
 
 If the source checkout is dirty, Baton asks first. Enter snapshots tracked and untracked non-ignored files into each worktree; `s` runs one harness in the live checkout; Esc cancels.
 
@@ -598,11 +598,29 @@ It is read-only except for `baton_queue` clear and `baton_fork`, which creates a
 
 ### 11.3 JSON streams
 
-`baton exec --stream-json` and `baton orchestrate --stream-json` emit one compact JSON object per line. Events include provider and turn ids, text deltas, tool start and finish, usage, turn completion, subagent start and finish, and a final `type: "result"` row.
+`baton exec --stream-json` and `baton orchestrate --stream-json` emit one compact JSON object per line. Events include provider and turn ids, text deltas, tool start and finish, approvals, provider questions, plan updates and removals, usage, turn completion, subagent start and finish, and a final `type: "result"` row. A `plan_updated` row carries `entries` with `content`, `status`, `priority`, and an optional `explanation`.
 
 ## 12. Command-line reference
 
 ### 12.1 Sessions and inspection
+
+Global flags apply before or after a subcommand:
+
+```sh
+baton -C <dir>                    # working directory
+baton -t <thread-id>              # target a thread
+baton -p <provider> -m <model>    # provider and model overrides
+baton --effort <level>            # reasoning effort where supported
+baton --mode <single|orchestrate> # session mode for new work
+baton --plan                      # read-only plan permission mode
+baton --full-auto | --yolo        # accept edits, or bypass permissions
+baton --claude-home <dir>         # override Claude config home
+baton --codex-home <dir>          # override Codex config home
+baton --limit <n>                 # list or output limit
+baton --dry-run                   # inspect without running a turn
+```
+
+`--plan` is the read-only permission mode, `--plan-file` feeds a plan to orchestration, and `/plan` shows the plan a harness reported.
 
 ```sh
 baton                              # fresh session

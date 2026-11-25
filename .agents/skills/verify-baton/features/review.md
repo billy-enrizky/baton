@@ -34,3 +34,4 @@ shows `notes: 1`, the row is stored unsent, and the TUI exits 0.
 - Do not wait for a marker string that appears in your own prompt. The probe
   watches the file side effect instead.
 - The note stays unsent until `s`, so the probe costs one model turn only.
+- Diff paths and line text are sanitized before rendering. A file can carry terminal escapes or bidi controls; the review overlay and the transcript diff replace them with U+FFFD.

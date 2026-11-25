@@ -253,7 +253,9 @@ pub fn render_diff_lines(diff: &str, width: usize) -> Vec<Line<'static>> {
     if single {
         header.push(Span::styled(files[0].verb, bold));
         header.push(Span::raw(" "));
-        header.push(Span::raw(files[0].path.clone()));
+        header.push(Span::raw(
+            crate::sanitize::sanitize_terminal_text(&files[0].path).into_owned(),
+        ));
         header.push(Span::raw(" "));
         header.extend(counts_summary(files[0].added, files[0].removed));
     } else {
@@ -269,7 +271,9 @@ pub fn render_diff_lines(diff: &str, width: usize) -> Vec<Line<'static>> {
         }
         if !single {
             let mut row: Vec<Span<'static>> = vec![Span::styled("  └ ", dim)];
-            row.push(Span::raw(file.path.clone()));
+            row.push(Span::raw(
+                crate::sanitize::sanitize_terminal_text(&file.path).into_owned(),
+            ));
             row.push(Span::raw(" "));
             row.extend(counts_summary(file.added, file.removed));
             out.push(Line::from(row));
@@ -301,7 +305,8 @@ pub fn render_diff_lines(diff: &str, width: usize) -> Vec<Line<'static>> {
                     gutter_style,
                 );
                 let content_style = Style::default().fg(content_fg);
-                let chars: Vec<char> = row.text.chars().collect();
+                let text = crate::sanitize::sanitize_terminal_text(&row.text);
+                let chars: Vec<char> = text.chars().collect();
                 let mut offset = 0;
                 loop {
                     let chunk: String = chars.iter().skip(offset).take(available).collect();
@@ -335,6 +340,19 @@ mod tests {
     use super::*;
 
     const SAMPLE: &str = "diff --git a/notes.txt b/notes.txt\nindex 700..de2 100644\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1,3 +1,3 @@\n context line\n-old line\n+new line\n+another new line\n";
+
+    #[test]
+    fn renderer_strips_control_sequences_from_paths_and_lines() {
+        let diff = "diff --git a/evil\u{1b}[2J.txt b/evil\u{1b}[2J.txt\n--- a/evil\u{1b}[2J.txt\n+++ b/evil\u{1b}[2J.txt\n@@ -1 +1 @@\n-old\n+\u{1b}[31mred\n";
+        let lines = render_diff_lines(diff, 80);
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
+            .collect::<String>();
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(text.contains("evil\u{fffd}[2J.txt"), "{text:?}");
+        assert!(text.contains("\u{fffd}[31mred"), "{text:?}");
+    }
 
     #[test]
     fn parses_files_counts_and_line_numbers() {

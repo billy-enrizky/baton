@@ -25,7 +25,7 @@ Costs belong to the harness provider: a subscription for the harness login, or u
 baton
 ```
 
-The TUI opens in the configured default session mode, which is orchestrate until you change the global default with `/settings` or `"defaultMode": "single"` in `config.json`. `/orchestrate off` changes only the current thread. Run `baton doctor` to see every harness binary, its auth mode, the Baton config files, database size, thread count, and tracked provider processes. Run `baton login <provider>` once for each harness you want to use.
+The TUI opens in the configured default session mode, which is orchestrate until you change the global default with `/settings` or `"defaultMode": "single"` in `config.json`. `/orchestrate off` changes only the current thread. Run `baton doctor` to see every harness binary, its auth mode, the Baton config files, database size, thread count, and tracked provider processes. For subscription billing, run `baton login <provider>` once for each harness you want to use. API-key setups can skip the login.
 
 ## Provider login
 
@@ -51,7 +51,7 @@ Each provider can run on its harness login or an API key. `/auth` opens a scroll
 | OpenCode | `OPENCODE_API_KEY` |
 | Antigravity | `GEMINI_API_KEY` |
 
-Set the key in the environment, the harness config, or `~/.baton/config.json`, then choose the API row. A missing key keeps the picker open with the exact variable name. The CLI form is `baton auth <provider> api`; `/auth <provider>` opens a two-row picker for that harness with the current mode marked, and it writes nothing until you choose a row.
+Set the key in the environment or `~/.baton/config.json`; Baton also reads Claude and Codex settings. Then choose the API row. A missing key keeps the picker open with the exact variable name. The CLI form is `baton auth <provider> api`; `/auth <provider>` opens a two-row picker for that harness with the current mode marked, and it writes nothing until you choose a row.
 
 Baton reads a provider-neutral variable when you set `apiKeyEnv`. The child still receives the harness-native variable:
 
@@ -87,7 +87,7 @@ OpenCode reads its own `opencode.json` for a custom provider. Baton does not map
 
 ## Config file
 
-`~/.baton/config.json` stores Baton overrides. Set `BATON_HOME` to use a different directory. The file is written with mode 0600. `/auth` and `/settings` refuse a malformed file instead of replacing it, so a hand-edit error never deletes your keys.
+`~/.baton/config.json` stores Baton overrides. Set `BATON_HOME` to use a different directory. The file is written with owner-only permissions on Unix. `/auth` and `/settings` refuse a malformed file instead of replacing it, so a hand-edit error never deletes your keys.
 
 Useful top-level keys:
 
@@ -106,11 +106,11 @@ Useful top-level keys:
 }
 ```
 
-`defaultMode` accepts `orchestrate` or `single`. Provider keys use the provider name as the key. Unknown fields survive a write.
+`defaultMode` accepts `orchestrate` or `single`. Provider keys use the provider name as the key. Unknown provider and notification fields survive a write.
 
 ## Roles
 
-Baton has four roles: orchestrator, planner, implementor, and reviewer. Defaults are Claude `claude-opus-5-5` for orchestrator and planner, Codex `gpt-6.2-sol` for implementor, and Codex `gpt-6.2-astra` for reviewer. A normal orchestration uses the planner role for its coordinator turn and the implementor role for matching worker tasks. After every completed worker, the reviewer role reads that worker's commit and answers `APPROVE` or `REQUEST_CHANGES`; only an approved commit can be integrated or shipped. `/roles` shows the resolved rows and Enter shows the provider, model, effort, prompt source, config source, and parsed hook events. `baton roles --json` exposes the same registry.
+Baton has four roles: orchestrator, planner, implementor, and reviewer. Defaults are Claude `claude-opus-5-5` for orchestrator and planner, Codex `gpt-6.2-sol` for implementor, and Codex `gpt-6.2-astra` for reviewer. The coordinator turn uses the planner role's provider and model, with both the orchestrator and planner prompts; matching worker tasks use the implementor role. After every completed worker that has a commit, the reviewer role reads that commit and answers `APPROVE` or `REQUEST_CHANGES`; only an approved commit can be integrated or shipped. `/roles` shows the resolved rows and Enter shows the provider, model, effort, prompt source, config source, and parsed hook events. `baton roles --json` exposes the same registry.
 
 Override models in `~/.baton/roles.json`:
 
@@ -169,22 +169,21 @@ Known events are `before_plan`, `after_plan`, `before_implement`, `after_impleme
 
 ## Verify every harness
 
-From a source checkout, the harness matrix probe records either a live turn or an explicit account block for each advertised harness:
+From a source checkout, build Baton and run the harness matrix probe. It probes every advertised harness, records account limits as `blocked`, and checks Cursor's capability. With `--include-claude` it also runs a live Claude turn; by default it skips that turn:
 
 ```sh
+cargo build --locked
 uv run --no-project python .agents/skills/verify-baton/scripts/harness_matrix_probe.py \
   --binary target/debug/baton \
   --evidence-dir local_docs/verification/evidence
 ```
 
-The default run skips a live Claude turn and checks Cursor's capability only. Add `--include-claude` only when you approve a live Claude subscription turn.
-
-The probe requires Python 3.10 or newer. `uv run --no-project python` supplies it; a bare `python3` on macOS 3.9 exits with a version message.
+The probe needs `CODEX_ICA_API_KEY`, or the matching variable named by `--key-env`, and Python 3.10 or newer. `uv run --no-project python` supplies it; a bare `python3` on macOS 3.9 exits with a version message. Add `--include-claude` only when you approve a live Claude subscription turn.
 
 ## Troubleshooting
 
 - `baton doctor` names a missing harness binary and the next step. Install the CLI or put it on `PATH`.
-- `/auth` says `missing <VARIABLE>`. Set that variable in the environment, the harness config, or `config.json`, then reopen `/auth`.
+- `/auth` says `missing <VARIABLE>`. Set that variable in the environment or `config.json`; Claude and Codex settings also work. Then reopen `/auth`.
 - `/auth` says `cannot read config`. Fix `~/.baton/config.json`; the picker did not overwrite it.
 - Cursor rejects a custom endpoint. Remove the cursor `apiBaseUrl` and use `cursor-agent login`.
 - A turn fails auth after the banner looks ready. The harness can still reject an unentitled model or expired login. Run the provider's login command again.

@@ -359,6 +359,10 @@ fn question_prompts(params: &Value) -> Vec<QuestionPrompt> {
                 question: text.to_string(),
                 options,
                 allow_custom,
+                multi_select: question
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 secret: question
                     .get("isSecret")
                     .and_then(Value::as_bool)
@@ -1081,6 +1085,7 @@ mod tests {
         assert_eq!(questions[0].options[0].label, "Strict schemas");
         assert_eq!(questions[0].options[1].description, "Looser validation");
         assert!(questions[0].allow_custom);
+        assert!(!questions[0].multi_select);
         assert!(!questions[1].allow_custom);
         assert!(questions[1].secret);
         assert_eq!(questions[1].id, "question-2");
@@ -1107,6 +1112,7 @@ mod tests {
                 question: "Pick".into(),
                 options: Vec::new(),
                 allow_custom: true,
+                multi_select: false,
                 secret: false,
             },
             QuestionPrompt {
@@ -1115,6 +1121,7 @@ mod tests {
                 question: "Pick again".into(),
                 options: Vec::new(),
                 allow_custom: true,
+                multi_select: false,
                 secret: false,
             },
         ];

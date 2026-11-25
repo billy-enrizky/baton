@@ -33,4 +33,4 @@ Run a turn that asks for permission. The overlay appears above the composer with
 - `permission_choices_keep_the_provider_labels_and_ids`
 - `a_typed_choice_must_be_one_of_the_offered_options`
 - `approval_events_do_not_leak_the_responder`
-- `approval_probe.py` runs a fake `agy` ACP agent, selects `opt-reject` with two Down presses and Enter, then answers an `interaction_` question with `opt-sqlite`, and checks both responses the agent received.
+- `approval_probe.py` runs a fake `agy` ACP agent, selects `opt-reject` with two Down presses and Enter, answers an `interaction_` question with `opt-sqlite`, then checks two xAI multi-select options with Space and Enter, and verifies all three native responses.

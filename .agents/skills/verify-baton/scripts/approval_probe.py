@@ -100,7 +100,7 @@ for line in sys.stdin:
                     ],
                 },
             })
-        else:
+        elif turn_count == 2:
             send({
                 "jsonrpc": "2.0",
                 "id": 9002,
@@ -117,9 +117,34 @@ for line in sys.stdin:
                     ],
                 },
             })
-    elif request_id in {9001, 9002}:
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "id": 9003,
+                "method": "x.ai/ask_user_question",
+                "params": {
+                    "sessionId": "acp-approval-1",
+                    "toolCallId": "tc-multi",
+                    "mode": "default",
+                    "questions": [{
+                        "id": "features",
+                        "question": "Which release features?",
+                        "multiSelect": True,
+                        "options": [
+                            {"label": "Readme", "description": "Update the public guide"},
+                            {"label": "CI", "description": "Keep the fast CI"},
+                            {"label": "Installer", "description": "Ship the installers"},
+                        ],
+                    }],
+                },
+            })
+    elif request_id in {9001, 9002, 9003}:
         record(frame)
-        text = "approval handled" if request_id == 9001 else "question handled"
+        text = {
+            9001: "approval handled",
+            9002: "question handled",
+            9003: "multi question handled",
+        }[request_id]
         send({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -217,6 +242,7 @@ def main() -> int:
     error = None
     selected = None
     question_selected = None
+    multi_answers = None
     try:
         if not wait_for_screen(
             master, "Ask anything", args.timeout, args.width, args.height, transcript
@@ -282,6 +308,52 @@ def main() -> int:
             question_after_text + "\n"
         )
 
+        os.write(master, b"choose release features\r")
+        if not wait_for_screen(
+            master,
+            "Which release features?",
+            args.timeout,
+            args.width,
+            args.height,
+            transcript,
+        ):
+            raise RuntimeError("TUI did not show the multi-select question")
+        if not wait_for_screen(
+            master, "Installer", 8.0, args.width, args.height, transcript
+        ):
+            raise RuntimeError("multi-select question did not list the options")
+        pump(master, 0.3, transcript)
+        multi = Screen(args.width, args.height)
+        multi.feed(bytes(transcript).decode("utf-8", "replace"))
+        multi_text = "\n".join(multi.lines())
+        (evidence / "screen-multi-question.txt").write_text(multi_text + "\n")
+
+        os.write(master, b"\x1b[B \x1b[B ")
+        pump(master, 0.3, transcript)
+        multi_selected = Screen(args.width, args.height)
+        multi_selected.feed(bytes(transcript).decode("utf-8", "replace"))
+        multi_selected_text = "\n".join(multi_selected.lines())
+        (evidence / "screen-multi-selected.txt").write_text(
+            multi_selected_text + "\n"
+        )
+        os.write(master, b"\r")
+        if not wait_for_screen(
+            master,
+            "multi question handled",
+            args.timeout,
+            args.width,
+            args.height,
+            transcript,
+        ):
+            raise RuntimeError("the fake ACP agent did not receive the multi-select answer")
+        pump(master, 0.5, transcript)
+        multi_after = Screen(args.width, args.height)
+        multi_after.feed(bytes(transcript).decode("utf-8", "replace"))
+        multi_after_text = "\n".join(multi_after.lines())
+        (evidence / "screen-multi-question-after.txt").write_text(
+            multi_after_text + "\n"
+        )
+
         if state_path.is_file():
             for line in state_path.read_text().splitlines():
                 try:
@@ -293,18 +365,36 @@ def main() -> int:
                     selected = outcome.get("optionId")
                 if frame.get("id") == 9002 and outcome.get("outcome") == "selected":
                     question_selected = outcome.get("optionId")
+                if frame.get("id") == 9003:
+                    multi_answers = (
+                        frame.get("result", {})
+                        .get("answers", {})
+                        .get("Which release features?")
+                    )
         choices = ["Allow once", "Always allow", "Reject"]
         missing = [choice for choice in choices if choice not in before_text]
         question_choices = ["Which database should the service use?", "Postgres", "SQLite"]
         missing.extend(
             choice for choice in question_choices if choice not in question_text
         )
+        multi_choices = [
+            "[x] CI",
+            "[x] Installer",
+            "space toggle · enter submit",
+        ]
+        missing.extend(
+            choice for choice in multi_choices if choice not in multi_selected_text
+        )
+        if "Which release features?" not in multi_text:
+            missing.append("Which release features?")
         passed = (
             not missing
             and selected == "opt-reject"
             and question_selected == "opt-sqlite"
+            and multi_answers == ["CI", "Installer"]
             and "approval handled" in after_text
             and "question handled" in question_after_text
+            and "multi question handled" in multi_after_text
         )
         if missing:
             error = f"missing choices: {missing}"
@@ -314,10 +404,14 @@ def main() -> int:
             error = (
                 f"question option was {question_selected!r}, expected 'opt-sqlite'"
             )
+        elif multi_answers != ["CI", "Installer"]:
+            error = f"multi-select answers were {multi_answers!r}"
         elif "approval handled" not in after_text:
             error = "the completed turn is missing from the final screen"
         elif "question handled" not in question_after_text:
             error = "the answered question is missing from the final screen"
+        elif "multi question handled" not in multi_after_text:
+            error = "the answered multi-select question is missing from the final screen"
     except Exception as caught:  # noqa: BLE001
         error = str(caught)
     finally:
@@ -335,6 +429,7 @@ def main() -> int:
             "binary": binary_identity(binary),
             "selected": selected,
             "question_selected": question_selected,
+            "multi_answers": multi_answers,
             "error": error,
             "exit_code": exit_code,
             "evidence": str(evidence),

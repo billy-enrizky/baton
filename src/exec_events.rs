@@ -333,6 +333,7 @@ mod tests {
                     question: "Pick one".into(),
                     options: Vec::new(),
                     allow_custom: true,
+                    multi_select: false,
                     secret: false,
                 }],
                 respond,

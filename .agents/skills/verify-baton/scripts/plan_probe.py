@@ -165,6 +165,11 @@ def main() -> int:
         ):
             raise RuntimeError("TUI did not show the composer")
         pump(master, 1.5, transcript)
+        os.write(master, b"/mode plan\r")
+        if not wait_for_screen(
+            master, "permission mode: plan", args.timeout, args.width, args.height, transcript
+        ):
+            raise RuntimeError("/mode plan did not set plan mode")
         os.write(master, b"make a plan\r")
         if not wait_for_screen(
             master, "plan ready", args.timeout, args.width, args.height, transcript
@@ -176,6 +181,8 @@ def main() -> int:
         ):
             raise RuntimeError("/plan did not open the overlay")
         for value in [
+            "enter accept",
+            "esc revise",
             "turn turn-plan",
             "Two checks",
             "✓ Inspect the parser",
@@ -191,7 +198,29 @@ def main() -> int:
         text = "\n".join(screen.lines())
         (evidence / "plan-screen.txt").write_text(text + "\n")
         os.write(master, b"\x1b")
+        if not wait_for_screen(
+            master, "revise the plan:", args.timeout, args.width, args.height, transcript
+        ):
+            raise RuntimeError("Esc did not return the plan for revision")
         pump(master, 0.3, transcript)
+        screen = Screen(args.width, args.height)
+        screen.feed(bytes(transcript).decode("utf-8", "replace"))
+        (evidence / "revise-screen.txt").write_text(
+            "\n".join(screen.lines()) + "\n"
+        )
+        # Clear the pre-filled revision text before running the next command.
+        os.write(master, b"\x7f" * 40)
+        pump(master, 0.3, transcript)
+        os.write(master, b"/plan\r")
+        if not wait_for_screen(
+            master, "plan · 1/2 done", args.timeout, args.width, args.height, transcript
+        ):
+            raise RuntimeError("/plan did not reopen before accept")
+        os.write(master, b"\r")
+        if not wait_for_screen(
+            master, "plan accepted", args.timeout, args.width, args.height, transcript
+        ):
+            raise RuntimeError("Enter did not accept the plan")
         os.write(master, b"/quit\r")
         pump(master, 0.5, transcript)
         exit_code = reap(pid, 5)

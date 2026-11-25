@@ -9,7 +9,7 @@ use crate::types::{PermissionMode, ProviderId};
 
 pub use crate::types::AuthMode;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize, Default)]
 pub struct ProviderAuthFile {
     pub mode: Option<AuthMode>,
     pub api_key: Option<String>,
@@ -22,6 +22,18 @@ pub struct ProviderAuthFile {
     pub api_base_url: Option<String>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
+}
+
+impl std::fmt::Debug for ProviderAuthFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderAuthFile")
+            .field("mode", &self.mode)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("api_key_env", &self.api_key_env)
+            .field("api_base_url", &self.api_base_url)
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -47,7 +59,7 @@ pub struct BatonConfigFile {
     pub default_mode: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EffectiveProviderConfig {
     pub provider: ProviderId,
     pub mode: AuthMode,
@@ -58,6 +70,20 @@ pub struct EffectiveProviderConfig {
     pub api_base_url: Option<String>,
     pub model: String,
     pub permission_mode: PermissionMode,
+}
+
+impl std::fmt::Debug for EffectiveProviderConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EffectiveProviderConfig")
+            .field("provider", &self.provider)
+            .field("mode", &self.mode)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("api_key_env_name", &self.api_key_env_name)
+            .field("api_base_url", &self.api_base_url)
+            .field("model", &self.model)
+            .field("permission_mode", &self.permission_mode)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -536,5 +562,38 @@ mod tests {
         let secret = provider_secret(ProviderId::Cursor, home.path(), home.path());
         assert_eq!(secret.key_source, ApiKeySource::Missing);
         assert!(!secret.key_present);
+    }
+
+    #[test]
+    fn debug_output_redacts_provider_keys() {
+        let mut providers = BTreeMap::new();
+        providers.insert(
+            "codex".to_string(),
+            ProviderAuthFile {
+                mode: Some(AuthMode::Api),
+                api_key: Some("sk-debug-secret-123456".to_string()),
+                ..Default::default()
+            },
+        );
+        let file = BatonConfigFile {
+            providers,
+            ..Default::default()
+        };
+        let text = format!("{file:?}");
+        assert!(!text.contains("sk-debug-secret-123456"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
+
+        let effective = EffectiveProviderConfig {
+            provider: ProviderId::Codex,
+            mode: AuthMode::Api,
+            api_key: Some("sk-debug-secret-123456".to_string()),
+            api_key_env_name: "OPENAI_API_KEY".to_string(),
+            api_base_url: None,
+            model: "gpt-6.1-sol".to_string(),
+            permission_mode: PermissionMode::Default,
+        };
+        let text = format!("{effective:?}");
+        assert!(!text.contains("sk-debug-secret-123456"), "{text}");
+        assert!(text.contains("[redacted]"), "{text}");
     }
 }

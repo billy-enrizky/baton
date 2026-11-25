@@ -6,6 +6,7 @@
 - The current mode carries a `●` marker, only the selected row carries `❯`, and the header always shows the selected position and the total, for example `1/12`.
 - Enter applies a valid choice and closes the picker. A missing API key or a malformed `config.json` keeps the picker open and names the exact variable or parse error.
 - `/auth <provider>` opens a two-row picker for that provider with the current mode marked. `/auth <provider> subscription|api` writes the same mode without opening the picker. Completion lists all twelve choices.
+- `ProviderAuthFile` and `EffectiveProviderConfig` have a manual `Debug` that prints `api_key` as `[redacted]`. Serialization still writes the real value to `config.json`, where it belongs.
 
 ## Problem statement
 

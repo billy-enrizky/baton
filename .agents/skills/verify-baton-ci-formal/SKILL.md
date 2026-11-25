@@ -15,7 +15,7 @@ The model is committed at `ci/formal/ci-admission/`.
 
 - `ci/classify-paths.sh`: selected gates for push, merge group, dispatch, pull request, and unknown paths.
 - `ci/check-ci.sh`: command identity and workflow guard.
-- `.github/workflows/ci.yml`: `changes`, `selection`, `check`, `build`, `test`, `debt`, and `verify` gate names and relationships. `changes` has no checkout and no pass/fail guards; `selection` runs them.
+- `.github/workflows/ci.yml`: `changes`, `selection`, `check`, `build`, `test`, and `verify` gate names and relationships. `changes` has no checkout and no pass/fail guards; `selection` runs them.
 
 The model covers selection, start, result, skip cause, command identity, a `CommandDriftAllowed` constant, and the `verify` verdict. The real configuration sets `CommandDriftAllowed = FALSE`; there is no label override in the workflow. It does not cover test inventory completeness, shard union, the shallow-fetch implementation, or the shell implementation inside a gate command beyond its identity.
 

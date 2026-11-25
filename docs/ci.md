@@ -100,7 +100,7 @@ The experiment is recorded in [ci-acceptance.md](ci-acceptance.md#rejected-arm-r
 
 ## What the gate enforces
 
-Every check below is a real command in `ci/`. `ci/selftest.sh` proves the workflow rules, and `ci/debt-selftest.sh` runs the negative format and Clippy ratchet fixtures in the debt job.
+Every check below is a real command in `ci/`. `ci/selftest.sh` proves the workflow rules, and `ci/debt-selftest.sh` runs the negative format and Clippy ratchet fixtures in the check job.
 
 | Area | File | Enforcement |
 |---|---|---|
@@ -112,7 +112,7 @@ Every check below is a real command in `ci/`. `ci/selftest.sh` proves the workfl
 | Format debt | `ci/fmt-debt.sh` | Count of `Diff in ` lines must not exceed the baseline |
 | Clippy debt | `ci/clippy-debt.sh` | Count of lint diagnostics, excluding compiler summary lines, must not exceed the baseline |
 | Self-test | `ci/selftest.sh` | Runs every workflow fixture, stale-base and Git typechange fixtures, the budget negative test, and the inventory floor, short-execution, and missing-total cases |
-| Debt self-test | `ci/debt-selftest.sh` | Runs in the debt job and proves a format diff and a Clippy lint over a zero baseline both fail |
+| Debt self-test | `ci/debt-selftest.sh` | Runs in the check job and proves a format diff and a Clippy lint over a zero baseline both fail |
 
 Workflow invariants:
 
@@ -172,7 +172,7 @@ Pull requests and merge groups use base-owned pass/fail scripts. Main pushes and
 
 `changes` is the fast path. It does not check out the worktree. For a pull request it initializes a temporary repository, fetches only `github.event.pull_request.base.sha` and `github.event.pull_request.head.sha` at depth one, exports the base-owned `budget.sh` and `classify-paths.sh` from the base commit, and classifies the base-to-head diff. Both SHAs come from the event payload and are fixed for the run, so the pair matches the base-to-HEAD diff that `selection` recomputes. The workflow guard rejects a `--files` classification that reads `refs/pull/` instead of the head SHA. That ref is refreshed asynchronously, so after a force-push it can still describe the previous head, which classifies a different diff than `selection` and fails the pull request at the guard. A failed fetch or classification selects every gate. The job deliberately carries no pass/fail guards, so the Rust jobs can start before the trusted tools finish staging.
 
-`selection` is the trust gate. It sparse-checks out the base copy with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`. On pull requests and merge groups it stages `base/ci`; on main pushes and dispatches it stages the checked-out head `ci/`, because main merges require `Verify` and an up-to-date branch and dispatches are owner-controlled. A direct owner push is a visible bypass, not a proved tree. It marks the staged copy read-only, records a SHA-256 manifest, and executes only from that copy. It runs gate integrity, the full tool self-test, and the baseline ratchets, then recomputes classification and compares every output with `changes`. It also compares `rust-toolchain.toml` and runs the workflow guard. The `test` job reads the inventory floor and timing script from its own trusted copy, treats the captured test log as untrusted input, and re-verifies the manifest after the test gates. The `debt` job reads both ratchet baselines from the same read-only copy, so a `build.rs` cannot raise its own ceiling before Clippy runs. Moving the guards into `selection` is safe because `verify` still requires both `changes` and `selection` to succeed.
+`selection` is the trust gate. It sparse-checks out the base copy with `/ci/`, `/.github/workflows/`, and `/rust-toolchain.toml`. On pull requests and merge groups it stages `base/ci`; on main pushes and dispatches it stages the checked-out head `ci/`, because main merges require `Verify` and an up-to-date branch and dispatches are owner-controlled. A direct owner push is a visible bypass, not a proved tree. It marks the staged copy read-only, records a SHA-256 manifest, and executes only from that copy. It runs gate integrity, the full tool self-test, and the baseline ratchets, then recomputes classification and compares every output with `changes`. It also compares `rust-toolchain.toml` and runs the workflow guard. The `test` job reads the inventory floor and timing script from its own trusted copy, treats the captured test log as untrusted input, and re-verifies the manifest after the test gates. The `check` job reads both ratchet baselines from the same read-only copy, so a `build.rs` cannot raise its own ceiling before Clippy runs. Moving the guards into `selection` is safe because `verify` still requires both `changes` and `selection` to succeed.
 
 That staging is a detection boundary, not a sandbox. `cargo test` runs arbitrary repository code with write access to the runner's filesystem, so a determined change can still tamper with the process. What staging buys is that tampering after the first gate step is visible as a manifest mismatch instead of silently changing the harness. A real sandbox needs a separate container or a read-only mount, which is a Phase 3 decision.
 
@@ -216,11 +216,10 @@ Triggers: `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review
 |---|---|---|---|
 | `changes` | none | 5 | Shallow base and head SHA fetch, trusted classifier from the base, no checkout |
 | `selection` | `changes` | 5 | Gate integrity, full tool self-test, baseline ratchets, recomputes the classifier and compares outputs, compares `rust-toolchain.toml`, runs the workflow guard |
-| `check` | `changes` | 10 | `cargo check --locked --all-targets` under a 120-second budget |
+| `check` | `changes` | 10 | `cargo check --locked --all-targets` under a 120-second budget, then the format ratchet under 60 seconds, the Clippy ratchet under 300 seconds, and the debt self-test |
 | `build` | `changes` | 10 | `cargo build --locked --bin baton` under a 150-second budget, then `--version` |
 | `test` | `changes` | 15 | `cargo test --locked` under a 300-second budget, then `ci/test-inventory.sh` |
-| `debt` | `changes` | 15 | Format ratchet under 60 seconds, Clippy ratchet under 300 seconds |
-| `verify` | all six | 2 | The required branch-protection check; strict up-to-date, with an owner-only `ci-repair` bypass |
+| `verify` | `changes`, `selection`, `check`, `build`, `test` | 2 | The required branch-protection check; strict up-to-date, with an owner-only `ci-repair` bypass |
 
 `changes` outputs: `check_needed`, `build_needed`, `test_needed`, `debt_needed`, `full_suite_reason`, `has_tests`, `docs_only`. `full_suite_reason` records the selection class (`code`, `meta`, `unknown`, `empty`, `docs`, or the event name for non-PR events); it is not a claim that the full suite ran.
 
@@ -230,19 +229,21 @@ Triggers: `pull_request` (`opened`, `synchronize`, `reopened`, `ready_for_review
 - A selected gate did not succeed, or an unselected gate is not `skipped`.
 - `test_needed` is true and `has_tests` is not true.
 - `test_needed` is true and the discovered test count is missing, not numeric, or zero.
-- A non-PR event did not select all four gates, or reports `docs_only`.
+- A non-PR event did not select `check`, `build`, and `test`, or reports `docs_only`.
 
 `verify` does not use `paths-ignore`, does not use `continue-on-error`, and has no `if` that can skip it.
 
 ### Path classification
 
-| Changed path class | check | build | test | debt | docs_only | has_tests | full_suite_reason |
+| Changed path class | check | build | test | debt_needed | docs_only | has_tests | full_suite_reason |
 |---|---|---|---|---|---|---|---|
 | Any `*.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `build.rs` | true | true | true | true | false | true | `code` |
 | `.github/workflows/**`, `ci/**`, `docs/ci.md`, `.agents/parity.md` | true | true | true | true | false | true | `meta` |
 | `docs/**`, `*.md`, `LICENSE`, `NOTICE` only | false | false | false | false | true | false | `docs` |
 | `.gitignore` or any other unknown path | true | true | true | true | false | true | `unknown` |
 | Empty diff | true | true | true | true | false | true | `empty` |
+
+`debt_needed` is still emitted for compatibility, but no job gates on it: the ratchets run inside `check` whenever `check_needed` is true, and the selection guard reads their baselines from the trusted copy.
 
 Precedence is first-match over the classes in the order `unknown`, `code`, `meta`, docs-only. A diff that mixes classes takes the strongest match, so `docs` plus `code` selects the full suite with reason `code`.
 
@@ -281,9 +282,9 @@ Count-based nextest shards were rejected in run 45002437721: one shard took 33 s
 
 ## Formal CI admission model
 
-`ci/formal/ci-admission/BatonCiAdmission.tla` models gate admission, not test correctness. `Gates` holds the six jobs plus the workflow-guard step (`changes`, `selection`, `workflow_guard`, `check`, `build`, `test`, `debt`); `verify` is modeled as the aggregator that reads them, because it never runs a check itself.
+`ci/formal/ci-admission/BatonCiAdmission.tla` models gate admission, not test correctness. `Gates` holds the five jobs plus the workflow-guard step (`changes`, `selection`, `workflow_guard`, `check`, `build`, `test`); `verify` is modeled as the aggregator that reads them, because it never runs a check itself.
 
-The real configuration, `BatonCiAdmission.cfg`, runs 583,175 states and 92,855 distinct states. Six mutation configs must each fail with a named invariant:
+The real configuration, `BatonCiAdmission.cfg`, runs 135,905 states and 24,125 distinct states. Six mutation configs must each fail with a named invariant:
 
 | Config | Invariant that must break |
 |---|---|

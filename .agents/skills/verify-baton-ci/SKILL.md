@@ -7,7 +7,7 @@ description: "Drive Baton's local CI helpers and prove the classifier, workflow 
 
 This skill proves the CI control plane without running a model turn or a GitHub runner. It compiles only tiny fixture crates for the debt-ratchet checks. The real workflow run is recorded separately in `docs/ci-acceptance.md`.
 
-The workflow has two pre-gate jobs. `changes` is the fast path: it fetches only the base and PR merge ref at depth one, exports the base-owned classifier and budget script, and emits the seven gate-selection outputs. It intentionally has no checkout and no pass/fail guards. `selection` is the trust gate: it stages the base tools read-only on pull requests and merge groups, stages the head tools on main pushes and dispatches, validates gate integrity, runs the full self-test, enforces the baseline ratchets, recomputes classification, compares every output with `changes`, and runs the workflow guard. `verify` requires both jobs, so moving the checks into `selection` cannot produce a green run without them.
+The workflow has two pre-gate jobs. `changes` is the fast path: it fetches only the base and PR head SHAs at depth one, exports the base-owned classifier and budget script, and emits the seven gate-selection outputs. It intentionally has no checkout and no pass/fail guards. `selection` is the trust gate: it stages the base tools read-only on pull requests and merge groups, stages the head tools on main pushes and dispatches, validates gate integrity, runs the full self-test, enforces the baseline ratchets, recomputes classification, compares every output with `changes`, and runs the workflow guard. `verify` requires both jobs, so moving the checks into `selection` cannot produce a green run without them.
 
 ## Launch
 
@@ -78,5 +78,5 @@ Start with `features/README.md`.
 - `--allow-change` never skips `CI014` or `CI017`, and it never permits job-level wiring changes. It only permits the reviewed base-to-head step comparison.
 - Do not add a checkout, self-test, or workflow guard back to `changes`; that puts 5 to 10 seconds on the critical path. The fast path must keep only the shallow fetch and classifier.
 - `selection` must keep `gate-integrity.sh`, `selftest.sh`, and `classify-paths.sh` under `ci/budget.sh`. `ci/check-ci.sh` requires all three.
-- The pull-request fast path must diff the base tip against `refs/pull/<number>/merge`, not the PR head. The head comparison includes base-side changes when the base advances and disagrees with the checked-out merge ref.
+- The pull-request fast path must diff the base tip against the immutable PR head SHA. Do not use `refs/pull/<number>/merge`; it is refreshed asynchronously and can still name the previous head after a force-push.
 - Git typechanges (`T`) are included in both the workflow diff and `classify-paths.sh`; a `.rs` file converted to a symlink must not fall into the docs-only path.

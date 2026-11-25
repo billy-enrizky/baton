@@ -205,7 +205,7 @@ The installer downloads the release for your OS and checks its SHA-256. When the
 brew install billy-enrizky/baton/baton
 ```
 
-Upgrade an existing install with `brew upgrade billy-enrizky/baton/baton`.
+Upgrade an existing install with `brew upgrade billy-enrizky/baton/baton`. The formula is maintained in the `billy-enrizky/baton` tap, outside this repository.
 
 ### 3.3 From source
 

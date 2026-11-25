@@ -11075,9 +11075,10 @@ fn draw_switch_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
         } else {
             " "
         };
+        let cursor = if index == selected { "❯" } else { " " };
         lines.push(Line::styled(
             format!(
-                "❯ {marker} {} · {} · {}",
+                "{cursor} {marker} {} · {} · {}",
                 provider_label(*provider),
                 provider_config.model,
                 describe_auth(provider_config)
@@ -11148,7 +11149,8 @@ fn draw_model_picker(
         } else {
             Style::default().fg(COLORS.muted)
         };
-        lines.push(Line::styled(format!("❯ {marker} {model}"), style));
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(format!("{cursor} {marker} {model}"), style));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -11184,8 +11186,9 @@ fn draw_settings_picker(
             Style::default().fg(COLORS.muted)
         };
         if category.action == SettingsAction::ReadOnly {
+            let cursor = if index == category_index { "❯" } else { " " };
             lines.push(Line::styled(
-                format!("❯ {} · read-only", category.label),
+                format!("{cursor} {} · read-only", category.label),
                 style,
             ));
         } else {
@@ -11205,8 +11208,9 @@ fn draw_settings_picker(
                     suffix.push_str(&format!(" · current {current}"));
                 }
             }
+            let cursor = if index == category_index { "❯" } else { " " };
             lines.push(Line::styled(
-                format!("❯ {}: {shown_value}{suffix}", category.label),
+                format!("{cursor} {}: {shown_value}{suffix}", category.label),
                 style,
             ));
         }
@@ -11255,7 +11259,8 @@ fn draw_mcp_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
         } else {
             Style::default().fg(COLORS.muted)
         };
-        lines.push(Line::styled(format!("❯ {action}"), style));
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(format!("{cursor} {action}"), style));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -11290,9 +11295,10 @@ fn draw_roles_picker(
             .as_deref()
             .map(|effort| format!("@{effort}"))
             .unwrap_or_default();
+        let cursor = if index == selected { "❯" } else { " " };
         lines.push(Line::styled(
             format!(
-                "❯ {} · {}/{}{effort} · config {} · prompt {}",
+                "{cursor} {} · {}/{}{effort} · config {} · prompt {}",
                 role.id.as_str(),
                 role.provider,
                 role.model,
@@ -12154,7 +12160,8 @@ fn draw_mode_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
         } else {
             Style::default().fg(COLORS.muted)
         };
-        lines.push(Line::styled(format!("❯ {marker} {mode}"), style));
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(format!("{cursor} {marker} {mode}"), style));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -12182,7 +12189,8 @@ fn draw_effort_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
         } else {
             Style::default().fg(COLORS.muted)
         };
-        lines.push(Line::styled(format!("❯ {marker} {level}"), style));
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(format!("{cursor} {marker} {level}"), style));
     }
     if !state.thread.current_provider.supports_effort() {
         lines.push(Line::styled(
@@ -14244,9 +14252,10 @@ fn draw_retry_picker(
         } else {
             Style::default().fg(COLORS.muted)
         };
+        let cursor = if index == selected { "❯" } else { " " };
         lines.push(Line::styled(
             format!(
-                "❯ turn {} {} · {}/{} · {context} · {preview}",
+                "{cursor} turn {} {} · {}/{} · {context} · {preview}",
                 choice.turn,
                 choice.phase.as_str(),
                 choice.provider,
@@ -21214,6 +21223,114 @@ mod tests {
         assert!(text.contains("turn 9"), "{text}");
         assert!(!text.contains("turn 0"), "{text}");
         assert_eq!(text.matches('❯').count(), 1, "{text}");
+    }
+
+    fn role_spec(id: crate::roles::RoleId, model: &str) -> crate::roles::RoleSpec {
+        crate::roles::RoleSpec {
+            id,
+            provider: ProviderId::Codex,
+            model: model.to_string(),
+            effort: None,
+            hook_events: Vec::new(),
+            prompt: "/tmp/role.md".into(),
+            config_source: crate::roles::RoleSource::Default,
+            config_path: "/tmp/role.json".into(),
+            prompt_source: crate::roles::RoleSource::Default,
+            prompt_path: "/tmp/role.md".into(),
+        }
+    }
+
+    #[test]
+    fn every_remaining_picker_paints_one_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+
+        let check = |state: &mut TuiState, label: &str, needle: &str| {
+            let text = buffer_lines(&render_state(state, 120, 34)).join("\n");
+            assert_eq!(
+                text.matches('❯').count(),
+                1,
+                "{label} must paint one cursor: {text}"
+            );
+            assert!(text.contains(needle), "{label} missing {needle}: {text}");
+        };
+
+        state.overlay = Overlay::SwitchPicker { selected: 1 };
+        check(&mut state, "switch", "switch harness · enter select");
+
+        state.overlay = Overlay::ModelPicker {
+            provider: state.thread.current_provider,
+            models: vec!["model-a".into(), "model-b".into(), "model-c".into()],
+            selected: 2,
+            filter: String::new(),
+            switch_mode: false,
+        };
+        check(&mut state, "model", "model-c");
+
+        state.overlay = Overlay::SettingsPicker {
+            provider: state.thread.current_provider,
+            categories: vec![
+                SettingsCategory {
+                    label: "permission mode".into(),
+                    values: vec!["default".into(), "plan".into()],
+                    current: 0,
+                    action: SettingsAction::DefaultMode,
+                },
+                SettingsCategory {
+                    label: "harness".into(),
+                    values: Vec::new(),
+                    current: 0,
+                    action: SettingsAction::ReadOnly,
+                },
+            ],
+            category_index: 1,
+            value_index: 0,
+        };
+        check(&mut state, "settings", "harness · read-only");
+
+        state.overlay = Overlay::McpPicker { selected: 1 };
+        check(&mut state, "mcp", "add server (typed)");
+
+        state.overlay = Overlay::RolesPicker {
+            selected: 1,
+            roles: vec![
+                role_spec(crate::roles::RoleId::Orchestrator, "gpt-6.1-sol"),
+                role_spec(crate::roles::RoleId::Reviewer, "gpt-6-astra"),
+            ],
+        };
+        check(&mut state, "roles", "reviewer");
+
+        state.overlay = Overlay::ModePicker { selected: 1 };
+        check(&mut state, "mode", "acceptEdits");
+
+        state.overlay = Overlay::EffortPicker { selected: 1 };
+        check(&mut state, "effort", "medium");
+
+        state.overlay = Overlay::RetryPicker {
+            selected: 1,
+            choices: (1..=2)
+                .map(|turn| RetryChoice {
+                    turn,
+                    phase: TurnPhase::Failed,
+                    provider: crate::types::ProviderKey::from_stored("codex"),
+                    model: Some("gpt-6.1-sol".into()),
+                    error_preview: Some("boom".into()),
+                    message_id: turn,
+                    prompt_preview: format!("prompt {turn}"),
+                    prompt_len: 8,
+                    same_provider: true,
+                    current_provider: crate::types::ProviderKey::from_stored("codex"),
+                    current_provider_id: state.thread.current_provider,
+                    current_model: None,
+                    effective_model: "gpt-6.1-sol".into(),
+                    permission_mode: PermissionMode::Default,
+                    native_session_id: None,
+                    session_covered_turn: None,
+                })
+                .collect(),
+        };
+        check(&mut state, "retry", "turn 2");
     }
 
     fn files_project(files: &[(&str, &str)]) -> tempfile::TempDir {

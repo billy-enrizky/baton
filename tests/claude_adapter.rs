@@ -575,5 +575,213 @@ async fn claude_adapter_answers_the_control_request_id_the_frame_carried() {
     );
     assert_eq!(answer["response"]["response"]["behavior"], "allow");
     assert_eq!(answer["response"]["response"]["toolUseID"], "toolu_9");
-    assert_eq!(answer["response"]["response"]["updatedInput"]["command"], "ls");
+    assert_eq!(
+        answer["response"]["response"]["updatedInput"]["command"],
+        "ls"
+    );
+}
+
+async fn fake_claude_question(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    captured: tokio::sync::mpsc::UnboundedSender<Value>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+        return;
+    }
+    send(
+        &mut write,
+        json!({
+            "type": "control_request",
+            "request_id": "req-7",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "AskUserQuestion",
+                "tool_use_id": "toolu_ask_1",
+                "input": {
+                    "questions": [
+                        {
+                            "header": "Approach",
+                            "question": "Which approach?",
+                            "multiSelect": true,
+                            "options": [
+                                { "label": "Simple", "description": "fewer parts" },
+                                { "label": "Safe", "description": "keep the current setup" }
+                            ]
+                        },
+                        {
+                            "header": "Scope",
+                            "question": "Ship what?",
+                            "options": [
+                                { "label": "Installer", "description": "ship the installer" },
+                                { "label": "Docs", "description": "ship the docs" }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }),
+    )
+    .await;
+    let mut answer = String::new();
+    if lines.read_line(&mut answer).await.unwrap_or(0) == 0 {
+        return;
+    }
+    let _ = captured.send(serde_json::from_str(&answer).unwrap_or(Value::Null));
+    send(
+        &mut write,
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "answered",
+            "session_id": "claude-session-question"
+        }),
+    )
+    .await;
+}
+
+async fn run_claude_question(
+    answers: Option<Vec<baton::types::QuestionAnswer>>,
+) -> (Vec<baton::adapters::TurnEvent>, Value) {
+    let (captured, mut captured_receiver) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let spawner: baton::adapters::claude::ClaudeSpawner = Arc::new(
+        move |_input: &baton::adapters::TurnStartInput,
+              _session: Option<&baton::types::NativeSessionRef>| {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_claude_question(
+                server_read,
+                server_write,
+                captured.clone(),
+            ));
+            Ok(halves)
+        },
+    );
+    let mut adapter = ClaudeAdapter::new(spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let turn = tokio::spawn(async move {
+        adapter
+            .start_turn(
+                baton::adapters::TurnStartInput {
+                    turn: 1,
+                    thread_id: "baton-thread".into(),
+                    cwd: "/work".into(),
+                    model: "claude-sonnet-4-5".into(),
+                    effort: None,
+                    prompt: "ask me".into(),
+                    permission_mode: PermissionMode::Default,
+                    auth_env: vec![],
+                },
+                None,
+                event_sender,
+            )
+            .await
+            .unwrap();
+    });
+
+    let request = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            while let Ok(event) = event_receiver.try_recv() {
+                if let baton::adapters::TurnEvent::QuestionRequest {
+                    id,
+                    questions,
+                    respond,
+                } = event
+                {
+                    return (id, questions, respond);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("question request");
+    assert_eq!(request.0, "claude:req-7");
+    assert_eq!(request.1.len(), 2, "both questions reach the overlay");
+    assert_eq!(request.1[0].id, "Which approach?");
+    assert_eq!(request.1[0].header, "Approach");
+    assert!(request.1[0].multi_select, "multiSelect reaches the overlay");
+    assert!(
+        !request.1[1].allow_custom,
+        "Claude draws only the labels it offered, so the overlay must not accept other text"
+    );
+    assert_eq!(request.1[1].options.len(), 2);
+    let _ = request.2.send(answers.unwrap_or_default());
+
+    tokio::time::timeout(Duration::from_secs(10), turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(10), captured_receiver.recv())
+        .await
+        .expect("the adapter wrote a control response")
+        .expect("control response value");
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    (events, answer)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_adapter_answers_ask_user_question_with_joined_labels() {
+    let (_events, answer) = run_claude_question(Some(vec![
+        baton::types::QuestionAnswer {
+            id: "Which approach?".into(),
+            answers: vec!["Simple".into(), "Safe".into()],
+        },
+        baton::types::QuestionAnswer {
+            id: "Ship what?".into(),
+            answers: vec!["Installer".into()],
+        },
+    ]))
+    .await;
+
+    assert_eq!(answer["response"]["request_id"], "req-7");
+    let result = &answer["response"]["response"];
+    assert_eq!(result["behavior"], "allow");
+    assert_eq!(result["toolUseID"], "toolu_ask_1");
+    assert_eq!(
+        result["updatedInput"]["answers"]["Which approach?"], "Simple, Safe",
+        "multi-select answers join into one comma-separated string: {answer}"
+    );
+    assert_eq!(result["updatedInput"]["answers"]["Ship what?"], "Installer");
+    assert_eq!(
+        result["updatedInput"]["questions"].as_array().map(Vec::len),
+        Some(2),
+        "the CLI receives the questions it asked: {answer}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_adapter_denies_an_answered_with_nothing_question() {
+    let (_events, answer) = run_claude_question(None).await;
+
+    let result = &answer["response"]["response"];
+    assert_eq!(
+        result["behavior"], "deny",
+        "a dismissed question must not hand the model an empty allow: {answer}"
+    );
+    assert_eq!(result["message"], "User cancelled tool execution.");
+    assert_eq!(result["toolUseID"], "toolu_ask_1");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_question_answers_ignore_ids_the_questions_never_offered() {
+    let (_events, answer) = run_claude_question(Some(vec![
+        baton::types::QuestionAnswer {
+            id: "Which approach?".into(),
+            answers: vec!["Simple".into()],
+        },
+        baton::types::QuestionAnswer {
+            id: "Made up".into(),
+            answers: vec!["Injected".into()],
+        },
+    ]))
+    .await;
+
+    let answers = &answer["response"]["response"]["updatedInput"]["answers"];
+    assert_eq!(answers["Which approach?"], "Simple");
+    assert!(
+        answers.get("Made up").is_none(),
+        "only offered questions may carry an answer: {answer}"
+    );
 }

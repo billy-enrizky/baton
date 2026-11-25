@@ -280,6 +280,8 @@ If a gate ceiling is missed, shards are filled from recorded per-test times, nev
 
 Count-based nextest shards were rejected in run 45002437721: one shard took 33 seconds and the other 61 seconds. The 61-second shard contained a single 30-second test.
 
+Per-test timing was measured on 2026-11-25 on macOS with 18 cores and a 1-minute load of 3.48. A full `cargo nextest run` reported 776 tests and a 151-second suite summary, but the sum of the per-test `exec_time` values was 2,595.9 seconds. One test, `tui::tests::git_command_flow`, reported 45.976 seconds in that parallel run and 7.635 seconds when run alone with `-j 1`. Nextest's per-test durations therefore include scheduling and resource contention, so they cannot fill a shard plan. A serialized baseline would take about 43 minutes on the same host, which is too long to collect per change. Shards stay blocked until nextest reports a per-test cost that survives parallelism, or a serialized baseline becomes affordable.
+
 ## Formal CI admission model
 
 `ci/formal/ci-admission/BatonCiAdmission.tla` models gate admission, not test correctness. `Gates` holds the five jobs plus the workflow-guard step (`changes`, `selection`, `workflow_guard`, `check`, `build`, `test`); `verify` is modeled as the aggregator that reads them, because it never runs a check itself.

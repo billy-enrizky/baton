@@ -818,6 +818,11 @@ struct PendingLogin {
     command: Vec<&'static str>,
 }
 
+struct ShellEvent {
+    request: u64,
+    result: Result<crate::shell::ShellResult, String>,
+}
+
 const FILES_PICKER_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_SUGGESTIONS: usize = 8;
@@ -919,6 +924,12 @@ pub struct TuiState {
     grep_picker_sender: std::sync::mpsc::Sender<GrepPickerEvent>,
     grep_picker_receiver: std::sync::mpsc::Receiver<GrepPickerEvent>,
     grep_picker_request: u64,
+    shell_bin: std::path::PathBuf,
+    shell_sender: std::sync::mpsc::Sender<ShellEvent>,
+    shell_receiver: std::sync::mpsc::Receiver<ShellEvent>,
+    shell_request: u64,
+    shell_running: bool,
+    shell_output: Option<crate::shell::ShellResult>,
 }
 
 pub fn run_tui(
@@ -962,6 +973,7 @@ pub fn run_tui(
     let (file_ref_sender, file_ref_receiver) = std::sync::mpsc::channel();
     let (issue_picker_sender, issue_picker_receiver) = std::sync::mpsc::channel();
     let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
+    let (shell_sender, shell_receiver) = std::sync::mpsc::channel();
     let bell_enabled = crate::config::notifications(&home).bell;
     let side_chat_of = store
         .lock()
@@ -1056,6 +1068,12 @@ pub fn run_tui(
         grep_picker_sender,
         grep_picker_receiver,
         grep_picker_request: 0,
+        shell_bin: crate::shell::default_shell(),
+        shell_sender,
+        shell_receiver,
+        shell_request: 0,
+        shell_running: false,
+        shell_output: None,
     };
 
     let mut startup_notes = Vec::new();
@@ -1163,6 +1181,9 @@ pub fn run_tui(
         }
         for event in grep_events {
             apply_grep_picker_event(&mut state, event);
+        }
+        while let Ok(event) = state.shell_receiver.try_recv() {
+            apply_shell_event(&mut state, event);
         }
         if let Some(open) = state.pending_editor_open.take() {
             let cwd = std::path::PathBuf::from(&state.thread.cwd);
@@ -1619,6 +1640,7 @@ fn apply_engine_event(
             state.tool_lines.clear();
             state.notice = None;
             state.diff_output = None;
+            state.shell_output = None;
         }
         EngineEvent::TurnFinished {
             thread_id,
@@ -2911,6 +2933,7 @@ fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
     state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
     state.diff_output = None;
+    state.shell_output = None;
     state.scroll_offset = 0;
     state.notice = Some(format!("opened {}", thread.title));
 }
@@ -4601,6 +4624,7 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
     state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
     state.diff_output = None;
+    state.shell_output = None;
     state.scroll_offset = 0;
     state.notice = Some(format!("opened {}", thread.title));
     state.overlay = Overlay::None;
@@ -7051,6 +7075,7 @@ fn begin_issue_task(
     state.thread.goal_paused = false;
     state.branch_label = None;
     state.diff_output = None;
+    state.shell_output = None;
     state.scroll_offset = 0;
     state.overlay = Overlay::None;
     state.banner_cache.borrow_mut().take();
@@ -7208,6 +7233,66 @@ fn send_queued_item(
     }
 }
 
+fn run_shell_command(state: &mut TuiState, command: String) {
+    if command.is_empty() {
+        state.notice = Some("usage: !<shell command>".into());
+        return;
+    }
+    if state.shell_running {
+        state.notice = Some("a shell command is already running".into());
+        return;
+    }
+    let request = state.shell_request.wrapping_add(1);
+    state.shell_request = request;
+    state.shell_running = true;
+    state.shell_output = None;
+    state.diff_output = None;
+    state.notice = Some(format!("running !{command}"));
+    let sender = state.shell_sender.clone();
+    let cwd = std::path::PathBuf::from(&state.thread.cwd);
+    let shell = state.shell_bin.clone();
+    std::thread::spawn(move || {
+        let result = crate::shell::run_with_shell(
+            &shell,
+            &cwd,
+            &command,
+            std::time::Duration::from_secs(60),
+        )
+        .map_err(|error| format!("{error:#}"));
+        let _ = sender.send(ShellEvent { request, result });
+    });
+}
+
+fn apply_shell_event(state: &mut TuiState, event: ShellEvent) {
+    if event.request != state.shell_request {
+        return;
+    }
+    state.shell_running = false;
+    match event.result {
+        Ok(result) => {
+            let exit = match result.exit_code {
+                Some(code) => format!("exit {code}"),
+                None => "signal".to_string(),
+            };
+            state.notice = Some(format!(
+                "!{} · {}{}",
+                result.command,
+                exit,
+                if result.truncated {
+                    " · truncated"
+                } else {
+                    ""
+                }
+            ));
+            state.shell_output = Some(result);
+        }
+        Err(error) => {
+            state.notice = Some(format!("shell command failed: {error}"));
+            state.shell_output = None;
+        }
+    }
+}
+
 fn dispatch_message(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -7215,6 +7300,10 @@ fn dispatch_message(
     text: String,
     allow_commands: bool,
 ) {
+    if let Some(command) = text.strip_prefix('!') {
+        run_shell_command(state, command.trim().to_string());
+        return;
+    }
     if allow_commands && text.starts_with('/') {
         handle_command(state, store, engine_command_sender, &text);
     } else if state.thread.session_mode == SessionMode::Orchestrate {
@@ -8503,6 +8592,7 @@ fn handle_command(
         }
         "/clear" => {
             state.diff_output = None;
+            state.shell_output = None;
             state.orchestration_report = None;
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
@@ -9442,6 +9532,7 @@ fn handle_command(
             state.thread.goal_paused = false;
             state.branch_label = None;
             state.diff_output = None;
+            state.shell_output = None;
             state.scroll_offset = 0;
             state.notice = Some("new thread, unsaved until you send a message".into());
         }
@@ -9935,6 +10026,7 @@ fn handle_command(
                             guard.list_queued_messages(&thread.id).unwrap_or_default();
                         state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
                         state.diff_output = None;
+                        state.shell_output = None;
                         state.scroll_offset = 0;
                         state.notice = Some(format!("opened {}", thread.title));
                     }
@@ -14240,6 +14332,29 @@ fn draw_checkpoint_picker(
 }
 
 fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize) {
+    if let Some(shell) = &state.shell_output {
+        hide_transcript_view(state);
+        let command = crate::sanitize::sanitize_terminal_text(&shell.command);
+        let exit = match shell.exit_code {
+            Some(code) => format!("exit {code}"),
+            None => "signal".to_string(),
+        };
+        let mut lines = vec![Line::styled(
+            format!(
+                "shell · !{command} · {exit}{} · /clear to close",
+                if shell.truncated { " · truncated" } else { "" }
+            ),
+            Style::default().fg(COLORS.muted),
+        )];
+        for line in shell.output.lines().take(500) {
+            lines.push(Line::styled(
+                line.to_string(),
+                Style::default().fg(COLORS.text),
+            ));
+        }
+        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        return;
+    }
     if let Some(diff) = &state.diff_output {
         hide_transcript_view(state);
         let rendered = state
@@ -15273,6 +15388,8 @@ fn composer_hint(state: &TuiState) -> Option<String> {
             "enter sends the next queued message ({} waiting) · shift+enter adds a newline",
             state.queued_messages.len()
         ))
+    } else if state.shell_running {
+        Some("shell command running; output appears when it finishes".to_string())
     } else if !state.input.starts_with('/')
         && file_reference_token(&state.input, state.input_cursor).is_some()
     {
@@ -15914,6 +16031,7 @@ mod tests {
         let (file_ref_sender, file_ref_receiver) = std::sync::mpsc::channel();
         let (issue_picker_sender, issue_picker_receiver) = std::sync::mpsc::channel();
         let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
+        let (shell_sender, shell_receiver) = std::sync::mpsc::channel();
         TuiState {
             bell_enabled: crate::config::notifications(home).bell,
             bell: crate::notify::BellLimiter::new(),
@@ -16004,6 +16122,12 @@ mod tests {
             grep_picker_sender,
             grep_picker_receiver,
             grep_picker_request: 0,
+            shell_bin: crate::shell::default_shell(),
+            shell_sender,
+            shell_receiver,
+            shell_request: 0,
+            shell_running: false,
+            shell_output: None,
         }
     }
 
@@ -27513,6 +27637,62 @@ exit 1
         assert!(composer_hint(&state)
             .unwrap()
             .contains("tab or enter completes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shell_command_runs_in_the_background_and_renders() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.shell_bin = std::path::PathBuf::from("/bin/sh");
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "!printf hello".to_string(),
+            false,
+        );
+        assert!(state.shell_running);
+        let event = state
+            .shell_receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("shell event");
+        apply_shell_event(&mut state, event);
+        assert!(!state.shell_running);
+        let shell = state.shell_output.as_ref().expect("shell output");
+        assert!(shell.output.contains("hello"), "{}", shell.output);
+        assert_eq!(shell.exit_code, Some(0));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("shell · !printf hello"), "{text}");
+        assert!(text.contains("hello"), "{text}");
+        assert!(state.notice.as_deref().unwrap_or("").contains("exit 0"));
+    }
+
+    #[test]
+    fn shell_command_needs_a_command() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "!   ".to_string(),
+            false,
+        );
+        assert!(!state.shell_running);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("usage: !<shell command>"),
+            "{:?}",
+            state.notice
+        );
     }
 
     #[test]

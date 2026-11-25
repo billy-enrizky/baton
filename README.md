@@ -13,7 +13,7 @@ A harness is the coding agent CLI you already use, such as Codex, Claude Code, C
 - Rewind a turn, restore a checkpoint, retry failed work, and inspect usage.
 - Commit, push, open, review, and merge pull requests from the terminal.
 - Read project files, search contents, and attach file mentions with `@`.
-- Use Claude and Codex memory files, skills, MCP servers, and hooks.
+- Use Claude and Codex memory and skill files, sync MCP servers across harnesses, and run role hooks.
 - Expose durable state as JSON and over MCP for other agents.
 - Run on a harness login or an API key, with no Baton account.
 
@@ -197,7 +197,7 @@ Windows PowerShell:
 irm https://raw.githubusercontent.com/billy-enrizky/baton/main/install.ps1 | iex
 ```
 
-The installer downloads the release for your OS and checks its SHA-256. If no release asset matches, it falls back to a source build when Cargo and git are installed.
+The installer downloads the release for your OS and checks its SHA-256. When the release archive is unavailable, it falls back to a source build when Cargo and git are installed.
 
 ### 3.2 Homebrew
 
@@ -221,7 +221,8 @@ baton
 - At least one harness CLI on `PATH`.
 - Git, for worktrees and the git commands.
 - `gh`, for pull request checks, creation, review, merge, and `/task`.
-- Optional: `rg` for faster file search, and `VISUAL` or `EDITOR` for opening files.
+- Optional: `rg` for faster file and content search. Without it, `/files` uses `git ls-files` and `/grep` uses `git grep` in a repository.
+- Optional: `VISUAL` or `EDITOR` for opening files.
 - Optional: Node or any other runtime your harness or MCP servers need.
 
 See [Install Baton](install.md) for supported platforms, checksums, upgrades, and uninstall.
@@ -262,7 +263,7 @@ baton -t <thread-id>
 baton threads
 ```
 
-`baton threads` lists thread ids, phases, goals, and queue counts. `baton -t` opens one and keeps its saved session mode.
+`baton threads` lists each thread's short id, title, harness, model, mode, phase, turn count, and queue count. `--json` also includes the goal. `baton -t` opens one and keeps its saved session mode.
 
 ### 4.5 Your first prompt
 
@@ -279,7 +280,7 @@ The harness choice and task split are visible before work starts. Press Enter to
 - `/help` shows the common paths.
 - `/help all` opens a scrollable list of every command and its syntax.
 - `baton doctor` checks what is installed and what to do next.
-- `/status` shows the current thread, phase, goal, queue, and usage.
+- `/status` shows the current thread, phase, goal, queue, and adapter state.
 
 ## 5. Core concepts
 
@@ -309,7 +310,7 @@ One orchestration attempt. A run has a plan, workers, commits, review verdicts, 
 
 ### 5.7 Role
 
-A named harness, model, effort, markdown prompt, and optional hooks. Baton has four roles: orchestrator, planner, implementor, and reviewer.
+A named provider, model, effort, and markdown prompt. Hooks are declared globally in the same roles file. Baton has four roles: orchestrator, planner, implementor, and reviewer.
 
 ### 5.8 Checkpoint
 
@@ -317,7 +318,7 @@ A hidden git ref that captures the working tree at a turn boundary. It powers `/
 
 ### 5.9 Native session and handoff
 
-Each harness keeps its own native session per Baton thread. Later turns send only the new message, which keeps provider prompt caches warm. The first turn on a harness with no session gets a handoff built from prior messages and the working tree, capped at 24,000 bytes.
+Each harness keeps its own native session per Baton thread. Later turns send only the new message, which keeps provider prompt caches warm. The first turn on a harness with no session gets a handoff built from prior messages and the working tree, with a 24,000-character budget.
 
 ## 6. The terminal interface
 
@@ -353,11 +354,11 @@ Ctrl+C interrupts a running turn or cancels an orchestration, including its work
 
 #### 6.5.3 Select and copy
 
-Drag in the transcript to select text across wrapped rows. `/copy` copies the latest assistant reply. Pickers and previews copy their selection with `c`.
+Drag in the transcript to select text across wrapped rows. `/copy` opens a list of assistant replies; choose one, or run `/copy 1` for the latest. Copy keys are shown in each overlay; the activity, review, and tool-call views use `y`.
 
 #### 6.5.4 Steering and queueing
 
-While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode. Other harnesses queue it durably. A bare `/queue` opens the queue: Enter sends, `e` edits, `d` deletes, `c` twice clears, and Ctrl+Up/Ctrl+Down reorders.
+While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode 2 or newer. Other harnesses queue it durably. A bare `/queue` opens the queue: Enter sends, `e` edits, `d` deletes, `c` twice clears, and Ctrl+Up/Ctrl+Down reorders.
 
 ## 7. Slash commands
 
@@ -372,12 +373,12 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/switch` | Pick a harness, then a model, for this thread |
 | `/model` | Pick a model for the current harness |
 | `/effort` | Pick a reasoning effort; `/effort default` clears it |
-| `/mode` | Pick `default`, `acceptEdits`, `bypassPermissions`, or `plan` |
+| `/mode` | Pick a permission mode for harnesses that support it: `default`, `acceptEdits`, `bypassPermissions`, or `plan` |
 | `/auth` | Pick a billing mode for any harness; `/auth codex` scopes it |
 | `/orchestrate` | Switch modes, start a plan-only goal, or open recent runs |
 | `/goal` | Set, pause, resume, or clear the thread goal |
-| `/settings` | Set the default session mode and terminal bell |
-| `/roles` | Inspect the four roles and their prompts |
+| `/settings` | Change the global default session mode and terminal bell, and inspect harness settings |
+| `/roles` | Inspect the four roles, models, and prompt sources |
 
 ### 7.3 Navigation and project
 
@@ -385,12 +386,14 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 |---|---|
 | `/threads`, `/open`, `/pin`, `/inbox` | List, open, pin, or triage threads |
 | `/new`, `/fork`, `/worktree`, `/task` | Start a thread, fork one, or start from a git worktree or GitHub issue |
-| `/files` | Pick a project file and insert its path, optionally with `:line` |
-| `/grep` | Search project contents and insert `path:line` |
+| `/files` | Pick a project file, insert its path or `path:line`, or open it in your editor |
+| `/grep` | Search project contents, insert `path:line`, or open the match |
 | `/find` | Search the conversation |
 | `/activity`, `/commands`, `/agents` | Inspect turns, tool calls, and subagent calls |
 | `/usage`, `/context`, `/status`, `/turns` | Inspect usage, context, status, and turn history |
 | `/memory` | Open Claude and Codex instruction files and project memory |
+
+`/files` and `/grep` use `rg` when it is installed and fall back to `git ls-files` and `git grep` inside a repository. Ctrl+O opens the selected file in `VISUAL` or `EDITOR`.
 
 ### 7.4 Review and recovery
 
@@ -399,7 +402,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/checkpoints` | List checkpoints for this thread |
 | `/review` | Review the latest turn diff and keep line notes |
 | `/diff` | Diff a checkpoint against the working tree |
-| `/rewind` | Restore a turn and optionally the code; `--native` uses a harness rollback |
+| `/rewind` | Restore a turn and optionally the code; `--native` uses a Codex or OpenCode native rollback |
 | `/retry` | Retry a failed or unverified turn on the same harness |
 | `/queue` | Inspect, send, edit, delete, reorder, or clear queued follow-ups |
 | `/compact` | Compact the conversation |
@@ -424,8 +427,8 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/git push` | Pick a remote and push without force |
 | `/git checks` | List the current pull request's checks |
 | `/git pr [title]` | Preview and open a pull request |
-| `/git review [action] [body]` | Approve, request changes, or comment |
-| `/git merge [method]` | Squash, merge-commit, or rebase the pull request |
+| `/git review [action] [body]` | Use `approve`, `request-changes`, or `comment` |
+| `/git merge [method]` | Use `squash`, `merge`, or `rebase` on the pull request |
 
 ### 7.7 Memory, skills, and settings
 
@@ -434,9 +437,9 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/memory` | Open instruction files, rules, and auto-memory topics |
 | `/skills` | Pick a Claude or Codex skill and insert its invocation |
 | `/mcp` | List, add, remove, or sync MCP servers |
-| `/init` | Create a project memory file |
+| `/init` | Create a starter `CLAUDE.md` project memory file |
 | `/export` | Export the conversation |
-| `/copy` | Copy the latest assistant reply |
+| `/copy` | Choose an assistant reply to copy; `/copy 1` copies the latest |
 | `/clear`, `/quit`, `/exit` | Clear or leave the session |
 
 ## 8. Orchestration
@@ -447,13 +450,13 @@ A coordinator receives the goal and returns a small set of independent tasks. Ea
 
 ### 8.2 Workers
 
-A worker starts in its own git worktree under `$BATON_HOME/worktrees/<run>/<task>` on branch `baton/<run>/<task>`. Workers run in parallel through the normal `baton exec` path. A successful worker commits as `baton worker: <title>`.
+A worker starts in its own git worktree under `$BATON_HOME/worktrees/<short-run>/<task-slug>` on branch `baton/<short-run>/<task-slug>`. Workers run in parallel through the normal `baton exec` path. A worker that changes files commits as `baton worker: <title>`.
 
 If the source checkout is dirty, Baton asks first. Enter snapshots tracked and untracked non-ignored files into each worktree; `s` runs one harness in the live checkout; Esc cancels.
 
 ### 8.3 Reviewer
 
-After each completed worker, the reviewer reads the commit diff and the worker report, then answers `APPROVE` or `REQUEST_CHANGES`. An unreadable verdict fails closed as `request_changes`. A blocked task makes the run `needs_review`, and integration or shipping names the task and refuses.
+After each completed worker with a commit, the reviewer reads the commit diff and the worker report, then answers `APPROVE` or `REQUEST_CHANGES`. A worker with no commit has no review to run. An unreadable verdict fails closed as `request_changes`. A blocked task makes the run `needs_review`, and integration or shipping names the task and refuses.
 
 Set `"review": false` in `roles.json` to skip the reviewer. The `before_review` and `after_review` hooks run around the turn.
 
@@ -475,7 +478,7 @@ Shipping pushes each approved worker branch and opens one pull request against t
 
 ### 8.6 Follow-ups
 
-Open a worker from the run report, send a follow-up, and the successful turn commits that worktree and refreshes the run. A new commit clears the merge and PR markers and marks the review `pending`. In the TUI, a completed follow-up with a new commit starts the reviewer automatically when the reviewer role is enabled. `baton exec -t` does the same for a worker answer and accepts `--no-review` to skip it. Press `r` in the report or run `baton orchestrate --review <run-id>` to re-review manually.
+Open a worker from the run report and send a follow-up. A turn that changes files commits that worktree and refreshes the run. A new commit clears the merge and PR markers and marks the review `pending`. In the TUI, a completed follow-up with a new commit starts the reviewer automatically when the reviewer role is enabled. `baton exec -t` does the same for a worker answer and accepts `--no-review` to skip it. Press `r` in the report or run `baton orchestrate --review <run-id>` to re-review manually.
 
 If a worker ends with `BATON_QUESTION: <question>`, the task and run become `needs_input`. Integration and shipping are refused until the worker thread is answered.
 
@@ -489,7 +492,7 @@ See [Set up Baton](setup.md) for defaults and complete `roles.json` examples.
 
 ### 8.8 Shared directories
 
-Large gitignored directories such as `node_modules` or `target` can be shared from the primary checkout:
+Large gitignored directories such as `node_modules` or `target` can be shared from the primary checkout. Create `baton.json` in the repository root:
 
 ```json
 {
@@ -499,7 +502,7 @@ Large gitignored directories such as `node_modules` or `target` can be shared fr
 }
 ```
 
-Each entry becomes a symlink in the new worktree. Edits inside a shared directory affect the primary checkout, so use it only for build output and dependency caches.
+Each listed directory that exists and is gitignored becomes a symlink in the new worktree. Edits inside a shared directory affect the primary checkout, so use it only for build output and dependency caches.
 
 ### 8.9 CLI examples
 
@@ -538,7 +541,7 @@ baton orchestrate --archive <run-id>
 ### 9.6 Safety rules
 
 - No force-push.
-- No automatic upstream change.
+- A push never sets or changes the branch upstream.
 - No PR without a preview.
 - No merge or review after the head moved.
 - No commit while another thread has open work in the same worktree.
@@ -640,7 +643,7 @@ baton worktrees --clean [--force] [--run <id>]
 baton files [query...] [--ignored] [--json]
 baton open <path[:line]> [--print]
 baton grep <query> [--case-sensitive] [--word] [--regex] [--json]
-baton memories [-C path] [--json]
+baton memories [add|remove|clear] [-C path] [--json]
 baton checkpoints <thread-id>
 baton queue [-t id] [--clear] [--json]
 baton auth [provider] [subscription|api]
@@ -659,13 +662,16 @@ baton update
 ### 13.1 Files
 
 - `~/.baton/baton.sqlite`: threads, provider sessions, message mirror, turns, queued follow-ups, review notes, checkpoints, usage, subagents, and verified process records.
-- `~/.baton/config.json`: explicit overrides for providers, default mode, and settings. Written with mode 0600.
+- `~/.baton/config.json`: explicit overrides for providers, default mode, and settings. Written with owner-only permissions on Unix.
 - `~/.baton/roles.json` and `~/.baton/roles/<role>.md`: role models and prompts.
-- Harness configs are read from `~/.claude`, `~/.codex`, and their project-level equivalents.
+- `~/.baton/worktrees/`: managed orchestration and thread worktrees.
+- `~/.baton/model-cache/`: the last full model list for each harness.
+- Baton reads Claude and Codex settings plus OpenCode's model setting from their global and project-level files.
+- `baton.json` in a repository root: optional shared worktree directories.
 
 ### 13.2 BATON_HOME
 
-Set `BATON_HOME` to relocate every Baton file. This is useful for isolated tests and for keeping work and personal state apart.
+Set `BATON_HOME` to relocate Baton's data directory, including configuration, database, roles, model cache, and worktrees. Checkpoint refs remain in each project repository. This is useful for isolated tests and for keeping work and personal state apart.
 
 ### 13.3 Permission modes
 
@@ -676,19 +682,21 @@ Set `BATON_HOME` to relocate every Baton file. This is useful for isolated tests
 | `bypassPermissions` | No permission checks; use only in trusted work |
 | `plan` | Read-only; the harness proposes a plan |
 
+Baton passes these modes to Claude and Codex. Cursor, Grok, OpenCode, and Antigravity keep their own permission flow.
+
 ### 13.4 Roles
 
-Roles choose the harness, model, effort, prompt, and hooks for planning, implementation, and review. `/roles` shows the resolved rows. `baton roles --json` exposes the full registry.
+Roles choose the harness, model, effort, and prompt for planning, implementation, and review. Hooks are global declarations in `roles.json`. `/roles` shows the resolved rows. `baton roles --json` exposes the full registry.
 
 ### 13.5 Harness config
 
-Baton reads each harness's own config for the model, permission mode, API key, and endpoint. An explicit `config.json` override wins. `/auth` shows which key variable Baton will read.
+Baton reads Claude settings, Codex config, and the OpenCode model setting. `~/.baton/config.json` supplies provider overrides, including API keys and, for Grok or Antigravity, a custom endpoint. Keys can also come from the environment or the Claude or Codex config. An explicit `config.json` value wins. `/auth` shows which key variable Baton will read.
 
 ## 14. Safety and recovery
 
 ### 14.1 Approvals and permissions
 
-Approval prompts are scoped to the thread that requested them. Answer with `y` to allow once, `a` to always allow, or `n` to deny. `c` copies the prompt.
+Approval prompts are scoped to the thread that requested them. Answer with `y` to allow once, `a` to allow for the session, or `n` to deny. Provider choices also appear as rows that accept Enter.
 
 ### 14.2 Processes
 
@@ -696,11 +704,11 @@ Each provider child has a recorded owner, PID, command line, and start time. Bat
 
 ### 14.3 Worktrees
 
-`baton worktrees` lists managed worktrees. `baton worktrees --clean` removes clean worktrees whose branch is merged or shipped; dirty or unmerged work needs `--force`.
+`baton worktrees` lists managed worktrees. `baton worktrees --clean` removes clean worktrees whose branch is merged or recorded as shipped with a pull request. Dirty work, or a branch with no merged commit and no recorded pull request, needs `--force`.
 
 ### 14.4 Privacy
 
-Baton sends no telemetry and has no hosted service. Prompts go to the harness you chose. API keys stay in your harness config, your environment, or `~/.baton/config.json`. The MCP server reads the same local database and honors `BATON_HOME`.
+Baton sends no telemetry and has no hosted service. Prompts go to the harness you chose. Baton reads API keys from `~/.baton/config.json`, the environment, or Claude and Codex settings. In API mode, it passes the key to the harness process. The MCP server reads the same local database and honors `BATON_HOME`.
 
 ## 15. Troubleshooting
 
@@ -717,7 +725,7 @@ Baton sends no telemetry and has no hosted service. Prompts go to the harness yo
 | `/auth` says `missing <VARIABLE>` | Set that variable, then reopen `/auth` |
 | `/auth` says `cannot read config` | Fix `~/.baton/config.json`; the picker did not overwrite it |
 | A turn fails immediately | Run `baton doctor` and read the harness error |
-| A worktree cannot be removed | It has unmerged or dirty work; use `--force` only after checking |
+| A worktree cannot be removed | It is dirty, or its branch has no merged commit and no recorded pull request; use `--force` only after checking |
 | `gh` is missing | Install GitHub CLI and run `gh auth login` |
 | A source checkout is dirty | Commit, stash, or accept the snapshot prompt |
 | No pull request is found | Push the branch and open a PR first |
@@ -741,7 +749,7 @@ cargo test --locked
 
 ### 16.2 Verification
 
-The repository keeps a CI contract, installed-binary probes, and formal state models under `docs/` and `.agents/`. See [docs/ci.md](docs/ci.md) for the CI design and [docs/ci-acceptance.md](docs/ci-acceptance.md) for the measured feedback windows.
+The repository keeps the CI contract in `docs/`, installed-binary probes under `.agents/`, and formal state models under `ci/formal/`. See [docs/ci.md](docs/ci.md) for the CI design and [docs/ci-acceptance.md](docs/ci-acceptance.md) for the measured feedback windows.
 
 ### 16.3 User guides
 

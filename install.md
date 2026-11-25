@@ -1,6 +1,6 @@
 # Install Baton
 
-Baton ships as a single binary for macOS and Linux, plus a Windows x64 archive. The harness CLIs you want to drive are separate programs and must be on `PATH`. A harness is the coding agent CLI you already use, such as Codex, Claude Code, Cursor, Grok, OpenCode, or Antigravity.
+Baton ships as a single binary in release archives for x86_64 and aarch64 macOS and Linux, plus x86_64 Windows. The harness CLIs you want to drive are separate programs and must be on `PATH`. A harness is the coding agent CLI you already use, such as Codex, Claude Code, Cursor, Grok, OpenCode, or Antigravity.
 
 ## macOS and Linux
 
@@ -23,7 +23,9 @@ If `~/.local/bin` is not on `PATH`, the script prints the export line to add. GN
 irm https://raw.githubusercontent.com/billy-enrizky/baton/main/install.ps1 | iex
 ```
 
-Windows on ARM is not published yet. Use an x64 Windows machine, or build from source.
+The script installs to `%LOCALAPPDATA%\Baton\bin` by default and adds it to your user `PATH`. Set `BATON_INSTALL_DIR` or `BATON_VERSION` before running it to change the directory or pin a release.
+
+Windows on ARM is not published yet. Use an x64 Windows machine, or build from a source checkout with `cargo install --path . --locked`.
 
 ## Homebrew
 
@@ -46,7 +48,7 @@ The source install goes to Cargo's bin directory, usually `~/.cargo/bin`.
 
 ## What the installer checks
 
-The release installer downloads the archive for the current OS and CPU, verifies its SHA-256 against `SHA256SUMS`, extracts `baton`, and prints the installed version. When no release asset matches, it falls back to a locked source build when Cargo and git are installed. A checksum mismatch stops the install.
+The release installer downloads the archive for the current OS and CPU, verifies its SHA-256 against `SHA256SUMS`, extracts the `baton` binary (`baton.exe` on Windows), and prints the installed version. When the archive is unavailable, it falls back to a locked source build when Cargo and git are installed. A checksum mismatch stops the install.
 
 ## Verify
 
@@ -90,7 +92,9 @@ brew uninstall baton     # Homebrew
 cargo uninstall baton    # source install
 ```
 
-Data lives in `~/.baton` unless `BATON_HOME` is set. Remove that directory only when you also want to delete threads, configuration, and the checkpoint index.
+On Windows, remove `%LOCALAPPDATA%\Baton\bin\baton.exe` and remove `%LOCALAPPDATA%\Baton\bin` from your user `PATH` if the installer added it.
+
+Data lives in `~/.baton` (`%USERPROFILE%\.baton` on Windows) unless `BATON_HOME` is set. Remove that directory only when you also want to delete threads, configuration, and the checkpoint index.
 
 Checkpoint snapshots are hidden Git refs under `refs/baton/checkpoints/` in each project repository, not files under `~/.baton`. Deleting the Baton data directory leaves those refs. To remove them from a repository:
 

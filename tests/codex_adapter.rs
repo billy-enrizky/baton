@@ -167,6 +167,80 @@ async fn fake_server_resume_with_approval(read: tokio::io::DuplexStream, mut wri
     }
 }
 
+async fn fake_server_plan(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+            }
+            "thread/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "thread": { "id": "native-plan", "path": null } }
+                    }),
+                )
+                .await;
+            }
+            "turn/start" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "turn": { "id": "turn-plan", "status": "inProgress" } }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/plan/updated",
+                        "params": {
+                            "threadId": "native-plan",
+                            "turnId": "turn-plan",
+                            "explanation": "Two checks",
+                            "plan": [
+                                { "step": "Inspect the parser", "status": "completed" },
+                                { "step": "Add the regression", "status": "inProgress" }
+                            ]
+                        }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "turn/completed",
+                        "params": {
+                            "threadId": "native-plan",
+                            "turn": { "id": "turn-plan", "status": "completed", "items": [] }
+                        }
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn fake_server_with_question(
     read: tokio::io::DuplexStream,
     mut write: tokio::io::DuplexStream,
@@ -542,6 +616,57 @@ async fn codex_adapter_runs_a_full_turn() {
         _ => None,
     });
     assert_eq!(provider_turn.as_deref(), Some("turn-1"));
+    adapter.dispose().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_adapter_maps_plan_updates() {
+    let spawner = Arc::new(
+        |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_server_plan(server_read, server_write));
+            Ok(halves)
+        },
+    );
+    let mut adapter = CodexAdapter::new(spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_turn(
+            baton::adapters::TurnStartInput {
+                turn: 1,
+                thread_id: "baton-thread".into(),
+                cwd: "/work".into(),
+                model: "gpt-6.1-sol".into(),
+                effort: None,
+                prompt: "plan".into(),
+                permission_mode: PermissionMode::Default,
+                auth_env: vec![],
+            },
+            None,
+            event_sender,
+        ),
+    )
+    .await
+    .expect("plan turn completes")
+    .expect("plan turn succeeds");
+
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            baton::adapters::TurnEvent::PlanUpdated { provider, plan_id, entries, explanation }
+                if *provider == ProviderId::Codex
+                    && plan_id.is_none()
+                    && explanation.as_deref() == Some("Two checks")
+                    && entries.len() == 2
+                    && entries[0].content == "Inspect the parser"
+                    && entries[0].status == "completed"
+                    && entries[1].content == "Add the regression"
+                    && entries[1].status == "in_progress"
+        )),
+        "plan event missing: {events:?}"
+    );
     adapter.dispose().await.unwrap();
 }
 

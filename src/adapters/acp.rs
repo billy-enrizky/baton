@@ -583,7 +583,33 @@ fn parse_usage(usage: &Value) -> TurnUsage {
     }
 }
 
-fn handle_session_update(update: &Value, emit: &TurnEventSender, final_text: &mut String) {
+fn plan_entries(value: Option<&Value>) -> Vec<crate::types::PlanEntry> {
+    value
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(crate::types::PlanEntry {
+                        content: entry.get("content")?.as_str()?.to_string(),
+                        status: crate::types::normalize_plan_status(entry.get("status")?.as_str()?),
+                        priority: entry
+                            .get("priority")
+                            .and_then(Value::as_str)
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn handle_session_update(
+    update: &Value,
+    provider: crate::types::ProviderId,
+    emit: &TurnEventSender,
+    final_text: &mut String,
+) {
     let variant = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
     match variant {
         "agent_message_chunk" => {
@@ -608,6 +634,40 @@ fn handle_session_update(update: &Value, emit: &TurnEventSender, final_text: &mu
                     *final_text = text;
                     let _ = emit.send(TurnEvent::AssistantText { text: final_text.clone() });
                 }
+            }
+        }
+        "plan" => {
+            let _ = emit.send(TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                entries: plan_entries(update.get("entries")),
+                explanation: None,
+            });
+        }
+        "plan_update" => {
+            let plan = update.get("plan");
+            if plan
+                .and_then(|plan| plan.get("type"))
+                .and_then(Value::as_str)
+                == Some("items")
+            {
+                let _ = emit.send(TurnEvent::PlanUpdated {
+                    provider,
+                    plan_id: plan
+                        .and_then(|plan| plan.get("planId"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    entries: plan_entries(plan.and_then(|plan| plan.get("entries"))),
+                    explanation: None,
+                });
+            }
+        }
+        "plan_removed" => {
+            if let Some(plan_id) = update.get("planId").and_then(Value::as_str) {
+                let _ = emit.send(TurnEvent::PlanRemoved {
+                    provider,
+                    plan_id: plan_id.to_string(),
+                });
             }
         }
         "tool_call" | "tool_call_update" => {
@@ -915,7 +975,7 @@ impl BatonAdapter for AcpAdapter {
                                 break Ok(());
                             }
                         }
-                        _ => handle_session_update(&update, &emit, &mut final_text),
+                        _ => handle_session_update(&update, self.provider, &emit, &mut final_text),
                     }
                 }
                 // The prompt RPC reply is the authoritative turn end. Every
@@ -941,7 +1001,12 @@ impl BatonAdapter for AcpAdapter {
                                         usage = Some(parse_usage(state_usage));
                                     }
                                 } else {
-                                    handle_session_update(&update, &emit, &mut final_text);
+                                    handle_session_update(
+                                        &update,
+                                        self.provider,
+                                        &emit,
+                                        &mut final_text,
+                                    );
                                 }
                             }
                             break Ok(());

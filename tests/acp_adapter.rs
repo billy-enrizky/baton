@@ -49,10 +49,10 @@ async fn fake_acp_agent(read: tokio::io::DuplexStream, mut write: tokio::io::Dup
             "session/resume" | "session/load" => {
                 send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
             }
-            "session/set_model" => {
+            "session/set_mode" | "session/set_config_option" => {
                 send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
             }
-            "session/set_mode" | "session/set_config_option" => {
+            "session/set_model" => {
                 send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
             }
             "session/prompt" => {
@@ -145,6 +145,66 @@ async fn fake_acp_session_error(read: tokio::io::DuplexStream, mut write: tokio:
                         "id": id,
                         "error": { "code": -32000, "message": "Authentication required" }
                     }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+async fn fake_acp_plan(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    protocol_version: u64,
+    updates: Vec<Value>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": protocol_version } }),
+                )
+                .await;
+            }
+            "session/new" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "sessionId": "acp-plan" } }),
+                )
+                .await;
+            }
+            "session/set_model" | "session/set_config_option" => {
+                send(&mut write, json!({ "jsonrpc": "2.0", "id": id, "result": {} })).await;
+            }
+            "session/prompt" => {
+                for update in &updates {
+                    send(
+                        &mut write,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "method": "session/update",
+                            "params": { "sessionId": "acp-plan", "update": update }
+                        }),
+                    )
+                    .await;
+                }
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "stopReason": "end_turn" } }),
                 )
                 .await;
             }
@@ -349,6 +409,149 @@ async fn acp_adapter_runs_a_full_turn_with_streaming() {
             baton::adapters::TurnEvent::TurnCompleted { final_text, .. } if final_text == "hello acp"
         )),
         "streamed ACP text is kept as the final answer"
+    );
+    adapter.dispose().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_adapter_maps_plan_updates() {
+    let updates = Arc::new(vec![
+        json!({
+            "sessionUpdate": "plan_update",
+            "plan": {
+                "type": "items",
+                "planId": "plan-1",
+                "entries": [
+                    { "content": "Read the request", "priority": "high", "status": "completed" },
+                    { "content": "Write the answer", "priority": "medium", "status": "in_progress" }
+                ]
+            }
+        }),
+        json!({ "sessionUpdate": "plan_removed", "planId": "plan-1" }),
+    ]);
+    let spawner_updates = updates.clone();
+    let spawner = Arc::new(
+        move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_acp_plan(
+                server_read,
+                server_write,
+                2,
+                (*spawner_updates).clone(),
+            ));
+            Ok(halves)
+        },
+    );
+    let mut adapter = AcpAdapter::new(ProviderId::Antigravity, spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_turn(
+            baton::adapters::TurnStartInput {
+                turn: 1,
+                thread_id: "bt".into(),
+                cwd: "/work".into(),
+                model: "gemini-3.7-flash".into(),
+                effort: None,
+                prompt: "plan".into(),
+                permission_mode: PermissionMode::Default,
+                auth_env: vec![],
+            },
+            None,
+            event_sender,
+        ),
+    )
+    .await
+    .expect("plan turn completes")
+    .expect("plan turn succeeds");
+
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            baton::adapters::TurnEvent::PlanUpdated { provider, plan_id, entries, explanation }
+                if *provider == ProviderId::Antigravity
+                    && plan_id.as_deref() == Some("plan-1")
+                    && explanation.is_none()
+                    && entries.len() == 2
+                    && entries[0].content == "Read the request"
+                    && entries[0].priority.as_deref() == Some("high")
+                    && entries[1].status == "in_progress"
+        )),
+        "plan event missing: {events:?}"
+    );
+    let plans: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            baton::adapters::TurnEvent::PlanUpdated { entries, .. } => Some(entries),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plans.len(), 1);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            baton::adapters::TurnEvent::PlanRemoved { provider, plan_id }
+                if *provider == ProviderId::Antigravity && plan_id == "plan-1"
+        )),
+        "plan_removed keeps its identity: {events:?}"
+    );
+    adapter.dispose().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_adapter_maps_the_legacy_plan_frame() {
+    let updates = Arc::new(vec![json!({
+        "sessionUpdate": "plan",
+        "entries": [
+            { "content": "Read the request", "priority": "high", "status": "completed" }
+        ]
+    })]);
+    let spawner_updates = updates.clone();
+    let spawner = Arc::new(
+        move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_acp_plan(
+                server_read,
+                server_write,
+                1,
+                (*spawner_updates).clone(),
+            ));
+            Ok(halves)
+        },
+    );
+    let mut adapter = AcpAdapter::new(ProviderId::Grok, spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_turn(
+            baton::adapters::TurnStartInput {
+                turn: 1,
+                thread_id: "bt".into(),
+                cwd: "/work".into(),
+                model: "grok-build".into(),
+                effort: None,
+                prompt: "plan".into(),
+                permission_mode: PermissionMode::Default,
+                auth_env: vec![],
+            },
+            None,
+            event_sender,
+        ),
+    )
+    .await
+    .expect("plan turn completes")
+    .expect("plan turn succeeds");
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            baton::adapters::TurnEvent::PlanUpdated { provider, entries, .. }
+                if *provider == ProviderId::Grok
+                    && entries.len() == 1
+                    && entries[0].content == "Read the request"
+        )),
+        "legacy plan event missing: {events:?}"
     );
     adapter.dispose().await.unwrap();
 }

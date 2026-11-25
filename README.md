@@ -339,6 +339,8 @@ Some providers also ask a question before continuing. The same overlay lists the
 
 Most commands open a picker instead of requiring memorized syntax. Pickers show their keys, the current selection, and the relevant detail. Remote actions open a preview first and recheck the live state before they run. When the terminal bell is enabled in settings, Baton rings once when a turn finishes, an approval arrives, or a provider asks a question. A two-second limiter mutes repeats.
 
+`/plan` opens a scrollable read-only overlay of the last plan the current harness reported, with `✓`, `▸`, and `·` markers. Up and Down, PageUp and PageDown, Home, and End scroll; Esc or `q` closes it.
+
 ### 6.4 Transcript
 
 The transcript streams Markdown with tables, aligned columns, tinted diffs, and one row per tool call. Running tools show a status; completed and failed tools keep their result.
@@ -410,6 +412,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 |---|---|
 | `/checkpoints` | List checkpoints for this thread |
 | `/review` | Review the latest turn diff, search it with `/`, and keep line notes |
+| `/plan` | Show the plan the current harness reported, with status and priority |
 | `/diff` | Diff a checkpoint against the working tree |
 | `/rewind` | Restore a turn and optionally the code; `--native` uses a Codex or OpenCode native rollback |
 | `/retry` | Retry a failed or unverified turn on the same harness |

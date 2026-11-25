@@ -306,6 +306,23 @@ pub struct QuestionAnswer {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanEntry {
+    pub content: String,
+    pub status: String,
+    pub priority: Option<String>,
+}
+
+pub fn normalize_plan_status(status: &str) -> String {
+    match status.trim() {
+        "inProgress" | "in-progress" | "in_progress" => "in_progress".to_string(),
+        "completed" => "completed".to_string(),
+        "cancelled" | "canceled" => "cancelled".to_string(),
+        "pending" => "pending".to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Accept,
     AcceptAlways,
@@ -394,6 +411,15 @@ mod tests {
         assert!(ProviderId::Claude.supports_effort());
         assert!(!ProviderId::OpenCode.supports_effort());
         assert!(!ProviderId::Cursor.supports_effort());
+    }
+
+    #[test]
+    fn plan_statuses_use_one_vocabulary() {
+        assert_eq!(normalize_plan_status("inProgress"), "in_progress");
+        assert_eq!(normalize_plan_status("in_progress"), "in_progress");
+        assert_eq!(normalize_plan_status("completed"), "completed");
+        assert_eq!(normalize_plan_status("pending"), "pending");
+        assert_eq!(normalize_plan_status("custom"), "custom");
     }
 
     #[test]

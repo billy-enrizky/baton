@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tui_probe import Screen, binary_identity, pump, set_size, wait_for
+from tui_probe import Screen, binary_identity, pump, read_available, set_size, wait_for
 
 COMMANDS = [
     ("/help", ["Type what you want to do"]),
@@ -23,6 +23,7 @@ COMMANDS = [
     ("/help all", ["/auth", "/task"]),
     ("/status", ["thread:", "adapters:"]),
     ("/usage", ["usage ·", "This thread", "All threads"]),
+    ("/plan", ["no plan available"]),
     ("/context", ["context:"]),
     ("/turns", ["no turn records yet"]),
     ("/queue", ["queue: empty"]),
@@ -30,6 +31,8 @@ COMMANDS = [
     ("/commands", ["no tool calls recorded yet"]),
     ("/agents", ["no subagent tool calls in this thread"]),
     ("/find zzz", ["no matches for"]),
+    ("/files", ["files ·"]),
+    ("/grep zzz", ["no matches for"]),
     ("/switch", ["switch harness", "antigravity"]),
     ("/model", ["models ·", "enter", "esc"]),
     ("/btw", ["side chat of"]),
@@ -180,7 +183,16 @@ def main() -> int:
             os.write(master, command.encode())
             pump(master, 0.6, transcript)
             os.write(master, b"\r")
-            pump(master, 0.9, transcript)
+            deadline = time.time() + 5.0
+            while time.time() < deadline:
+                data = read_available(master)
+                if data:
+                    transcript.extend(data)
+                screen = screen_text(transcript, args.width, args.height)
+                if all(value in screen for value in required):
+                    break
+                time.sleep(0.05)
+            pump(master, 0.2, transcript)
             screen = screen_text(transcript, args.width, args.height)
             name = command.strip("/").replace(" ", "_") or "root"
             (evidence / f"{index:02d}-{name}.txt").write_text(screen + "\n")

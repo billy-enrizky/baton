@@ -650,6 +650,7 @@ baton memories [add|remove|clear] [-C path] [--json]
 baton checkpoints <thread-id>
 baton queue [-t id] [--clear] [--json]
 baton auth [provider] [subscription|api]
+baton secret check [--json]
 baton roles [--json]
 baton diff <id> [turn]
 baton restore <id> <turn> [--force]
@@ -693,7 +694,7 @@ Roles choose the harness, model, effort, and prompt for planning, implementation
 
 ### 13.5 Harness config
 
-Baton reads Claude settings, Codex config, and the OpenCode model setting. `~/.baton/config.json` supplies provider overrides, including API keys and, for Grok or Antigravity, a custom endpoint. Keys can also come from the environment or the Claude or Codex config. An explicit `config.json` value wins. `/auth` shows which key variable Baton will read.
+Baton reads Claude settings, Codex config, and the OpenCode model setting. A key resolves from `~/.baton/config.json` first, then the harness config, then the environment. `baton secret check` names the winning source for every harness without printing the key. `~/.baton/config.json` supplies provider overrides, including API keys and, for Grok or Antigravity, a custom endpoint. Keys can also come from the environment or the Claude or Codex config. An explicit `config.json` value wins. `/auth` shows which key variable Baton will read.
 
 ## 14. Safety and recovery
 

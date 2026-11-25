@@ -15295,6 +15295,153 @@ mod tests {
         }
     }
 
+    /// The first argument a completion offers, with the command stripped.
+    fn first_args(suggestions: &[CommandSuggestion], command: &str) -> Vec<String> {
+        let prefix = format!("{command} ");
+        suggestions
+            .iter()
+            .filter_map(|suggestion| {
+                suggestion
+                    .insert
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&suggestion.insert)
+                    .split_whitespace()
+                    .next()
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// Every argument token a completion offers, so a two-part choice such as
+    /// `auth claude subscription` contributes both `claude` and `subscription`.
+    fn all_args(suggestions: &[CommandSuggestion], command: &str) -> Vec<String> {
+        let prefix = format!("{command} ");
+        suggestions
+            .iter()
+            .flat_map(|suggestion| {
+                suggestion
+                    .insert
+                    .strip_prefix(&prefix)
+                    .unwrap_or(&suggestion.insert)
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// Verbs named by a usage line, for example `status|commit [--staged]`
+    /// becomes `status`, `commit`.
+    fn usage_verbs(command: &str) -> Vec<String> {
+        let usage = command_usage(&format!("{command} ")).expect("every command has a usage line");
+        let body = usage
+            .split_once(' ')
+            .map(|(_, rest)| rest)
+            .unwrap_or(usage)
+            .trim();
+        body.split('|')
+            .filter_map(|part| {
+                let part = part.trim();
+                // A `<placeholder>` part is free-form text, not a verb.
+                if part.starts_with('<') {
+                    return None;
+                }
+                part.split_whitespace()
+                    .next()
+                    .filter(|verb| !verb.is_empty() && !verb.starts_with('['))
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_fixed_choice_completion_offers_the_whole_accepted_set() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+
+        // Constant-backed commands: the completion must offer exactly what the
+        // handler accepts, so a new provider, mode, or effort level cannot
+        // appear in one place without the other.
+        for command in ["/switch", "/effort", "/mode", "/auth", "/multi"] {
+            state.input = format!("{command} ");
+            let choices = first_args(&argument_suggestions(&state, command), command);
+            let expected: Vec<String> = match command {
+                "/switch" | "/multi" => PROVIDERS.iter().map(|p| p.as_str().to_string()).collect(),
+                "/effort" => EFFORT_VALUES.iter().map(|v| v.to_string()).collect(),
+                "/mode" => PERMISSION_MODE_VALUES.iter().map(|v| v.to_string()).collect(),
+                "/auth" => {
+                    let mut providers: Vec<String> = auth_choices()
+                        .map(|(provider, _)| provider.as_str().to_string())
+                        .collect();
+                    providers.sort();
+                    providers.dedup();
+                    providers
+                }
+                _ => unreachable!(),
+            };
+            for value in &expected {
+                assert!(
+                    choices.contains(value),
+                    "{command} completion omits {value}: {choices:?}"
+                );
+            }
+        }
+
+        // A provider that gains a billing mode must gain a completion with it.
+        state.input = "/auth ".to_string();
+        let auth_modes: Vec<String> = auth_choices()
+            .map(|(_, mode)| match mode {
+                crate::config::AuthMode::Subscription => "subscription".to_string(),
+                crate::config::AuthMode::Api => "api".to_string(),
+            })
+            .collect();
+        let offered = all_args(&argument_suggestions(&state, "/auth"), "/auth");
+        for mode in auth_modes {
+            assert!(
+                offered.contains(&mode),
+                "/auth completion omits billing mode {mode}: {offered:?}"
+            );
+        }
+
+        // Usage-backed commands: the verbs the usage line documents and the
+        // verbs the completion offers must be the same set.
+        for command in ["/git", "/mcp", "/goal", "/orchestrate"] {
+            state.input = format!("{command} ");
+            let offered = first_args(&argument_suggestions(&state, command), command);
+            for verb in usage_verbs(command) {
+                assert!(
+                    offered.contains(&verb),
+                    "{command} usage documents {verb} but the completion omits it: {offered:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn nested_git_completions_offer_every_documented_action() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+
+        for (input, expected) in [
+            ("/git merge ", vec!["squash", "merge", "rebase"]),
+            (
+                "/git review ",
+                vec!["approve", "request-changes", "comment"],
+            ),
+        ] {
+            state.input = input.to_string();
+            let offered = first_args(&argument_suggestions(&state, "/git"), "/git");
+            for verb in expected {
+                assert!(
+                    offered.contains(&verb.to_string()),
+                    "{input} completion omits {verb}: {offered:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn slash_choices_include_store_backed_values() {
         let home = tempfile::tempdir().unwrap();

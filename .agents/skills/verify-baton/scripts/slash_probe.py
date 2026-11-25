@@ -131,6 +131,15 @@ def main() -> int:
         "exit 1\n"
     )
     gh.chmod(0o755)
+    # The login drive must never reach a real harness login, which can open a
+    # browser. This fake records the argv and exits clean.
+    fake_codex = editor_bin / "codex"
+    fake_codex.write_text(
+        "#!/bin/sh\n"
+        "printf 'fake-codex-login %s\\n' \"$*\"\n"
+        "exit 0\n"
+    )
+    fake_codex.chmod(0o755)
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=workdir, check=True)
     no_hooks = Path(home) / "no-hooks"
     no_hooks.mkdir()
@@ -497,6 +506,33 @@ def main() -> int:
             transcript, args.width, args.height
         ):
             missing.append("auth codex subscription notice")
+
+        os.write(master, b"/login\r")
+        pump(master, 0.8, transcript)
+        login_picker = screen_text(transcript, args.width, args.height)
+        for value in [
+            "sign in ·",
+            "claude · run claude auth login",
+            "codex · run codex login",
+            "antigravity · no CLI login",
+            "enter run",
+        ]:
+            if value not in login_picker:
+                missing.append(f"login picker: {value}")
+        if login_picker.count("❯") != 1:
+            missing.append("login picker must paint one cursor")
+        (evidence / "login-picker-screen.txt").write_text(login_picker + "\n")
+        os.write(master, b"\x1b[B")
+        pump(master, 0.2, transcript)
+        os.write(master, b"\r")
+        pump(master, 1.2, transcript)
+        login_result = screen_text(transcript, args.width, args.height)
+        if "codex login finished" not in login_result:
+            missing.append("login completion notice")
+        raw = bytes(transcript).decode("utf-8", "replace")
+        if "fake-codex-login login" not in raw:
+            missing.append("login ran the harness command with inherited stdio")
+        (evidence / "login-result-screen.txt").write_text(login_result + "\n")
 
         os.write(master, b"/settings\r")
         pump(master, 0.8, transcript)

@@ -36,6 +36,7 @@ COMMANDS = [
     ("/mode", ["permission mode", "acceptEdits", "plan"]),
     ("/auth", ["billing mode", "1/12", "enter apply"]),
     ("/auth codex", ["codex billing", "subscription", "api"]),
+    ("/login", ["sign in ·", "run claude auth login", "antigravity", "enter run"]),
     ("/roles", ["roles (4)", "orchestrator", "reviewer"]),
     ("/settings", ["+ global", "default session mode", "enter apply"]),
     ("/mcp", ["MCP servers", "add server", "sync to all harnesses"]),

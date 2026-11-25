@@ -63,6 +63,7 @@ A harness is the coding agent CLI you already use, such as Codex, Claude Code, C
     - 6.5.2 [Interrupt and exit](#652-interrupt-and-exit)
     - 6.5.3 [Select and copy](#653-select-and-copy)
     - 6.5.4 [Steering and queueing](#654-steering-and-queueing)
+    - 6.5.5 [Palette](#655-palette)
 - 7\. [Slash commands](#7-slash-commands)
   - 7.1 [How commands behave](#71-how-commands-behave)
   - 7.2 [Session and model](#72-session-and-model)
@@ -360,11 +361,15 @@ Drag in the transcript to select text across wrapped rows. `/copy` opens a list 
 
 While a turn is running, a new composer message is sent as a steer on Codex, Claude, and OpenCode 2 or newer. Other harnesses queue it durably. A bare `/queue` opens the queue: Enter sends, `e` edits, `d` deletes, `c` twice clears, and Ctrl+Up/Ctrl+Down reorders.
 
+#### 6.5.5 Palette
+
+Ctrl+K opens the command palette. It filters built-in actions, threads, and recent files as you type. Enter runs an action, opens a thread, or inserts a file path; Esc closes it. Ctrl+K is ignored while a picker is open, so it cannot replace work in progress.
+
 ## 7. Slash commands
 
 ### 7.1 How commands behave
 
-Type `/` to see commands. Typing a command followed by a space always answers: it lists valid choices, shows the argument syntax, or says the command takes no arguments. Partial text filters the choices; Tab completes; Enter runs a complete command. The direct forms remain available for scripts.
+Type `/` to see commands. Typing a command followed by a space always answers: it lists valid choices, shows the argument syntax, or says the command takes no arguments. Partial text filters the choices; Tab completes; Enter runs a complete command. The direct forms remain available for scripts. Ctrl+K opens the same actions as a palette, with thread and recent-file choices.
 
 ### 7.2 Session and model
 

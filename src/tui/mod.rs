@@ -397,6 +397,20 @@ struct ReviewSearch {
     matches: Vec<usize>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaletteAction {
+    Command(&'static str),
+    Thread(String),
+    File(String),
+}
+
+#[derive(Debug, Clone)]
+struct PaletteItem {
+    label: String,
+    detail: String,
+    action: PaletteAction,
+}
+
 struct ActivityView {
     rows: Vec<crate::activity::ActivityRow>,
     selected: usize,
@@ -684,6 +698,11 @@ enum Overlay {
     InboxPicker {
         selected: usize,
         items: Vec<InboxItem>,
+    },
+    CommandPalette {
+        selected: usize,
+        query: String,
+        items: Vec<PaletteItem>,
     },
     QuestionInboxPicker {
         selected: usize,
@@ -4557,6 +4576,93 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.overlay = Overlay::None;
 }
 
+fn open_command_palette(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
+    let actions = [
+        ("New thread", "start a fresh thread", "/new"),
+        ("Switch harness", "pick a provider and model", "/switch"),
+        ("Model", "pick a model for this thread", "/model"),
+        ("Reasoning effort", "pick low through max", "/effort"),
+        (
+            "Permission mode",
+            "default, accept edits, bypass, plan",
+            "/mode",
+        ),
+        ("Billing mode", "subscription or API per harness", "/auth"),
+        ("Sign in", "run a harness login", "/login"),
+        ("Memory", "open instruction and rule files", "/memory"),
+        ("Skills", "insert a harness skill", "/skills"),
+        ("Settings", "global mode and bell", "/settings"),
+        ("MCP servers", "list, add, remove, sync", "/mcp"),
+        ("Review", "diff the latest turn", "/review"),
+        ("Rewind", "restore a turn", "/rewind"),
+        ("Retry", "retry a failed turn", "/retry"),
+        ("Checkpoints", "list checkpoints", "/checkpoints"),
+        ("Git", "status, commit, push, PR, merge", "/git"),
+        ("Runs", "list orchestration runs", "/runs"),
+        ("Inbox", "threads that need attention", "/inbox"),
+        ("Worker questions", "answer waiting workers", "/questions"),
+        ("Usage", "token and cache totals", "/usage"),
+        ("Threads", "list threads", "/threads"),
+        ("Help", "keyboard and command help", "/help"),
+        ("Quit", "exit baton", "/quit"),
+    ];
+    let mut items: Vec<PaletteItem> = actions
+        .into_iter()
+        .map(|(label, detail, command)| PaletteItem {
+            label: label.to_string(),
+            detail: detail.to_string(),
+            action: PaletteAction::Command(command),
+        })
+        .collect();
+    let project = crate::files::recent_project_key(&state.thread.cwd);
+    let (threads, recent) = {
+        let guard = store.lock().unwrap();
+        (
+            guard.list_threads(None).unwrap_or_default(),
+            guard.list_recent_files(&project, 20).unwrap_or_default(),
+        )
+    };
+    for thread in threads.into_iter().take(30) {
+        items.push(PaletteItem {
+            label: thread.title.clone(),
+            detail: format!(
+                "thread {} · {}",
+                &thread.id[..8.min(thread.id.len())],
+                thread.current_provider
+            ),
+            action: PaletteAction::Thread(thread.id),
+        });
+    }
+    for path in recent {
+        items.push(PaletteItem {
+            label: path.clone(),
+            detail: "recent file · enter inserts path".to_string(),
+            action: PaletteAction::File(path),
+        });
+    }
+    state.overlay = Overlay::CommandPalette {
+        selected: 0,
+        query: String::new(),
+        items,
+    };
+}
+
+fn palette_filter_indices(items: &[PaletteItem], query: &str) -> Vec<usize> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return (0..items.len()).collect();
+    }
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.label.to_lowercase().contains(&needle)
+                || item.detail.to_lowercase().contains(&needle)
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
 fn handle_key(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -4708,6 +4814,14 @@ fn handle_key(
             state.notice = Some(format!("parallel thread {thread_id} no longer exists"));
         }
         state.multi = Some(multi);
+        return;
+    }
+
+    if key.code == KeyCode::Char('k')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(state.overlay, Overlay::None)
+    {
+        open_command_palette(state, store);
         return;
     }
 
@@ -6007,6 +6121,106 @@ fn handle_key(
                 };
             }
         },
+        Overlay::CommandPalette {
+            mut selected,
+            mut query,
+            items,
+        } => {
+            let filtered = palette_filter_indices(&items, &query);
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Up => {
+                    if !filtered.is_empty() {
+                        selected = (selected + filtered.len() - 1) % filtered.len();
+                    }
+                    state.overlay = Overlay::CommandPalette {
+                        selected,
+                        query,
+                        items,
+                    };
+                }
+                KeyCode::Down => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 1) % filtered.len();
+                    }
+                    state.overlay = Overlay::CommandPalette {
+                        selected,
+                        query,
+                        items,
+                    };
+                }
+                KeyCode::PageUp => {
+                    selected = selected.saturating_sub(10);
+                    state.overlay = Overlay::CommandPalette {
+                        selected,
+                        query,
+                        items,
+                    };
+                }
+                KeyCode::PageDown => {
+                    if !filtered.is_empty() {
+                        selected = (selected + 10).min(filtered.len() - 1);
+                    }
+                    state.overlay = Overlay::CommandPalette {
+                        selected,
+                        query,
+                        items,
+                    };
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    state.overlay = Overlay::CommandPalette {
+                        selected: 0,
+                        query,
+                        items,
+                    };
+                }
+                KeyCode::Char(character)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    query.push(character);
+                    state.overlay = Overlay::CommandPalette {
+                        selected: 0,
+                        query,
+                        items,
+                    };
+                }
+                KeyCode::Enter => {
+                    let chosen = filtered
+                        .get(selected.min(filtered.len().saturating_sub(1)))
+                        .copied();
+                    if let Some(index) = chosen {
+                        let action = items[index].action.clone();
+                        match action {
+                            PaletteAction::Command(command) => {
+                                state.overlay = Overlay::None;
+                                handle_command(state, store, engine_command_sender, command);
+                            }
+                            PaletteAction::Thread(thread_id) => {
+                                open_thread_by_id(state, store, &thread_id);
+                            }
+                            PaletteAction::File(path) => {
+                                state.overlay = Overlay::None;
+                                state.insert_input_str(&format!("{path} "));
+                                state.notice = Some(format!("inserted {path}"));
+                            }
+                        }
+                    } else {
+                        state.overlay = Overlay::None;
+                        state.notice = Some(format!("no palette match for \"{query}\""));
+                    }
+                }
+                _ => {
+                    state.overlay = Overlay::CommandPalette {
+                        selected,
+                        query,
+                        items,
+                    };
+                }
+            }
+        }
         Overlay::InboxPicker { selected, items } => match key.code {
             KeyCode::Esc => {}
             KeyCode::Up => {
@@ -10792,6 +11006,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 wanted.min((area.height as usize).saturating_sub(reserved).max(4))
             }
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
+            Overlay::CommandPalette { items, query, .. } => {
+                palette_filter_indices(items, query).len().min(10) + 5
+            }
             Overlay::InboxPicker { items, .. } => items.len().min(8) + 4,
             Overlay::QuestionInboxPicker { items, .. } => items.len().min(8) + 4,
             Overlay::GrepPicker {
@@ -10962,6 +11179,11 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::InboxPicker { selected, items } => {
                 draw_inbox_picker(frame, chunks[1], items, *selected)
             }
+            Overlay::CommandPalette {
+                selected,
+                query,
+                items,
+            } => draw_command_palette(frame, chunks[1], query, items, *selected),
             Overlay::QuestionInboxPicker { selected, items } => {
                 draw_question_inbox(frame, chunks[1], items, *selected)
             }
@@ -13721,6 +13943,58 @@ fn draw_inbox_picker(frame: &mut ratatui::Frame, area: Rect, items: &[InboxItem]
             style,
         ));
     }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_command_palette(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    query: &str,
+    items: &[PaletteItem],
+    selected: usize,
+) {
+    let filtered = palette_filter_indices(items, query);
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!(
+            "palette · {} matches · type to filter · ↑↓ select · enter run · esc close",
+            filtered.len()
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    if filtered.is_empty() {
+        lines.push(Line::styled(
+            "no matches",
+            Style::default().fg(COLORS.muted),
+        ));
+    } else {
+        let (start, visible) = picker_window(filtered.len(), selected, 10);
+        for (position, index) in filtered.iter().enumerate().skip(start).take(visible) {
+            let item = &items[*index];
+            let style = if position == selected {
+                Style::default()
+                    .fg(COLORS.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(COLORS.text)
+            };
+            let cursor = if position == selected { "❯" } else { " " };
+            let label = crate::sanitize::sanitize_terminal_text(&item.label);
+            let detail = crate::sanitize::sanitize_terminal_text(&item.detail);
+            lines.push(Line::from(vec![
+                Span::styled(format!("{cursor} "), Style::default().fg(COLORS.accent)),
+                Span::styled(label.into_owned(), style),
+                Span::styled(format!("  {detail}"), Style::default().fg(COLORS.muted)),
+            ]));
+        }
+    }
+    lines.push(Line::from(vec![
+        Span::styled("filter › ", Style::default().fg(COLORS.accent)),
+        Span::styled(query.to_string(), Style::default().fg(COLORS.text)),
+        Span::styled("█", Style::default().fg(COLORS.accent)),
+    ]));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(COLORS.border));
@@ -21784,6 +22058,24 @@ mod tests {
         state.overlay = Overlay::LoginPicker { selected: 1 };
         check(&mut state, "login", "codex · run codex login");
 
+        state.overlay = Overlay::CommandPalette {
+            selected: 1,
+            query: String::new(),
+            items: vec![
+                PaletteItem {
+                    label: "New thread".to_string(),
+                    detail: "start a fresh thread".to_string(),
+                    action: PaletteAction::Command("/new"),
+                },
+                PaletteItem {
+                    label: "Review".to_string(),
+                    detail: "diff the latest turn".to_string(),
+                    action: PaletteAction::Command("/review"),
+                },
+            ],
+        };
+        check(&mut state, "palette", "Review");
+
         state.overlay = Overlay::ModelPicker {
             provider: state.thread.current_provider,
             models: vec!["model-a".into(), "model-b".into(), "model-c".into()],
@@ -27730,6 +28022,157 @@ exit 1
         handle_command(&mut state, &store, &engine_command_sender, "/questions");
         assert!(matches!(state.overlay, Overlay::None));
         assert_eq!(state.notice.as_deref(), Some("no open worker questions"));
+    }
+
+    #[test]
+    fn ctrl_k_palette_filters_and_runs_an_action() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(state.overlay, Overlay::CommandPalette { .. }));
+        for character in "inbox".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::empty()),
+            );
+        }
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("Inbox"), "{text}");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("inbox empty"), "{notice}");
+    }
+
+    #[test]
+    fn ctrl_k_palette_opens_a_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let target = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "palette target".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        for character in "palette target".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::empty()),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(state.thread.id, target.id);
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn ctrl_k_palette_inserts_a_recent_file() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let project = crate::files::recent_project_key(&state.thread.cwd);
+        store
+            .lock()
+            .unwrap()
+            .record_recent_file(&project, "src/lib.rs")
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        for character in "src/lib.rs".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::empty()),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert_eq!(state.input, "src/lib.rs ");
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn ctrl_k_palette_respects_an_open_picker_and_escape_closes() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/auth");
+        assert!(matches!(state.overlay, Overlay::AuthPicker { .. }));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert!(
+            matches!(state.overlay, Overlay::AuthPicker { .. }),
+            "an open picker keeps the key"
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+        );
+        assert!(matches!(state.overlay, Overlay::CommandPalette { .. }));
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
     }
 
     #[test]

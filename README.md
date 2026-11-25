@@ -402,7 +402,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | Command | What it does |
 |---|---|
 | `/checkpoints` | List checkpoints for this thread |
-| `/review` | Review the latest turn diff and keep line notes |
+| `/review` | Review the latest turn diff, search it with `/`, and keep line notes |
 | `/diff` | Diff a checkpoint against the working tree |
 | `/rewind` | Restore a turn and optionally the code; `--native` uses a Codex or OpenCode native rollback |
 | `/retry` | Retry a failed or unverified turn on the same harness |

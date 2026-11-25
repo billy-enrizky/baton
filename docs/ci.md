@@ -77,6 +77,9 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
+| Debt ratchet before the merge | Ratchet job 48 seconds on the critical path: 13 seconds restoring the lint toolchain, 9 restoring cargo, 3 format, 7 clippy, and the rest setup; Check ran alongside at 20 seconds | Run 45599904468 |
+| Debt ratchet after the merge | The job is gone. Check absorbed it at 38 seconds, the run fell from 64 to 60 seconds wall, and the critical path moved to Test at 44 seconds | Run 45606086754 |
+| Post-merge job count | Six jobs instead of seven, and three Rust jobs restoring caches instead of four | Runs 45599904468 and 45606086754 |
 | Warm Rust rebuild after this slice | 51 seconds; `Changes` 6, `Test` 35, `Verify` 5 | Branch dispatch 45114396442 |
 | Final head-tools dispatch | 48 seconds; `Changes` 6, `Test` 32, `Debt ratchet` 32 | Branch dispatch 45119247835 |
 | First post-merge main push | 59 seconds; `Changes` 6, `Test` 43, `Verify` 5 | Push 45119477704 |

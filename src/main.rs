@@ -1546,8 +1546,16 @@ fn main_result(started: Instant) -> Result<()> {
                     "rewound {} from turn {}{}{}",
                     &source.id[..8.min(source.id.len())],
                     turn,
-                    if native_reverted { " (native, provider session preserved)" } else { "" },
-                    if provider_retry_skipped { " (completed pending store rewind)" } else { "" }
+                    if native_reverted {
+                        " (native, provider session preserved)"
+                    } else {
+                        ""
+                    },
+                    if provider_retry_skipped {
+                        " (completed pending store rewind)"
+                    } else {
+                        ""
+                    }
                 );
             }
             Ok(())
@@ -2594,11 +2602,12 @@ fn reconcile_startup_orchestrations() {
         Ok(runs) => {
             for run in runs {
                 eprintln!(
-                    "recovered abandoned orchestration {} ({}, {} completed, {} failed, {} cancelled, {} needs input)",
+                    "recovered abandoned orchestration {} ({}, {} completed, {} failed, {} skipped, {} cancelled, {} needs input)",
                     &run.run_id[..8.min(run.run_id.len())],
                     run.status,
                     run.completed_tasks,
                     run.failed_tasks,
+                    run.skipped_tasks,
                     run.cancelled_tasks,
                     run.needs_input_tasks
                 );

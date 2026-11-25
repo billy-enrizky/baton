@@ -5,7 +5,7 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{child_halves, child_halves_with_cleanup, ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineWriter, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{child_halves, child_halves_with_cleanup, standard_approval_choices, ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineWriter, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::process::{self, ProcessRecorder};
 use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
 
@@ -162,10 +162,10 @@ fn tool_input_summary(input: &Value) -> Option<String> {
 /// The CLI treats `AcceptAlways` as a permanent user decision only when the
 /// answer carries its suggested permission updates.
 fn permission_response(request: &Value, tool_input: &Value, decision: ApprovalDecision) -> Value {
-    let (behavior, classification) = match decision {
+    let (behavior, classification) = match &decision {
         ApprovalDecision::Accept => ("allow", "user_temporary"),
         ApprovalDecision::AcceptAlways => ("allow", "user_permanent"),
-        ApprovalDecision::Deny => ("deny", "user_reject"),
+        ApprovalDecision::Deny | ApprovalDecision::Choose(_) => ("deny", "user_reject"),
     };
     let mut result = json!({
         "behavior": behavior,
@@ -469,6 +469,7 @@ impl BatonAdapter for ClaudeAdapter {
                             id: format!("claude:{request_id}"),
                             kind: "command".into(),
                             summary,
+                            choices: standard_approval_choices(),
                             respond,
                         });
                         let decision = receiver.await.unwrap_or(ApprovalDecision::Deny);

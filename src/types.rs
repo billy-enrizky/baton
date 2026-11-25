@@ -271,11 +271,19 @@ impl TurnPhase {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ApprovalChoice {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Accept,
     AcceptAlways,
     Deny,
+    Choose(String),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]

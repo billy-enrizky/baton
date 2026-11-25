@@ -10,6 +10,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Slash choices | TUI | typing a command argument lists valid choices or its syntax, filters them, and completes with Tab or Enter; `slash_sweep.py` runs every command and requires its stable surface |
 | Settings | TUI | `/settings` writes global default mode and bell choices, shows the selected category's options, and labels harness rows read-only |
 | Auth billing | TUI | `/auth` lists every harness with subscription and API rows, marks the current mode, names the key variable or `missing`, applies a keyed choice, and keeps the picker open on a missing key or malformed config |
+| Approval choices | TUI | an approval lists the provider's own choices, arrows and Enter send the selected id, y/a/n keep the standard shortcuts, and a child request names the child thread |
 | Roles | TUI and CLI | `/roles` shows the four resolved role rows and detail; `baton roles --json` also returns effort, prompt source/path, and parsed hook declarations |
 | Skills | TUI | `/skills` lists Claude and Codex skills, scrolls past eight rows, and Enter inserts the source-specific invocation into the composer |
 | Status next action | CLI | `baton status` and `--json` answer what to do now |

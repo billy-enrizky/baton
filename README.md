@@ -331,6 +331,8 @@ The composer is where prompts, slash commands, and file mentions are typed. `@` 
 
 ### 6.3 Pickers and previews
 
+An approval request shows the provider's own choices. Up and Down select a row, Enter sends it, and y, a, and n keep the standard allow once, allow for session, and deny shortcuts. A request from a child thread names that thread in the header.
+
 Most commands open a picker instead of requiring memorized syntax. Pickers show their keys, the current selection, and the relevant detail. Remote actions open a preview first and recheck the live state before they run.
 
 ### 6.4 Transcript

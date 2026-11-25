@@ -343,6 +343,13 @@ async fn acp_adapter_runs_a_full_turn_with_streaming() {
         )),
         "the ACP session id is persisted as soon as the session is established"
     );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            baton::adapters::TurnEvent::TurnCompleted { final_text, .. } if final_text == "hello acp"
+        )),
+        "streamed ACP text is kept as the final answer"
+    );
     adapter.dispose().await.unwrap();
 }
 
@@ -442,8 +449,14 @@ async fn acp_adapter_maps_permission_decisions_to_options() {
     let approval = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             while let Ok(event) = event_receiver.try_recv() {
-                if let baton::adapters::TurnEvent::ApprovalRequest { summary, respond, .. } = event {
-                    return (summary, respond);
+                if let baton::adapters::TurnEvent::ApprovalRequest {
+                    summary,
+                    choices,
+                    respond,
+                    ..
+                } = event
+                {
+                    return (summary, choices, respond);
                 }
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -452,7 +465,10 @@ async fn acp_adapter_maps_permission_decisions_to_options() {
     .await
     .expect("approval event");
     assert!(approval.0.contains("rm -rf"));
-    approval.1.send(ApprovalDecision::AcceptAlways).unwrap();
+    assert_eq!(approval.1.len(), 3);
+    assert_eq!(approval.1[0].label, "Allow");
+    assert_eq!(approval.1[1].kind, "allow_always");
+    approval.2.send(ApprovalDecision::AcceptAlways).unwrap();
 
     let response = tokio::time::timeout(Duration::from_secs(10), response_receiver.recv())
         .await

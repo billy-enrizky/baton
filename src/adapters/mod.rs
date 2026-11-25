@@ -5,7 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::oneshot;
 
-use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, TurnUsage};
+use crate::types::{ApprovalChoice, ApprovalDecision, NativeSessionRef, PermissionMode, TurnUsage};
 
 /// Explicit lifecycle for one provider adapter. The engine can read this
 /// without taking the adapter mutex, so a busy or stuck turn remains
@@ -239,6 +239,7 @@ pub enum TurnEvent {
         id: String,
         kind: String,
         summary: String,
+        choices: Vec<ApprovalChoice>,
         respond: oneshot::Sender<ApprovalDecision>,
     },
     Usage { usage: TurnUsage },
@@ -267,6 +268,29 @@ pub enum TurnEvent {
 }
 
 pub type TurnEventSender = std::sync::mpsc::Sender<TurnEvent>;
+
+/// The three decisions every provider protocol can express. Providers with a
+/// wider choice set, such as ACP permission options, replace these with their
+/// own labels and ids.
+pub fn standard_approval_choices() -> Vec<ApprovalChoice> {
+    vec![
+        ApprovalChoice {
+            id: "accept".into(),
+            label: "Allow once".into(),
+            kind: "allow_once".into(),
+        },
+        ApprovalChoice {
+            id: "accept_always".into(),
+            label: "Allow for session".into(),
+            kind: "allow_always".into(),
+        },
+        ApprovalChoice {
+            id: "deny".into(),
+            label: "Deny".into(),
+            kind: "reject_once".into(),
+        },
+    ]
+}
 
 /// The harness turn an adapter is driving right now. Adapters publish this as
 /// one value so a steer validates the baton turn and routes with the native

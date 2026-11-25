@@ -10,9 +10,9 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 use uuid::Uuid;
 
 use crate::adapters::{
-    ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, ModelListInput,
-    RevertSessionInput, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TurnEvent,
-    TurnEventSender, TurnStartInput,
+    standard_approval_choices, ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter,
+    ForkSessionInput, ModelListInput, RevertSessionInput, SteerFuture, SteerHandle, SteerOutcome,
+    SteerRequest, TurnEvent, TurnEventSender, TurnStartInput,
 };
 use crate::config::auth_signature;
 use crate::process::ProcessRecorder;
@@ -769,6 +769,7 @@ impl BatonAdapter for OpenCodeAdapter {
                         id: format!("opencode:{request_id}"),
                         kind: "permissions".into(),
                         summary,
+                        choices: standard_approval_choices(),
                         respond,
                     });
                     let runtime_for_reply = runtime.clone();

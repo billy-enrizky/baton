@@ -371,7 +371,7 @@ Ctrl+K opens the command palette. It filters built-in actions, threads, and rece
 
 ### 7.1 How commands behave
 
-Type `/` to see commands. Typing a command followed by a space always answers: it lists valid choices, shows the argument syntax, or says the command takes no arguments. Partial text filters the choices; Tab completes; Enter runs a complete command. The direct forms remain available for scripts. Ctrl+K opens the same actions as a palette, with thread and recent-file choices.
+Type `/` to see commands. Typing a command followed by a space always answers: it lists valid choices, shows the argument syntax, or says the command takes no arguments. Partial text filters the choices; Tab completes; Enter runs a complete command. If you move through the choices with Up or Down, Enter completes the highlighted one instead. The direct forms remain available for scripts. Ctrl+K opens the same actions as a palette, with thread and recent-file choices.
 
 ### 7.2 Session and model
 
@@ -382,7 +382,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/model` | Pick a model for the current harness |
 | `/effort` | Pick a reasoning effort on Codex or Claude; `/effort default` clears it |
 | `/mode` | Pick a permission mode for harnesses that support it: `default`, `acceptEdits`, `bypassPermissions`, or `plan` |
-| `/auth` | Pick a billing mode for any harness; `/auth codex` scopes it |
+| `/auth` | Pick a billing mode for any harness; `/auth codex` scopes it. Queries stay available during work; writes wait until it ends |
 | `/login` | Sign in to a harness; pick one from the list or run `/login codex` |
 | `/orchestrate` | Switch modes, start a plan-only goal, or open recent runs |
 | `/goal` | Set, pause, resume, or clear the thread goal |

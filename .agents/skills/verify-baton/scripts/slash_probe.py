@@ -396,7 +396,24 @@ def main() -> int:
         ]:
             if value not in auth_completion:
                 missing.append(f"auth completion: {value}")
+        if auth_completion.count("❯") != 1:
+            missing.append("auth completion must paint one cursor")
         (evidence / "auth-completion-screen.txt").write_text(auth_completion + "\n")
+        os.write(master, b"\x1b[B\r")
+        pump(master, 0.5, transcript)
+        auth_arrow_selected = screen_text(transcript, args.width, args.height)
+        if not any(
+            line.strip().startswith("│/auth antigravity api")
+            for line in auth_arrow_selected.splitlines()
+        ):
+            missing.append("arrow-selected auth completion was not inserted into the composer")
+        if "billing mode ·" in auth_arrow_selected:
+            missing.append("arrow-selected auth completion ran the bare picker")
+        (evidence / "auth-arrow-selected-screen.txt").write_text(
+            auth_arrow_selected + "\n"
+        )
+        os.write(master, b"\x7f" * 24)
+        pump(master, 0.3, transcript)
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 

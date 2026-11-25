@@ -455,7 +455,15 @@ impl BatonAdapter for ClaudeAdapter {
                 "control_request" => {
                     let request = message.get("request").cloned().unwrap_or(Value::Null);
                     if request.get("subtype").and_then(Value::as_str) == Some("can_use_tool") {
-                        let request_id = request.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+                        // The frame carries the id beside `request`; the inner
+                        // object has none, so reading it there answered with an
+                        // empty id the CLI could not match.
+                        let request_id = message
+                            .get("request_id")
+                            .and_then(Value::as_str)
+                            .or_else(|| request.get("id").and_then(Value::as_str))
+                            .unwrap_or("")
+                            .to_string();
                         let tool_name = request
                             .get("tool_name")
                             .and_then(Value::as_str)

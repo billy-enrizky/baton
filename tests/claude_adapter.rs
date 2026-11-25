@@ -1,6 +1,6 @@
 use baton::adapters::{duplex_halves, BatonAdapter};
 use baton::adapters::claude::ClaudeAdapter;
-use baton::types::PermissionMode;
+use baton::types::{ApprovalDecision, PermissionMode};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
@@ -462,4 +462,118 @@ async fn claude_adapter_reports_task_subagents() {
     assert_eq!(finished.0.as_deref(), Some("toolu_task_1"));
     assert_eq!(finished.1, "Explore");
     assert_eq!(finished.2, "done");
+}
+
+async fn fake_claude_approval(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    captured: tokio::sync::mpsc::UnboundedSender<Value>,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+        return;
+    }
+    send(
+        &mut write,
+        json!({
+            "type": "control_request",
+            "request_id": "req-1",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "input": { "command": "ls" },
+                "tool_use_id": "toolu_9"
+            }
+        }),
+    )
+    .await;
+    let mut answer = String::new();
+    if lines.read_line(&mut answer).await.unwrap_or(0) == 0 {
+        return;
+    }
+    let _ = captured.send(serde_json::from_str(&answer).unwrap_or(Value::Null));
+    send(
+        &mut write,
+        json!({
+            "type": "result",
+            "subtype": "success",
+            "result": "approved",
+            "session_id": "claude-session-approval"
+        }),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn claude_adapter_answers_the_control_request_id_the_frame_carried() {
+    let (captured, mut captured_receiver) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let spawner: baton::adapters::claude::ClaudeSpawner = Arc::new(
+        move |_input: &baton::adapters::TurnStartInput,
+              _session: Option<&baton::types::NativeSessionRef>| {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_claude_approval(
+                server_read,
+                server_write,
+                captured.clone(),
+            ));
+            Ok(halves)
+        },
+    );
+    let mut adapter = ClaudeAdapter::new(spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let turn = tokio::spawn(async move {
+        adapter
+            .start_turn(
+                baton::adapters::TurnStartInput {
+                    turn: 1,
+                    thread_id: "baton-thread".into(),
+                    cwd: "/work".into(),
+                    model: "claude-sonnet-4-5".into(),
+                    effort: None,
+                    prompt: "list files".into(),
+                    permission_mode: PermissionMode::Default,
+                    auth_env: vec![],
+                },
+                None,
+                event_sender,
+            )
+            .await
+            .unwrap();
+    });
+
+    let approval = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            while let Ok(event) = event_receiver.try_recv() {
+                if let baton::adapters::TurnEvent::ApprovalRequest {
+                    summary, respond, ..
+                } = event
+                {
+                    return (summary, respond);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("approval event");
+    assert_eq!(approval.0, "ls");
+    approval.1.send(ApprovalDecision::Accept).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(10), turn)
+        .await
+        .unwrap()
+        .unwrap();
+    let answer = tokio::time::timeout(Duration::from_secs(10), captured_receiver.recv())
+        .await
+        .expect("the adapter wrote a control response")
+        .expect("control response value");
+    assert_eq!(answer["type"], "control_response");
+    assert_eq!(
+        answer["response"]["request_id"], "req-1",
+        "the response must carry the id the frame carried: {answer}"
+    );
+    assert_eq!(answer["response"]["response"]["behavior"], "allow");
+    assert_eq!(answer["response"]["response"]["toolUseID"], "toolu_9");
+    assert_eq!(answer["response"]["response"]["updatedInput"]["command"], "ls");
 }

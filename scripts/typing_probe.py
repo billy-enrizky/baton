@@ -5,6 +5,10 @@ The TUI repaints on every frame, so "rendered" means the output stream went
 quiet after a keystroke. That is a proxy for keystroke-to-render that needs no
 instrumentation inside the app, and it stays honest: if a repaint is slow to
 start, the quiet window starts later.
+
+Each probe types 80 samples by cycling the sample text; three whole-probe
+repetitions are compared by their minimum p50 and p95. The larger sample keeps
+the p95 stable enough for a 10 percent gate on a shared host.
 """
 
 import argparse
@@ -129,9 +133,8 @@ def measure(binary: Path, args: argparse.Namespace) -> dict | None:
                 os.write(master, b"\x1b")
                 drain(master, QUIET_MS, 1.0)
         else:
-            for index, char in enumerate(args.text):
-                if index >= args.runs:
-                    break
+            for index in range(args.runs):
+                char = args.text[index % len(args.text)]
                 os.write(master, char.encode())
                 samples.append(drain(master, QUIET_MS, args.timeout) * 1000.0)
 
@@ -166,7 +169,12 @@ def measure(binary: Path, args: argparse.Namespace) -> dict | None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/baton")
-    parser.add_argument("--runs", type=int, default=40)
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=80,
+        help="keystrokes per probe; a larger sample stabilizes the p95",
+    )
     parser.add_argument("--text", default="the quick brown fox jumps over 13 lazy dogs")
     parser.add_argument(
         "--slash",

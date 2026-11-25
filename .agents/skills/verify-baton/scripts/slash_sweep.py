@@ -22,7 +22,7 @@ COMMANDS = [
     # command reaches the rendered surface, which clips on a short terminal.
     ("/help all", ["/auth", "/task"]),
     ("/status", ["thread:", "adapters:"]),
-    ("/usage", ["no usage yet"]),
+    ("/usage", ["usage ·", "This thread", "All threads"]),
     ("/context", ["context:"]),
     ("/turns", ["no turn records yet"]),
     ("/queue", ["queue: empty"]),

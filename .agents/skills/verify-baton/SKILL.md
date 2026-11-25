@@ -96,6 +96,7 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 | Codex user-input questions | `scripts/question_probe.py` | zero, fake Codex app-server |
 | MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, seeds an empty thread with `baton new` |
 | Command palette | `scripts/palette_probe.py` | zero |
+| Usage scope and grouping picker | 54-case slash sweep | zero |
 | One-shot shell command | `scripts/tui_probe.py --command '!printf shell-probe'` | zero |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |
 | Slash argument choices and completion | `scripts/slash_probe.py` | zero |

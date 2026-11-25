@@ -13861,9 +13861,7 @@ fn approval_rows(approval: &ApprovalState) -> usize {
 
 fn question_rows(question: &QuestionState, width: u16) -> usize {
     let prompt = &question.questions[question.index];
-    let text_rows = wrap_text_rows(&prompt.question, width.saturating_sub(2) as usize)
-        .len()
-        .max(1);
+    let text_rows = question_text_rows(&prompt.question, width.saturating_sub(2) as usize).len();
     let visible_options = prompt.options.len().min(6);
     let custom_row = usize::from(prompt.allow_custom);
     let custom_input = usize::from(question.custom.is_some());
@@ -13875,6 +13873,16 @@ fn question_rows(question: &QuestionState, width: u16) -> usize {
                 .is_some_and(|option| !option.description.is_empty()),
     );
     2 + 1 + text_rows + visible_options + custom_row + custom_input + description_rows + 1
+}
+
+fn question_text_rows(text: &str, width: usize) -> Vec<String> {
+    let rows = wrap_text_rows(text, width);
+    if rows.len() <= 6 {
+        return rows;
+    }
+    let mut visible: Vec<String> = rows.into_iter().take(5).collect();
+    visible.push("…".into());
+    visible
 }
 
 fn draw_question(
@@ -13907,7 +13915,7 @@ fn draw_question(
         truncate_chars(&header, width),
         Style::default().fg(COLORS.secondary),
     )];
-    for row in wrap_text_rows(&prompt.question, width) {
+    for row in question_text_rows(&prompt.question, width) {
         lines.push(Line::styled(row, Style::default().fg(COLORS.text)));
     }
     let visible = 6usize;
@@ -17227,6 +17235,44 @@ mod tests {
         let screen = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(screen.contains("answer: ******"), "{screen}");
         assert!(!screen.contains("answer: secret"), "{screen}");
+    }
+
+    #[test]
+    fn long_question_keeps_options_visible_on_a_short_terminal() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::QuestionRequest {
+                id: "long-question".into(),
+                questions: vec![QuestionPrompt {
+                    id: "long".into(),
+                    header: "Long".into(),
+                    question: "x".repeat(2000),
+                    options: vec![
+                        QuestionOption {
+                            label: "Strict".into(),
+                            description: "Tight validation".into(),
+                        },
+                        QuestionOption {
+                            label: "Flexible".into(),
+                            description: "Loose validation".into(),
+                        },
+                    ],
+                    allow_custom: true,
+                    secret: false,
+                }],
+                respond: sender,
+            },
+        );
+        let screen = buffer_lines(&render_state(&state, 80, 24)).join("\n");
+        assert!(screen.contains("Strict"), "{screen}");
+        assert!(screen.contains("Other (type an answer)"), "{screen}");
+        assert!(screen.contains("up/down select"), "{screen}");
     }
 
     #[test]

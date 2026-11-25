@@ -7,7 +7,7 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use crate::adapters::{child_halves, child_halves_with_cleanup, standard_approval_choices, ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineWriter, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::process::{self, ProcessRecorder};
-use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
+use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, QuestionAnswer, QuestionOption, QuestionPrompt, TurnUsage};
 
 pub type ClaudeSpawner = Arc<dyn Fn(&TurnStartInput, Option<&NativeSessionRef>) -> Result<TransportHalves> + Send + Sync>;
 
@@ -184,6 +184,136 @@ fn permission_response(request: &Value, tool_input: &Value, decision: ApprovalDe
         result["toolUseID"] = json!(tool_use_id);
     }
     result
+}
+
+/// Asks the TUI for the answers and builds the `control_response` to write back.
+/// A dismissed question denies the tool, because an `allow` with no answers
+/// hands the model an empty result it cannot interpret.
+async fn question_control_response(
+    request_id: &str,
+    tool_input: &Value,
+    emit: &TurnEventSender,
+    request: &Value,
+) -> Value {
+    let questions = question_prompts(tool_input);
+    let result = if questions.is_empty() {
+        json!({
+            "behavior": "deny",
+            "message": "The question carried no usable prompts.",
+        })
+    } else {
+        let (respond, receiver) = oneshot::channel::<Vec<QuestionAnswer>>();
+        let _ = emit.send(TurnEvent::QuestionRequest {
+            id: format!("claude:{request_id}"),
+            questions,
+            respond,
+        });
+        let answers = receiver.await.unwrap_or_default();
+        if answers.iter().all(|answer| answer.answers.is_empty()) {
+            json!({
+                "behavior": "deny",
+                "message": "User cancelled tool execution.",
+            })
+        } else {
+            question_response(tool_input, &answers)
+        }
+    };
+    let mut result = result;
+    if let Some(tool_use_id) = request.get("tool_use_id").and_then(Value::as_str) {
+        result["toolUseID"] = json!(tool_use_id);
+    }
+    json!({
+        "type": "control_response",
+        "response": {
+            "subtype": "success",
+            "request_id": request_id,
+            "response": result
+        }
+    })
+}
+
+/// The tool Claude Code uses to ask the user a structured question. It arrives
+/// as a `can_use_tool` control request, so the answer is the permission result.
+const QUESTION_TOOL: &str = "AskUserQuestion";
+
+fn question_prompts(tool_input: &Value) -> Vec<QuestionPrompt> {
+    let Some(questions) = tool_input.get("questions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    questions
+        .iter()
+        .filter_map(|question| {
+            let text = question.get("question").and_then(Value::as_str)?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let header = question
+                .get("header")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|header| !header.is_empty())
+                .unwrap_or("Question")
+                .to_string();
+            let options: Vec<QuestionOption> = question
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| {
+                            let label = option.get("label").and_then(Value::as_str)?.trim();
+                            if label.is_empty() {
+                                return None;
+                            }
+                            let description = option
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or(label)
+                                .to_string();
+                            Some(QuestionOption {
+                                label: label.to_string(),
+                                description,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(QuestionPrompt {
+                // Claude keys its answers map by the question text.
+                id: text.to_string(),
+                header,
+                question: text.to_string(),
+                allow_custom: options.is_empty(),
+                options,
+                multi_select: question
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                secret: false,
+            })
+        })
+        .collect()
+}
+
+/// Builds the `allow` permission result Claude expects for a answered question.
+/// The CLI reads `updatedInput.answers`, keyed by question text, with
+/// multi-select answers joined into one comma-separated string.
+fn question_response(tool_input: &Value, answers: &[QuestionAnswer]) -> Value {
+    let prompts = question_prompts(tool_input);
+    let mut map = serde_json::Map::new();
+    for answer in answers {
+        if answer.answers.is_empty() || !prompts.iter().any(|prompt| prompt.id == answer.id) {
+            continue;
+        }
+        map.insert(answer.id.clone(), json!(answer.answers.join(", ")));
+    }
+    json!({
+        "behavior": "allow",
+        "updatedInput": {
+            "questions": tool_input.get("questions").cloned().unwrap_or_else(|| json!([])),
+            "answers": map,
+        },
+    })
 }
 
 #[async_trait]
@@ -470,6 +600,15 @@ impl BatonAdapter for ClaudeAdapter {
                             .unwrap_or("tool")
                             .to_string();
                         let tool_input = request.get("input").cloned().unwrap_or(Value::Null);
+                        if tool_name == QUESTION_TOOL {
+                            write_value(
+                                &writer,
+                                &question_control_response(&request_id, &tool_input, &emit, &request)
+                                    .await,
+                            )
+                            .await?;
+                            continue;
+                        }
                         let summary = tool_input_summary(&tool_input)
                             .unwrap_or_else(|| tool_name.clone());
                         let (respond, receiver) = oneshot::channel::<ApprovalDecision>();

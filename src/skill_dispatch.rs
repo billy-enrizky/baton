@@ -94,10 +94,19 @@ pub fn prompt_for_provider_from(
     prompt: &str,
     current_message: Option<&str>,
 ) -> String {
+    prompt_for_provider_from_in(provider, prompt, current_message, std::path::Path::new(""))
+}
+
+pub fn prompt_for_provider_from_in(
+    provider: ProviderId,
+    prompt: &str,
+    current_message: Option<&str>,
+    cwd: &std::path::Path,
+) -> String {
     if provider != ProviderId::Claude {
         return prompt.to_string();
     }
-    let known = crate::sync::scan_skills()
+    let known = crate::sync::scan_skills_in(cwd)
         .into_iter()
         .filter(|skill| skill.source == "claude")
         .map(|skill| skill.name)
@@ -122,6 +131,41 @@ pub fn current_message(prompt: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn project_skill(cwd: &std::path::Path, name: &str) {
+        let path = cwd.join(".claude").join("skills").join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("SKILL.md"), "---\nname: test\n---\n").unwrap();
+    }
+
+    #[test]
+    fn project_skills_are_known_from_the_project_cwd() {
+        let cwd = tempfile::tempdir().unwrap();
+        project_skill(cwd.path(), "demo");
+        assert_eq!(
+            prompt_for_provider_from_in(ProviderId::Claude, "please $demo this", None, cwd.path()),
+            "/demo please this"
+        );
+        assert_eq!(
+            prompt_for_provider_from_in(
+                ProviderId::Claude,
+                "please $not-a-project-skill this",
+                None,
+                cwd.path()
+            ),
+            "please $not-a-project-skill this"
+        );
+    }
+
+    #[test]
+    fn project_skills_do_not_rewrite_codex_prompts() {
+        let cwd = tempfile::tempdir().unwrap();
+        project_skill(cwd.path(), "demo");
+        assert_eq!(
+            prompt_for_provider_from_in(ProviderId::Codex, "use $demo", None, cwd.path()),
+            "use $demo"
+        );
+    }
 
     #[test]
     fn claude_rewrites_a_known_mention_to_a_leading_command() {

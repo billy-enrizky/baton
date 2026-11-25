@@ -568,7 +568,7 @@ baton orchestrate --archive <run-id>
 
 ### 10.2 Skills
 
-`/skills` lists skills discovered in the Claude and Codex skill directories. Enter inserts `$name` into the composer and reports the source. A Claude thread rewrites the final payload to `/name`; the stored transcript keeps `$name`.
+`/skills` lists skills discovered in the project's `.claude/skills` and `.codex/skills` directories first, then the global Claude and Codex skill directories; a project skill with the same name shadows the global one. Enter inserts `$name` into the composer and reports the source. A Claude thread rewrites the final payload to `/name`; the stored transcript keeps `$name`.
 
 ### 10.3 Governed memories
 

@@ -8610,10 +8610,11 @@ fn handoff_preview(
         None,
         intro,
     );
-    let payload = crate::skill_dispatch::prompt_for_provider_from(
+    let payload = crate::skill_dispatch::prompt_for_provider_from_in(
         state.thread.current_provider,
         &payload,
         Some(crate::skill_dispatch::current_message(text)),
+        std::path::Path::new(&state.thread.cwd),
     );
     Some(HandoffPrompt {
         prompt: text.to_string(),
@@ -9665,10 +9666,11 @@ fn handle_command(
             }
         }
         "/skills" => {
-            let skills: Vec<(String, String)> = sync::scan_skills()
-                .into_iter()
-                .map(|skill| (skill.name, skill.source))
-                .collect();
+            let skills: Vec<(String, String)> =
+                sync::scan_skills_in(std::path::Path::new(&state.thread.cwd))
+                    .into_iter()
+                    .map(|skill| (skill.name, skill.source))
+                    .collect();
             if skills.is_empty() {
                 state.notice = Some(
                     "no skills found in the configured Claude or Codex skill directories".into(),
@@ -21147,6 +21149,31 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("no assistant reply at position 3"));
+    }
+
+    #[test]
+    fn skills_command_lists_project_skills() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home
+            .path()
+            .join(".claude")
+            .join("skills")
+            .join("project-skill");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("SKILL.md"), "---\nname: project-skill\n---\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/skills");
+        let Overlay::SkillsPicker { skills, .. } = &state.overlay else {
+            panic!("expected the skills picker");
+        };
+        assert!(
+            skills
+                .iter()
+                .any(|(name, source)| name == "project-skill" && source == "claude"),
+            "project skill missing: {skills:?}"
+        );
     }
 
     #[test]

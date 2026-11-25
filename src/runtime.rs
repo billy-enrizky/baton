@@ -518,19 +518,19 @@ pub async fn run_engine(
                         let model = thread.current_model.clone().unwrap_or_else(|| {
                             crate::models::default_model(thread.current_provider).to_string()
                         });
-                        (thread.current_provider, model)
+                        (thread.current_provider, model, thread.cwd)
                     })
                 };
-                let claim = resolved.as_ref().and_then(|(provider, _)| {
+                let claim = resolved.as_ref().and_then(|(provider, _, _)| {
                     provider_claims.lock().unwrap().get(provider).cloned()
                 });
-                let handle = resolved.as_ref().and_then(|(provider, _)| {
+                let handle = resolved.as_ref().and_then(|(provider, _, _)| {
                     steer_handles
                         .iter()
                         .find(|(candidate, _)| candidate == provider)
                         .map(|(_, handle)| handle.clone())
                 });
-                let Some((provider, model)) = resolved else {
+                let Some((provider, model, thread_cwd)) = resolved else {
                     let _ = engine_event_sender.send(EngineEvent::SteerRejected {
                         thread_id,
                         text,
@@ -569,7 +569,12 @@ pub async fn run_engine(
                 let sender = engine_event_sender.clone();
                 let store = store.clone();
                 let steer_text = if skill_dispatch_enabled() {
-                    crate::skill_dispatch::prompt_for_provider(provider, &text)
+                    crate::skill_dispatch::prompt_for_provider_from_in(
+                        provider,
+                        &text,
+                        None,
+                        std::path::Path::new(&thread_cwd),
+                    )
                 } else {
                     text.clone()
                 };
@@ -1046,10 +1051,11 @@ async fn execute_turn(
         );
     }
     if skill_dispatch_enabled() {
-        prompt = crate::skill_dispatch::prompt_for_provider_from(
+        prompt = crate::skill_dispatch::prompt_for_provider_from_in(
             provider,
             &prompt,
             Some(crate::skill_dispatch::current_message(&prompt_text)),
+            std::path::Path::new(&cwd),
         );
     }
 

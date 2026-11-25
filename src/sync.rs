@@ -236,6 +236,33 @@ pub fn scan_skills() -> Vec<DiscoveredSkill> {
     )
 }
 
+/// Project skills shadow global skills with the same name. Both harness
+/// spellings are read from the working directory; the source keeps the
+/// harness that owns the skill so the invocation and switch hint stay right.
+pub fn scan_skills_in(cwd: &Path) -> Vec<DiscoveredSkill> {
+    scan_skills_with(
+        cwd,
+        &crate::paths::claude_global_settings_dir().join("skills"),
+        &crate::paths::codex_global_home().join("skills"),
+    )
+}
+
+fn scan_skills_with(cwd: &Path, claude_root: &Path, codex_root: &Path) -> Vec<DiscoveredSkill> {
+    let mut skills = scan_skill_root(&cwd.join(".claude").join("skills"), "claude");
+    for skill in scan_skill_root(&cwd.join(".codex").join("skills"), "codex") {
+        if !skills.iter().any(|existing| existing.name == skill.name) {
+            skills.push(skill);
+        }
+    }
+    for skill in scan_skill_roots(claude_root, codex_root) {
+        if !skills.iter().any(|existing| existing.name == skill.name) {
+            skills.push(skill);
+        }
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+
 pub fn settings_for_provider(provider: ProviderId) -> Vec<(&'static str, Vec<&'static str>)> {
     match provider {
         ProviderId::Claude => vec![
@@ -309,6 +336,62 @@ mod tests {
                 ("nested", "claude"),
             ]
         );
+    }
+
+    #[test]
+    fn project_skills_shadow_global_skills_and_keep_their_harness() {
+        let cwd = tempfile::tempdir().unwrap();
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        skill(
+            &cwd.path().join(".claude").join("skills"),
+            "shared",
+            "SKILL.md",
+        );
+        skill(
+            &cwd.path().join(".codex").join("skills"),
+            "codex-project",
+            "SKILL.md",
+        );
+        skill(claude.path(), "shared", "SKILL.md");
+        skill(claude.path(), "global-only", "SKILL.md");
+
+        let skills = scan_skills_with(cwd.path(), claude.path(), codex.path());
+        let names = skills
+            .iter()
+            .map(|skill| (skill.name.as_str(), skill.source.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("codex-project", "codex"),
+                ("global-only", "claude"),
+                ("shared", "claude"),
+            ]
+        );
+        let shared = skills.iter().find(|skill| skill.name == "shared").unwrap();
+        assert!(
+            shared.path.starts_with(cwd.path()),
+            "the project skill must win: {:?}",
+            shared.path
+        );
+    }
+
+    #[test]
+    fn a_project_codex_skill_is_listed_when_no_claude_skill_exists() {
+        let cwd = tempfile::tempdir().unwrap();
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        skill(
+            &cwd.path().join(".codex").join("skills"),
+            "project",
+            "SKILL.md",
+        );
+
+        let skills = scan_skills_with(cwd.path(), claude.path(), codex.path());
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "project");
+        assert_eq!(skills[0].source, "codex");
     }
 
     #[test]

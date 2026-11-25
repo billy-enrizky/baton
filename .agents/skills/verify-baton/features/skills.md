@@ -15,20 +15,21 @@ A terminal user can see installed Claude Code and Codex skills, but Baton only l
 
 - Installing, updating, or removing skills. Baton does not own an install workflow; it reads existing skill directories.
 - A skill marketplace, metadata editor, or per-skill enable switch.
-- Project-level skill roots, skill descriptions, and skill execution inside the orchestration coordinator.
+- Skill descriptions and skill execution inside the orchestration coordinator.
 - Rewriting a Codex-only skill for Claude or a Claude-only skill for Codex.
 
 ## Proposed architecture
 
-`src/sync.rs::scan_skill_roots` reads the Claude and Codex skill roots, prefers Claude on duplicate names, and requires a `SKILL.md` or `skill.md` file. A container directory such as Codex's `.system` is scanned one level deep, so its built-in skills are listed instead of the container itself.
+`src/sync.rs::scan_skill_roots` reads the global Claude and Codex skill roots, prefers Claude on duplicate names, and requires a `SKILL.md` or `skill.md` file. A container directory such as Codex's `.system` is scanned one level deep, so its built-in skills are listed instead of the container itself. `scan_skills_in(cwd)` adds the project roots `.claude/skills` and `.codex/skills`, and a project skill shadows a global skill with the same name.
 
 `src/tui/mod.rs` maps those rows into `Overlay::SkillsPicker`. `insert_skill` validates the name, inserts `$name ` at a token boundary, closes the picker, and reports the source. It adds a warning when the source differs from the current harness or when the thread is in orchestrate mode.
 
-`src/skill_dispatch.rs::prompt_for_provider` runs after the handoff or goal wrapper is built. For Claude, it finds the last known `$name` mention, moves it to the start as `/name`, and keeps the rest of the payload as arguments. Other providers keep the prompt unchanged. The stored message remains the original `$name` text.
+`src/skill_dispatch.rs::prompt_for_provider_from_in` runs after the handoff or goal wrapper is built. For Claude, it finds the last known `$name` mention using the project and global scan for the turn's working directory, moves it to the start as `/name`, and keeps the rest of the payload as arguments. Other providers keep the prompt unchanged. The stored message remains the original `$name` text.
 
 ## Sub-features
 
 - The Claude root is `CLAUDE_CONFIG_DIR/skills` when that variable is set, otherwise `~/.claude/skills`. The Codex root is `CODEX_HOME/skills` when set, otherwise `~/.codex/skills`.
+- The project roots are `<cwd>/.claude/skills` and `<cwd>/.codex/skills`. A project skill shadows a global skill of the same name, and Claude still wins over Codex at the same level.
 - Each root lists directories with `SKILL.md` or `skill.md`. A directory without either file is treated as a container and its immediate children are checked once. Deeper nesting is not scanned.
 - Rows show `name (source)`. Duplicate names keep the Claude row and hide the Codex duplicate. Empty discovery leaves the overlay closed and reports `no skills found in the configured Claude or Codex skill directories`.
 - `/skills` opens the picker. Enter inserts `$name ` at the caret, adding a leading space when the preceding character is not whitespace. The picker closes and reports `inserted $name (source)`.
@@ -66,11 +67,13 @@ The probe creates isolated `CLAUDE_CONFIG_DIR` and `CODEX_HOME` trees with one s
 cargo test --locked --lib tui::tests::skills_picker -- --nocapture
 cargo test --locked --lib skill_dispatch::tests -- --nocapture
 cargo test --locked --lib sync::tests::skill_roots -- --nocapture
+cargo test --locked --lib sync::tests::project_skills -- --nocapture
+cargo test --locked --lib tui::tests::skills_command_lists_project_skills -- --nocapture
 ```
 
 ### Coverage map
 
-`skills_picker_inserts_skill_tokens_at_token_boundaries` proves a Codex token starts a new word at a mid-word caret and a Claude token keeps a trailing source label. `skills_picker_warns_when_source_or_mode_needs_switching` proves both warnings. `skills_picker_rejects_reserved_and_unsafe_names_and_keeps_the_picker_open` proves `$memories` refusal, control and newline rejection, one rendered line, and the picker staying open. `skills_picker_window_follows_selection_past_eight` proves the window, the single selected cursor, and Down wrapping from the last row to the first. `skills_picker_visible_window_fits_a_short_terminal` proves the selected row stays visible when the overlay is shorter than the default eight-row window. `skill_tokens_submit_as_messages_instead_of_slash_commands` proves `$name` reaches the engine as a normal message. `skill_dispatch::tests` proves Claude rewriting, goal-prefix placement, last-mention precedence, ignored boundaries, digit-only rejection, handoff-history exclusion, goal-text exclusion, and unchanged Codex prompts. `runtime::tests::claude_payload_uses_native_skill_syntax_and_keeps_the_transcript_token` proves the provider payload is `/review` while the stored user message stays `$review`. `sync::tests::skill_roots_scan_flat_and_container_directories` and `claude_skills_win_duplicate_names_and_codex_adds_the_rest` prove `SKILL.md` discovery, one-level container scanning, Claude precedence, and source labels. The PTY probe proves the real picker, warning, and composer insertion.
+`skills_picker_inserts_skill_tokens_at_token_boundaries` proves a Codex token starts a new word at a mid-word caret and a Claude token keeps a trailing source label. `skills_picker_warns_when_source_or_mode_needs_switching` proves both warnings. `skills_picker_rejects_reserved_and_unsafe_names_and_keeps_the_picker_open` proves `$memories` refusal, control and newline rejection, one rendered line, and the picker staying open. `skills_picker_window_follows_selection_past_eight` proves the window, the single selected cursor, and Down wrapping from the last row to the first. `skills_picker_visible_window_fits_a_short_terminal` proves the selected row stays visible when the overlay is shorter than the default eight-row window. `skill_tokens_submit_as_messages_instead_of_slash_commands` proves `$name` reaches the engine as a normal message. `skill_dispatch::tests` proves Claude rewriting, goal-prefix placement, last-mention precedence, ignored boundaries, digit-only rejection, handoff-history exclusion, goal-text exclusion, and unchanged Codex prompts. `runtime::tests::claude_payload_uses_native_skill_syntax_and_keeps_the_transcript_token` proves the provider payload is `/review` while the stored user message stays `$review`. `sync::tests::skill_roots_scan_flat_and_container_directories` and `claude_skills_win_duplicate_names_and_codex_adds_the_rest` prove `SKILL.md` discovery, one-level container scanning, Claude precedence, and source labels. `sync::tests::project_skills_shadow_global_skills_and_keep_their_harness`, `a_project_codex_skill_is_listed_when_no_claude_skill_exists`, `skill_dispatch::tests::project_skills_are_known_from_the_project_cwd`, `project_skills_do_not_rewrite_codex_prompts`, and `tui::tests::skills_command_lists_project_skills` prove the project roots, their precedence, the Claude rewrite, and the `/skills` listing. The PTY probe proves the real picker, warning, and composer insertion.
 
 ## Alternatives
 
@@ -93,7 +96,7 @@ cargo test --locked --lib sync::tests::skill_roots -- --nocapture
 
 ## Gotchas
 
-- `/skills` is a list and insert surface, not an install command.
+- `/skills` is a list and insert surface, not an install command. It lists project skills for the current thread's working directory ahead of global skills.
 - The first Enter opens the picker; the second Enter inserts the selected row.
 - The composer keeps `$name`; only the Claude provider payload becomes `/name`.
 - An orchestrate-mode thread needs `/orchestrate off` before a skill can reach one harness.

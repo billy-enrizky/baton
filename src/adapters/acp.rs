@@ -1,7 +1,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -184,6 +184,7 @@ fn xai_question_prompts(params: &Value) -> Vec<QuestionPrompt> {
     let Some(questions) = params.get("questions").and_then(Value::as_array) else {
         return Vec::new();
     };
+    let mut used_ids = HashSet::new();
     questions
         .iter()
         .filter_map(|question| {
@@ -191,13 +192,25 @@ fn xai_question_prompts(params: &Value) -> Vec<QuestionPrompt> {
             if text.is_empty() {
                 return None;
             }
-            let id = question
+            let mut id = question
                 .get("id")
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| text.to_string());
+            if !used_ids.insert(id.clone()) {
+                let base = id.clone();
+                let mut suffix = 2;
+                loop {
+                    let candidate = format!("{base}:{suffix}");
+                    if used_ids.insert(candidate.clone()) {
+                        id = candidate;
+                        break;
+                    }
+                    suffix += 1;
+                }
+            }
             let mut options: Vec<QuestionOption> = question
                 .get("options")
                 .and_then(Value::as_array)
@@ -940,5 +953,22 @@ mod tests {
         );
         let cancelled = xai_question_response(&questions, &[]);
         assert_eq!(cancelled["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn xai_question_prompts_make_prompt_ids_unique() {
+        let params = json!({
+            "sessionId": "session-1",
+            "toolCallId": "tool-call-1",
+            "mode": "default",
+            "questions": [
+                { "id": "Pick one", "question": "First question" },
+                { "question": "Pick one" }
+            ]
+        });
+        let questions = xai_question_prompts(&params);
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].id, "Pick one");
+        assert_eq!(questions[1].id, "Pick one:2");
     }
 }

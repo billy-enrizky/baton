@@ -656,7 +656,8 @@ async fn acp_adapter_routes_xai_questions_to_the_tui_surface() {
         response.contains("\"Which scope should Grok use?\":[\"Workspace\"]"),
         "{response}"
     );
-    let _ = tokio::time::timeout(Duration::from_secs(10), turn)
+    tokio::time::timeout(Duration::from_secs(10), turn)
         .await
-        .expect("turn completes");
+        .expect("turn completes")
+        .expect("turn succeeds");
 }

@@ -19,6 +19,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Provider readiness | CLI and TUI | doctor summarizes ready/missing; pickers mark missing harnesses |
 | Default provider | CLI and TUI | new work starts on an installed harness, with an explicit override |
 | Recent thread hint | TUI | a new session points at existing threads in the folder |
+| Usage report | TUI | `/usage` picks this thread or all threads, then totals or a day/model/provider grouping, and shows a scrollable report |
 | Attention inbox | TUI | `/inbox` lists failed, unverified, interrupted, needs-input, and queued work and opens the selected thread |
 | Thread pins | TUI; CLI read | `/pin` toggles a durable pin, Ctrl+Up/Ctrl+Down or `/pin move` orders pinned threads, pinned rows sort first, and `baton threads --json` exposes `pinned` and `pin_order_key` |
 | File navigation | TUI; CLI | `/files [--ignored]` inserts a selected project path or `path:line` and warns when ignored files are included; Ctrl+O launches that target or a selected `/grep` match in `VISUAL` or `EDITOR`; `/grep` and `baton grep` search file contents with sorted previews; `baton files` ranks project paths with ripgrep or git; and `baton open` launches the editor with `-C`-directory containment |

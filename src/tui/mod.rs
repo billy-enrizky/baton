@@ -28,7 +28,9 @@ use crate::types::{
     normalize_reasoning_effort, ApprovalChoice, ApprovalDecision, PermissionMode, ProviderId,
     QuestionAnswer, QuestionPrompt, SessionMode, TurnPhase,
 };
-use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
+use crate::usage::{
+    cache_hit_rate, format_token_count, format_usage_line, group_usage, sum_usage, UsageGroup,
+};
 
 pub mod viewport;
 
@@ -127,7 +129,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "pick a project file and insert its path, optionally with :line",
     ),
     ("/grep", "search project contents and insert path:line"),
-    ("/usage", "token usage and cache hit rate"),
+    ("/usage", "token usage and cache hit rate; pick a scope and grouping"),
     ("/checkpoints", "list checkpoints for this thread"),
     ("/review", "review the latest turn diff with line notes"),
     ("/diff", "diff a checkpoint against the working tree"),
@@ -205,6 +207,16 @@ fn help_lines() -> &'static [String] {
 
 const EFFORT_VALUES: [&str; 6] = ["default", "low", "medium", "high", "xhigh", "max"];
 const PERMISSION_MODE_VALUES: [&str; 4] = ["default", "acceptEdits", "bypassPermissions", "plan"];
+const USAGE_CHOICES: [(&str, &str); 8] = [
+    ("This thread", "token, cache, and cost totals"),
+    ("All threads", "totals across every thread"),
+    ("This thread by day", "newest days first"),
+    ("This thread by model", "alphabetical model totals"),
+    ("This thread by provider", "alphabetical provider totals"),
+    ("All threads by day", "newest days first"),
+    ("All threads by model", "alphabetical model totals"),
+    ("All threads by provider", "alphabetical provider totals"),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CommandSuggestion {
@@ -579,6 +591,14 @@ struct TranscriptPoint {
 enum Overlay {
     None,
     Help {
+        scroll: usize,
+    },
+    UsagePicker {
+        selected: usize,
+    },
+    UsageReport {
+        title: String,
+        lines: Vec<String>,
         scroll: usize,
     },
     RewindPicker {
@@ -4910,6 +4930,86 @@ fn handle_key(
             }
             if keep {
                 state.overlay = Overlay::Help { scroll };
+            }
+        }
+        Overlay::UsagePicker { mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = (selected + USAGE_CHOICES.len() - 1) % USAGE_CHOICES.len();
+                state.overlay = Overlay::UsagePicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % USAGE_CHOICES.len();
+                state.overlay = Overlay::UsagePicker { selected };
+            }
+            KeyCode::Enter => {
+                open_usage_report(state, store, selected);
+            }
+            _ => {
+                state.overlay = Overlay::UsagePicker { selected };
+            }
+        },
+        Overlay::UsageReport {
+            title,
+            lines,
+            mut scroll,
+        } => {
+            let max = lines.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    state.overlay = Overlay::UsageReport {
+                        title,
+                        lines,
+                        scroll,
+                    };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll = (scroll + 1).min(max);
+                    state.overlay = Overlay::UsageReport {
+                        title,
+                        lines,
+                        scroll,
+                    };
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(10);
+                    state.overlay = Overlay::UsageReport {
+                        title,
+                        lines,
+                        scroll,
+                    };
+                }
+                KeyCode::PageDown => {
+                    scroll = (scroll + 10).min(max);
+                    state.overlay = Overlay::UsageReport {
+                        title,
+                        lines,
+                        scroll,
+                    };
+                }
+                KeyCode::Home => {
+                    state.overlay = Overlay::UsageReport {
+                        title,
+                        lines,
+                        scroll: 0,
+                    };
+                }
+                KeyCode::End => {
+                    state.overlay = Overlay::UsageReport {
+                        title,
+                        lines,
+                        scroll: max,
+                    };
+                }
+                _ => {
+                    state.overlay = Overlay::UsageReport {
+                        title,
+                        lines,
+                        scroll,
+                    };
+                }
             }
         }
         Overlay::RewindPicker {
@@ -10172,16 +10272,7 @@ fn handle_command(
             });
         }
         "/usage" => {
-            let lines = {
-                let guard = store.lock().unwrap();
-                let rows = guard.list_usage(Some(&state.thread.id)).unwrap_or_default();
-                if rows.is_empty() {
-                    None
-                } else {
-                    Some(format_usage_line(&sum_usage(&rows)))
-                }
-            };
-            state.notice = Some(lines.unwrap_or_else(|| "no usage yet".into()));
+            state.overlay = Overlay::UsagePicker { selected: 0 };
         }
         "/checkpoints" => {
             let checkpoints: Vec<(i64, String)> = {
@@ -11207,6 +11298,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         match &state.overlay {
             Overlay::None => 0,
             Overlay::Help { .. } => HELP_VIEW_ROWS + 3,
+            Overlay::UsagePicker { .. } => USAGE_CHOICES.len() + 4,
+            Overlay::UsageReport { lines, .. } => lines.len().min(12) + 3,
             Overlay::RewindPicker { .. } => {
                 state
                     .history
@@ -11545,6 +11638,12 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::HandoffPreview { pending } => draw_handoff_preview(frame, chunks[1], pending),
             Overlay::Help { scroll } => draw_help(frame, chunks[1], *scroll),
+            Overlay::UsagePicker { selected } => draw_usage_picker(frame, chunks[1], *selected),
+            Overlay::UsageReport {
+                title,
+                lines,
+                scroll,
+            } => draw_usage_report(frame, chunks[1], title, lines, *scroll),
             Overlay::None => {}
         }
     }
@@ -13321,6 +13420,65 @@ fn draw_login_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn open_usage_report(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, choice: usize) {
+    let (all, group, title) = match choice {
+        0 => (false, None, "this thread"),
+        1 => (true, None, "all threads"),
+        2 => (false, Some(UsageGroup::Day), "this thread · by day"),
+        3 => (false, Some(UsageGroup::Model), "this thread · by model"),
+        4 => (
+            false,
+            Some(UsageGroup::Provider),
+            "this thread · by provider",
+        ),
+        5 => (true, Some(UsageGroup::Day), "all threads · by day"),
+        6 => (true, Some(UsageGroup::Model), "all threads · by model"),
+        _ => (
+            true,
+            Some(UsageGroup::Provider),
+            "all threads · by provider",
+        ),
+    };
+    let rows = {
+        let guard = store.lock().unwrap();
+        guard
+            .list_usage(if all { None } else { Some(&state.thread.id) })
+            .unwrap_or_default()
+    };
+    let mut lines = Vec::new();
+    if rows.is_empty() {
+        lines.push("no usage yet".to_string());
+    } else if let Some(group) = group {
+        for (key, totals) in group_usage(&rows, group) {
+            lines.push(format!(
+                "{:<24} {:>3} turns  {}",
+                key,
+                totals.turns,
+                format_usage_line(&totals)
+            ));
+        }
+        lines.push(String::new());
+        let total = sum_usage(&rows);
+        lines.push(format!(
+            "total {:>3} turns  {}",
+            total.turns,
+            format_usage_line(&total)
+        ));
+    } else {
+        let total = sum_usage(&rows);
+        lines.push(format!(
+            "{:>3} turns  {}",
+            total.turns,
+            format_usage_line(&total)
+        ));
+    }
+    state.overlay = Overlay::UsageReport {
+        title: title.to_string(),
+        lines,
+        scroll: 0,
+    };
+}
+
 fn open_runs_picker(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, include_archived: bool) {
     let runs = store
         .lock()
@@ -13928,6 +14086,64 @@ struct FilesPickerView<'a> {
     truncated: bool,
     loading: bool,
     spinner: usize,
+}
+
+fn draw_usage_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "usage · enter view · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (label, detail)) in USAGE_CHOICES.iter().enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.text)
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{cursor} "), Style::default().fg(COLORS.accent)),
+            Span::styled((*label).to_string(), style),
+            Span::styled(format!("  {detail}"), Style::default().fg(COLORS.muted)),
+        ]));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_usage_report(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    title: &str,
+    lines: &[String],
+    scroll: usize,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let visible = inner.height.saturating_sub(1) as usize;
+    let start = if visible == 0 || lines.len() <= visible {
+        0
+    } else {
+        scroll.min(lines.len() - visible)
+    };
+    let mut rendered = vec![Line::styled(
+        format!("usage · {title} · ↑↓ scroll · esc close"),
+        Style::default().fg(COLORS.muted),
+    )];
+    for line in lines.iter().skip(start).take(visible) {
+        let safe = crate::sanitize::sanitize_terminal_text(line);
+        rendered.push(Line::styled(
+            safe.into_owned(),
+            Style::default().fg(COLORS.text),
+        ));
+    }
+    frame.render_widget(Paragraph::new(rendered), inner);
 }
 
 fn draw_help(frame: &mut ratatui::Frame, area: Rect, scroll: usize) {
@@ -22397,6 +22613,9 @@ mod tests {
         };
         check(&mut state, "palette", "Review");
 
+        state.overlay = Overlay::UsagePicker { selected: 1 };
+        check(&mut state, "usage", "All threads");
+
         state.overlay = Overlay::ModelPicker {
             provider: state.thread.current_provider,
             models: vec!["model-a".into(), "model-b".into(), "model-c".into()],
@@ -28604,6 +28823,96 @@ exit 1
         handle_command(&mut state, &store, &engine_command_sender, "/questions");
         assert!(matches!(state.overlay, Overlay::None));
         assert_eq!(state.notice.as_deref(), Some("no open worker questions"));
+    }
+
+    #[test]
+    fn usage_picker_offers_every_scope_and_grouping() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/usage");
+        assert!(matches!(state.overlay, Overlay::UsagePicker { .. }));
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        for label in [
+            "This thread",
+            "All threads",
+            "This thread by model",
+            "All threads by provider",
+        ] {
+            assert!(text.contains(label), "{label} missing: {text}");
+        }
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+    }
+
+    #[test]
+    fn usage_report_groups_this_thread_by_model() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        store
+            .lock()
+            .unwrap()
+            .add_usage(
+                &thread_id,
+                1,
+                ProviderId::Codex,
+                Some("gpt-6.1-sol"),
+                &crate::types::TurnUsage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    cache_read_tokens: 6,
+                    cache_creation_tokens: 0,
+                    cost_usd: Some(0.01),
+                },
+            )
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/usage");
+        for _ in 0..3 {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Down, KeyModifiers::empty()),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        let Overlay::UsageReport { title, lines, .. } = &state.overlay else {
+            panic!("expected the usage report");
+        };
+        assert_eq!(title, "this thread · by model");
+        let report = lines.join("\n");
+        assert!(report.contains("gpt-6.1-sol"), "{report}");
+        assert!(report.contains("1 turns"), "{report}");
+        assert!(report.contains("total"), "{report}");
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("usage · this thread · by model"), "{text}");
+    }
+
+    #[test]
+    fn usage_report_handles_empty_history() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/usage");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        let Overlay::UsageReport { lines, .. } = &state.overlay else {
+            panic!("expected the usage report");
+        };
+        assert_eq!(lines, &vec!["no usage yet".to_string()]);
     }
 
     #[test]

@@ -48,6 +48,16 @@ pub enum UsageGroup {
     Provider,
 }
 
+impl UsageGroup {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            UsageGroup::Day => "day",
+            UsageGroup::Model => "model",
+            UsageGroup::Provider => "provider",
+        }
+    }
+}
+
 /// Totals per key. Days are newest first; model and provider keys are
 /// alphabetical so two runs of the same history print the same order.
 pub fn group_usage(rows: &[UsageRow], group: UsageGroup) -> Vec<(String, UsageTotals)> {

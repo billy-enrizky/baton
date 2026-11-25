@@ -171,16 +171,32 @@ outputs = changes["outputs"].is_a?(Hash) ? changes["outputs"].keys.map(&:to_s) :
   fail!("CI009", "changes is missing output #{output}") unless outputs.include?(output)
 end
 
+# The debt ratchet may run as its own job or inside the check job. Both shapes
+# are accepted so the merge can land in two steps: first this acceptance, then
+# the workflow. The linter always runs from the trusted base, so a workflow that
+# merges them cannot pass until this file on the base already allows it.
+DEBT_COMMANDS = ["fmt-debt.sh", "clippy-debt.sh", "debt-selftest.sh"].freeze
+
 {
   "check" => "check_needed",
   "build" => "build_needed",
   "test" => "test_needed",
-  "debt" => "debt_needed",
 }.each do |job_name, output|
   job = jobs[job_name]
   fail!("CI010", "missing #{job_name} job") unless job.is_a?(Hash)
   condition = job["if"].to_s
   fail!("CI010", "#{job_name} must read changes.outputs.#{output}") unless condition.include?(output)
+end
+
+debt_job = jobs["debt"]
+if debt_job.is_a?(Hash)
+  condition = debt_job["if"].to_s
+  fail!("CI010", "debt must read changes.outputs.debt_needed") unless condition.include?("debt_needed")
+else
+  check_condition = jobs["check"]["if"].to_s
+  unless check_condition.include?("check_needed") && check_condition.include?("debt_needed")
+    fail!("CI010", "without a debt job, check must read changes.outputs.check_needed and debt_needed")
+  end
 end
 
 changes_text = Array(changes["steps"]).map { |step| step["run"].to_s }.join("\n")
@@ -199,9 +215,10 @@ required_commands = {
   "check" => ["cargo check --locked"],
   "build" => ["cargo build --locked"],
   "test" => ["cargo test --locked"],
-  "debt" => ["fmt-debt.sh", "clippy-debt.sh", "debt-selftest.sh"],
   "verify" => ["check_gate"],
 }
+required_commands["debt"] = DEBT_COMMANDS if jobs["debt"].is_a?(Hash)
+DEBT_COMMANDS.each { |command| required_commands["check"] << command } unless jobs["debt"].is_a?(Hash)
 job_text = {}
 required_commands.each do |job_name, commands|
   job = jobs[job_name]

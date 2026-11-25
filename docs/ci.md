@@ -315,6 +315,18 @@ What it does not prove: test inventory completeness, shard union coverage, or th
 
 Phase 1 values are three times a conservative local cold estimate. They are caps, not targets: a command that exceeds one fails the job. Phase 2 replaces each value with the measured Linux p95 plus 20 percent. That replacement is the only allowed increase; after it, no value may increase. Clippy is a separate debt ratchet, not a build or test command; its 300-second ceiling is recorded here so the 90-second warm build/test goal is not misread as a Clippy ceiling.
 
+## Debt ratchet job shape
+
+`ci/check-ci.sh` accepts two shapes: the ratchet as its own `debt` job, or its three commands inside the `check`
+job. Both are enforced, not waved through: with a `debt` job the linter requires `debt_needed` on that job, and
+without one it requires `check` to read both `check_needed` and `debt_needed` and to run `fmt-debt.sh`,
+`clippy-debt.sh`, and `debt-selftest.sh` under `ci/budget.sh`. Removing the commands from the merged job fails
+CI014.
+
+The two shapes exist because the linter always runs from the trusted base. A workflow that merges the jobs
+cannot pass until the base already allows the merged shape, so the acceptance lands first and the workflow
+change second.
+
 ## Debt ratchets
 
 A count is a floor, not a quality gate: fixing one violation while adding another keeps the count flat. Phase 1 accepts that weakness because the current baseline is 550 format diffs and 61 Clippy errors, and a full gate would fail every PR on day one.

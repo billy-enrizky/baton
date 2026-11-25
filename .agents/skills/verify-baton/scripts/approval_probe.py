@@ -220,7 +220,14 @@ def main() -> int:
     evidence.mkdir(parents=True, exist_ok=True)
     write_fake_agy(fake_bin)
     (home / "config.json").write_text(
-        json.dumps({"defaultProvider": "antigravity", "defaultMode": "single"}) + "\n"
+        json.dumps(
+            {
+                "defaultProvider": "antigravity",
+                "defaultMode": "single",
+                "notifications": {"bell": True},
+            }
+        )
+        + "\n"
     )
     state_path = root / "responses.jsonl"
 
@@ -259,6 +266,8 @@ def main() -> int:
         ):
             raise RuntimeError("approval overlay did not list the provider choices")
         pump(master, 0.3, transcript)
+        if b"\x07" not in bytes(transcript):
+            raise RuntimeError("approval did not ring the terminal bell")
         before = Screen(args.width, args.height)
         before.feed(bytes(transcript).decode("utf-8", "replace"))
         before_text = "\n".join(before.lines())

@@ -8,6 +8,7 @@
 - The y, a, and n shortcuts still send allow once, allow for session, and deny.
 - A child-thread approval names the first eight characters of the child thread id and stays on the same stack as an open picker or review.
 - The exec JSON stream includes the choices and never includes the responder.
+- An approval rings the terminal bell when `notifications.bell` is on. The shared two-second limiter is the same one used on turn end and questions.
 
 ## How to get to it (user POV)
 

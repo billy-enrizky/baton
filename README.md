@@ -337,7 +337,7 @@ An approval request shows the provider's own choices. Up and Down select a row, 
 
 Some providers also ask a question before continuing. The same overlay lists the choices, walks multiple questions in order, and allows a custom answer when the provider permits one. A secret answer is masked on screen.
 
-Most commands open a picker instead of requiring memorized syntax. Pickers show their keys, the current selection, and the relevant detail. Remote actions open a preview first and recheck the live state before they run.
+Most commands open a picker instead of requiring memorized syntax. Pickers show their keys, the current selection, and the relevant detail. Remote actions open a preview first and recheck the live state before they run. When the terminal bell is enabled in settings, Baton rings once when a turn finishes, an approval arrives, or a provider asks a question. A two-second limiter mutes repeats.
 
 ### 6.4 Transcript
 

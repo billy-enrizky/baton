@@ -107,7 +107,7 @@ Every check below is a real command in `ci/`. `ci/selftest.sh` proves the workfl
 | Budgets | `ci/budget.sh` | `timeout` with a Perl fallback; a miss exits 124 and fails the job |
 | Path selection | `ci/classify-paths.sh` | `--event`, `--files`, first-match precedence `unknown` > `code` > `meta` > docs |
 | Workflow invariants | `ci/check-ci.sh` | Rules CI001 to CI015, CI017, and CI018 (CI016 is unused) |
-| Gate integrity | `ci/gate-integrity.sh` | Rules GI001 to GI006 |
+| Gate integrity | `ci/gate-integrity.sh` | Rules GI001 to GI007 |
 | Test inventory | `ci/test-inventory.sh` | Rules TI001 to TI005. Run mode compares announced and executed totals; list mode counts discovered tests |
 | Format debt | `ci/fmt-debt.sh` | Count of `Diff in ` lines must not exceed the baseline |
 | Clippy debt | `ci/clippy-debt.sh` | Count of lint diagnostics, excluding compiler summary lines, must not exceed the baseline |
@@ -146,6 +146,7 @@ Gate-integrity rules:
 | GI004 | A blanket all, pedantic, nursery, or correctness Clippy allow in `src/` or `tests/` |
 | GI005 | A warning suppression or conditional Clippy suppression in tracked Rust sources |
 | GI006 | A `#[rustfmt::skip]` attribute in tracked Rust sources |
+| GI007 | A fixture path `ci/selftest.sh` references that is not in the tree |
 
 ## Risks and mitigations
 

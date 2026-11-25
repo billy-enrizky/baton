@@ -2,6 +2,7 @@
 
 ## Sub-features
 - Codex `item/tool/requestUserInput` becomes a question overlay instead of an unhandled server request.
+- Grok ACP `x.ai/ask_user_question` and `_x.ai/ask_user_question` requests use the same overlay. A question without options gets an `OK` row, and answers are keyed by the question text in the xAI response.
 - One request can carry multiple questions. The TUI walks them one at a time and sends one batched answers map.
 - Each question lists its options. The selected option is sent as the answer.
 - A question with `isOther` shows an `Other (type an answer)` row. Enter opens the custom input, Enter submits it, and Escape returns to the options.
@@ -18,7 +19,7 @@ Run a Codex turn that asks a clarifying question, for example from Plan mode or 
 `TurnEvent::QuestionRequest` carries `QuestionPrompt` values and a responder for `Vec<QuestionAnswer>`. Codex `handle_user_input_request` parses `questions`, `options`, `isOther`, and `isSecret`, then `question_response` builds the native `{answers:{id:{answers:[...]}}}` result. The TUI stores a `QuestionState` per request, walks `index`, and `finish_question_answer` either advances to the next question or sends the batch. `question_key` handles the option cursor and the custom input; `draw_question` renders the header, wrapped question, options, custom row, and description.
 
 ## Gotchas
-- Only Codex emits this event today. ACP questions and the other adapters still need their own mappings.
+- Codex and Grok emit this event today. Claude, OpenCode, and Antigravity still need their own mappings.
 - The overlay shows six options at a time and keeps the selected row in the window. The Other row is always last.
 - A child thread id is shortened to eight characters in the header.
 - Multi-select is not implemented. Each question takes one answer.

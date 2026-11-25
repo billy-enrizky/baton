@@ -8,7 +8,10 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use crate::adapters::{standard_approval_choices, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineReader, LineWriter, ModelListInput, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
-use crate::types::{ApprovalChoice, ApprovalDecision, NativeSessionRef, ProviderId, TurnUsage};
+use crate::types::{
+    ApprovalChoice, ApprovalDecision, NativeSessionRef, ProviderId, QuestionAnswer, QuestionOption,
+    QuestionPrompt, TurnUsage,
+};
 
 struct AcpRuntime {
     reader: AsyncMutex<Box<dyn LineReader>>,
@@ -113,6 +116,10 @@ async fn handle_server_request(
     method: &str,
     params: Value,
 ) {
+    if matches!(method, "x.ai/ask_user_question" | "_x.ai/ask_user_question") {
+        handle_xai_question(runtime, id, &params).await;
+        return;
+    }
     if method != "session/request_permission" {
         let response = json!({
             "jsonrpc": "2.0",
@@ -163,6 +170,130 @@ async fn handle_server_request(
             let _ = writer.write_line(&serialized).await;
         }
     });
+}
+
+fn xai_question_params(params: &Value) -> &Value {
+    params
+        .get("params")
+        .filter(|_| params.get("method").is_some())
+        .unwrap_or(params)
+}
+
+fn xai_question_prompts(params: &Value) -> Vec<QuestionPrompt> {
+    let params = xai_question_params(params);
+    let Some(questions) = params.get("questions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    questions
+        .iter()
+        .filter_map(|question| {
+            let text = question.get("question").and_then(Value::as_str)?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let id = question
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| text.to_string());
+            let mut options: Vec<QuestionOption> = question
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| {
+                            let label = option.get("label").and_then(Value::as_str)?.trim();
+                            if label.is_empty() {
+                                return None;
+                            }
+                            let description = option
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or(label)
+                                .to_string();
+                            Some(QuestionOption {
+                                label: label.to_string(),
+                                description,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if options.is_empty() {
+                options.push(QuestionOption {
+                    label: "OK".into(),
+                    description: "Continue".into(),
+                });
+            }
+            Some(QuestionPrompt {
+                id,
+                header: "Question".into(),
+                question: text.to_string(),
+                options,
+                allow_custom: true,
+                secret: false,
+            })
+        })
+        .collect()
+}
+
+fn xai_question_response(questions: &[QuestionPrompt], answers: &[QuestionAnswer]) -> Value {
+    let mut map = serde_json::Map::new();
+    for question in questions {
+        if let Some(answer) = answers.iter().find(|answer| answer.id == question.id) {
+            if !answer.answers.is_empty() {
+                map.insert(question.question.clone(), json!(answer.answers));
+            }
+        }
+    }
+    if map.is_empty() {
+        json!({ "outcome": "cancelled" })
+    } else {
+        json!({ "outcome": "accepted", "answers": map })
+    }
+}
+
+async fn handle_xai_question(runtime: &Arc<AcpRuntime>, id: Value, params: &Value) {
+    let questions = xai_question_prompts(params);
+    if questions.is_empty() {
+        send_acp_result(runtime, id, json!({ "outcome": "cancelled" })).await;
+        return;
+    }
+    let params = xai_question_params(params);
+    let request_id = format!(
+        "xai:{}",
+        params
+            .get("toolCallId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+    );
+    let (respond, receiver) = oneshot::channel::<Vec<QuestionAnswer>>();
+    {
+        let emit = runtime.current_emit.lock().await;
+        if let Some(emit) = emit.as_ref() {
+            let _ = emit.send(TurnEvent::QuestionRequest {
+                id: request_id,
+                questions: questions.clone(),
+                respond,
+            });
+        }
+    }
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        let answers = receiver.await.unwrap_or_default();
+        send_acp_result(&runtime, id, xai_question_response(&questions, &answers)).await;
+    });
+}
+
+async fn send_acp_result(runtime: &Arc<AcpRuntime>, id: Value, result: Value) {
+    let response = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    if let Ok(serialized) = serde_json::to_string(&response) {
+        let mut writer = runtime.writer.lock().await;
+        let _ = writer.write_line(&serialized).await;
+    }
 }
 
 fn pick_permission_option(options: &[Value], decision: Option<ApprovalDecision>) -> Option<String> {
@@ -695,8 +826,11 @@ impl BatonAdapter for AcpAdapter {
 
 #[cfg(test)]
 mod tests {
-    use super::{antigravity_model_family, permission_choices, pick_permission_option};
-    use crate::types::ApprovalDecision;
+    use super::{
+        antigravity_model_family, permission_choices, pick_permission_option, xai_question_prompts,
+        xai_question_response,
+    };
+    use crate::types::{ApprovalDecision, QuestionAnswer, QuestionPrompt};
     use serde_json::json;
 
     #[test]
@@ -745,5 +879,66 @@ mod tests {
             pick_permission_option(&options, Some(ApprovalDecision::Accept)),
             Some("opt-allow".into())
         );
+    }
+
+    #[test]
+    fn xai_question_prompts_keep_labels_and_fallbacks() {
+        let direct = json!({
+            "sessionId": "session-1",
+            "toolCallId": "tool-call-1",
+            "mode": "default",
+            "questions": [{
+                "id": "scope",
+                "question": "Which scope should Grok use?",
+                "options": [
+                    { "label": "Workspace", "description": "Use the current workspace" },
+                    { "label": "Session", "description": "Only use this session" }
+                ]
+            }]
+        });
+        let questions = xai_question_prompts(&direct);
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].id, "scope");
+        assert_eq!(questions[0].header, "Question");
+        assert_eq!(questions[0].options[0].label, "Workspace");
+        assert_eq!(questions[0].options[1].description, "Only use this session");
+        assert!(questions[0].allow_custom);
+
+        let wrapped = json!({
+            "method": "_x.ai/ask_user_question",
+            "params": {
+                "sessionId": "session-1",
+                "toolCallId": "tool-call-2",
+                "mode": "plan",
+                "questions": [{ "question": "Pick one", "options": [] }]
+            }
+        });
+        let questions = xai_question_prompts(&wrapped);
+        assert_eq!(questions[0].id, "Pick one");
+        assert_eq!(questions[0].options[0].label, "OK");
+    }
+
+    #[test]
+    fn xai_question_response_uses_question_text_keys() {
+        let questions = vec![QuestionPrompt {
+            id: "scope".into(),
+            header: "Question".into(),
+            question: "Which scope should Grok use?".into(),
+            options: Vec::new(),
+            allow_custom: true,
+            secret: false,
+        }];
+        let answers = vec![QuestionAnswer {
+            id: "scope".into(),
+            answers: vec!["Workspace".into()],
+        }];
+        let response = xai_question_response(&questions, &answers);
+        assert_eq!(response["outcome"], "accepted");
+        assert_eq!(
+            response["answers"]["Which scope should Grok use?"][0],
+            "Workspace"
+        );
+        let cancelled = xai_question_response(&questions, &[]);
+        assert_eq!(cancelled["outcome"], "cancelled");
     }
 }

@@ -314,8 +314,7 @@ fn question_prompts(params: &Value) -> Vec<QuestionPrompt> {
             let id = question
                 .get("id")
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|id| !id.is_empty())
+                .filter(|id| !id.trim().is_empty())
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("question-{}", index + 1));
             let header = question
@@ -325,7 +324,7 @@ fn question_prompts(params: &Value) -> Vec<QuestionPrompt> {
                 .filter(|header| !header.is_empty())
                 .unwrap_or("Question")
                 .to_string();
-            let options = question
+            let options: Vec<QuestionOption> = question
                 .get("options")
                 .and_then(Value::as_array)
                 .map(|options| {
@@ -349,15 +348,17 @@ fn question_prompts(params: &Value) -> Vec<QuestionPrompt> {
                         .collect()
                 })
                 .unwrap_or_default();
+            let allow_custom = question
+                .get("isOther")
+                .and_then(Value::as_bool)
+                .unwrap_or(true)
+                || options.is_empty();
             Some(QuestionPrompt {
                 id,
                 header,
                 question: text.to_string(),
                 options,
-                allow_custom: question
-                    .get("isOther")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
+                allow_custom,
                 secret: question
                     .get("isSecret")
                     .and_then(Value::as_bool)
@@ -1067,7 +1068,10 @@ mod tests {
                     "header": "Secret",
                     "question": "Token?",
                     "isOther": false,
-                    "isSecret": true
+                    "isSecret": true,
+                    "options": [
+                        { "label": "Use token", "description": "Continue with the token" }
+                    ]
                 }
             ]
         });
@@ -1080,6 +1084,18 @@ mod tests {
         assert!(!questions[1].allow_custom);
         assert!(questions[1].secret);
         assert_eq!(questions[1].id, "question-2");
+    }
+
+    #[test]
+    fn user_input_question_ids_keep_surrounding_whitespace() {
+        let params = json!({
+            "questions": [
+                { "id": " choice ", "header": "One", "question": "Pick", "isOther": false }
+            ]
+        });
+        let questions = question_prompts(&params);
+        assert_eq!(questions[0].id, " choice ");
+        assert!(questions[0].allow_custom, "an empty option list needs the custom row");
     }
 
     #[test]

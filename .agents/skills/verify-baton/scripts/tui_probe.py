@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Drive a baton TUI through a PTY, capture a full screen, and preserve evidence."""
 
+from __future__ import annotations
+
 import argparse
 import fcntl
 import hashlib

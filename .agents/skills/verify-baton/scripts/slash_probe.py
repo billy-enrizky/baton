@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Prove that slash arguments expose choices and complete in the real TUI."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -14,7 +16,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from tui_probe import Screen, binary_identity, pump, reap, set_size, wait_for
+from tui_probe import Screen, binary_identity, pump, reap, set_size
 
 
 def screen_text(transcript: bytearray, width: int, height: int) -> str:
@@ -247,7 +249,7 @@ def main() -> int:
     exit_code = None
     try:
         set_size(master, args.width, args.height)
-        if not wait_for(master, "Ask anything", args.timeout, transcript):
+        if not wait_for_screen(master, "Ask anything", args.timeout, transcript, args.width, args.height):
             raise RuntimeError("TUI did not show its composer")
         pump(master, 3.0, transcript)
 
@@ -571,7 +573,7 @@ def main() -> int:
         ):
             missing.append("project instructions row selection")
         os.write(master, b"\r")
-        if not wait_for(master, "opened ", 5.0, transcript):
+        if not wait_for_screen(master, "opened ", 5.0, transcript, args.width, args.height):
             missing.append("memory editor opened notice")
         pump(master, 0.5, transcript)
         memory_open = screen_text(transcript, args.width, args.height)
@@ -589,7 +591,7 @@ def main() -> int:
                 missing.append("memory editor target")
 
         os.write(master, b"/git\r")
-        if not wait_for(master, "Git ·", 10.0, transcript):
+        if not wait_for_screen(master, "Git ·", 10.0, transcript, args.width, args.height):
             missing.append("git picker")
         pump(master, 0.2, transcript)
         git_picker = screen_text(transcript, args.width, args.height)
@@ -605,10 +607,10 @@ def main() -> int:
         missing.extend(value for value in git_required if value not in git_picker)
         (evidence / "git-picker-screen.txt").write_text(git_picker + "\n")
         os.write(master, b"\x1b[B")
-        if not wait_for(master, "❯ Commit all changes", 5.0, transcript):
+        if not wait_for_screen(master, "❯ Commit all changes", 5.0, transcript, args.width, args.height):
             missing.append("git commit row selection")
         os.write(master, b"\r")
-        if not wait_for(master, "message: baton:", 10.0, transcript):
+        if not wait_for_screen(master, "message: baton:", 10.0, transcript, args.width, args.height):
             missing.append("git confirm screen")
         pump(master, 0.2, transcript)
         git_confirm = screen_text(transcript, args.width, args.height)
@@ -624,7 +626,7 @@ def main() -> int:
         )
         (evidence / "git-confirm-screen.txt").write_text(git_confirm + "\n")
         os.write(master, b"\r")
-        if not wait_for(master, "committed ", 20.0, transcript):
+        if not wait_for_screen(master, "committed ", 20.0, transcript, args.width, args.height):
             missing.append("git commit notice")
         pump(master, 0.4, transcript)
         (evidence / "git-committed-screen.txt").write_text(
@@ -658,7 +660,7 @@ def main() -> int:
                 missing.append("git committed an ignored file")
 
         os.write(master, b"/git push\r")
-        if not wait_for(master, "Git push", 10.0, transcript):
+        if not wait_for_screen(master, "Git push", 10.0, transcript, args.width, args.height):
             missing.append("git push picker")
         pump(master, 0.2, transcript)
         push_picker = screen_text(transcript, args.width, args.height)
@@ -668,7 +670,7 @@ def main() -> int:
             missing.append("git push target selection")
         (evidence / "git-push-picker-screen.txt").write_text(push_picker + "\n")
         os.write(master, b"\r")
-        if not wait_for(master, "Push ·", 10.0, transcript):
+        if not wait_for_screen(master, "Push ·", 10.0, transcript, args.width, args.height):
             missing.append("git push confirm")
         pump(master, 0.2, transcript)
         push_confirm = screen_text(transcript, args.width, args.height)
@@ -678,7 +680,7 @@ def main() -> int:
         )
         (evidence / "git-push-confirm-screen.txt").write_text(push_confirm + "\n")
         os.write(master, b"\r")
-        if not wait_for(master, "pushed main to origin/main", 20.0, transcript):
+        if not wait_for_screen(master, "pushed main to origin/main", 20.0, transcript, args.width, args.height):
             missing.append("git push notice")
         pump(master, 0.3, transcript)
         (evidence / "git-pushed-screen.txt").write_text(
@@ -700,7 +702,7 @@ def main() -> int:
             missing.append("git push remote head")
 
         os.write(master, b"/git\r")
-        if not wait_for(master, "Git ·", 10.0, transcript):
+        if not wait_for_screen(master, "Git ·", 10.0, transcript, args.width, args.height):
             missing.append("git checks picker")
         pump(master, 0.2, transcript)
         for _ in range(4):
@@ -768,7 +770,7 @@ def main() -> int:
             ["git", "-C", workdir, "push", "-q", "origin", "feat/pr"], check=True
         )
         os.write(master, b"/git pr\r")
-        if not wait_for(master, "Pull request ·", 10.0, transcript):
+        if not wait_for_screen(master, "Pull request ·", 10.0, transcript, args.width, args.height):
             missing.append("git pull request confirmation")
         pump(master, 0.2, transcript)
         git_pr = screen_text(transcript, args.width, args.height)
@@ -857,7 +859,7 @@ def main() -> int:
         os.write(master, b"/files pmod rs:12\r")
         pump(master, 1.5, transcript)
         os.write(master, b"\x0f")
-        if not wait_for(master, "opened src/parser/mod.rs:12", 3.0, transcript):
+        if not wait_for_screen(master, "opened src/parser/mod.rs:12", 3.0, transcript, args.width, args.height):
             missing.append("files ctrl+o opened notice")
         pump(master, 0.5, transcript)
         editor_result = screen_text(transcript, args.width, args.height)
@@ -880,7 +882,7 @@ def main() -> int:
         os.write(master, b"/files pmod rs:12\r")
         pump(master, 1.5, transcript)
         os.write(master, b"\x0f")
-        if not wait_for(master, "editor failed:", 3.0, transcript):
+        if not wait_for_screen(master, "editor failed:", 3.0, transcript, args.width, args.height):
             missing.append("files ctrl+o editor failure notice")
         pump(master, 0.5, transcript)
         os.write(master, b"/status\r")
@@ -959,7 +961,7 @@ def main() -> int:
         os.write(master, b"/grep parse\r")
         pump(master, 1.5, transcript)
         os.write(master, b"\x0f")
-        if not wait_for(master, "opened src/parser/mod.rs:1", 3.0, transcript):
+        if not wait_for_screen(master, "opened src/parser/mod.rs:1", 3.0, transcript, args.width, args.height):
             missing.append("grep ctrl+o opened notice")
         pump(master, 0.5, transcript)
         grep_open_result = screen_text(transcript, args.width, args.height)

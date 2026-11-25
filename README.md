@@ -609,11 +609,13 @@ baton status [-t id] [--json]
 baton activity [-t id] [--json]
 baton turns [-t id] [--json]
 baton agents -t <thread-id> [--json]
-baton usage
+baton usage [--by day|model|provider]
 baton search <query> [--all] [--json]
 baton doctor [--json]
 baton ps [--json]
 ```
+
+`baton usage` prints one row per thread. `--by day` sums newest days first; `--by model` and `--by provider` sum alphabetically.
 
 ### 12.2 Turns and execution
 

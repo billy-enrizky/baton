@@ -17,7 +17,7 @@ use types::{
     TurnPhase,
 };
 use adapters::TurnEvent;
-use usage::{cache_hit_rate, format_usage_line, sum_usage};
+use usage::{cache_hit_rate, format_usage_line, group_usage, sum_usage, UsageGroup};
 
 fn main() {
     let started = Instant::now();
@@ -1695,8 +1695,33 @@ fn main_result(started: Instant) -> Result<()> {
             println!("restored {} to {}", thread.cwd, checkpoint.git_ref);
             Ok(())
         }
-        cli::Commands::Usage { thread_id } => {
+        cli::Commands::Usage { thread_id, by } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
+            if let Some(group) = by {
+                let filter = match &thread_id {
+                    Some(thread_id) => Some(resolve_thread(&store, thread_id)?.id),
+                    None => None,
+                };
+                let rows = store.list_usage(filter.as_deref())?;
+                if rows.is_empty() {
+                    println!("no usage yet");
+                    return Ok(());
+                }
+                let group = match group {
+                    cli::UsageGroupBy::Day => UsageGroup::Day,
+                    cli::UsageGroupBy::Model => UsageGroup::Model,
+                    cli::UsageGroupBy::Provider => UsageGroup::Provider,
+                };
+                for (key, totals) in group_usage(&rows, group) {
+                    println!(
+                        "{:<24} {:>3} turns  {}",
+                        key,
+                        totals.turns,
+                        format_usage_line(&totals)
+                    );
+                }
+                return Ok(());
+            }
             let resolved = resolve_config(&home, &cwd);
             let threads = match thread_id {
                 Some(thread_id) => vec![resolve_thread(&store, &thread_id)?],

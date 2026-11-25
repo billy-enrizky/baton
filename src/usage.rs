@@ -1,5 +1,6 @@
 use crate::store::UsageRow;
 use crate::types::TurnUsage;
+use std::collections::BTreeMap;
 
 pub fn cache_hit_rate(usage: &TurnUsage) -> Option<f64> {
     let total = usage.cache_read_tokens + usage.cache_creation_tokens + usage.input_tokens;
@@ -33,26 +34,74 @@ impl UsageTotals {
 }
 
 pub fn sum_usage(rows: &[UsageRow]) -> UsageTotals {
-    let mut totals = UsageTotals {
-        turns: rows.len(),
-        ..Default::default()
-    };
-    let mut saw_cost = false;
-    let mut cost_sum = 0.0f64;
+    let mut sum = UsageSum::default();
     for row in rows {
-        totals.input_tokens += row.usage.input_tokens;
-        totals.output_tokens += row.usage.output_tokens;
-        totals.cache_read_tokens += row.usage.cache_read_tokens;
-        totals.cache_creation_tokens += row.usage.cache_creation_tokens;
+        sum.add(row);
+    }
+    sum.finish()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageGroup {
+    Day,
+    Model,
+    Provider,
+}
+
+/// Totals per key. Days are newest first; model and provider keys are
+/// alphabetical so two runs of the same history print the same order.
+pub fn group_usage(rows: &[UsageRow], group: UsageGroup) -> Vec<(String, UsageTotals)> {
+    let mut groups: BTreeMap<String, UsageSum> = BTreeMap::new();
+    for row in rows {
+        let key = match group {
+            UsageGroup::Day => row.created_at.chars().take(10).collect::<String>(),
+            UsageGroup::Model => row
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .unwrap_or("unknown")
+                .to_string(),
+            UsageGroup::Provider => row.provider.as_str().to_string(),
+        };
+        groups.entry(key).or_default().add(row);
+    }
+    let mut grouped: Vec<(String, UsageTotals)> = groups
+        .into_iter()
+        .map(|(key, sum)| (key, sum.finish()))
+        .collect();
+    if group == UsageGroup::Day {
+        grouped.reverse();
+    }
+    grouped
+}
+
+#[derive(Debug, Default)]
+struct UsageSum {
+    totals: UsageTotals,
+    cost_sum: f64,
+    saw_cost: bool,
+}
+
+impl UsageSum {
+    fn add(&mut self, row: &UsageRow) {
+        self.totals.turns += 1;
+        self.totals.input_tokens += row.usage.input_tokens;
+        self.totals.output_tokens += row.usage.output_tokens;
+        self.totals.cache_read_tokens += row.usage.cache_read_tokens;
+        self.totals.cache_creation_tokens += row.usage.cache_creation_tokens;
         if let Some(cost) = row.usage.cost_usd {
-            saw_cost = true;
-            cost_sum += cost;
+            self.saw_cost = true;
+            self.cost_sum += cost;
         }
     }
-    if saw_cost {
-        totals.cost_usd = Some((cost_sum * 1e6).round() / 1e6);
+
+    fn finish(mut self) -> UsageTotals {
+        if self.saw_cost {
+            self.totals.cost_usd = Some((self.cost_sum * 1e6).round() / 1e6);
+        }
+        self.totals
     }
-    totals
 }
 
 pub fn format_token_count(tokens: i64) -> String {

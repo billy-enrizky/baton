@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::types::ProviderId;
 
@@ -257,6 +257,9 @@ pub enum Commands {
     /// Show token usage and cache hit rates
     Usage {
         thread_id: Option<String>,
+        /// Group the totals instead of printing one row per thread
+        #[arg(long, value_enum, value_name = "GROUP")]
+        by: Option<UsageGroupBy>,
     },
     /// Inspect orchestrator, planner, implementor, and reviewer roles
     Roles {
@@ -417,6 +420,13 @@ pub enum SecretCommand {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageGroupBy {
+    Day,
+    Model,
+    Provider,
 }
 
 #[derive(Subcommand, Clone)]

@@ -2126,3 +2126,152 @@ fn secret_check_reports_sources_without_printing_values() {
     assert_eq!(codex["key_present"], true);
     assert_eq!(codex["key_variable"], "BATON_TEST_SECRET_CLI_KEY");
 }
+
+fn usage_row(
+    thread_id: &str,
+    turn: i64,
+    provider: ProviderId,
+    model: Option<&str>,
+    created_at: &str,
+    input: i64,
+    output: i64,
+    cache_read: i64,
+    cost: Option<f64>,
+) -> baton::store::UsageRow {
+    baton::store::UsageRow {
+        thread_id: thread_id.to_string(),
+        turn,
+        provider,
+        model: model.map(str::to_string),
+        usage: TurnUsage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: cache_read,
+            cache_creation_tokens: 0,
+            cost_usd: cost,
+        },
+        created_at: created_at.to_string(),
+    }
+}
+
+#[test]
+fn group_usage_sums_days_models_and_providers() {
+    let rows = vec![
+        usage_row(
+            "t1",
+            1,
+            ProviderId::Codex,
+            Some("gpt-6.1-sol"),
+            "2026-11-24T10:00:00Z",
+            10,
+            2,
+            5,
+            Some(0.01),
+        ),
+        usage_row(
+            "t1",
+            2,
+            ProviderId::Codex,
+            Some("gpt-6.1-sol"),
+            "2026-11-25T10:00:00Z",
+            20,
+            4,
+            10,
+            Some(0.02),
+        ),
+        usage_row(
+            "t2",
+            1,
+            ProviderId::Claude,
+            None,
+            "2026-11-25T11:00:00Z",
+            30,
+            6,
+            15,
+            None,
+        ),
+    ];
+
+    let days = baton::usage::group_usage(&rows, baton::usage::UsageGroup::Day);
+    assert_eq!(days.len(), 2);
+    assert_eq!(days[0].0, "2026-11-25", "days are newest first");
+    assert_eq!(days[0].1.turns, 2);
+    assert_eq!(days[0].1.input_tokens, 50);
+    assert_eq!(days[0].1.cache_read_tokens, 25);
+    assert_eq!(days[0].1.cost_usd, Some(0.02));
+    assert_eq!(days[1].0, "2026-11-24");
+    assert_eq!(days[1].1.turns, 1);
+
+    let models = baton::usage::group_usage(&rows, baton::usage::UsageGroup::Model);
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0].0, "gpt-6.1-sol");
+    assert_eq!(models[0].1.turns, 2);
+    assert_eq!(models[0].1.cost_usd, Some(0.03));
+    assert_eq!(models[1].0, "unknown");
+
+    let providers = baton::usage::group_usage(&rows, baton::usage::UsageGroup::Provider);
+    assert_eq!(
+        providers
+            .iter()
+            .map(|(key, _)| key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["claude", "codex"]
+    );
+}
+
+#[test]
+fn usage_by_model_reads_recorded_history() {
+    let home = tempfile::tempdir().unwrap();
+    {
+        let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "usage thread".to_string(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .add_usage(
+                &thread.id,
+                1,
+                ProviderId::Codex,
+                Some("gpt-6.1-sol"),
+                &TurnUsage {
+                    input_tokens: 12,
+                    output_tokens: 3,
+                    cache_read_tokens: 6,
+                    cache_creation_tokens: 0,
+                    cost_usd: Some(0.01),
+                },
+            )
+            .unwrap();
+    }
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["usage", "--by", "model"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("gpt-6.1-sol"), "{stdout}");
+    assert!(stdout.contains("1 turns"), "{stdout}");
+    assert!(stdout.contains("in 18"), "{stdout}");
+
+    let rejected = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["usage", "--by", "fortnight"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(
+        String::from_utf8_lossy(&rejected.stderr).contains("invalid value"),
+        "{}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}

@@ -95,6 +95,7 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 | Provider approval choices and Antigravity questions | `scripts/approval_probe.py` | zero, fake ACP agent |
 | Codex user-input questions | `scripts/question_probe.py` | zero, fake Codex app-server |
 | MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, seeds an empty thread with `baton new` |
+| Command palette | `scripts/palette_probe.py` | zero |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |
 | Slash argument choices and completion | `scripts/slash_probe.py` | zero |
 | All 52 sweep cases across the registered slash commands | `scripts/slash_sweep.py` | zero |

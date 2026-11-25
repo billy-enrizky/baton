@@ -367,6 +367,8 @@ Published 2026-11-24 from tag `v0.4.1` at `afab876ca4390c5e29c6f5ad4562e6ab1ce19
 
 The tap formula pins the four Unix archives to these values. The v0.4.1 Homebrew binary and the v0.4.1 curl install both passed the PTY slash probe.
 
+Installed performance on the 0.4.1 Homebrew binary: typing p50 7.9 ms and p95 8.0 ms, `/` suggestion p50 0.7 ms and p95 0.9 ms, and process start p50 20.5 ms on a 13.9 ms control spawn (ratio 1.34 against the 1.36 baseline). `startup.store` at 0.52 ms and slash p50 at 0.7 ms exceed the recorded 0.32 ms and 0.35 ms baselines. The 0.4.0 and 0.4.1 binaries measure the same values and the process ratio is flat, so the sub-millisecond baselines need a fresh host record or a wider absolute slack. That decision is open.
+
 ## Review record
 
 The EGM Goldfish loop used two reviewers: Hypatia as design critic and Raman as structural reviewer. Round 1 found the unsupported complete-archive claim and mixed measurement definitions. Rounds 2 through 4 found and fixed wrong Verify endpoints, retry handling, Rust and meta sample mixing, and percentile reporting inconsistencies. Round 7 caught an out-of-date-base run that the classifier labeled `unknown`; it was removed rather than counted as meta. Rounds 8 and 9 reported no Blocker or Major findings. Rounds 10 and 11 reviewed the ARM runner proposal with four fresh reviewers. They found test-step and job-duration conflation, mixed PR-feedback and job-duration metrics, and a blocker: an ARM-only PR Test job would remove Linux x64 runtime coverage from the pre-merge gate while merge queue is unavailable. The proposal was rejected and the x64 Test job retained.

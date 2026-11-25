@@ -127,6 +127,16 @@ if [[ $code -eq 0 ]] || ! grep -q 'ERROR: CI013 job check wiring changed' <<< "$
 fi
 
 set +e
+output=$(bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/verify-drops-live-job.yml" --allow-change 2>&1)
+code=$?
+set -e
+if [[ $code -eq 0 ]] || ! grep -q 'ERROR: CI005 verify is missing needs: debt' <<< "$output"; then
+  echo "verify stopped requiring a job that still exists" >&2
+  printf '%s\n' "$output" >&2
+  exit 1
+fi
+
+set +e
 output=$(bash "$root/check-ci.sh" --base "$valid" "$root/fixtures/check-ci/invalid-allow-change-missing-command.yml" --allow-change 2>&1)
 code=$?
 set -e

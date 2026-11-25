@@ -1,11 +1,11 @@
 ---
 name: verify-baton
-description: "Drive baton's Rust CLI, TUI, and MCP stdio server through isolated state and prove user-visible behavior. Use after changing slash commands, adapter lifecycle/status, doctor, fork, queue, review, rewind, steering, paste, greeting, MCP tools, turn phases, or any TUI rendering. Also use when a provider readiness or process-leak claim needs live evidence."
+description: "Drive baton's Rust CLI, TUI, and MCP stdio server through isolated state and prove user-visible behavior. Use after changing slash commands, adapter lifecycle/status, doctor, fork, queue, review, rewind, steering, paste, greeting, subagent rows, git review or merge, auto-review, MCP tools, turn phases, or any TUI rendering. Also use when a provider readiness or process-leak claim needs live evidence."
 ---
 
 # Verify baton
 
-Baton is a terminal app, so the proof is a terminal transcript, not a unit test alone. This skill builds the debug binary once, starts each drive in its own PTY with a temporary `BATON_HOME` and working directory, captures a full screen after forcing a redraw, and preserves the evidence.
+Baton is a terminal app, so the proof is a terminal transcript, not a unit test alone. This skill builds the debug binary once, starts each drive in its own PTY with a temporary `BATON_HOME` and working directory, captures a full screen after forcing a redraw, and preserves the evidence. It also runs the 50-command slash sweep, the hermetic MCP probe, and the installed-binary check after a release.
 
 ## Launch
 
@@ -92,9 +92,10 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 | TUI native rewind (`/rewind --native`) | `scripts/rewind_probe.py` | zero, uses the OpenCode 401 fixture |
 | Retry a failed turn (`/retry`) | `scripts/retry_probe.py` | zero, uses a fake Claude harness |
 | Greeting in default orchestrate mode | `scripts/greeting_probe.py` | one small Codex turn |
-| MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, uses the OpenCode 401 seed |
+| MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, seeds an empty thread with `baton new` |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |
 | Slash argument choices and completion | `scripts/slash_probe.py` | zero |
+| All 50 advertised slash commands | `scripts/slash_sweep.py` | zero |
 | All advertised harnesses with ICA or an explicit account block | `scripts/harness_matrix_probe.py` | four small ICA turns; the live Claude turn is opt-in and Cursor is capability-only |
 
 Every probe accepts `--binary` (default `~/.cargo/bin/baton`) and `--evidence-dir`. To run it against a change before merge, pass `--binary target/debug/baton`.
@@ -107,28 +108,33 @@ Model-turn policy:
 
 ## State-machine gates
 
-Run every formal gate from the repository root:
+Run every formal gate from the repository root. Put a JDK 21 on `PATH` first; the Homebrew path on macOS is shown. The loop stops at the first failing gate so a red model cannot be mistaken for a pass.
 
 ```sh
+export PATH="/opt/homebrew/opt/openjdk@21/bin:$PATH"
 for d in local_docs/verification/*/; do
-  [ -f "$d/run.sh" ] && bash "$d/run.sh"
+  [ -f "$d/run.sh" ] && bash "$d/run.sh" || exit 1
 done
 ```
 
-A gate has a real config that must pass and at least one mutation that must fail. Read its `SKILL.md` before changing the flow it models.
+Keep the log under `local_docs/verification/evidence/formal-<sha>-<timestamp>.log`. A gate has a real config that must pass and at least one mutation that must fail. Read its `SKILL.md` before changing the flow it models.
 
 ## After merge
 
 Reinstall from the repository root, then run the installed binary through the journey you changed and check for leftovers:
 
 ```sh
-cargo install --path . --force
-~/.cargo/bin/baton ps --json
+cargo install --path . --force --locked
+installed=$(command -v baton)
+"$installed" --version
+"$installed" ps --json
 ```
+
+Run the installed binary by the path `command -v baton` returns, not a relative path. The cargo and Homebrew installs can differ; check the version and source commit before trusting a manual result.
 
 ## Feature map
 
-Start with `features/README.md`. Each file names the user path, the drive command, and the observable end state. Add a feature file when a new user-facing command or state is added; do not weaken a journey to make it pass.
+Start with `features/README.md`. Each file names the user path, the drive command, and the observable end state. The files for `/agents`, `/queue`, `/git review` and `/git merge`, `/auth <provider>`, `baton agents -t`, and `baton_agents` cover the surfaces added after the first feature map. Add a feature file when a new user-facing command or state is added; do not weaken a journey to make it pass.
 
 ## Gotchas
 

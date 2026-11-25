@@ -344,6 +344,13 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | v0.4.2 Homebrew formula | Tap commit `1fa3223`, `brew audit --strict --online`, upgrade, `brew test`, version 0.4.2 | Passed 2026-11-25 |
 | v0.4.2 curl install | Local `install.sh` with `BATON_VERSION=v0.4.2` into a clean `bin`, `baton 0.4.2`, no source fallback | Passed 2026-11-25 |
 | v0.4.2 installed feature smoke | PTY question probe passed against the Homebrew, Cargo, and curl binaries; slash probe and 50-command sweep passed against the Homebrew binary; focused `/auth` and `/model` probes passed | Passed 2026-11-25 |
+| v0.4.3 version bump | PR #252, PR run 45563560971 and main push 45563774098: full suite, Test passed | Passed 2026-11-25 |
+| v0.4.3 release assets and checksums | Release run [45563843655](https://github.com/billy-enrizky/baton/actions/runs/45563843655), tag `v0.4.3`, five archives plus `SHA256SUMS`; all five sums verified | Passed 2026-11-25 |
+| v0.4.3 immutable latest release | `isDraft=false`, `isPrerelease=false`, `isImmutable=true`, `releases/latest=v0.4.3` | Passed 2026-11-25 |
+| v0.4.3 Homebrew formula | Tap commit `ab46981`, `brew audit --strict --online`, upgrade, `brew test`, version 0.4.3 | Passed 2026-11-25 |
+| v0.4.3 curl install | Local `install.sh` with `BATON_VERSION=v0.4.3` into a clean `bin`, `baton 0.4.3`, no source fallback | Passed 2026-11-25 |
+| v0.4.3 installed feature smoke | Homebrew 0.4.3 passed the slash probe, the 50-command sweep, the Codex question probe, and the Antigravity approval plus question probe; the Cargo 0.4.3 binary passed the slash probe | Passed 2026-11-25 |
+| v0.4.3 formal gates | All 15 suites at `da9f3ef`; log `local_docs/verification/evidence/formal-da9f3ef-20261125-014211.log` | Passed 2026-11-25 |
 
 ## v0.4.0 release assets
 
@@ -386,6 +393,20 @@ Published 2026-11-25 from tag `v0.4.2` at `21c1b739788d5c8989928c2a526f6981fc585
 | `baton-x86_64-unknown-linux-gnu.tar.gz` | `989743557881ef706f2fdb1e87532be04707a54d5a72b4b1980e3b42fc9be2ae` |
 
 The tap formula pins the four Unix archives to these values. The v0.4.2 Homebrew, Cargo, and curl binaries all passed the PTY question probe; the Homebrew binary passed the slash probe and the 50-command sweep.
+
+## v0.4.3 release assets
+
+Published 2026-11-25 from tag `v0.4.3` at `662bc0421139acca1110e1ddd51df61f6500281d`.
+
+| Asset | SHA-256 |
+|---|---|
+| `baton-aarch64-apple-darwin.tar.gz` | `27d5ace85d7f889004b20741baf98c0ea8aa56e0b739deee61075eeed5fa95c4` |
+| `baton-aarch64-unknown-linux-gnu.tar.gz` | `356e52ebb933e8ed721e16d36552549dbd2126ba45637b5be91b06ec043c8dd2` |
+| `baton-x86_64-apple-darwin.tar.gz` | `e2857e3f49344e3d3be69bd96f4f1cdce5a53f73572daea9f4ee6599aea05cd8` |
+| `baton-x86_64-pc-windows-msvc.zip` | `baccad9530ebc05c81a0b8fbface9ad0e1987a8468fe9476b5037951333cf966` |
+| `baton-x86_64-unknown-linux-gnu.tar.gz` | `00622e3396bd8ad36114ef23a567021c99806f6cd5337ed48f4b09cda0b9ffa4` |
+
+The tap formula pins the four Unix archives to these values. The Homebrew 0.4.3 binary passed the slash probe, the 50-command sweep, the Codex question probe, and the Antigravity approval plus question probe. The Cargo 0.4.3 binary passed the slash probe. The curl 0.4.3 install reported `baton 0.4.3`.
 
 Installed performance on the 0.4.1 Homebrew binary: typing p50 7.9 ms and p95 8.0 ms, `/` suggestion p50 0.7 ms and p95 0.9 ms, and process start p50 20.5 ms on a 13.9 ms control spawn (ratio 1.34 against the 1.36 baseline). `startup.store` at 0.52 ms and slash p50 at 0.7 ms exceed the recorded 0.32 ms and 0.35 ms baselines. The 0.4.0 and 0.4.1 binaries measure the same values and the process ratio is flat, so the sub-millisecond baselines need a fresh host record or a wider absolute slack. That decision is open.
 

@@ -8,6 +8,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use crate::config::resolve_config;
@@ -801,7 +802,10 @@ fn run_planner(
             }
         };
         if std::env::var_os("BATON_ORCHESTRATE_DEBUG").is_some() {
-            eprintln!("[orchestrate] planner text (attempt {}): {text}", attempt + 1);
+            eprintln!(
+                "[orchestrate] planner text (attempt {}): {text}",
+                attempt + 1
+            );
         }
         match parse_plan(&text, max_tasks)
             .and_then(|plan| validate_plan_providers(&plan, available).map(|()| plan))
@@ -900,6 +904,155 @@ struct WorkerFallback {
     model: String,
     effort: Option<String>,
     prompt: String,
+}
+
+/// The terminal state of one task as seen by the dependency gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionState {
+    Waiting,
+    Running,
+    Completed,
+    /// The worker ran and did not complete.
+    Failed,
+    /// The worker never ran: a dependency did not complete, or the run was
+    /// cancelled first.
+    Skipped,
+}
+
+impl AdmissionState {
+    fn settled(self) -> bool {
+        matches!(
+            self,
+            AdmissionState::Completed | AdmissionState::Failed | AdmissionState::Skipped
+        )
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Admission {
+    Start,
+    /// A dependency reached a terminal state without completing.
+    Blocked {
+        dependency: String,
+        status: AdmissionState,
+    },
+    Cancelled,
+}
+
+/// Admits a plan task only once every task it depends on has completed.
+///
+/// The plan is validated before a run starts, so the dependency graph is
+/// acyclic and some waiting task always becomes admissible. A task whose
+/// dependency failed or was skipped never starts, because the base it was
+/// planned against would be missing that work.
+struct AdmissionGate {
+    dependencies: Vec<Vec<usize>>,
+    ids: Vec<String>,
+    states: Mutex<Vec<AdmissionState>>,
+    ready: Condvar,
+}
+
+impl AdmissionGate {
+    fn new(plan: &Plan) -> AdmissionGate {
+        AdmissionGate {
+            dependencies: (0..plan.tasks.len())
+                .map(|index| plan_task_dependencies(plan, index))
+                .collect(),
+            ids: (0..plan.tasks.len())
+                .map(|index| plan_task_id(&plan.tasks[index], index))
+                .collect(),
+            states: Mutex::new(vec![AdmissionState::Waiting; plan.tasks.len()]),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn admit(&self, index: usize, cancel: Option<&AtomicBool>) -> Admission {
+        let mut states = self.states.lock().unwrap();
+        loop {
+            if is_cancelled(cancel) {
+                states[index] = AdmissionState::Skipped;
+                self.ready.notify_all();
+                return Admission::Cancelled;
+            }
+            let mut waiting_on = None;
+            for dependency in &self.dependencies[index] {
+                match states[*dependency] {
+                    AdmissionState::Completed => {}
+                    state if state.settled() => {
+                        states[index] = AdmissionState::Skipped;
+                        self.ready.notify_all();
+                        return Admission::Blocked {
+                            dependency: self.ids[*dependency].clone(),
+                            status: state,
+                        };
+                    }
+                    _ => {
+                        waiting_on = Some(*dependency);
+                        break;
+                    }
+                }
+            }
+            if waiting_on.is_none() {
+                states[index] = AdmissionState::Running;
+                return Admission::Start;
+            }
+            states = self.ready.wait(states).unwrap();
+        }
+    }
+
+    /// Records the outcome so waiting dependents can move. A task that was
+    /// never admitted is left alone, so a cancelled or blocked task cannot
+    /// overwrite its own skip.
+    fn settle(&self, index: usize, completed: bool) {
+        let mut states = self.states.lock().unwrap();
+        if states[index] == AdmissionState::Running {
+            states[index] = if completed {
+                AdmissionState::Completed
+            } else {
+                AdmissionState::Failed
+            };
+        }
+        self.ready.notify_all();
+    }
+
+    /// Releases dependents after a worker thread panicked without reporting.
+    fn abandon(&self, index: usize) {
+        let mut states = self.states.lock().unwrap();
+        if !states[index].settled() {
+            states[index] = AdmissionState::Skipped;
+        }
+        self.ready.notify_all();
+    }
+}
+
+/// A task that never ran because a dependency did not complete.
+fn blocked_worker(fallback: &WorkerFallback, status: &str, error: String) -> (usize, WorkerResult) {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    (
+        fallback.index,
+        WorkerResult {
+            review_status: None,
+            review_text: None,
+            reviewed_at: None,
+            id: uuid::Uuid::new_v4().to_string(),
+            title: fallback.title.clone(),
+            provider: fallback.provider,
+            model: fallback.model.clone(),
+            effort: fallback.effort.clone(),
+            prompt: fallback.prompt.clone(),
+            worktree: None,
+            snapshot: None,
+            commit: None,
+            thread_id: None,
+            status: status.to_string(),
+            text: None,
+            error: Some(error),
+            pr_url: None,
+            merged_at: None,
+            created_at: now.clone(),
+            finished_at: now,
+        },
+    )
 }
 
 fn panicked_worker(fallback: &WorkerFallback) -> (usize, WorkerResult) {
@@ -2642,6 +2795,7 @@ fn run_with_worker_bin_and_progress(
             tasks: plan.tasks.clone(),
         },
     );
+    let gate = AdmissionGate::new(&plan);
     let mut results = std::thread::scope(|scope| {
         let handles = plan
             .tasks
@@ -2665,21 +2819,71 @@ fn run_with_worker_bin_and_progress(
                 let worker_bin = worker_bin.map(Path::to_path_buf);
                 let implementor_prompt = implementor_prompt.clone();
                 let worker_snapshot = repo_snapshot.as_ref();
-                let handle = scope.spawn(move || {
-                    run_worker(
-                        task,
-                        index,
-                        &run_id,
-                        &home,
-                        &cwd,
-                        Some(repo_root.as_path()),
-                        worker_snapshot,
-                        worker_bin.as_deref(),
-                        &implementor_prompt,
-                        progress,
-                        cancel,
-                        permission_mode,
-                    )
+                let gate = &gate;
+                let gate_fallback = WorkerFallback {
+                    index: fallback.index,
+                    title: fallback.title.clone(),
+                    provider: fallback.provider,
+                    model: fallback.model.clone(),
+                    effort: fallback.effort.clone(),
+                    prompt: fallback.prompt.clone(),
+                };
+                let handle = scope.spawn(move || match gate.admit(index, cancel) {
+                    Admission::Start => {
+                        let result = run_worker(
+                            task,
+                            index,
+                            &run_id,
+                            &home,
+                            &cwd,
+                            Some(repo_root.as_path()),
+                            worker_snapshot,
+                            worker_bin.as_deref(),
+                            &implementor_prompt,
+                            progress,
+                            cancel,
+                            permission_mode,
+                        );
+                        gate.settle(index, result.1.status == "completed");
+                        result
+                    }
+                    Admission::Blocked { dependency, status } => {
+                        let error = if status == AdmissionState::Skipped {
+                            format!("not run: task {dependency} was skipped")
+                        } else {
+                            format!("not run: task {dependency} did not complete")
+                        };
+                        let result = blocked_worker(&gate_fallback, "skipped", error);
+                        emit(
+                            progress,
+                            OrchestrationProgress::WorkerFinished {
+                                index: index + 1,
+                                title: result.1.title.clone(),
+                                status: result.1.status.clone(),
+                                commit: None,
+                                error: result.1.error.clone(),
+                            },
+                        );
+                        result
+                    }
+                    Admission::Cancelled => {
+                        let result = blocked_worker(
+                            &gate_fallback,
+                            "cancelled",
+                            "cancelled before its dependencies finished".to_string(),
+                        );
+                        emit(
+                            progress,
+                            OrchestrationProgress::WorkerFinished {
+                                index: index + 1,
+                                title: result.1.title.clone(),
+                                status: result.1.status.clone(),
+                                commit: None,
+                                error: result.1.error.clone(),
+                            },
+                        );
+                        result
+                    }
                 });
                 (handle, fallback)
             })
@@ -2689,6 +2893,7 @@ fn run_with_worker_bin_and_progress(
             .map(|(handle, fallback)| match handle.join() {
                 Ok(result) => result,
                 Err(_) => {
+                    gate.abandon(fallback.index);
                     let (index, result) = panicked_worker(&fallback);
                     emit(
                         progress,
@@ -3130,6 +3335,7 @@ pub struct ReconciledRun {
     pub failed_tasks: usize,
     pub cancelled_tasks: usize,
     pub needs_input_tasks: usize,
+    pub skipped_tasks: usize,
 }
 
 /// A run whose orchestrator process is gone can never finish on its own.
@@ -3153,8 +3359,15 @@ pub fn reconcile_abandoned_runs(store: &BatonStore) -> Result<Vec<ReconciledRun>
         let tasks = store.list_orchestration_tasks(&run.id)?;
         let completed_tasks = tasks.iter().filter(|task| task.status == "completed").count();
         let failed_tasks = tasks.iter().filter(|task| task.status == "failed").count();
-        let cancelled_tasks = tasks.iter().filter(|task| task.status == "cancelled").count();
-        let needs_input_tasks = tasks.iter().filter(|task| task.status == "needs_input").count();
+        let cancelled_tasks = tasks
+            .iter()
+            .filter(|task| task.status == "cancelled")
+            .count();
+        let needs_input_tasks = tasks
+            .iter()
+            .filter(|task| task.status == "needs_input")
+            .count();
+        let skipped_tasks = tasks.iter().filter(|task| task.status == "skipped").count();
         let status = if cancelled_tasks > 0 {
             "cancelled"
         } else if needs_input_tasks > 0 {
@@ -3174,6 +3387,7 @@ pub fn reconcile_abandoned_runs(store: &BatonStore) -> Result<Vec<ReconciledRun>
             failed_tasks,
             cancelled_tasks,
             needs_input_tasks,
+            skipped_tasks,
         });
     }
     Ok(reconciled)
@@ -3317,6 +3531,104 @@ mod tests {
         let json = serde_json::to_string(&plan).unwrap();
         assert!(!json.contains("dependsOn"), "{json}");
         assert!(!json.contains("\"id\""), "{json}");
+    }
+
+    /// A worker that records which task ran, in order, and can be told to fail.
+    fn order_log(home: &std::path::Path) -> String {
+        home.join("order.log").to_string_lossy().to_string()
+    }
+
+    fn read_order(home: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(home.join("order.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn a_dependent_task_starts_only_after_its_dependency_completes() {
+        let body = r#"for a in "$@"; do last="$a"; done
+case "$last" in
+  *MARKER_ALPHA*) sleep 0.3; printf 'slow\n' >> "$BATON_HOME/order.log" ;;
+  *MARKER_BETA*) printf 'fast\n' >> "$BATON_HOME/order.log" ;;
+esac"#;
+        // "fast" is listed first so it would win the race without a gate.
+        let plan = r#"{"tasks":[
+            {"id":"fast","title":"fast","provider":"codex","prompt":"MARKER_BETA","dependsOn":["slow"]},
+            {"id":"slow","title":"slow","provider":"codex","prompt":"MARKER_ALPHA"}]}"#;
+        let (_repo, home, _store, report) = run_fixture(plan, body);
+        assert_eq!(
+            read_order(home.path()),
+            vec!["slow".to_string(), "fast".to_string()],
+            "a dependent must not start before its dependency finishes"
+        );
+        assert_eq!(report.status, "completed");
+        assert_eq!(
+            report.tasks.iter().filter(|task| task.status == "completed").count(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_task_whose_dependency_failed_is_skipped_without_running() {
+        let body = r#"for a in "$@"; do last="$a"; done
+case "$last" in
+  *MARKER_BROKEN*)
+    printf 'broken\n' >> "$BATON_HOME/order.log"
+    printf '%s\n' '{"schema_version":1,"thread_id":"fake-thread","ok":false,"phase":"failed","error":"boom","text":null}'
+    exit 0 ;;
+  *MARKER_AFTER*)
+    printf 'after\n' >> "$BATON_HOME/order.log" ;;
+esac"#;
+        let plan = r#"{"tasks":[
+            {"id":"broken","title":"broken","provider":"codex","prompt":"MARKER_BROKEN"},
+            {"id":"after","title":"after","provider":"codex","prompt":"MARKER_AFTER","dependsOn":["broken"]},
+            {"id":"downstream","title":"downstream","provider":"codex","prompt":"MARKER_DOWNSTREAM","dependsOn":["after"]}]}"#;
+        let (_repo, home, store, report) = run_fixture(plan, body);
+        assert_eq!(
+            read_order(home.path()),
+            vec!["broken".to_string()],
+            "neither the dependent nor its own dependent may run"
+        );
+        let statuses: Vec<&str> = report
+            .tasks
+            .iter()
+            .map(|task| task.status.as_str())
+            .collect();
+        assert_eq!(statuses, vec!["failed", "skipped", "skipped"]);
+        assert_eq!(
+            report.tasks[1].error.as_deref(),
+            Some("not run: task broken did not complete")
+        );
+        assert_eq!(
+            report.tasks[2].error.as_deref(),
+            Some("not run: task after was skipped"),
+            "a transitive skip names the task it waited on"
+        );
+        assert_ne!(
+            report.status, "completed",
+            "a skipped task cannot look like success"
+        );
+        let rows = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert_eq!(rows[1].status, "skipped");
+    }
+
+    #[test]
+    fn a_plan_without_dependencies_still_runs_every_task() {
+        let body = r#"for a in "$@"; do last="$a"; done
+case "$last" in
+  *MARKER_ALPHA*) sleep 0.1; printf 'one\n' >> "$BATON_HOME/order.log" ;;
+  *MARKER_BETA*) printf 'two\n' >> "$BATON_HOME/order.log" ;;
+esac"#;
+        let plan = r#"{"tasks":[
+            {"title":"one","provider":"codex","prompt":"MARKER_ALPHA"},
+            {"title":"two","provider":"codex","prompt":"MARKER_BETA"}]}"#;
+        let (_repo, home, _store, report) = run_fixture(plan, body);
+        let mut order = read_order(home.path());
+        order.sort();
+        assert_eq!(order, vec!["one".to_string(), "two".to_string()]);
+        assert_eq!(report.status, "completed");
     }
 
     #[cfg(unix)]

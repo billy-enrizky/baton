@@ -3,6 +3,7 @@
 ## Sub-features
 - Codex `item/tool/requestUserInput` becomes a question overlay instead of an unhandled server request.
 - Claude Code's `AskUserQuestion` tool arrives as a `can_use_tool` control request. Its `questions` array becomes the same overlay, and the answer is returned as an `allow` result carrying `updatedInput.answers` keyed by question text.
+- OpenCode 2 sends a `form.created` event mid-turn. Its fields become the same overlay, the reply posts to `/api/session/{session}/form/{form}/reply` with an `answer` map, and a dismissed or unanswerable form is cancelled on the same route.
 - Grok ACP `x.ai/ask_user_question` and `_x.ai/ask_user_question` requests use the same overlay. A question without options gets an `OK` row, and answers are keyed by the question text in the xAI response.
 - A provider question with `multiSelect` renders checkboxes. Space toggles the highlighted option, Enter submits every checked label in option order, and an empty selection does not submit.
 - Antigravity sends user input as `session/request_permission` with a `toolCallId` that starts with `interaction_`. Those requests use the question overlay, show the provider option labels, and return the selected `optionId`; ordinary permission requests still use the approval overlay.
@@ -22,7 +23,9 @@ Run a Codex turn that asks a clarifying question, for example from Plan mode or 
 `TurnEvent::QuestionRequest` carries `QuestionPrompt` values and a responder for `Vec<QuestionAnswer>`. Claude `question_control_response` parses `questions`, `options`, and `multiSelect`, emits the overlay, and answers `question_response`, which keys each answer by the question text and joins a multi-select answer into one comma-separated string; a dismissed question denies the tool because an `allow` with no answers would hand the model an empty result. Codex `handle_user_input_request` parses `questions`, `options`, `isOther`, `isSecret`, and an optional `multiSelect`, then `question_response` builds the native `{answers:{id:{answers:[...]}}}` result. ACP uses `handle_question_request` for both Grok and Antigravity: Grok builds the xAI text-keyed response, while Antigravity maps the answered label back to exactly one provider `optionId` and refuses an ambiguous or unknown label. The TUI stores a `QuestionState` per request, walks `index`, and `finish_question_answers` either advances to the next question or sends the batch. `question_key` handles the option cursor, Space toggles, and the custom input; `question_selected_labels` preserves display order; `draw_question` renders checkboxes, the header, wrapped question, options, custom row, and description.
 
 ## Gotchas
-- Codex, Claude, Grok, and Antigravity emit this event today. OpenCode still needs its own mapping.
+- Codex, Claude, Grok, Antigravity, and OpenCode 2 emit this event today.
+- An OpenCode form field that depends on another field through `when`, an `external` field, and a hidden field are not offered, because Baton cannot evaluate or fill them. A field with no answerable content makes the whole form cancelled instead of pending, so the turn cannot hang.
+- An OpenCode `multiselect` field answers with an array and every other field answers with one string, matching the form's own `Form.Value` union. A `boolean` field has no options in the schema, so the overlay offers Yes and No.
 - Claude offers only the labels it sent, so its questions carry no custom row unless the option list is empty. Claude keys its answers by question text, so a prompt id is the question text, trimmed.
 - The overlay shows six options at a time and keeps the selected row in the window. The Other row is always last.
 - A child thread id is shortened to eight characters in the header.

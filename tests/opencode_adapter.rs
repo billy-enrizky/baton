@@ -103,6 +103,13 @@ fn respond(
                 .push((path.to_string(), body.to_string()));
             respond_json(&mut stream, "200 OK", r#"{"data":{"id":"msg_1"}}"#)
         }
+        "/api/session/ses_test/form/frm_1/reply" => {
+            requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.to_string()));
+            respond_json(&mut stream, "204 No Content", "")
+        }
         "/api/session/ses_test/interrupt" => {
             requests
                 .lock()
@@ -579,4 +586,282 @@ async fn opencode_adapter_stages_and_commits_a_history_only_revert() {
         "a failed stage clears the pending revert"
     );
     adapter.dispose().await.unwrap();
+}
+
+/// A server that asks one OpenCode 2 form mid-turn and reports what the adapter
+/// posts back. The form shape and the reply route come from the server's own
+/// `Form.Info` schema and `/api/session/:sessionID/form/:formID` routes.
+fn serve_opencode_with_form(listener: std::net::TcpListener, requests: Requests) {
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { break };
+        let requests = requests.clone();
+        std::thread::spawn(move || handle_form_connection(stream, &requests));
+    }
+}
+
+fn handle_form_connection(mut stream: std::net::TcpStream, requests: &Requests) {
+    let mut buffer = [0u8; 8192];
+    let mut head = Vec::new();
+    loop {
+        let read = match stream.read(&mut buffer) {
+            Ok(0) | Err(_) => return,
+            Ok(read) => read,
+        };
+        head.extend_from_slice(&buffer[..read]);
+        if let Some(header_end) = find_header_end(&head) {
+            let mut request = head.split_off(header_end);
+            let head_text = String::from_utf8_lossy(&head).to_string();
+            let content_length = head_text
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map(|value| value.trim().parse::<usize>().unwrap_or(0))
+                .unwrap_or(0);
+            while request.len() < content_length {
+                let read = match stream.read(&mut buffer) {
+                    Ok(0) | Err(_) => return,
+                    Ok(read) => read,
+                };
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let line = head_text.lines().next().unwrap_or("");
+            let mut parts = line.split(' ');
+            let method = parts.next().unwrap_or("").to_string();
+            let path = parts.next().unwrap_or("").to_string();
+            let body =
+                String::from_utf8_lossy(&request[..content_length.min(request.len())]).to_string();
+            respond_form(stream, &method, &path, requests, &body);
+            return;
+        }
+    }
+}
+
+fn respond_form(
+    mut stream: std::net::TcpStream,
+    method: &str,
+    path: &str,
+    requests: &Requests,
+    body: &str,
+) {
+    let respond_json = |stream: &mut std::net::TcpStream, status: &str, body: &str| {
+        let response = format!(
+            "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    };
+    match (method, path) {
+        ("GET", "/api/info") => respond_json(&mut stream, "200 OK", r#"{"version":"2.0.18"}"#),
+        ("GET", "/api/model") | ("GET", _) if path.starts_with("/api/model") => respond_json(
+            &mut stream,
+            "200 OK",
+            r#"{"data":[{"providerID":"p","id":"m"}]}"#,
+        ),
+        ("POST", "/api/session") => {
+            respond_json(&mut stream, "200 OK", r#"{"data":{"id":"ses_test"}}"#)
+        }
+        ("POST", "/api/session/ses_test/prompt") => {
+            respond_json(&mut stream, "200 OK", r#"{"data":{"id":"msg_1"}}"#)
+        }
+        ("GET", "/api/event") => {
+            let headers =
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+            if stream.write_all(headers.as_bytes()).is_err() {
+                return;
+            }
+            let send = |stream: &mut std::net::TcpStream, frame: &Value| {
+                let payload = format!("data: {}\n\n", serde_json::to_string(frame).unwrap());
+                let _ = stream.write_all(payload.as_bytes());
+                let _ = stream.flush();
+            };
+            send(
+                &mut stream,
+                &json!({
+                    "type": "form.created",
+                    "data": { "form": {
+                        "id": "frm_1",
+                        "sessionID": "ses_test",
+                        "title": "Questions",
+                        "fields": [
+                            {
+                                "key": "q0",
+                                "title": "Color preference",
+                                "description": "Which color do you prefer?",
+                                "type": "multiselect",
+                                "options": [
+                                    { "value": "Red", "label": "Red", "description": "Choose red" },
+                                    { "value": "Blue", "label": "Blue" }
+                                ]
+                            },
+                            {
+                                "key": "q1",
+                                "title": "Ship now?",
+                                "type": "boolean"
+                            }
+                        ]
+                    } }
+                }),
+            );
+            // Hold the stream open until the reply lands so the adapter's turn
+            // cannot finish before the assertion can see it.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let answered = requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(request_path, _)| request_path.contains("/form/frm_1"));
+                if answered || std::time::Instant::now() > deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            send(
+                &mut stream,
+                &json!({"type": "session.next.text.ended", "data": {"sessionID": "ses_test", "text": "answered"}}),
+            );
+            send(
+                &mut stream,
+                &json!({"type": "session.next.step.ended", "data": {"sessionID": "ses_test", "finish": "stop", "tokens": {"input": 1, "output": 1, "reasoning": 0, "cache": {"read": 0, "write": 0}}}}),
+            );
+        }
+        ("POST", path) if path.contains("/form/") => {
+            requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.to_string()));
+            respond_json(&mut stream, "204 No Content", "")
+        }
+        ("DELETE", path) if path.contains("/form/") => {
+            requests
+                .lock()
+                .unwrap()
+                .push((path.to_string(), body.to_string()));
+            respond_json(&mut stream, "204 No Content", "")
+        }
+        _ => respond_json(&mut stream, "404 Not Found", "{}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opencode_adapter_answers_a_v2_form_through_the_reply_route() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let requests_for_server = requests.clone();
+    std::thread::spawn(move || serve_opencode_with_form(listener, requests_for_server));
+
+    let spawner: OpenCodeSpawner = Arc::new(move |_auth_env: &[(String, String)]| {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .spawn()?;
+        Ok(OpenCodeChild {
+            port,
+            password: "pw".to_string(),
+            child,
+        })
+    });
+    let mut adapter = OpenCodeAdapter::new(spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let turn = tokio::spawn(async move {
+        adapter
+            .start_turn(
+                baton::adapters::TurnStartInput {
+                    turn: 1,
+                    thread_id: "baton-thread".into(),
+                    cwd: "/work".into(),
+                    model: "p/m".into(),
+                    effort: None,
+                    prompt: "ask me".into(),
+                    permission_mode: PermissionMode::Default,
+                    auth_env: vec![],
+                },
+                None,
+                event_sender,
+            )
+            .await
+            .unwrap();
+    });
+
+    let question = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            while let Ok(event) = event_receiver.try_recv() {
+                if let baton::adapters::TurnEvent::QuestionRequest {
+                    id,
+                    questions,
+                    respond,
+                } = event
+                {
+                    return (id, questions, respond);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a form becomes a question request");
+    assert_eq!(question.0, "opencode:frm_1");
+    assert_eq!(question.1.len(), 2);
+    assert_eq!(question.1[0].id, "q0");
+    assert!(question.1[0].multi_select);
+    assert_eq!(question.1[1].id, "q1");
+    assert_eq!(
+        question.1[1]
+            .options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Yes", "No"]
+    );
+    question
+        .2
+        .send(vec![
+            baton::types::QuestionAnswer {
+                id: "q0".into(),
+                answers: vec!["Blue".into(), "Red".into()],
+            },
+            baton::types::QuestionAnswer {
+                id: "q1".into(),
+                answers: vec!["Yes".into()],
+            },
+        ])
+        .unwrap();
+
+    tokio::time::timeout(Duration::from_secs(20), turn)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let reply = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let found = requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(path, _)| path.contains("/form/frm_1"))
+                .cloned();
+            if let Some(found) = found {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the adapter posted the form answer");
+    assert_eq!(
+        reply.0, "/api/session/ses_test/form/frm_1/reply",
+        "the reply goes to the session form route"
+    );
+    let body: Value = serde_json::from_str(&reply.1).unwrap();
+    assert_eq!(
+        body["answer"]["q0"],
+        json!(["Blue", "Red"]),
+        "a multiselect field answers with an array in option order"
+    );
+    assert_eq!(
+        body["answer"]["q1"], "Yes",
+        "a boolean field answers with one value"
+    );
 }

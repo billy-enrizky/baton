@@ -423,7 +423,9 @@ Published 2026-11-25 from tag `v0.4.3` at `662bc0421139acca1110e1ddd51df61f65002
 
 The tap formula pins the four Unix archives to these values. The Homebrew 0.4.3 binary passed the slash probe, the 50-command sweep, the Codex question probe, and the Antigravity approval plus question probe. The Cargo 0.4.3 binary passed the slash probe. The curl 0.4.3 install reported `baton 0.4.3`.
 
-Installed performance on the 0.4.1 Homebrew binary: typing p50 7.9 ms and p95 8.0 ms, `/` suggestion p50 0.7 ms and p95 0.9 ms, and process start p50 20.5 ms on a 13.9 ms control spawn (ratio 1.34 against the 1.36 baseline). `startup.store` at 0.52 ms and slash p50 at 0.7 ms exceed the recorded 0.32 ms and 0.35 ms baselines. The 0.4.0 and 0.4.1 binaries measure the same values and the process ratio is flat, so the sub-millisecond baselines need a fresh host record or a wider absolute slack. That decision is open.
+Installed performance on the 0.4.1 Homebrew binary: typing p50 7.9 ms and p95 8.0 ms, `/` suggestion p50 0.7 ms and p95 0.9 ms, and process start p50 20.5 ms on a 13.9 ms control spawn (ratio 1.34 against the 1.36 baseline).
+
+On 2026-11-25 the debug performance gates were re-recorded after a host-drift check. A transient control-spawn fluctuation failed the startup gate at ratio 1.58 while the absolute process time improved; the gate now repeats the whole sample three times. Typing and slash failed their 2026-11-24 baselines by roughly 25 percent, but an interleaved A/B with the 0.4.0 binary built at `0b899f2` measured the same 10.3 to 10.8 ms typing p50 and 2.57 to 2.61 ms slash p50, so the old baselines described a quieter host. The probes now collect 80 samples per run, repeat three times, and compare the minimum p50 and p95; the negative controls scaled to 70 percent of p50 and 50 percent of p95 still fail. `startup.store` at 0.52 ms and slash p50 at 0.7 ms exceed the recorded 0.32 ms and 0.35 ms baselines. The 0.4.0 and 0.4.1 binaries measure the same values and the process ratio is flat, so the sub-millisecond baselines need a fresh host record or a wider absolute slack. That decision is open.
 
 ## Review record
 

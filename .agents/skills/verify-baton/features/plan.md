@@ -35,7 +35,7 @@ Non-goals:
 
 The Codex and ACP adapters translate their native plan event to `TurnEvent::PlanUpdated`. Codex supplies `plan[].step`, `plan[].status`, and an optional explanation; its `inProgress` status is normalized to `in_progress`. ACP v2 supplies `plan_update` with an item list and stable `planId`, `plan_removed` carries that id, and the v1 `plan` frame remains a compatibility input. ACP entries supply `content`, `status`, and `priority`.
 
-The TUI keeps an in-memory snapshot per thread and provider. `/plan` reads only the snapshot for the visible thread and current harness, and an ACP removal clears a snapshot only when its plan id matches. Starting any new work from the thread (a turn, `/multi`, or orchestration) or rewinding the thread history clears that thread's snapshots, and a restart clears the map.
+The TUI keeps an in-memory snapshot per thread and provider. `/plan` reads only the snapshot for the visible thread and current harness, and an ACP removal clears a snapshot only when its plan id matches. New work clears the previous snapshots before the submit leaves the TUI; a later `TurnStarted` does not remove a plan already emitted by that turn. `/multi` and orchestration clear at their shared start paths, a rewind clears its completed thread, and a restart clears the map. ACP drain frames from another session are filtered before dispatch.
 
 The retention path covers events handled by the TUI process, including the in-process multi-provider children. Orchestration workers run as separate `baton exec` subprocesses, so their plan events are not forwarded to the parent TUI snapshot map yet.
 
@@ -56,14 +56,17 @@ The overlay is read-only. It does not change plan mode, send a provider message,
 | Risk | Mitigation |
 |---|---|
 | A provider sends control characters in step text, priority, or explanation | All three pass through `sanitize_terminal_text`; the status is normalized to a known vocabulary before rendering. |
-| A stale plan is shown after new work, rewind, thread switch, or harness switch | Starting a turn, `/multi`, or orchestration removes the visible thread's snapshots, as does applying a rewind. The thread id and provider must both match before `/plan` opens or the overlay draws. |
+| A stale plan is shown after new work, rewind, thread switch, or harness switch | The TUI removes the visible thread's snapshots before submitting a turn, at the `/multi` and orchestration start paths, and on rewind. A later `TurnStarted` does not clear a plan already emitted for that turn. The thread id and provider must both match before `/plan` opens or the overlay draws. |
 | Switching back to an old thread loses its plan | The per-thread/provider map retains it until that thread starts another turn or Baton exits. Plans are not persisted across restart. |
 | An orchestration worker's plan never reaches the parent TUI | Workers run as `baton exec --json` subprocesses. Their plan event is consumed and discarded: it is not written by `--json`, not persisted, and not inserted into the parent snapshot map. Opening that worker thread reports the empty state. Forwarding it is an explicit non-goal and tracked follow-up. |
 | ACP file or markdown `plan_update` arrives and the view stays stale | Those payload types are ignored rather than approximated. A later `plan_removed` clears the item plan; a live ACP plan event has not been recorded yet. |
 | A `plan_removed` for another plan clears the visible plan | The snapshot carries its ACP `planId`, and only a removal with the same id clears it. A removal for an ignored file or markdown plan is a no-op. |
+| A foreign ACP session update reaches the active turn during reply drain | Drained `session/update` frames are filtered by `sessionId` before plan, usage, or text handling. |
 | A harness reports an empty list | The same empty-state notice is used for a missing report and a deliberately empty plan. It states that no plan is available rather than pretending steps exist. |
 | A plan is treated as approval | The overlay is read-only and never changes mode or sends a message. Accept and reject require their own confirmation and provider transition. |
 | A long explanation or step is silently clipped | The overlay renders one terminal line per item with `truncate_chars`. Wrapping is left to the action slice, which owns the taller layout and scroll math. |
+| End scrolls past the rendered viewport | Rendering records the viewport-aware maximum, and keyboard handling clamps the stored offset to it before every key. |
+| A matching plan removal leaves a blank open overlay | The view renders the same `no plan available for this thread` empty state when the current plan disappears. |
 | A plan is shown without its reporting turn | The snapshot is cleared when a new turn starts, so it describes the current or most recently settled turn. The header does not name a turn number. |
 | Provider snapshots accumulate in memory | The map is bounded by the threads and harnesses observed in one TUI process, and a restart clears it. A cap becomes necessary if a future background service retains them. |
 | An agent cannot read the plan through CLI or MCP | This slice is TUI-only. The event is present in `exec --stream-json`, but no durable reader exists. |
@@ -90,6 +93,10 @@ Run a turn on a harness that reports plans, then type `/plan`. A Codex app serve
 - `background_plan_is_kept_for_its_thread`
 - `plan_removal_matches_the_plan_id`
 - `starting_multi_clears_the_visible_plan`
+- `dispatch_submit_clears_the_previous_plan`
+- `late_turn_started_does_not_erase_the_new_plan`
+- `plan_scroll_end_uses_the_rendered_viewport_limit`
+- `removing_an_open_plan_renders_the_empty_state`
 - `plan_events_keep_the_entries_and_explanation`
 - `plan_statuses_use_one_vocabulary`
 - `plan_removal_keeps_the_plan_id`

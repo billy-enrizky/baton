@@ -32,7 +32,7 @@ COMMANDS = [
     ("/agents", ["no subagent tool calls in this thread"]),
     ("/find zzz", ["no matches for"]),
     ("/files", ["files ·"]),
-    ("/grep zzz", ["no matches for"]),
+    ("/grep zzz", ['grep: no matches for "zzz"']),
     ("/switch", ["switch harness", "antigravity"]),
     ("/model", ["models ·", "enter", "esc"]),
     ("/btw", ["side chat of"]),

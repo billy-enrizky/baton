@@ -192,12 +192,20 @@ async fn fake_acp_plan(
             }
             "session/prompt" => {
                 for update in &updates {
+                    let session_id = update
+                        .get("_sessionId")
+                        .and_then(Value::as_str)
+                        .unwrap_or("acp-plan");
+                    let mut update = update.clone();
+                    if let Some(object) = update.as_object_mut() {
+                        object.remove("_sessionId");
+                    }
                     send(
                         &mut write,
                         json!({
                             "jsonrpc": "2.0",
                             "method": "session/update",
-                            "params": { "sessionId": "acp-plan", "update": update }
+                            "params": { "sessionId": session_id, "update": update }
                         }),
                     )
                     .await;
@@ -428,6 +436,17 @@ async fn acp_adapter_maps_plan_updates() {
             }
         }),
         json!({ "sessionUpdate": "plan_removed", "planId": "plan-1" }),
+        json!({
+            "_sessionId": "another-session",
+            "sessionUpdate": "plan_update",
+            "plan": {
+                "type": "items",
+                "planId": "foreign-plan",
+                "entries": [
+                    { "content": "Foreign step", "priority": "high", "status": "pending" }
+                ]
+            }
+        }),
     ]);
     let spawner_updates = updates.clone();
     let spawner = Arc::new(

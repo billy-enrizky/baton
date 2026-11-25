@@ -1695,30 +1695,58 @@ fn main_result(started: Instant) -> Result<()> {
             println!("restored {} to {}", thread.cwd, checkpoint.git_ref);
             Ok(())
         }
-        cli::Commands::Usage { thread_id, by } => {
+        cli::Commands::Usage {
+            thread_id,
+            by,
+            json,
+        } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             if let Some(group) = by {
-                let filter = match &thread_id {
-                    Some(thread_id) => Some(resolve_thread(&store, thread_id)?.id),
-                    None => None,
-                };
-                let rows = store.list_usage(filter.as_deref())?;
-                if rows.is_empty() {
-                    println!("no usage yet");
-                    return Ok(());
-                }
                 let group = match group {
                     cli::UsageGroupBy::Day => UsageGroup::Day,
                     cli::UsageGroupBy::Model => UsageGroup::Model,
                     cli::UsageGroupBy::Provider => UsageGroup::Provider,
                 };
-                for (key, totals) in group_usage(&rows, group) {
+                let filter = match &thread_id {
+                    Some(thread_id) => Some(resolve_thread(&store, thread_id)?.id),
+                    None => None,
+                };
+                let rows = store.list_usage(filter.as_deref())?;
+                let grouped = group_usage(&rows, group);
+                if json {
+                    let groups = grouped
+                        .iter()
+                        .map(|(key, totals)| {
+                            serde_json::json!({
+                                "key": key,
+                                "turns": totals.turns,
+                                "input_tokens": totals.input_tokens,
+                                "output_tokens": totals.output_tokens,
+                                "cache_read_tokens": totals.cache_read_tokens,
+                                "cache_creation_tokens": totals.cache_creation_tokens,
+                                "cost_usd": totals.cost_usd,
+                            })
+                        })
+                        .collect::<Vec<_>>();
                     println!(
-                        "{:<24} {:>3} turns  {}",
-                        key,
-                        totals.turns,
-                        format_usage_line(&totals)
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "schema_version": 1,
+                            "by": group.as_str(),
+                            "groups": groups,
+                        }))?
                     );
+                } else if grouped.is_empty() {
+                    println!("no usage yet");
+                } else {
+                    for (key, totals) in grouped {
+                        println!(
+                            "{:<24} {:>3} turns  {}",
+                            key,
+                            totals.turns,
+                            format_usage_line(&totals)
+                        );
+                    }
                 }
                 return Ok(());
             }
@@ -1730,21 +1758,37 @@ fn main_result(started: Instant) -> Result<()> {
             if threads.is_empty() {
                 anyhow::bail!("no threads found");
             }
+            let mut entries = Vec::new();
             for thread in threads {
                 let rows = store.list_usage(Some(&thread.id))?;
                 if rows.is_empty() {
                     continue;
                 }
                 let totals = sum_usage(&rows);
+                let model = thread
+                    .current_model
+                    .clone()
+                    .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
+                if json {
+                    entries.push(serde_json::json!({
+                        "thread_id": thread.id,
+                        "title": thread.title,
+                        "provider": thread.current_provider.as_str(),
+                        "model": model,
+                        "turns": totals.turns,
+                        "input_tokens": totals.input_tokens,
+                        "output_tokens": totals.output_tokens,
+                        "cache_read_tokens": totals.cache_read_tokens,
+                        "cache_creation_tokens": totals.cache_creation_tokens,
+                        "cost_usd": totals.cost_usd,
+                    }));
+                    continue;
+                }
                 let rate = cache_hit_rate(&totals.total_usage());
                 let rate_label = match rate {
                     None => "n/a".to_string(),
                     Some(rate) => format!("{:.0}%", rate * 100.0),
                 };
-                let model = thread
-                    .current_model
-                    .clone()
-                    .unwrap_or_else(|| resolved.for_provider(thread.current_provider).model.clone());
                 println!(
                     "{}  {}/{}  {}  {}  hit {}",
                     &thread.id[..8],
@@ -1753,6 +1797,15 @@ fn main_result(started: Instant) -> Result<()> {
                     thread.title,
                     format_usage_line(&totals),
                     rate_label
+                );
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": 1,
+                        "threads": entries,
+                    }))?
                 );
             }
             Ok(())

@@ -2263,6 +2263,48 @@ fn usage_by_model_reads_recorded_history() {
     assert!(stdout.contains("1 turns"), "{stdout}");
     assert!(stdout.contains("in 18"), "{stdout}");
 
+    let json_output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["usage", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        json_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json_output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&json_output.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    let threads = value["threads"].as_array().unwrap();
+    assert_eq!(threads.len(), 1);
+    assert_eq!(threads[0]["turns"], 1);
+    assert_eq!(threads[0]["input_tokens"], 12);
+    assert_eq!(threads[0]["provider"], "codex");
+    assert_eq!(threads[0]["model"], "gpt-6.1-sol");
+
+    let grouped_json = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["usage", "--by", "model", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        grouped_json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&grouped_json.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&grouped_json.stdout).unwrap();
+    assert_eq!(value["schema_version"], 1);
+    assert_eq!(value["by"], "model");
+    let groups = value["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["key"], "gpt-6.1-sol");
+    assert_eq!(groups[0]["turns"], 1);
+    assert!(
+        (groups[0]["cost_usd"].as_f64().unwrap() - 0.01).abs() < 1e-9,
+        "{}",
+        groups[0]["cost_usd"]
+    );
+
     let rejected = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
         .args(["usage", "--by", "fortnight"])
         .env("BATON_HOME", home.path())

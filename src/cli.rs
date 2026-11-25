@@ -260,6 +260,9 @@ pub enum Commands {
         /// Group the totals instead of printing one row per thread
         #[arg(long, value_enum, value_name = "GROUP")]
         by: Option<UsageGroupBy>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect orchestrator, planner, implementor, and reviewer roles
     Roles {

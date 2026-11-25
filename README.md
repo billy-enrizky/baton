@@ -616,13 +616,13 @@ baton status [-t id] [--json]
 baton activity [-t id] [--json]
 baton turns [-t id] [--json]
 baton agents -t <thread-id> [--json]
-baton usage [--by day|model|provider]
+baton usage [--by day|model|provider] [--json]
 baton search <query> [--all] [--json]
 baton doctor [--json]
 baton ps [--json]
 ```
 
-`baton usage` prints one row per thread. `--by day` sums newest days first; `--by model` and `--by provider` sum alphabetically.
+`baton usage` prints one row per thread. `--by day` sums newest days first; `--by model` and `--by provider` sum alphabetically. `--json` emits schema version 1 with a `threads` array, or a `groups` array with `by` when grouping.
 
 ### 12.2 Turns and execution
 

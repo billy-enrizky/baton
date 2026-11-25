@@ -3175,9 +3175,14 @@ fn is_exact_retry_turn(input: &str) -> bool {
 /// `/auth codex` is a billing query, and completing it to
 /// `/auth codex subscription` would change state on the next Enter.
 fn is_complete_command(input: &str) -> bool {
+    let input = input.trim();
+    if SLASH_COMMANDS.iter().any(|(command, _)| *command == input) {
+        return true;
+    }
     let mut parts = input.split_whitespace();
     match (parts.next(), parts.next(), parts.next()) {
         (Some("/auth" | "/switch"), Some(value), None) => ProviderId::parse(value).is_some(),
+        (Some("/git"), Some("review" | "merge"), None) => true,
         _ => false,
     }
 }
@@ -15144,6 +15149,26 @@ mod tests {
     }
 
     #[test]
+    fn picker_commands_are_complete_without_an_argument() {
+        for input in [
+            "/auth",
+            "/auth ",
+            "/model ",
+            "/git",
+            "/git review",
+            "/git merge",
+        ] {
+            assert!(is_complete_command(input), "{input:?} must run on Enter");
+        }
+        for input in ["/au", "/auth codex api extra", "/git review approve now"] {
+            assert!(
+                !is_complete_command(input),
+                "{input:?} must keep completing"
+            );
+        }
+    }
+
+    #[test]
     fn every_provider_has_slash_command_choices() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -15619,15 +15644,9 @@ mod tests {
             &engine_command_sender,
             key(KeyCode::Enter),
         );
-        assert_eq!(state.input, "/retry 10 ");
-        handle_composer_key(
-            &mut state,
-            &store,
-            &engine_command_sender,
-            key(KeyCode::Enter),
-        );
+        assert_eq!(state.input, "");
         let Overlay::RetryPicker { selected, choices } = &state.overlay else {
-            panic!("the selected completion must open the retry picker");
+            panic!("a bare retry must open the retry picker");
         };
         assert_eq!(choices[*selected].turn, 10);
 
@@ -17504,7 +17523,8 @@ mod tests {
         let mut state = test_state(home.path(), &store, Vec::new());
         state.set_session_mode(&store, SessionMode::Orchestrate);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        handle_command(&mut state, &store, &sender, "/model");
+        state.input = "/model ".to_string();
+        handle_key(&mut state, &store, &sender, key(KeyCode::Enter));
         let Overlay::ModelPicker {
             provider,
             models,
@@ -23783,6 +23803,29 @@ mod tests {
             r#"{"codex":{"mode":"subscription"}}"#,
             "opening the scoped picker must not rewrite config.json"
         );
+    }
+
+    #[test]
+    fn trailing_space_opens_the_bare_auth_picker() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/auth ".to_string();
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+
+        assert!(
+            state.input.is_empty(),
+            "Enter must run the command, not complete the first row: {}",
+            state.input
+        );
+        assert!(matches!(state.overlay, Overlay::AuthPicker { selected: 0 }));
     }
 
     #[test]

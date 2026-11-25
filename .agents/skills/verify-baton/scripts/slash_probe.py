@@ -409,6 +409,38 @@ def main() -> int:
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)
 
+        os.write(master, b"/auth \r")
+        if not wait_for_screen(
+            master,
+            "billing mode · 1/12",
+            3.0,
+            transcript,
+            args.width,
+            args.height,
+        ):
+            missing.append("auth trailing-space Enter opens the picker")
+        (evidence / "auth-trailing-space-screen.txt").write_text(
+            screen_text(transcript, args.width, args.height) + "\n"
+        )
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
+        os.write(master, b"/model \r")
+        if not wait_for_screen(
+            master,
+            "models ·",
+            3.0,
+            transcript,
+            args.width,
+            args.height,
+        ):
+            missing.append("model trailing-space Enter opens the picker")
+        (evidence / "model-trailing-space-screen.txt").write_text(
+            screen_text(transcript, args.width, args.height) + "\n"
+        )
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+
         os.write(master, b"/auth codex api\r")
         pump(master, 0.6, transcript)
         auth_set = screen_text(transcript, args.width, args.height)

@@ -278,7 +278,7 @@ The harness choice and task split are visible before work starts. Press Enter to
 ### 4.6 Help inside the app
 
 - `/help` shows the common paths.
-- `/help all` opens a scrollable list of every command and its syntax.
+- `/help all` opens a scrollable list of every command and its description; type a command and a space for its syntax.
 - `baton doctor` checks what is installed and what to do next.
 - `/status` shows the current thread, phase, goal, queue, and adapter state.
 
@@ -370,11 +370,13 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 
 | Command | What it does |
 |---|---|
+| `/help` | Show common paths; `/help all` opens the full command list |
 | `/switch` | Pick a harness, then a model, for this thread |
 | `/model` | Pick a model for the current harness |
 | `/effort` | Pick a reasoning effort; `/effort default` clears it |
 | `/mode` | Pick a permission mode for harnesses that support it: `default`, `acceptEdits`, `bypassPermissions`, or `plan` |
 | `/auth` | Pick a billing mode for any harness; `/auth codex` scopes it |
+| `/login` | Sign in to a harness; pick one from the list or run `/login codex` |
 | `/orchestrate` | Switch modes, start a plan-only goal, or open recent runs |
 | `/goal` | Set, pause, resume, or clear the thread goal |
 | `/settings` | Change the global default session mode and terminal bell, and inspect harness settings |

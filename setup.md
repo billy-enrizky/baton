@@ -6,7 +6,7 @@ Baton drives harness CLIs that you install and authenticate yourself. A harness 
 
 Baton needs no account of its own and sends no telemetry. It runs your harness CLIs with your credentials.
 
-Required for a turn: one harness CLI on `PATH`, either signed in with `baton login <provider>` or pointed at an API key with `/auth <provider> api`. The tables below list the login command and the key variable for each harness.
+Required for a turn: one harness CLI on `PATH`, either signed in with `baton login <provider>` (or `/login` inside the workspace) or pointed at an API key with `/auth <provider> api`. The tables below list the login command and the key variable for each harness.
 
 Optional, only for the features that use them:
 
@@ -25,9 +25,11 @@ Costs belong to the harness provider: a subscription for the harness login, or u
 baton
 ```
 
-The TUI opens in the configured default session mode, which is orchestrate until you change the global default with `/settings` or `"defaultMode": "single"` in `config.json`. `/orchestrate off` changes only the current thread. Run `baton doctor` to see every harness binary, its auth mode, the Baton config files, database size, thread count, and tracked provider processes. For subscription billing, run `baton login <provider>` once for each harness you want to use. API-key setups can skip the login.
+The TUI opens in the configured default session mode, which is orchestrate until you change the global default with `/settings` or `"defaultMode": "single"` in `config.json`. `/orchestrate off` changes only the current thread. Run `baton doctor` to see every harness binary, its auth mode, the Baton config files, database size, thread count, and tracked provider processes. For subscription billing, run `baton login <provider>` once for each harness you want to use, or type `/login` inside the workspace. API-key setups can skip the login.
 
 ## Provider login
+
+Inside the workspace, `/login` opens the same choice as a picker. It runs the selected harness login in the terminal, then returns to Baton with the result.
 
 | Provider | Command | Notes |
 |---|---|---|

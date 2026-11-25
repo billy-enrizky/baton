@@ -5,7 +5,7 @@ description: "Drive baton's Rust CLI, TUI, and MCP stdio server through isolated
 
 # Verify baton
 
-Baton is a terminal app, so the proof is a terminal transcript, not a unit test alone. This skill builds the debug binary once, starts each drive in its own PTY with a temporary `BATON_HOME` and working directory, captures a full screen after forcing a redraw, and preserves the evidence. It also runs the 50-command slash sweep, the hermetic MCP probe, and the installed-binary check after a release.
+Baton is a terminal app, so the proof is a terminal transcript, not a unit test alone. This skill builds the debug binary once, starts each drive in its own PTY with a temporary `BATON_HOME` and working directory, captures a full screen after forcing a redraw, and preserves the evidence. It also runs the 51-command slash sweep, the hermetic MCP probe, and the installed-binary check after a release.
 
 ## Launch
 
@@ -97,7 +97,7 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 | MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, seeds an empty thread with `baton new` |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |
 | Slash argument choices and completion | `scripts/slash_probe.py` | zero |
-| All 50 advertised slash commands | `scripts/slash_sweep.py` | zero |
+| All 51 sweep cases across the registered slash commands | `scripts/slash_sweep.py` | zero |
 | All advertised harnesses with ICA or an explicit account block | `scripts/harness_matrix_probe.py` | four small ICA turns; the live Claude turn is opt-in and Cursor is capability-only |
 
 Every probe accepts `--binary` (default `~/.cargo/bin/baton`) and `--evidence-dir`. To run it against a change before merge, pass `--binary target/debug/baton`.

@@ -88,7 +88,8 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/mode",
         "permission mode: default|acceptEdits|bypassPermissions|plan",
     ),
-    ("/auth", "billing mode: /auth <provider> <subscription|api>"),
+    ("/auth", "billing mode: /auth [provider [subscription|api]]"),
+    ("/login", "sign in to a harness: /login [provider]"),
     (
         "/roles",
         "inspect orchestrator, planner, implementor, and reviewer roles",
@@ -645,6 +646,9 @@ enum Overlay {
         provider: ProviderId,
         selected: usize,
     },
+    LoginPicker {
+        selected: usize,
+    },
     OrchestratePicker {
         selected: usize,
     },
@@ -763,6 +767,13 @@ struct PendingEditorOpen {
     label: String,
 }
 
+/// A provider sign-in that needs the terminal back. The event loop suspends
+/// the TUI, runs the harness login command with inherited stdio, then resumes.
+struct PendingLogin {
+    provider: ProviderId,
+    command: Vec<&'static str>,
+}
+
 const FILES_PICKER_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_SUGGESTIONS: usize = 8;
@@ -859,6 +870,7 @@ pub struct TuiState {
     issue_picker_receiver: std::sync::mpsc::Receiver<IssuePickerEvent>,
     issue_request: u64,
     pending_editor_open: Option<PendingEditorOpen>,
+    pending_login: Option<PendingLogin>,
     grep_picker_sender: std::sync::mpsc::Sender<GrepPickerEvent>,
     grep_picker_receiver: std::sync::mpsc::Receiver<GrepPickerEvent>,
     grep_picker_request: u64,
@@ -987,6 +999,7 @@ pub fn run_tui(
         issue_picker_receiver,
         issue_request: 0,
         pending_editor_open: None,
+        pending_login: None,
         grep_picker_sender,
         grep_picker_receiver,
         grep_picker_request: 0,
@@ -1117,6 +1130,37 @@ pub fn run_tui(
                     state.notice = Some(
                         crate::sanitize::sanitize_terminal_text(&format!(
                             "editor launch failed: {error}"
+                        ))
+                        .into_owned(),
+                    );
+                }
+            }
+        }
+        if let Some(login) = state.pending_login.take() {
+            let PendingLogin { provider, command } = login;
+            match suspend_tui(&mut terminal) {
+                Ok(()) => {
+                    println!("running: {}", command.join(" "));
+                    let run_result = std::process::Command::new(command[0])
+                        .args(&command[1..])
+                        .status();
+                    resume_tui(&mut terminal)?;
+                    state.banner_cache.borrow_mut().take();
+                    state.notice = Some(match run_result {
+                        Ok(status) if status.success() => format!("{provider} login finished"),
+                        Ok(status) => format!("{provider} login exited with {status}"),
+                        Err(error) => crate::sanitize::sanitize_terminal_text(&format!(
+                            "cannot run {}: {error}",
+                            command.join(" ")
+                        ))
+                        .into_owned(),
+                    });
+                }
+                Err(error) => {
+                    let _ = resume_tui(&mut terminal);
+                    state.notice = Some(
+                        crate::sanitize::sanitize_terminal_text(&format!(
+                            "login launch failed: {error}"
                         ))
                         .into_owned(),
                     );
@@ -3183,7 +3227,9 @@ fn is_complete_command(input: &str) -> bool {
     }
     let mut parts = input.split_whitespace();
     match (parts.next(), parts.next(), parts.next()) {
-        (Some("/auth" | "/switch"), Some(value), None) => ProviderId::parse(value).is_some(),
+        (Some("/auth" | "/switch" | "/login"), Some(value), None) => {
+            ProviderId::parse(value).is_some()
+        }
         (Some("/git"), Some("review" | "merge"), None) => true,
         _ => false,
     }
@@ -3209,7 +3255,8 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/model", _) => Some("model <id>"),
         ("/effort", _) => Some("effort default|low|medium|high|xhigh|max"),
         ("/mode", _) => Some("mode default|acceptEdits|bypassPermissions|plan"),
-        ("/auth", _) => Some("auth <provider> subscription|api"),
+        ("/auth", _) => Some("auth [<provider> [subscription|api]]"),
+        ("/login", _) => Some("login [<provider>]"),
         ("/new", _) => Some("new [title]"),
         ("/fork", _) => Some("fork [--turn N] [title]"),
         ("/worktree", _) => Some("worktree [title]"),
@@ -3225,7 +3272,9 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/goal", _) => Some("goal pause|resume|clear|<done criteria>"),
         ("/find", _) => Some("find <text>"),
         ("/multi", _) => Some("multi [--worktrees] [provider ...] <prompt>"),
-        ("/orchestrate", _) => Some("orchestrate on|off|--plan-only|<goal>"),
+        ("/orchestrate", _) => {
+            Some("orchestrate on|off|--plan-only|--max-tasks|--plan-file|<goal>")
+        }
         ("/runs", _) => Some("runs --all|<run id>"),
         ("/commands", _) => Some("commands [turn]"),
         ("/agents", _) => Some("agents (no arguments)"),
@@ -3337,6 +3386,19 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 }
             }
         }
+        "/login" => {
+            for provider in PROVIDERS {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    provider.as_str(),
+                    match crate::cli::login_command(provider) {
+                        Some(command) => format!("run {}", command.join(" ")),
+                        None => "Google sign-in or API key".to_string(),
+                    },
+                );
+            }
+        }
         "/goal" => {
             for action in ["pause", "resume", "clear"] {
                 push_suggestion(&mut suggestions, command, action, format!("goal {action}"));
@@ -3387,6 +3449,8 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 ("on", "enable orchestrate mode"),
                 ("off", "switch to single-harness mode"),
                 ("--plan-only", "preview the plan without starting workers"),
+                ("--max-tasks", "cap the number of workers (N)"),
+                ("--plan-file", "read the plan from a file (path)"),
             ] {
                 push_suggestion(&mut suggestions, command, action, description);
             }
@@ -5600,6 +5664,25 @@ fn handle_key(
             }
             _ => {
                 state.overlay = Overlay::AuthProviderPicker { provider, selected };
+            }
+        },
+        Overlay::LoginPicker { mut selected } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                selected = (selected + PROVIDERS.len() - 1) % PROVIDERS.len();
+                state.overlay = Overlay::LoginPicker { selected };
+            }
+            KeyCode::Down => {
+                selected = (selected + 1) % PROVIDERS.len();
+                state.overlay = Overlay::LoginPicker { selected };
+            }
+            KeyCode::Enter => {
+                if let Some(provider) = PROVIDERS.get(selected).copied() {
+                    start_login(state, provider);
+                }
+            }
+            _ => {
+                state.overlay = Overlay::LoginPicker { selected };
             }
         },
         Overlay::OrchestratePicker { mut selected } => match key.code {
@@ -8955,6 +9038,14 @@ fn handle_command(
                 },
             }
         }
+        "/login" => match (args.first().map(String::as_str), args.len()) {
+            (None, _) => state.overlay = Overlay::LoginPicker { selected: 0 },
+            (Some(provider), 1) => match ProviderId::parse(provider) {
+                Some(parsed) => start_login(state, parsed),
+                None => state.notice = Some(format!("usage: /{}", login_usage())),
+            },
+            _ => state.notice = Some(format!("usage: /{}", login_usage())),
+        },
         "/new" => {
             let title = if args.is_empty() {
                 "New thread".to_string()
@@ -10485,6 +10576,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::RetryPicker { choices, .. } => choices.len().min(6) + 9,
             Overlay::CodeConfirm { .. } => 4,
             Overlay::SwitchPicker { .. } => PROVIDERS.len() + 4,
+            Overlay::LoginPicker { .. } => PROVIDERS.len() + 4,
             Overlay::ModelPicker { models, filter, .. } => {
                 model_filter_indices(models, filter).len().min(8) + 4
             }
@@ -10687,6 +10779,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::AuthProviderPicker { provider, selected } => {
                 draw_auth_provider_picker(frame, chunks[1], state, *provider, *selected)
             }
+            Overlay::LoginPicker { selected } => draw_login_picker(frame, chunks[1], *selected),
             Overlay::OrchestratePicker { selected } => {
                 draw_orchestrate_picker(frame, chunks[1], state, *selected)
             }
@@ -12422,6 +12515,34 @@ fn auth_usage() -> String {
     format!("auth <{providers}> subscription|api")
 }
 
+fn login_usage() -> String {
+    let providers = PROVIDERS
+        .iter()
+        .map(|provider| provider.as_str())
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("login <{providers}>")
+}
+
+/// Queues the harness sign-in for the event loop, which owns the terminal
+/// handle. Antigravity has no CLI login and states its two supported paths.
+fn start_login(state: &mut TuiState, provider: ProviderId) {
+    state.overlay = Overlay::None;
+    if state.running {
+        state.notice = Some("interrupt the running turn before signing in".into());
+        return;
+    }
+    match crate::cli::login_command(provider) {
+        Some(command) => state.pending_login = Some(PendingLogin { provider, command }),
+        None => {
+            state.notice = Some(
+                "Antigravity has no CLI login: use Google sign-in inside Antigravity, or set GEMINI_API_KEY and run /auth antigravity api"
+                    .into(),
+            );
+        }
+    }
+}
+
 fn apply_auth_mode(
     state: &mut TuiState,
     provider: ProviderId,
@@ -12499,6 +12620,43 @@ fn draw_auth_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, se
                 "{cursor} {marker} {} {mode_label} · {detail}",
                 provider_label(provider)
             ),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_login_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
+    let count = PROVIDERS.len();
+    let selected = selected.min(count.saturating_sub(1));
+    let visible = count.min((area.height as usize).saturating_sub(3)).max(1);
+    let start = if count <= visible {
+        0
+    } else {
+        selected.saturating_sub(visible / 2).min(count - visible)
+    };
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "sign in · ↑↓ select · enter run · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, provider) in PROVIDERS.iter().enumerate().skip(start).take(visible) {
+        let detail = match crate::cli::login_command(*provider) {
+            Some(command) => format!("run {}", command.join(" ")),
+            None => "no CLI login; Google sign-in or API key".to_string(),
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(
+            format!("{cursor} {} · {detail}", provider_label(*provider)),
             style,
         ));
     }
@@ -15168,6 +15326,7 @@ mod tests {
             issue_picker_receiver,
             issue_request: 0,
             pending_editor_open: None,
+            pending_login: None,
             grep_picker_sender,
             grep_picker_receiver,
             grep_picker_request: 0,
@@ -15258,6 +15417,8 @@ mod tests {
         for input in [
             "/auth",
             "/auth ",
+            "/login",
+            "/login ",
             "/model ",
             "/git",
             "/git review",
@@ -15278,7 +15439,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        for command in ["/switch ", "/auth ", "/multi "] {
+        for command in ["/switch ", "/auth ", "/login ", "/multi "] {
             state.input = command.to_string();
             let rendered = suggestions_for(&state)
                 .into_iter()
@@ -15363,13 +15524,18 @@ mod tests {
         // Constant-backed commands: the completion must offer exactly what the
         // handler accepts, so a new provider, mode, or effort level cannot
         // appear in one place without the other.
-        for command in ["/switch", "/effort", "/mode", "/auth", "/multi"] {
+        for command in ["/switch", "/effort", "/mode", "/auth", "/login", "/multi"] {
             state.input = format!("{command} ");
             let choices = first_args(&argument_suggestions(&state, command), command);
             let expected: Vec<String> = match command {
-                "/switch" | "/multi" => PROVIDERS.iter().map(|p| p.as_str().to_string()).collect(),
+                "/switch" | "/login" | "/multi" => {
+                    PROVIDERS.iter().map(|p| p.as_str().to_string()).collect()
+                }
                 "/effort" => EFFORT_VALUES.iter().map(|v| v.to_string()).collect(),
-                "/mode" => PERMISSION_MODE_VALUES.iter().map(|v| v.to_string()).collect(),
+                "/mode" => PERMISSION_MODE_VALUES
+                    .iter()
+                    .map(|v| v.to_string())
+                    .collect(),
                 "/auth" => {
                     let mut providers: Vec<String> = auth_choices()
                         .map(|(provider, _)| provider.as_str().to_string())
@@ -21410,6 +21576,9 @@ mod tests {
         state.overlay = Overlay::SwitchPicker { selected: 1 };
         check(&mut state, "switch", "switch harness · enter select");
 
+        state.overlay = Overlay::LoginPicker { selected: 1 };
+        check(&mut state, "login", "codex · run codex login");
+
         state.overlay = Overlay::ModelPicker {
             provider: state.thread.current_provider,
             models: vec!["model-a".into(), "model-b".into(), "model-c".into()],
@@ -24526,6 +24695,130 @@ mod tests {
         let notice = state.notice.as_deref().unwrap_or("");
         assert!(notice.contains("cannot read config"), "{notice}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{broken");
+    }
+
+    #[test]
+    fn login_picker_names_every_harness_command() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::LoginPicker { selected: 1 };
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+        for provider in PROVIDERS {
+            assert!(
+                text.contains(&provider_label(provider)),
+                "{provider} missing: {text}"
+            );
+        }
+        for command in [
+            "run claude auth login",
+            "run codex login",
+            "run cursor-agent login",
+            "run grok login",
+            "run opencode auth login",
+        ] {
+            assert!(text.contains(command), "{command} missing: {text}");
+        }
+        assert!(text.contains("antigravity · no CLI login"), "{text}");
+        assert!(text.contains("enter run"), "{text}");
+    }
+
+    #[test]
+    fn login_picker_enter_queues_the_selected_harness() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::LoginPicker { selected: 1 };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        let pending = state.pending_login.as_ref().expect("queued login");
+        assert_eq!(pending.provider, ProviderId::Codex);
+        assert_eq!(pending.command, ["codex", "login"]);
+    }
+
+    #[test]
+    fn login_command_line_queues_a_harness() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/login cursor".to_string();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(state.input.is_empty(), "Enter must run the command");
+        let pending = state.pending_login.as_ref().expect("queued login");
+        assert_eq!(pending.provider, ProviderId::Cursor);
+        assert_eq!(pending.command, ["cursor-agent", "login"]);
+    }
+
+    #[test]
+    fn login_antigravity_states_both_supported_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/login antigravity".to_string();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(state.pending_login.is_none());
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("Google sign-in"), "{notice}");
+        assert!(notice.contains("GEMINI_API_KEY"), "{notice}");
+        assert!(notice.contains("/auth antigravity api"), "{notice}");
+    }
+
+    #[test]
+    fn login_refuses_while_a_turn_is_running() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.running = true;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.input = "/login codex".to_string();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        assert!(state.pending_login.is_none());
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("interrupt the running turn"), "{notice}");
+    }
+
+    #[test]
+    fn login_rejects_unknown_or_extra_arguments() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        for input in ["/login nope", "/login codex now"] {
+            state.input = input.to_string();
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+            );
+            assert!(state.pending_login.is_none(), "{input}");
+            let notice = state.notice.as_deref().unwrap_or("");
+            assert!(notice.starts_with("usage: /login"), "{input}: {notice}");
+        }
     }
 
     #[test]

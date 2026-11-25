@@ -402,6 +402,7 @@ struct QuestionState {
     questions: Vec<QuestionPrompt>,
     index: usize,
     selected: usize,
+    toggled: Vec<usize>,
     custom: Option<String>,
     answers: Vec<QuestionAnswer>,
     respond: tokio::sync::oneshot::Sender<Vec<QuestionAnswer>>,
@@ -2789,6 +2790,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
                     questions,
                     index: 0,
                     selected: 0,
+                    toggled: Vec::new(),
                     custom: None,
                     answers: Vec::new(),
                     respond,
@@ -4581,7 +4583,7 @@ fn handle_key(
             question_key(question, key)
         };
         if let QuestionKey::Answer(answer) = outcome {
-            finish_question_answer(state, answer);
+            finish_question_answers(state, answer);
         }
         return;
     }
@@ -13761,7 +13763,7 @@ fn decision_for_choice(choice: &ApprovalChoice) -> ApprovalDecision {
 
 enum QuestionKey {
     None,
-    Answer(String),
+    Answer(Vec<String>),
 }
 
 fn question_key(question: &mut QuestionState, key: KeyEvent) -> QuestionKey {
@@ -13774,7 +13776,14 @@ fn question_key(question: &mut QuestionState, key: KeyEvent) -> QuestionKey {
                     question.custom = Some(custom);
                     return QuestionKey::None;
                 }
-                return QuestionKey::Answer(answer);
+                let prompt = &question.questions[question.index];
+                let mut answers = if prompt.multi_select {
+                    question_selected_labels(question)
+                } else {
+                    Vec::new()
+                };
+                answers.push(answer);
+                return QuestionKey::Answer(answers);
             }
             KeyCode::Backspace => {
                 custom.pop();
@@ -13792,9 +13801,9 @@ fn question_key(question: &mut QuestionState, key: KeyEvent) -> QuestionKey {
             }
         }
     }
-    let (options_len, allow_custom) = {
+    let (options_len, allow_custom, multi_select) = {
         let prompt = &question.questions[question.index];
-        (prompt.options.len(), prompt.allow_custom)
+        (prompt.options.len(), prompt.allow_custom, prompt.multi_select)
     };
     let row_count = options_len + usize::from(allow_custom);
     match key.code {
@@ -13816,13 +13825,31 @@ fn question_key(question: &mut QuestionState, key: KeyEvent) -> QuestionKey {
         KeyCode::End => {
             question.selected = row_count.saturating_sub(1);
         }
+        KeyCode::Char(' ') if multi_select && question.selected < options_len => {
+            if let Some(position) = question
+                .toggled
+                .iter()
+                .position(|index| *index == question.selected)
+            {
+                question.toggled.remove(position);
+            } else {
+                question.toggled.push(question.selected);
+            }
+        }
         KeyCode::Enter => {
             let label = question.questions[question.index]
                 .options
                 .get(question.selected)
                 .map(|option| option.label.clone());
             if let Some(label) = label {
-                return QuestionKey::Answer(label);
+                if multi_select {
+                    let answers = question_selected_labels(question);
+                    if !answers.is_empty() {
+                        return QuestionKey::Answer(answers);
+                    }
+                } else {
+                    return QuestionKey::Answer(vec![label]);
+                }
             }
             if allow_custom {
                 question.custom = Some(String::new());
@@ -13836,18 +13863,30 @@ fn question_key(question: &mut QuestionState, key: KeyEvent) -> QuestionKey {
     QuestionKey::None
 }
 
-fn finish_question_answer(state: &mut TuiState, answer: String) {
+fn question_selected_labels(question: &QuestionState) -> Vec<String> {
+    let prompt = &question.questions[question.index];
+    prompt
+        .options
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| question.toggled.contains(index))
+        .map(|(_, option)| option.label.clone())
+        .collect()
+}
+
+fn finish_question_answers(state: &mut TuiState, answers: Vec<String>) {
     let Some(question) = state.questions.last_mut() else {
         return;
     };
     let prompt_id = question.questions[question.index].id.clone();
     question.answers.push(QuestionAnswer {
         id: prompt_id,
-        answers: vec![answer],
+        answers,
     });
     if question.index + 1 < question.questions.len() {
         question.index += 1;
         question.selected = 0;
+        question.toggled.clear();
         question.custom = None;
         return;
     }
@@ -13950,8 +13989,20 @@ fn draw_question(
         } else {
             Style::default().fg(COLORS.muted)
         };
+        let prefix = if prompt.multi_select {
+            format!(
+                "{marker} [{}] ",
+                if question.toggled.contains(&index) {
+                    "x"
+                } else {
+                    " "
+                }
+            )
+        } else {
+            format!("{marker} ")
+        };
         lines.push(Line::styled(
-            truncate_chars(&format!("{marker} {}", option.label), width),
+            truncate_chars(&format!("{prefix}{}", option.label), width),
             style,
         ));
     }
@@ -13990,6 +14041,10 @@ fn draw_question(
     }
     let footer = if question.custom.is_some() {
         "type an answer · enter submit · esc back"
+    } else if prompt.multi_select && prompt.allow_custom {
+        "space toggle · enter submit · esc type an answer"
+    } else if prompt.multi_select {
+        "space toggle · enter submit"
     } else if prompt.allow_custom {
         "up/down select · enter answer · esc type an answer"
     } else {
@@ -17051,6 +17106,7 @@ mod tests {
                             },
                         ],
                         allow_custom: false,
+                        multi_select: false,
                         secret: false,
                     },
                     QuestionPrompt {
@@ -17068,6 +17124,7 @@ mod tests {
                             },
                         ],
                         allow_custom: false,
+                        multi_select: false,
                         secret: false,
                     },
                 ],
@@ -17137,6 +17194,7 @@ mod tests {
                         description: String::new(),
                     }],
                     allow_custom: true,
+                    multi_select: false,
                     secret: false,
                 }],
                 respond: sender,
@@ -17180,6 +17238,106 @@ mod tests {
     }
 
     #[test]
+    fn question_picker_toggles_multi_select_options_in_display_order() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::QuestionRequest {
+                id: "multi-question".into(),
+                questions: vec![QuestionPrompt {
+                    id: "features".into(),
+                    header: "Features".into(),
+                    question: "Which features should the release include?".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "Readme".into(),
+                            description: String::new(),
+                        },
+                        QuestionOption {
+                            label: "CI".into(),
+                            description: String::new(),
+                        },
+                        QuestionOption {
+                            label: "Installer".into(),
+                            description: String::new(),
+                        },
+                    ],
+                    allow_custom: false,
+                    multi_select: true,
+                    secret: false,
+                }],
+                respond: sender,
+            },
+        );
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert!(receiver.try_recv().is_err(), "an empty selection must not answer");
+        assert_eq!(state.questions.len(), 1);
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char(' ')),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Home),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char(' ')),
+        );
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("[x] Readme"), "{text}");
+        assert!(text.contains("[x] CI"), "{text}");
+        assert!(text.contains("space toggle · enter submit"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let answers = receiver.try_recv().unwrap();
+        assert_eq!(answers.len(), 1);
+        assert_eq!(answers[0].id, "features");
+        assert_eq!(
+            answers[0].answers,
+            vec!["Readme".to_string(), "CI".to_string()],
+            "answers follow the option order, not the toggle order"
+        );
+        assert!(state.questions.is_empty());
+    }
+
+    #[test]
     fn child_question_overlay_names_the_child_and_lists_options() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -17205,6 +17363,7 @@ mod tests {
                         },
                     ],
                     allow_custom: true,
+                    multi_select: false,
                     secret: false,
                 }],
                 respond: sender,
@@ -17237,6 +17396,7 @@ mod tests {
                     question: "Token?".into(),
                     options: Vec::new(),
                     allow_custom: true,
+                    multi_select: false,
                     secret: true,
                 }],
                 respond: sender,
@@ -17294,6 +17454,7 @@ mod tests {
                         },
                     ],
                     allow_custom: true,
+                    multi_select: false,
                     secret: false,
                 }],
                 respond: sender,

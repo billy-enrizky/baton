@@ -257,6 +257,10 @@ fn xai_question_prompts(params: &Value) -> Vec<QuestionPrompt> {
                 question: text.to_string(),
                 options,
                 allow_custom: true,
+                multi_select: question
+                    .get("multiSelect")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
                 secret: false,
             })
         })
@@ -347,6 +351,7 @@ fn antigravity_question_prompts(params: &Value) -> Vec<QuestionPrompt> {
         question: question.to_string(),
         options,
         allow_custom: false,
+        multi_select: false,
         secret: false,
     }]
 }
@@ -1057,6 +1062,7 @@ mod tests {
             question: "Which database?".into(),
             options: Vec::new(),
             allow_custom: false,
+            multi_select: false,
             secret: false,
         }];
         let answers = vec![QuestionAnswer {
@@ -1091,6 +1097,7 @@ mod tests {
             question: "Pick".into(),
             options: Vec::new(),
             allow_custom: false,
+            multi_select: false,
             secret: false,
         }];
         let answers = vec![QuestionAnswer {
@@ -1138,6 +1145,7 @@ mod tests {
             "questions": [{
                 "id": "scope",
                 "question": "Which scope should Grok use?",
+                "multiSelect": true,
                 "options": [
                     { "label": "Workspace", "description": "Use the current workspace" },
                     { "label": "Session", "description": "Only use this session" }
@@ -1151,6 +1159,7 @@ mod tests {
         assert_eq!(questions[0].options[0].label, "Workspace");
         assert_eq!(questions[0].options[1].description, "Only use this session");
         assert!(questions[0].allow_custom);
+        assert!(questions[0].multi_select);
 
         let wrapped = json!({
             "method": "_x.ai/ask_user_question",
@@ -1164,6 +1173,7 @@ mod tests {
         let questions = xai_question_prompts(&wrapped);
         assert_eq!(questions[0].id, "Pick one");
         assert_eq!(questions[0].options[0].label, "OK");
+        assert!(!questions[0].multi_select);
     }
 
     #[test]
@@ -1174,6 +1184,7 @@ mod tests {
             question: "Which scope should Grok use?".into(),
             options: Vec::new(),
             allow_custom: true,
+            multi_select: false,
             secret: false,
         }];
         let answers = vec![QuestionAnswer {
@@ -1188,6 +1199,27 @@ mod tests {
         );
         let cancelled = xai_question_response(&questions, &[]);
         assert_eq!(cancelled["outcome"], "cancelled");
+    }
+
+    #[test]
+    fn xai_multi_select_response_keeps_every_choice() {
+        let questions = vec![QuestionPrompt {
+            id: "features".into(),
+            header: "Question".into(),
+            question: "Which features?".into(),
+            options: Vec::new(),
+            allow_custom: true,
+            multi_select: true,
+            secret: false,
+        }];
+        let answers = vec![QuestionAnswer {
+            id: "features".into(),
+            answers: vec!["CI".into(), "Installer".into()],
+        }];
+        let response = xai_question_response(&questions, &answers);
+        assert_eq!(response["outcome"], "accepted");
+        assert_eq!(response["answers"]["Which features?"][0], "CI");
+        assert_eq!(response["answers"]["Which features?"][1], "Installer");
     }
 
     #[test]

@@ -291,6 +291,7 @@ pub struct QuestionPrompt {
     pub question: String,
     pub options: Vec<QuestionOption>,
     pub allow_custom: bool,
+    pub multi_select: bool,
     pub secret: bool,
 }
 

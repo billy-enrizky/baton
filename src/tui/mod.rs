@@ -388,6 +388,13 @@ struct ReviewState {
     selected: usize,
     notes: Vec<ReviewNote>,
     note_input: Option<String>,
+    search_input: Option<String>,
+    search: Option<ReviewSearch>,
+}
+
+struct ReviewSearch {
+    query: String,
+    matches: Vec<usize>,
 }
 
 struct ActivityView {
@@ -7139,6 +7146,63 @@ fn handle_review_key(
         return;
     };
 
+    if let Some(input) = review.search_input.as_mut() {
+        match key.code {
+            KeyCode::Esc => review.search_input = None,
+            KeyCode::Enter => {
+                let raw = input.trim().to_string();
+                let needle = raw.to_lowercase();
+                review.search_input = None;
+                if needle.is_empty() {
+                    review.search = None;
+                } else {
+                    let matches: Vec<usize> = review
+                        .rows
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, row)| {
+                            row.text.to_lowercase().contains(&needle)
+                                || row.path.to_lowercase().contains(&needle)
+                        })
+                        .map(|(index, _)| index)
+                        .collect();
+                    if matches.is_empty() {
+                        review.search = None;
+                        state.notice = Some(format!("no review rows match \"{raw}\""));
+                    } else {
+                        let next = matches
+                            .iter()
+                            .copied()
+                            .find(|index| *index > review.selected)
+                            .unwrap_or(matches[0]);
+                        review.selected = next;
+                        let position =
+                            matches.iter().position(|index| *index == next).unwrap_or(0) + 1;
+                        state.notice =
+                            Some(format!("match {position}/{} for \"{raw}\"", matches.len()));
+                        review.search = Some(ReviewSearch {
+                            query: raw,
+                            matches,
+                        });
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                input.push(character);
+            }
+            _ => {}
+        }
+        state.review = Some(review);
+        return;
+    }
+
     if let Some(input) = review.note_input.as_mut() {
         match key.code {
             KeyCode::Esc => review.note_input = None,
@@ -7195,6 +7259,15 @@ fn handle_review_key(
 
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => return,
+        KeyCode::Char('/') => {
+            review.search_input = Some(
+                review
+                    .search
+                    .as_ref()
+                    .map(|search| search.query.clone())
+                    .unwrap_or_default(),
+            );
+        }
         KeyCode::Up | KeyCode::Char('k') => {
             review.selected = review.selected.saturating_sub(1);
         }
@@ -9710,6 +9783,8 @@ fn handle_command(
                             selected,
                             notes,
                             note_input: None,
+                            search_input: None,
+                            search: None,
                         });
                         state.notice =
                             load_error.map(|error| format!("cannot restore review notes: {error}"));
@@ -9963,10 +10038,23 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let search = review
+        .search
+        .as_ref()
+        .map(|search| {
+            let position = search
+                .matches
+                .iter()
+                .position(|index| *index == review.selected)
+                .map(|position| position + 1)
+                .unwrap_or(0);
+            format!(" · /{} {position}/{}", search.query, search.matches.len())
+        })
+        .unwrap_or_default();
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::styled(
         format!(
-            "review turn {} · {} changed lines · ↑↓ move · [ ] file · n note · y copy · ctrl+y copy note · d delete · s send · esc close",
+            "review turn {} · {} changed lines{search} · ↑↓ move · [ ] file · / find · n note · y copy · d delete · s send · esc close",
             review.turn,
             review.rows.iter().filter(|row| row.added || row.removed).count()
         ),
@@ -10036,7 +10124,17 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
         ]));
     }
 
-    if let Some(input) = review.note_input.as_ref() {
+    if let Some(input) = review.search_input.as_ref() {
+        lines.push(Line::from(vec![
+            Span::styled("/", Style::default().fg(COLORS.accent)),
+            Span::styled(input.clone(), Style::default().fg(COLORS.text)),
+            Span::styled("█", Style::default().fg(COLORS.accent)),
+            Span::styled(
+                " · enter find · esc cancel",
+                Style::default().fg(COLORS.muted),
+            ),
+        ]));
+    } else if let Some(input) = review.note_input.as_ref() {
         let row = review.rows.get(review.selected);
         let target = row
             .map(|row| format!("{}:{}", row.path, row.line_number))
@@ -20624,6 +20722,8 @@ mod tests {
             selected: 0,
             notes: Vec::new(),
             note_input: Some(String::new()),
+            search_input: None,
+            search: None,
         });
         handle_paste(&mut state, "first\nsecond");
         assert!(state.input.is_empty(), "the note editor owns the paste");
@@ -24206,6 +24306,8 @@ mod tests {
             selected: 0,
             notes: Vec::new(),
             note_input: Some("ab".into()),
+            search_input: None,
+            search: None,
         });
         handle_key(
             &mut state,
@@ -24242,6 +24344,85 @@ mod tests {
             notice.contains("copied"),
             "expected a copy notice, got {notice:?} with clipboard command {command:?}"
         );
+    }
+
+    #[test]
+    fn review_search_jumps_between_matches_and_reports_a_miss() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let row = |line_number: usize, text: &str| diff_render::DiffRowRef {
+            path: "src/lib.rs".into(),
+            line_number,
+            added: true,
+            removed: false,
+            text: text.into(),
+        };
+        state.review = Some(ReviewState {
+            turn: 1,
+            fingerprint: "fingerprint".into(),
+            rows: vec![row(1, "alpha"), row(2, "needle one"), row(3, "beta needle")],
+            selected: 0,
+            notes: Vec::new(),
+            note_input: None,
+            search_input: None,
+            search: None,
+        });
+        let press = |state: &mut TuiState, code: KeyCode| {
+            handle_key(
+                state,
+                &store,
+                &sender,
+                KeyEvent::new(code, KeyModifiers::empty()),
+            );
+        };
+
+        press(&mut state, KeyCode::Char('/'));
+        assert!(state.review.as_ref().unwrap().search_input.is_some());
+        for character in "needle".chars() {
+            press(&mut state, KeyCode::Char(character));
+        }
+        press(&mut state, KeyCode::Enter);
+        {
+            let review = state.review.as_ref().unwrap();
+            assert_eq!(review.selected, 1);
+            assert_eq!(
+                review.search.as_ref().unwrap().matches,
+                vec![1, 2],
+                "both matching rows are recorded"
+            );
+        }
+        assert!(state.notice.as_deref().unwrap_or("").contains("match 1/2"));
+
+        press(&mut state, KeyCode::Char('/'));
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(state.review.as_ref().unwrap().selected, 2);
+        press(&mut state, KeyCode::Char('/'));
+        press(&mut state, KeyCode::Enter);
+        assert_eq!(
+            state.review.as_ref().unwrap().selected,
+            1,
+            "the search wraps to the first match"
+        );
+
+        press(&mut state, KeyCode::Char('/'));
+        press(&mut state, KeyCode::Char('z'));
+        press(&mut state, KeyCode::Enter);
+        {
+            let review = state.review.as_ref().unwrap();
+            assert_eq!(review.selected, 1, "a miss keeps the selection");
+            assert!(review.search.is_none(), "a miss clears the old search");
+        }
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("no review rows match"));
+
+        press(&mut state, KeyCode::Char('/'));
+        press(&mut state, KeyCode::Esc);
+        assert!(state.review.as_ref().unwrap().search_input.is_none());
     }
 
     #[test]

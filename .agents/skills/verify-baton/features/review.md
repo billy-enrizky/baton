@@ -7,6 +7,7 @@
 - Notes are stored unsent with the turn, path, line, side, and diff fingerprint
 - `s` sends notes as a steer or the next prompt; Esc closes without sending
 - `[` and `]` move between files, `d` deletes the note on the selected line
+- `/` searches the row text and path; Enter jumps to the next match and wraps, a miss clears the query, and Esc cancels the search input
 
 ## How to get to it
 Run one turn that changes a file, wait for the turn to finish, then type `/review`.

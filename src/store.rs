@@ -369,6 +369,11 @@ CREATE TABLE IF NOT EXISTS recent_files (
   PRIMARY KEY (project_path, path)
 );
 CREATE INDEX IF NOT EXISTS recent_files_project_idx ON recent_files (project_path, seq DESC);
+CREATE TABLE IF NOT EXISTS side_chats (
+  thread_id TEXT PRIMARY KEY,
+  source_thread_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS checkpoints (
   thread_id TEXT NOT NULL,
   turn INTEGER NOT NULL,
@@ -938,6 +943,31 @@ impl BatonStore {
         tx.commit()?;
         self.get_thread(&id)?
             .ok_or_else(|| anyhow::anyhow!("forked thread disappeared: {id}"))
+    }
+
+    /// Marks a forked thread as a side chat without changing the source.
+    pub fn mark_side_chat(&self, thread_id: &str, source_thread_id: &str) -> Result<()> {
+        self.db.execute(
+            "INSERT OR REPLACE INTO side_chats (thread_id, source_thread_id, created_at) VALUES (?, ?, ?)",
+            params![thread_id, source_thread_id, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    /// The thread a side chat was forked from, if this thread is one.
+    pub fn side_chat_source(&self, thread_id: &str) -> Result<Option<ThreadRow>> {
+        let source: Option<String> = self
+            .db
+            .query_row(
+                "SELECT source_thread_id FROM side_chats WHERE thread_id = ?1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match source {
+            Some(source) => self.get_thread(&source),
+            None => Ok(None),
+        }
     }
 
     pub fn draft_thread(&self, input: NewThread) -> ThreadRow {

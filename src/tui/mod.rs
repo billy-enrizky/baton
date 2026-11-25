@@ -99,6 +99,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/new", "start a new thread"),
     ("/fork", "branch this conversation into a new thread"),
     (
+        "/btw",
+        "open a side chat from this thread; /btw <prompt> prefills it",
+    ),
+    (
         "/worktree",
         "fork this conversation into an isolated git worktree",
     ),
@@ -838,6 +842,7 @@ pub struct TuiState {
     home: std::path::PathBuf,
     memory_environment: crate::memory_files::MemoryEnvironment,
     thread: ThreadRow,
+    side_chat_of: Option<String>,
     adapter_lifecycles: std::collections::HashMap<ProviderId, AdapterLifecycle>,
     history: Vec<MessageRow>,
     input: String,
@@ -954,6 +959,13 @@ pub fn run_tui(
     let (issue_picker_sender, issue_picker_receiver) = std::sync::mpsc::channel();
     let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
     let bell_enabled = crate::config::notifications(&home).bell;
+    let side_chat_of = store
+        .lock()
+        .unwrap()
+        .side_chat_source(&thread.id)
+        .ok()
+        .flatten()
+        .map(|source| source.title);
     let mut state = TuiState {
         bell_enabled,
         bell: crate::notify::BellLimiter::new(),
@@ -967,6 +979,7 @@ pub fn run_tui(
         home,
         memory_environment: crate::memory_files::MemoryEnvironment::from_env(),
         thread,
+        side_chat_of,
         adapter_lifecycles,
         history,
         input: String::new(),
@@ -2888,6 +2901,11 @@ fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.goal_paused = thread.goal_paused;
     state.thread = thread.clone();
     let guard = store.lock().unwrap();
+    state.side_chat_of = guard
+        .side_chat_source(&thread.id)
+        .ok()
+        .flatten()
+        .map(|source| source.title);
     state.history = guard.list_messages(&thread.id).unwrap_or_default();
     state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
     state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
@@ -3295,6 +3313,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/login", _) => Some("login [<provider>]"),
         ("/new", _) => Some("new [title]"),
         ("/fork", _) => Some("fork [--turn N] [title]"),
+        ("/btw", _) => Some("btw [prompt]"),
         ("/worktree", _) => Some("worktree [title]"),
         ("/task", _) => Some("task [issue number]"),
         ("/open", _) => Some("open <thread id prefix>"),
@@ -4567,6 +4586,11 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.goal_paused = thread.goal_paused;
     state.thread = thread.clone();
     let guard = store.lock().unwrap();
+    state.side_chat_of = guard
+        .side_chat_source(&thread.id)
+        .ok()
+        .flatten()
+        .map(|source| source.title);
     state.history = guard.list_messages(&thread.id).unwrap_or_default();
     state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
     state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
@@ -9491,6 +9515,49 @@ fn handle_command(
                     });
                 }
                 Err(error) => state.notice = Some(format!("cannot fork: {error}")),
+            }
+        }
+        "/btw" => {
+            let source_id = state.thread.id.clone();
+            let source_title = state.thread.title.clone();
+            let prompt = args.join(" ");
+            let exists = match store.lock().unwrap().get_thread(&source_id) {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(error) => {
+                    state.notice = Some(format!("cannot inspect thread: {error}"));
+                    return;
+                }
+            };
+            if !exists {
+                state.notice = Some("nothing to side-chat yet; send a message first".into());
+                return;
+            }
+            let title = format!("{source_title} (side chat)");
+            let result = {
+                let guard = store.lock().unwrap();
+                guard
+                    .fork_thread_through_turn(&source_id, &title, None)
+                    .and_then(|thread| {
+                        guard.mark_side_chat(&thread.id, &source_id)?;
+                        Ok(thread)
+                    })
+            };
+            match result {
+                Ok(thread) => {
+                    load_thread_state(state, store, thread);
+                    if prompt.is_empty() {
+                        state.notice = Some(format!(
+                            "side chat of {source_title}; the source thread is unchanged"
+                        ));
+                    } else {
+                        state.set_input(prompt);
+                        state.notice = Some(format!(
+                            "side chat of {source_title}; review the prompt, then press enter"
+                        ));
+                    }
+                }
+                Err(error) => state.notice = Some(format!("cannot start side chat: {error}")),
             }
         }
         "/task" => match args.first() {
@@ -15486,6 +15553,12 @@ impl TuiState {
                 ),
             ]),
         ];
+        if let Some(source) = &self.side_chat_of {
+            lines.push(Line::styled(
+                format!("   side chat of {source} · the source thread is unchanged"),
+                Style::default().fg(COLORS.secondary),
+            ));
+        }
         if let Some(hint) = crate::doctor::missing_provider_hint(provider) {
             lines.push(Line::styled(
                 format!("   {hint}"),
@@ -15735,6 +15808,7 @@ mod tests {
                 home.to_path_buf(),
             ),
             thread,
+            side_chat_of: None,
             adapter_lifecycles: std::collections::HashMap::new(),
             history,
             input: String::new(),
@@ -27577,6 +27651,55 @@ exit 1
         assert!(notice.contains("nothing to fork yet"), "{notice}");
         let after = store.lock().unwrap().list_threads(None).unwrap().len();
         assert_eq!(before, after, "a draft fork must not create a thread");
+    }
+
+    #[test]
+    fn btw_opens_a_marked_side_chat_and_prefills_the_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let source_id = state.thread.id.clone();
+        store
+            .lock()
+            .unwrap()
+            .add_message(
+                &source_id,
+                1,
+                "user",
+                Some("claude"),
+                None,
+                "source message",
+            )
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/btw what about this?",
+        );
+        assert_ne!(state.thread.id, source_id);
+        assert_eq!(state.thread.title, "test (side chat)");
+        assert_eq!(state.side_chat_of.as_deref(), Some("test"));
+        assert_eq!(state.input, "what about this?");
+        assert!(
+            state
+                .history
+                .iter()
+                .any(|message| message.text == "source message"),
+            "the side chat starts with the source history"
+        );
+        let guard = store.lock().unwrap();
+        assert_eq!(
+            guard.list_messages(&source_id).unwrap().len(),
+            1,
+            "the source keeps its history"
+        );
+        drop(guard);
+
+        open_thread_by_id(&mut state, &store, &source_id);
+        assert!(state.side_chat_of.is_none());
     }
 
     #[test]

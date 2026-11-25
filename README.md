@@ -291,7 +291,7 @@ The coding agent CLI that performs a turn. Baton can switch harnesses inside one
 
 ### 5.2 Thread
 
-A durable conversation with an id, a working directory, a harness, a model, a session mode, and a transcript. Threads survive restarts.
+A durable conversation with an id, a working directory, a harness, a model, a session mode, and a transcript. Threads survive restarts. A side chat is a fork marked as belonging to its source thread; `/btw` opens one and leaves the source unchanged.
 
 ### 5.3 Turn
 
@@ -393,6 +393,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 |---|---|
 | `/threads`, `/open`, `/pin`, `/inbox` | List, open, pin, or triage threads |
 | `/new`, `/fork`, `/worktree`, `/task` | Start a thread, fork one, or start from a git worktree or GitHub issue |
+| `/btw` | Open a side chat from this thread; the source thread is unchanged |
 | `/files` | Pick a project file, insert its path or `path:line`, or open it in your editor |
 | `/grep` | Search project contents, insert `path:line`, or open the match |
 | `/find` | Search the conversation |

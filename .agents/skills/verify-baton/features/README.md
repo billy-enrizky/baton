@@ -30,14 +30,14 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | TUI native rewind | TUI | `/rewind --native` truncates the provider and store history and prefills the message |
 | Retry | TUI | `/retry` lists failed or unverified turns and submits the chosen prompt as a new turn |
 | Greeting | TUI | `hi` in default orchestrate mode answers directly, with no planner run |
-| MCP stdio | CLI | `baton mcp` handshakes, lists 14 tools, and answers status, turns, threads, and doctor |
+| MCP stdio | CLI | `baton mcp` handshakes, lists 15 tools including agents, and answers status, turns, threads, agents, and doctor |
 | Antigravity | CLI | `agy acp` completes one turn with the ICA key and custom base URL |
 | Harness matrix | CLI | Codex, Claude, Cursor, Grok, OpenCode, and Antigravity are checked for a live ICA turn or an explicit external account block |
 | Output sanitization | CLI and TUI | Control sequences are replaced before `exec` stdout and the transcript; unit proof only |
 | Activity | TUI and CLI | `/activity` and `baton activity --json` index every turn's tools, diff, and usage |
-| Subagent calls | TUI | `/agents` lists Task and Agent tool calls from the thread with running, done, or failed status and copies the selected label |
+| Subagent calls | TUI and CLI | `/agents` lists live and persisted subagent calls with running, done, failed, or unknown status; `baton agents -t <id>` and `baton_agents` expose the persisted rows |
 | Memory files | TUI | `/memory` lists Claude and Codex instruction files, opens or creates them in the editor, and toggles Claude auto-memory |
-| Git status, commit, push, checks, pull request, and review | TUI | `/git` inspects the repository, confirms exact commit plans, pushes a chosen remote without force, lists the current pull request's `gh` checks, opens a pull request after a title and body preview, approves, requests changes on, or comments on the current pull request after rechecking the head, and merges it with squash, merge commit, or rebase after the same recheck |
+| Git status, commit, push, checks, pull request, review, and merge | TUI | `/git` inspects the repository, confirms exact commit plans, pushes a chosen remote without force, lists the current pull request's `gh` checks, opens a pull request after a title and body preview, approves, requests changes on, or comments on the current pull request after rechecking the head, and merges it with squash, merge commit, or rebase after the same recheck |
 | Grok | CLI | `grok agent stdio` completes a turn on the ICA endpoint |
 | Cursor | CLI | `cursor-agent acp` gives the login hint and rejects a custom endpoint |
 | Process registry | CLI | `baton ps --json` returns a stable schema and no false live processes |

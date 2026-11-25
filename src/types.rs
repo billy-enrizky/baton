@@ -305,7 +305,7 @@ pub struct QuestionAnswer {
     pub answers: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanEntry {
     pub content: String,
     pub status: String,

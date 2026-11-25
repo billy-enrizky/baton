@@ -1117,6 +1117,8 @@ pub fn run_tui(
         shell_running: false,
         shell_output: None,
     };
+    let visible_thread = state.thread.id.clone();
+    hydrate_plans(&mut state, &visible_thread);
 
     let mut startup_notes = Vec::new();
     let recent_threads = {
@@ -2554,7 +2556,7 @@ fn request_orchestration_preview(
         state.notice = Some(ORCHESTRATE_USAGE.into());
         return;
     }
-    state.plans.remove(&state.thread.id);
+    state.clear_plans_for(&state.thread.id.clone());
     start_orchestration_preview(state, goal, max_tasks, plan_file);
 }
 
@@ -2691,7 +2693,7 @@ fn start_orchestration(
         state.notice = Some(ORCHESTRATE_USAGE.into());
         return;
     }
-    state.plans.remove(&state.thread.id);
+    state.clear_plans_for(&state.thread.id.clone());
     let cwd = state.thread.cwd.clone();
     let home = state.home.clone();
     let permission_mode = state.permission_mode;
@@ -2802,6 +2804,7 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                         explanation,
                     },
                 );
+            persist_plan(state, &state.thread.id.clone(), provider);
         }
         TurnEvent::PlanRemoved { provider, plan_id } => {
             let remove = state
@@ -2813,6 +2816,11 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                 if let Some(plans) = state.plans.get_mut(&state.thread.id) {
                     plans.remove(&provider);
                 }
+                let _ = state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .remove_plan(&state.thread.id, provider);
             }
         }
         TurnEvent::TextDelta { text } => {
@@ -2974,7 +2982,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
             entries,
             explanation,
         } => {
-            state.plans.entry(thread_id).or_default().insert(
+            state.plans.entry(thread_id.clone()).or_default().insert(
                 provider,
                 PlanSnapshot {
                     plan_id,
@@ -2983,6 +2991,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
                     explanation,
                 },
             );
+            persist_plan(state, &thread_id, provider);
         }
         TurnEvent::PlanRemoved { provider, plan_id } => {
             let remove = state
@@ -2994,6 +3003,11 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
                 if let Some(plans) = state.plans.get_mut(&thread_id) {
                     plans.remove(&provider);
                 }
+                let _ = state
+                    .store
+                    .lock()
+                    .unwrap()
+                    .remove_plan(&thread_id, provider);
             }
         }
         TurnEvent::ApprovalRequest {
@@ -3060,6 +3074,8 @@ fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.shell_output = None;
     state.scroll_offset = 0;
     state.notice = Some(format!("opened {}", thread.title));
+    drop(guard);
+    hydrate_plans(state, &thread.id);
 }
 
 fn input_index_at(state: &TuiState, column: u16, row: u16) -> Option<usize> {
@@ -7374,7 +7390,7 @@ fn apply_native_rewind_event(
             provider_retry_skipped,
         } => {
             state.native_rewind_running = false;
-            state.plans.remove(&thread_id);
+            state.clear_plans_for(&thread_id);
             if thread_id != state.thread.id {
                 state.notice = Some(format!(
                     "native rewind finished for another thread ({})",
@@ -7429,7 +7445,7 @@ fn apply_rewind(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, turn: i64,
     };
     match result {
         Ok(()) => {
-            state.plans.remove(&state.thread.id);
+            state.clear_plans_for(&state.thread.id.clone());
             {
                 let guard = store.lock().unwrap();
                 state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
@@ -8609,7 +8625,7 @@ fn dispatch_submit(
     let thread_id = state.thread.id.clone();
     let permission_mode = state.permission_mode;
     state.persist_thread_state(store);
-    state.plans.remove(&state.thread.id);
+    state.clear_plans_for(&state.thread.id.clone());
     let _ = engine_command_sender.send(EngineCommand::Submit {
         thread_id,
         text,
@@ -9046,7 +9062,7 @@ fn handle_command(
             }
             let valid_providers = parsed.providers;
             let prompt = parsed.prompt;
-            state.plans.remove(&state.thread.id);
+            state.clear_plans_for(&state.thread.id.clone());
             state.notice = Some(format!(
                 "sending to {} providers in parallel: {}",
                 valid_providers.len(),
@@ -14362,6 +14378,48 @@ fn draw_usage_picker(frame: &mut ratatui::Frame, area: Rect, selected: usize) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn persist_plan(state: &TuiState, thread_id: &str, provider: ProviderId) {
+    let Some(plan) = state
+        .plans
+        .get(thread_id)
+        .and_then(|plans| plans.get(&provider))
+    else {
+        return;
+    };
+    let stored = crate::store::StoredPlan {
+        provider,
+        plan_id: plan.plan_id.clone(),
+        turn_id: plan.turn_id.clone(),
+        entries: plan.entries.clone(),
+        explanation: plan.explanation.clone(),
+    };
+    let _ = state.store.lock().unwrap().save_plan(thread_id, &stored);
+}
+
+fn hydrate_plans(state: &mut TuiState, thread_id: &str) {
+    let stored = state
+        .store
+        .lock()
+        .unwrap()
+        .list_plans(thread_id)
+        .unwrap_or_default();
+    let plans = stored
+        .into_iter()
+        .map(|plan| {
+            (
+                plan.provider,
+                PlanSnapshot {
+                    plan_id: plan.plan_id,
+                    turn_id: plan.turn_id,
+                    entries: plan.entries,
+                    explanation: plan.explanation,
+                },
+            )
+        })
+        .collect();
+    state.plans.insert(thread_id.to_string(), plans);
+}
+
 fn current_plan(state: &TuiState) -> Option<&PlanSnapshot> {
     state
         .plans
@@ -16232,6 +16290,16 @@ fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
 }
 
 impl TuiState {
+    /// Removes the in-memory and persisted plans for one thread.
+    fn clear_plans_for(&mut self, thread_id: &str) {
+        self.plans.remove(thread_id);
+        let _ = self
+            .store
+            .lock()
+            .unwrap()
+            .remove_plans_for_thread(thread_id);
+    }
+
     fn persist_thread_state(&self, store: &Arc<Mutex<BatonStore>>) {
         let guard = store.lock().unwrap();
         if guard.get_thread(&self.thread.id).ok().flatten().is_none() {
@@ -29840,6 +29908,147 @@ exit 1
             }],
             explanation: None,
         }
+    }
+
+    #[test]
+    fn plan_event_is_persisted_and_hydrated_after_restart() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("state.sqlite");
+        let store = Arc::new(Mutex::new(BatonStore::open(&path).unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let provider = state.thread.current_provider;
+        apply_turn_event(&mut state, sample_plan_event(provider));
+        assert_eq!(
+            store.lock().unwrap().list_plans(&thread_id).unwrap().len(),
+            1
+        );
+        drop(state);
+        let reopened = Arc::new(Mutex::new(BatonStore::open(&path).unwrap()));
+        let mut fresh = test_state(home.path(), &reopened, Vec::new());
+        fresh.thread.id = thread_id.clone();
+        fresh.plans.clear();
+        hydrate_plans(&mut fresh, &thread_id);
+        let plan = current_plan(&fresh).expect("the stored plan must hydrate");
+        assert_eq!(plan.entries[0].content, "one step");
+    }
+
+    #[test]
+    fn submit_clears_the_persisted_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let provider = state.thread.current_provider;
+        apply_turn_event(&mut state, sample_plan_event(provider));
+        assert_eq!(
+            store.lock().unwrap().list_plans(&thread_id).unwrap().len(),
+            1
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_submit(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "new work".into(),
+            false,
+            None,
+            false,
+        );
+        assert!(current_plan(&state).is_none());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_plans(&thread_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn plan_removal_clears_the_persisted_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let provider = state.thread.current_provider;
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: Some("plan-1".into()),
+                turn_id: None,
+                entries: vec![crate::types::PlanEntry {
+                    content: "one step".into(),
+                    status: "pending".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanRemoved {
+                provider,
+                plan_id: "plan-1".into(),
+            },
+        );
+        assert!(current_plan(&state).is_none());
+        assert!(store
+            .lock()
+            .unwrap()
+            .list_plans(&thread_id)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn thread_switch_hydrates_its_own_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let source_id = state.thread.id.clone();
+        let provider = state.thread.current_provider;
+        apply_turn_event(&mut state, sample_plan_event(provider));
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "other".into(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: provider,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .save_plan(
+                &other.id,
+                &crate::store::StoredPlan {
+                    provider,
+                    plan_id: None,
+                    turn_id: None,
+                    entries: vec![crate::types::PlanEntry {
+                        content: "other step".into(),
+                        status: "completed".into(),
+                        priority: None,
+                    }],
+                    explanation: None,
+                },
+            )
+            .unwrap();
+        load_thread_state(&mut state, &store, other.clone());
+        let plan = current_plan(&state).expect("the other thread's plan");
+        assert_eq!(plan.entries[0].content, "other step");
+        assert_eq!(state.thread.id, other.id);
+        let source = store
+            .lock()
+            .unwrap()
+            .get_thread(&source_id)
+            .unwrap()
+            .unwrap();
+        load_thread_state(&mut state, &store, source);
+        assert_eq!(current_plan(&state).unwrap().entries[0].content, "one step");
     }
 
     #[test]

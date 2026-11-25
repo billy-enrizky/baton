@@ -69,6 +69,15 @@ pub enum ThreadOpenWork {
     Orchestration,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPlan {
+    pub provider: ProviderId,
+    pub plan_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub entries: Vec<crate::types::PlanEntry>,
+    pub explanation: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ProviderSessionRow {
     pub thread_id: String,
@@ -450,6 +459,16 @@ CREATE TABLE IF NOT EXISTS orchestration_tasks (
   reasoning_effort TEXT
 );
 CREATE INDEX IF NOT EXISTS orchestration_tasks_run_idx ON orchestration_tasks (run_id, created_at);
+CREATE TABLE IF NOT EXISTS plans (
+  thread_id TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  plan_id TEXT,
+  turn_id TEXT,
+  entries TEXT NOT NULL,
+  explanation TEXT,
+  updated_at TEXT NOT NULL,
+  PRIMARY KEY (thread_id, provider)
+);
 "#;
 
 /// One schema path for on-disk and in-memory stores. A test store that skips a
@@ -1625,6 +1644,71 @@ impl BatonStore {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    pub fn save_plan(&self, thread_id: &str, plan: &StoredPlan) -> Result<()> {
+        let entries = serde_json::to_string(&plan.entries)?;
+        self.db.execute(
+            r#"INSERT INTO plans (thread_id, provider, plan_id, turn_id, entries, explanation, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT (thread_id, provider) DO UPDATE SET
+                 plan_id = excluded.plan_id,
+                 turn_id = excluded.turn_id,
+                 entries = excluded.entries,
+                 explanation = excluded.explanation,
+                 updated_at = excluded.updated_at"#,
+            params![
+                thread_id,
+                plan.provider.as_str(),
+                plan.plan_id,
+                plan.turn_id,
+                entries,
+                plan.explanation,
+                now_iso()
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_plan(&self, thread_id: &str, provider: ProviderId) -> Result<()> {
+        self.db.execute(
+            "DELETE FROM plans WHERE thread_id = ? AND provider = ?",
+            params![thread_id, provider.as_str()],
+        )?;
+        Ok(())
+    }
+
+    pub fn remove_plans_for_thread(&self, thread_id: &str) -> Result<()> {
+        self.db
+            .execute("DELETE FROM plans WHERE thread_id = ?", params![thread_id])?;
+        Ok(())
+    }
+
+    pub fn list_plans(&self, thread_id: &str) -> Result<Vec<StoredPlan>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT provider, plan_id, turn_id, entries, explanation FROM plans WHERE thread_id = ? ORDER BY provider")?;
+        let rows = statement.query_map(params![thread_id], |row| {
+            let provider: String = row.get(0)?;
+            let entries: String = row.get(3)?;
+            Ok((provider, row.get(1)?, row.get(2)?, entries, row.get(4)?))
+        })?;
+        let mut plans = Vec::new();
+        for row in rows {
+            let (provider, plan_id, turn_id, entries, explanation) = row?;
+            let Some(provider) = ProviderId::parse(&provider) else {
+                continue;
+            };
+            let entries = serde_json::from_str(&entries).unwrap_or_default();
+            plans.push(StoredPlan {
+                provider,
+                plan_id,
+                turn_id,
+                entries,
+                explanation,
+            });
+        }
+        Ok(plans)
     }
 
     pub fn list_provider_sessions(&self, thread_id: &str) -> Result<Vec<ProviderSessionRow>> {
@@ -2898,6 +2982,88 @@ pub struct ImportedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stored_plan(provider: ProviderId, content: &str) -> StoredPlan {
+        StoredPlan {
+            provider,
+            plan_id: Some("plan-1".into()),
+            turn_id: Some("turn-1".into()),
+            entries: vec![crate::types::PlanEntry {
+                content: content.into(),
+                status: "in_progress".into(),
+                priority: Some("high".into()),
+            }],
+            explanation: Some("two steps".into()),
+        }
+    }
+
+    #[test]
+    fn plans_round_trip_per_provider() {
+        let store = BatonStore::memory().unwrap();
+        store
+            .save_plan("thread-1", &stored_plan(ProviderId::Codex, "inspect"))
+            .unwrap();
+        store
+            .save_plan("thread-1", &stored_plan(ProviderId::Claude, "review"))
+            .unwrap();
+        let plans = store.list_plans("thread-1").unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].provider, ProviderId::Claude);
+        assert_eq!(plans[1].provider, ProviderId::Codex);
+        assert_eq!(plans[1].entries[0].content, "inspect");
+        assert_eq!(plans[1].entries[0].priority.as_deref(), Some("high"));
+        assert_eq!(plans[1].explanation.as_deref(), Some("two steps"));
+        assert_eq!(plans[1].plan_id.as_deref(), Some("plan-1"));
+        assert_eq!(plans[1].turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn saving_a_plan_replaces_the_same_provider() {
+        let store = BatonStore::memory().unwrap();
+        store
+            .save_plan("thread-1", &stored_plan(ProviderId::Codex, "first"))
+            .unwrap();
+        store
+            .save_plan("thread-1", &stored_plan(ProviderId::Codex, "second"))
+            .unwrap();
+        let plans = store.list_plans("thread-1").unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].entries[0].content, "second");
+    }
+
+    #[test]
+    fn plans_are_scoped_and_removable() {
+        let store = BatonStore::memory().unwrap();
+        store
+            .save_plan("thread-1", &stored_plan(ProviderId::Codex, "one"))
+            .unwrap();
+        store
+            .save_plan("thread-2", &stored_plan(ProviderId::Codex, "two"))
+            .unwrap();
+        store.remove_plan("thread-1", ProviderId::Codex).unwrap();
+        assert!(store.list_plans("thread-1").unwrap().is_empty());
+        assert_eq!(store.list_plans("thread-2").unwrap().len(), 1);
+        store.remove_plans_for_thread("thread-2").unwrap();
+        assert!(store.list_plans("thread-2").unwrap().is_empty());
+    }
+
+    #[test]
+    fn unknown_stored_providers_are_skipped() {
+        let store = BatonStore::memory().unwrap();
+        store
+            .save_plan("thread-1", &stored_plan(ProviderId::Codex, "known"))
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO plans (thread_id, provider, entries, updated_at) VALUES (?, ?, ?, ?)",
+                params!["thread-1", "mystery", "[]", now_iso()],
+            )
+            .unwrap();
+        let plans = store.list_plans("thread-1").unwrap();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].provider, ProviderId::Codex);
+    }
 
     #[test]
     fn recent_files_upsert_and_order() {

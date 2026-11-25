@@ -85,7 +85,7 @@ COMMANDS = [
     ("/new", ["new thread, unsaved until you send a message"]),
     ("/fork", ["nothing to fork yet"]),
     ("/worktree", ["source checkout has uncommitted changes"]),
-    ("/task", ["issues ·"]),
+    ("/task", ["task: no origin remote", "/task <issue-number>"]),
     ("/exit", []),
 ]
 

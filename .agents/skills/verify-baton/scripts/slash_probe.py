@@ -302,9 +302,15 @@ def main() -> int:
         )
         if model_header is None or int(model_header.group(2)) < 2:
             missing.append("model picker count is at least 2")
-        model_rows = re.findall(r"❯\s+(?:●\s+)?\S+", model_picker)
-        if len(model_rows) < 2:
+        # Count option rows by the model names they show, not by the cursor
+        # glyph. Counting cursors accepted a picker that painted one on every
+        # row, which is exactly the defect this has to catch.
+        catalog = ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5"]
+        option_rows = [name for name in catalog if name in model_picker]
+        if len(option_rows) < 2:
             missing.append("model picker has at least 2 option rows")
+        if model_picker.count("❯") != 1:
+            missing.append("model picker must paint one cursor")
         (evidence / "model-picker-screen.txt").write_text(model_picker + "\n")
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)

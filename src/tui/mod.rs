@@ -7631,11 +7631,13 @@ fn multi_worktree_plan(providers: &[ProviderId], prompt: &str) -> orchestrate::P
         tasks: providers
             .iter()
             .map(|provider| orchestrate::PlanTask {
+                id: None,
                 title: format!("multi {provider}"),
                 provider: provider.as_str().to_string(),
                 model: None,
                 effort: None,
                 prompt: prompt.to_string(),
+                depends_on: Vec::new(),
             })
             .collect(),
     }
@@ -9153,11 +9155,13 @@ fn handle_command(
                 summary: Some(format!("thread worktree from {short_thread}")),
                 role_defaults_applied: false,
                 tasks: vec![orchestrate::PlanTask {
+                    id: None,
                     title: "thread worktree".to_string(),
                     provider: source_provider.as_str().to_string(),
                     model: None,
                     effort: None,
                     prompt: title.clone(),
+                    depends_on: Vec::new(),
                 }],
             };
             let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
@@ -26640,6 +26644,8 @@ exit 1
                         model: None,
                         effort: None,
                         prompt: "do one".to_string(),
+                        id: None,
+                        depends_on: Vec::new(),
                     },
                     crate::orchestrate::PlanTask {
                         title: "worker two".to_string(),
@@ -26647,6 +26653,8 @@ exit 1
                         model: None,
                         effort: None,
                         prompt: "do two".to_string(),
+                        id: None,
+                        depends_on: Vec::new(),
                     },
                 ],
             },
@@ -27633,6 +27641,8 @@ exit 1
                         model: None,
                         effort: None,
                         prompt: "one".to_string(),
+                        id: None,
+                        depends_on: Vec::new(),
                     },
                     crate::orchestrate::PlanTask {
                         title: "second task".to_string(),
@@ -27640,6 +27650,8 @@ exit 1
                         model: None,
                         effort: None,
                         prompt: "two".to_string(),
+                        id: None,
+                        depends_on: Vec::new(),
                     },
                 ],
             }),

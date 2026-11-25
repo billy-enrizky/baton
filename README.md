@@ -394,7 +394,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | Command | What it does |
 |---|---|
 | `/threads`, `/open`, `/pin`, `/inbox` | List, open, pin, or triage threads |
-| `/new`, `/fork`, `/worktree`, `/task` | Start a thread, fork one, or start from a git worktree or GitHub issue |
+| `/new`, `/fork`, `/worktree`, `/task` | Start a thread, fork one, or start from a git worktree or GitHub issue; `/task` without a number loads open issues and falls back to a clear notice when none can be read |
 | `/btw` | Open a side chat from this thread; the source thread is unchanged |
 | `/merge-back` | Append the side chat's new messages to its source as a redacted delta |
 | `/files` | Pick a project file, insert its path or `path:line`, or open it in your editor |

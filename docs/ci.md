@@ -72,7 +72,7 @@ Measured on 2026-11-22 from the cited runs. The Rust samples were based on `be31
 | Main push at `7f22ab5` | Whole run 66 seconds; Test job 51 seconds. Job steps: 17 seconds of checkout and cache restore, 30 seconds of Test, 4 seconds of tail. The run starts the Test job 5 seconds in because it waits only on `changes`, so the remaining lead-in is runner startup | Run 45580109649 |
 | `cargo test --lib` | 1.67 to 3.70 seconds at the cited runs; 719 library tests in the current suite | Runs 45009466461 and 45011836996; current count from the 2026-11-25 full run at `f43df88` |
 | Integration tests | 0.40 to 0.75 seconds at the cited runs; 121 tests across nine binaries in the current suite | Runs 45009466461 and 45011836996; current count from the 2026-11-25 full run at `f43df88` |
-| Executed test count (`ci/test-inventory.sh`) | 840 macOS at `f43df88` | Current source inventory; Linux runs the same suite plus the two platform-specific tests named below |
+| Executed test count (`ci/test-inventory.sh`) | 841 macOS after the task-picker fix | Current source inventory; Linux runs the same suite plus the two platform-specific tests named below |
 | `ci/test-inventory-floor.txt` | 776 | Lower-bound floor; it does not shrink when the current count grows |
 | `ci/fmt-baseline.txt` | 550 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |

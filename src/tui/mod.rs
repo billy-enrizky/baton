@@ -7203,6 +7203,14 @@ fn apply_issue_picker_event(state: &mut TuiState, event: IssuePickerEvent) {
     state.overlay = match result {
         Ok(list) => {
             let issues = list.issues;
+            if issues.is_empty() {
+                state.overlay = Overlay::None;
+                state.notice = Some(format!(
+                    "no open issues in {}; use /task <issue-number>",
+                    list.repo
+                ));
+                return;
+            }
             Overlay::IssuePicker {
                 selected: selected.min(issues.len().saturating_sub(1)),
                 issues,
@@ -7212,14 +7220,12 @@ fn apply_issue_picker_event(state: &mut TuiState, event: IssuePickerEvent) {
                 error: None,
             }
         }
-        Err(error) => Overlay::IssuePicker {
-            selected,
-            issues: Vec::new(),
-            root: None,
-            repo: String::new(),
-            loading: false,
-            error: Some(crate::sanitize::sanitize_terminal_text(&error).into_owned()),
-        },
+        Err(error) => {
+            let error = crate::sanitize::sanitize_terminal_text(&error).into_owned();
+            state.overlay = Overlay::None;
+            state.notice = Some(format!("task: {error}; use /task <issue-number>"));
+            return;
+        }
     };
 }
 
@@ -27928,7 +27934,7 @@ exit 1
     }
 
     #[test]
-    fn issue_picker_shows_an_error_and_cancels_with_escape() {
+    fn issue_picker_error_returns_to_the_composer() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
@@ -27948,24 +27954,41 @@ exit 1
                 result: Err("gh is not authenticated".to_string()),
             },
         );
-        match &state.overlay {
-            Overlay::IssuePicker { error, loading, .. } => {
-                assert_eq!(error.as_deref(), Some("gh is not authenticated"));
-                assert!(!loading);
-            }
-            _ => panic!("issue picker closed on an error"),
-        }
-        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
-        assert!(text.contains("gh is not authenticated"), "{text}");
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("gh is not authenticated"), "{notice}");
+        assert!(notice.contains("/task <issue-number>"), "{notice}");
+    }
 
-        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        handle_key(
+    #[test]
+    fn issue_picker_empty_list_returns_to_the_composer() {
+        let (repo, _gh) = task_repo();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(repo.path(), &store, Vec::new());
+        state.issue_request = 4;
+        state.overlay = Overlay::IssuePicker {
+            selected: 0,
+            issues: Vec::new(),
+            root: Some(repo.path().to_path_buf()),
+            repo: "example/repo".to_string(),
+            loading: true,
+            error: None,
+        };
+        apply_issue_picker_event(
             &mut state,
-            &store,
-            &engine_command_sender,
-            key(KeyCode::Esc),
+            IssuePickerEvent::Loaded {
+                request: 4,
+                result: Ok(crate::tasks::IssueList {
+                    root: repo.path().to_path_buf(),
+                    repo: "example/repo".to_string(),
+                    issues: Vec::new(),
+                }),
+            },
         );
         assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("no open issues in example/repo"), "{notice}");
+        assert!(notice.contains("/task <issue-number>"), "{notice}");
     }
 
     #[cfg(unix)]

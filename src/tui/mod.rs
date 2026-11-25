@@ -830,6 +830,7 @@ pub struct TuiState {
     orchestration_ship_report: Option<ShipReport>,
     orchestration_reviewing: bool,
     orchestration_confirm_review: bool,
+    auto_review: bool,
     orchestration_sender: std::sync::mpsc::Sender<OrchestrationEvent>,
     native_rewind_sender: std::sync::mpsc::Sender<NativeRewindEvent>,
     native_rewind_running: bool,
@@ -956,6 +957,7 @@ pub fn run_tui(
         orchestration_ship_report: None,
         orchestration_reviewing: false,
         orchestration_confirm_review: false,
+        auto_review: true,
         orchestration_sender,
         native_rewind_sender,
         native_rewind_running: false,
@@ -1955,7 +1957,14 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             let notice = format!("review done: {approved} approved, {blocked} blocked");
             record_orchestration_message(state, format!("review · {notice}"));
             state.notice = Some(notice);
-            state.orchestration_report = Some(*report);
+            let same_run = state
+                .orchestration_report
+                .as_ref()
+                .map(|open| open.run_id == report.run_id)
+                .unwrap_or(false);
+            if same_run {
+                state.orchestration_report = Some(*report);
+            }
         }
         OrchestrationEvent::ReviewFailed(error) => {
             state.orchestration_reviewing = false;
@@ -2052,23 +2061,43 @@ fn start_review(state: &mut TuiState) {
     let Some(report) = state.orchestration_report.as_ref() else {
         return;
     };
-    if state.orchestration_reviewing {
-        return;
-    }
     let run_id = report.run_id.clone();
     let cwd = report
         .repo_root
         .clone()
         .unwrap_or_else(|| std::path::PathBuf::from(&state.thread.cwd));
+    start_review_run(state, run_id, cwd, Vec::new());
+}
+
+fn start_review_run(
+    state: &mut TuiState,
+    run_id: String,
+    cwd: std::path::PathBuf,
+    selection: Vec<usize>,
+) {
+    if state.orchestration_reviewing {
+        return;
+    }
     let home = state.home.clone();
     let permission_override = Some(state.permission_mode);
     state.orchestration_reviewing = true;
     state.orchestration_confirm_review = false;
-    state.notice = Some("reviewing completed worker commits...".into());
+    state.notice = Some(if selection.is_empty() {
+        "reviewing completed worker commits...".into()
+    } else {
+        "auto-reviewing the follow-up commit...".into()
+    });
     let sender = state.orchestration_sender.clone();
     std::thread::spawn(move || {
         let result = BatonStore::open(&home.join("baton.sqlite")).and_then(|store| {
-            orchestrate::review_run(&store, &home, &cwd, &run_id, &[], permission_override)
+            orchestrate::review_run(
+                &store,
+                &home,
+                &cwd,
+                &run_id,
+                &selection,
+                permission_override,
+            )
         });
         let event = match result {
             Ok(report) => OrchestrationEvent::Reviewed(Box::new(report)),
@@ -2195,6 +2224,43 @@ fn record_orchestration_message(state: &mut TuiState, text: String) {
     }
 }
 
+fn orchestration_task_position(store: &BatonStore, run_id: &str, task_id: &str) -> Option<usize> {
+    store
+        .list_orchestration_tasks(run_id)
+        .ok()?
+        .iter()
+        .position(|task| task.id == task_id)
+        .map(|index| index + 1)
+}
+
+fn maybe_auto_review(state: &mut TuiState, outcome: &orchestrate::WorkerFollowupOutcome) {
+    if !state.auto_review
+        || outcome.status != "completed"
+        || outcome.commit.is_none()
+        || outcome.error.is_some()
+        || outcome.question.is_some()
+    {
+        return;
+    }
+    match crate::roles::load(&state.home) {
+        Ok(registry) if registry.review => {}
+        _ => return,
+    }
+    let position = {
+        let guard = state.store.lock().unwrap();
+        orchestration_task_position(&guard, &outcome.run_id, &outcome.task_id)
+    };
+    let Some(position) = position else {
+        return;
+    };
+    start_review_run(
+        state,
+        outcome.run_id.clone(),
+        std::path::PathBuf::from(&state.thread.cwd),
+        vec![position],
+    );
+}
+
 fn record_worker_followup(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -2240,6 +2306,7 @@ fn record_worker_followup(
                     None => format!("worker follow-up recorded in run {run} · no file changes"),
                 });
             }
+            maybe_auto_review(state, &outcome);
         }
         Ok(None) => {}
         Err(error) => state.notice = Some(error.to_string()),
@@ -14575,6 +14642,7 @@ mod tests {
             orchestration_ship_report: None,
             orchestration_reviewing: false,
             orchestration_confirm_review: false,
+            auto_review: false,
             orchestration_sender: std::sync::mpsc::channel().0,
             native_rewind_sender: std::sync::mpsc::channel().0,
             native_rewind_running: false,
@@ -26867,6 +26935,63 @@ exit 1
                 .contains("no subagent tool calls"),
             "{:?}",
             state.notice
+        );
+    }
+
+    #[test]
+    fn orchestration_task_position_matches_the_followup_task() {
+        let store = BatonStore::memory().unwrap();
+        store
+            .create_orchestration_run(
+                "run-pos",
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+            )
+            .unwrap();
+        for (position, id) in [(1, "task-a"), (2, "task-b")] {
+            store
+                .add_orchestration_task(
+                    id,
+                    "run-pos",
+                    position,
+                    id,
+                    ProviderId::Codex,
+                    "model",
+                    "prompt",
+                    None,
+                    None,
+                    None,
+                    None,
+                    "completed",
+                    None,
+                    None,
+                    "now",
+                    Some("now"),
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            orchestration_task_position(&store, "run-pos", "task-a"),
+            Some(1)
+        );
+        assert_eq!(
+            orchestration_task_position(&store, "run-pos", "task-b"),
+            Some(2)
+        );
+        assert_eq!(
+            orchestration_task_position(&store, "run-pos", "missing"),
+            None
+        );
+        assert_eq!(
+            orchestration_task_position(&store, "missing-run", "task-a"),
+            None
         );
     }
 

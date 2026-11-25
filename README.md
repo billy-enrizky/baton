@@ -468,7 +468,7 @@ Shipping pushes each approved worker branch and opens one pull request against t
 
 ### 8.6 Follow-ups
 
-Open a worker from the run report, send a follow-up, and the successful turn commits that worktree and refreshes the run. A new commit clears the merge and PR markers and marks the review `pending`. Press `r` in the report or run `baton orchestrate --review <run-id>` to re-review.
+Open a worker from the run report, send a follow-up, and the successful turn commits that worktree and refreshes the run. A new commit clears the merge and PR markers and marks the review `pending`. In the TUI, a completed follow-up with a new commit starts the reviewer automatically when the reviewer role is enabled; press `r` in the report or run `baton orchestrate --review <run-id>` to re-review manually.
 
 If a worker ends with `BATON_QUESTION: <question>`, the task and run become `needs_input`. Integration and shipping are refused until the worker thread is answered.
 

@@ -175,7 +175,12 @@ def main() -> int:
             master, "plan · 1/2 done", args.timeout, args.width, args.height, transcript
         ):
             raise RuntimeError("/plan did not open the overlay")
-        for value in ["Two checks", "✓ Inspect the parser", "▸ Add the regression"]:
+        for value in [
+            "turn turn-plan",
+            "Two checks",
+            "✓ Inspect the parser",
+            "▸ Add the regression",
+        ]:
             if not wait_for_screen(
                 master, value, 8.0, args.width, args.height, transcript
             ):

@@ -238,7 +238,9 @@ printf 'fn a() {}\n' > "$integrity_root/warnings/src/lib.rs"
 printf '#![allow(warnings)]\n' > "$integrity_root/warnings/src/lib.rs"
 printf '#[cfg_attr(test, allow(clippy::all))]\nfn a() {}\n' > "$integrity_root/cfgattr/src/lib.rs"
 printf '#[rustfmt::skip]\nfn a() {}\n' > "$integrity_root/skip/src/lib.rs"
-for pair in rustfmt:GI001 wrapper:GI002 lints:GI003 allow:GI004 warnings:GI005 cfgattr:GI005 skip:GI006; do
+mkdir -p "$integrity_root/missingfixture/ci"
+printf 'bash "$root/fixtures/check-ci/never-committed.yml"\n' > "$integrity_root/missingfixture/ci/selftest.sh"
+for pair in rustfmt:GI001 wrapper:GI002 lints:GI003 allow:GI004 warnings:GI005 cfgattr:GI005 skip:GI006 missingfixture:GI007; do
   case_name=${pair%%:*}
   rule=${pair##*:}
   set +e

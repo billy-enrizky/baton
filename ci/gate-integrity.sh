@@ -36,4 +36,14 @@ if grep -rqE '#\[rustfmt::skip\]' --include='*.rs' src tests 2>/dev/null; then
   fail "GI006 rustfmt skip in tracked Rust sources"
 fi
 
+# A new self-test case is unverified until the selftest reaches main, because the
+# selection guard runs ci/selftest.sh from the trusted base. A case whose fixture
+# was never committed therefore goes unnoticed on its own pull request and turns
+# main red on the next push. This checks the references instead of trusting them.
+if [[ -f ci/selftest.sh ]]; then
+  while IFS= read -r reference; do
+    [[ -f "ci/$reference" ]] || fail "GI007 ci/selftest.sh references ci/$reference, which does not exist"
+  done < <(grep -oE 'fixtures/check-ci/[A-Za-z0-9._-]+\.(yml|expected)' ci/selftest.sh | sort -u)
+fi
+
 echo "gate integrity passed"

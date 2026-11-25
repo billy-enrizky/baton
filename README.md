@@ -378,7 +378,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/help` | Show common paths; `/help all` opens the full command list |
 | `/switch` | Pick a harness, then a model, for this thread |
 | `/model` | Pick a model for the current harness |
-| `/effort` | Pick a reasoning effort; `/effort default` clears it |
+| `/effort` | Pick a reasoning effort on Codex or Claude; `/effort default` clears it |
 | `/mode` | Pick a permission mode for harnesses that support it: `default`, `acceptEdits`, `bypassPermissions`, or `plan` |
 | `/auth` | Pick a billing mode for any harness; `/auth codex` scopes it |
 | `/login` | Sign in to a harness; pick one from the list or run `/login codex` |

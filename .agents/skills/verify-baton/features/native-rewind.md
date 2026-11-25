@@ -1,5 +1,7 @@
 # Native rewind
 
+`/rewind --native` completion is offered only on Codex and OpenCode. Other harnesses see `/rewind [turn] · native rewind is Codex/OpenCode only` and plain `/rewind` still works.
+
 ## Sub-features
 - CLI rewind to before a turn
 - Codex native `thread/resume` + `thread/revert`

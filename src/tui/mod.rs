@@ -84,7 +84,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/model", "set model for this thread"),
     (
         "/effort",
-        "set reasoning effort: /effort opens a picker or takes low|medium|high|xhigh|max|default",
+        "set reasoning effort on codex or claude: /effort opens a picker or takes low|medium|high|xhigh|max|default",
     ),
     (
         "/mode",
@@ -3409,17 +3409,19 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
             }
         }
         "/effort" => {
-            for effort in EFFORT_VALUES {
-                push_suggestion(
-                    &mut suggestions,
-                    command,
-                    effort,
-                    if effort == "default" {
-                        "clear thread effort".to_string()
-                    } else {
-                        format!("reasoning effort {effort}")
-                    },
-                );
+            if state.thread.current_provider.supports_effort() {
+                for effort in EFFORT_VALUES {
+                    push_suggestion(
+                        &mut suggestions,
+                        command,
+                        effort,
+                        if effort == "default" {
+                            "clear thread effort".to_string()
+                        } else {
+                            format!("reasoning effort {effort}")
+                        },
+                    );
+                }
             }
         }
         "/mode" => {
@@ -3682,12 +3684,14 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
             }
         }
         "/rewind" => {
-            push_suggestion(
-                &mut suggestions,
-                command,
-                "--native",
-                "use native provider rewind",
-            );
+            if state.thread.current_provider.supports_native_rewind() {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    "--native",
+                    "use native provider rewind",
+                );
+            }
         }
         "/retry" => {
             for choice in retry_choices(state, &state.store).unwrap_or_default() {
@@ -6763,10 +6767,7 @@ fn start_native_rewind(
         state.notice = Some("interrupt the current turn before a native rewind".into());
         return;
     }
-    if !matches!(
-        state.thread.current_provider,
-        ProviderId::Codex | ProviderId::OpenCode
-    ) {
+    if !state.thread.current_provider.supports_native_rewind() {
         state.notice =
             Some("native rewind is Codex and OpenCode-only; use /rewind without --native".into());
         return;
@@ -15262,6 +15263,7 @@ fn draw_code_confirm(frame: &mut ratatui::Frame, area: Rect, turn: i64) {
 /// One line that explains what Enter will do right now. Shown only when the
 /// answer is not the default submit, so the composer stays quiet when idle.
 fn composer_hint(state: &TuiState) -> Option<String> {
+    let command = state.input.split_whitespace().next().unwrap_or_default();
     if state.running {
         Some("enter steers the live turn · esc interrupts · shift+enter adds a newline".to_string())
     } else if state.orchestration_pending {
@@ -15282,6 +15284,13 @@ fn composer_hint(state: &TuiState) -> Option<String> {
             .error
             .as_ref()
             .map(|error| format!("file index unavailable: {error}"))
+    } else if command == "/effort" && !state.thread.current_provider.supports_effort() {
+        Some(format!(
+            "{} has no reasoning effort; switch to codex or claude",
+            state.thread.current_provider
+        ))
+    } else if command == "/rewind" && !state.thread.current_provider.supports_native_rewind() {
+        Some("/rewind [turn] · native rewind is Codex/OpenCode only · enter runs it".to_string())
     } else if let Some(usage) = command_usage(&state.input) {
         let suffix = if suggestions_for(state).is_empty() {
             "enter runs it"
@@ -27473,6 +27482,37 @@ exit 1
             text.contains("enter sends the next queued message (1 waiting)"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn capability_hints_hide_unavailable_choices() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+
+        state.thread.current_provider = ProviderId::Cursor;
+        state.input = "/effort ".to_string();
+        assert!(suggestions_for(&state).is_empty());
+        let hint = composer_hint(&state).unwrap();
+        assert!(hint.contains("no reasoning effort"), "{hint}");
+
+        state.thread.current_provider = ProviderId::Claude;
+        state.input = "/rewind ".to_string();
+        assert!(suggestions_for(&state).is_empty());
+        let hint = composer_hint(&state).unwrap();
+        assert!(hint.contains("Codex/OpenCode"), "{hint}");
+
+        state.thread.current_provider = ProviderId::OpenCode;
+        assert!(suggestions_for(&state)
+            .iter()
+            .any(|suggestion| suggestion.insert.contains("--native")));
+
+        state.thread.current_provider = ProviderId::Codex;
+        state.input = "/effort ".to_string();
+        assert_eq!(suggestions_for(&state).len(), 6);
+        assert!(composer_hint(&state)
+            .unwrap()
+            .contains("tab or enter completes"));
     }
 
     #[test]

@@ -10459,7 +10459,8 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
             && review.notes.iter().any(|note| {
                 note.path == row.path && note.line == row.line_number && note.added == row.added
             });
-        let path_label = format!("{}:{}", row.path, row.line_number);
+        let path = crate::sanitize::sanitize_terminal_text(&row.path);
+        let path_label = format!("{}:{}", path, row.line_number);
         let max_path = (inner.width as usize).saturating_sub(12).max(12);
         let path_label = if path_label.chars().count() > max_path {
             let tail: String = path_label
@@ -10485,7 +10486,8 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
         };
         let used = path_label.chars().count() + 4;
         let text_width = (inner.width as usize).saturating_sub(used).max(1);
-        let text: String = row.text.chars().take(text_width).collect();
+        let text_value = crate::sanitize::sanitize_terminal_text(&row.text);
+        let text: String = text_value.chars().take(text_width).collect();
         let mut style = Style::default().fg(row_color);
         if selected {
             style = style.bg(COLORS.user_bg).add_modifier(Modifier::BOLD);
@@ -10516,7 +10518,13 @@ fn draw_review(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, review:
     } else if let Some(input) = review.note_input.as_ref() {
         let row = review.rows.get(review.selected);
         let target = row
-            .map(|row| format!("{}:{}", row.path, row.line_number))
+            .map(|row| {
+                format!(
+                    "{}:{}",
+                    crate::sanitize::sanitize_terminal_text(&row.path),
+                    row.line_number
+                )
+            })
             .unwrap_or_else(|| "no line".into());
         lines.push(Line::from(vec![
             Span::styled(
@@ -24816,6 +24824,32 @@ mod tests {
             notice.contains("copied"),
             "expected a copy notice, got {notice:?} with clipboard command {command:?}"
         );
+    }
+
+    #[test]
+    fn review_render_sanitizes_paths_and_lines() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.review = Some(ReviewState {
+            turn: 1,
+            fingerprint: "fingerprint".into(),
+            rows: vec![diff_render::DiffRowRef {
+                path: "src/\u{202e}lib.rs".into(),
+                line_number: 7,
+                added: true,
+                removed: false,
+                text: "safe \u{202e}red".into(),
+            }],
+            selected: 0,
+            notes: Vec::new(),
+            note_input: None,
+            search_input: None,
+            search: None,
+        });
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(!text.contains('\u{202e}'), "{text:?}");
+        assert!(text.contains('\u{fffd}'), "{text:?}");
     }
 
     #[test]

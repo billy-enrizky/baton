@@ -102,6 +102,10 @@ fn run_command_cancellable(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanTask {
+    /// A stable name another task can depend on. A task without one is
+    /// addressed by its one-based position, so an older plan keeps working.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub title: String,
     pub provider: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -109,6 +113,16 @@ pub struct PlanTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     pub prompt: String,
+    /// Tasks that must finish before this one may start. A dependency that
+    /// fails leaves this task unrun rather than starting it on a base that
+    /// never received the earlier work.
+    #[serde(
+        default,
+        rename = "dependsOn",
+        alias = "depends_on",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub depends_on: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -422,6 +436,105 @@ fn validate_plan_providers(plan: &Plan, available: &[ProviderId]) -> Result<()> 
     Ok(())
 }
 
+/// The name a task is addressed by: its own id, or its one-based position.
+fn plan_task_id(task: &PlanTask, index: usize) -> String {
+    task.id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| (index + 1).to_string())
+}
+
+/// Rejects a plan whose dependencies cannot be satisfied. A cycle would hang a
+/// dependency-aware run, and an unknown id would silently drop an ordering the
+/// planner asked for, so both are errors rather than warnings.
+fn validate_plan_dependencies(plan: &Plan) -> Result<()> {
+    let ids: Vec<String> = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(index, task)| plan_task_id(task, index))
+        .collect();
+    let mut seen: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (index, id) in ids.iter().enumerate() {
+        if let Some(first) = seen.insert(id.as_str(), index) {
+            anyhow::bail!(
+                "planner reused task id {id} for tasks {} and {}",
+                first + 1,
+                index + 1
+            );
+        }
+    }
+    let mut edges: Vec<Vec<usize>> = vec![Vec::new(); ids.len()];
+    for (index, task) in plan.tasks.iter().enumerate() {
+        for dependency in &task.depends_on {
+            let dependency = dependency.trim();
+            let Some(target) = seen.get(dependency) else {
+                anyhow::bail!("task {} depends on unknown task {dependency}", ids[index]);
+            };
+            if *target == index {
+                anyhow::bail!("task {} depends on itself", ids[index]);
+            }
+            if !edges[index].contains(target) {
+                edges[index].push(*target);
+            }
+        }
+    }
+    // Depth-first cycle detection over the dependency edges.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Mark {
+        Unvisited,
+        Active,
+        Done,
+    }
+    fn visit(
+        node: usize,
+        edges: &[Vec<usize>],
+        marks: &mut [Mark],
+        ids: &[String],
+    ) -> Result<()> {
+        match marks[node] {
+            Mark::Done => return Ok(()),
+            Mark::Active => anyhow::bail!(
+                "planner returned a dependency cycle through task {}",
+                ids[node]
+            ),
+            Mark::Unvisited => {}
+        }
+        marks[node] = Mark::Active;
+        for next in &edges[node] {
+            visit(*next, edges, marks, ids)?;
+        }
+        marks[node] = Mark::Done;
+        Ok(())
+    }
+    let mut marks = vec![Mark::Unvisited; ids.len()];
+    for index in 0..ids.len() {
+        visit(index, &edges, &mut marks, &ids)?;
+    }
+    Ok(())
+}
+
+/// The tasks that must finish before the task at `index` may start, resolved to
+/// plan positions.
+pub fn plan_task_dependencies(plan: &Plan, index: usize) -> Vec<usize> {
+    let ids: Vec<String> = plan
+        .tasks
+        .iter()
+        .enumerate()
+        .map(|(position, task)| plan_task_id(task, position))
+        .collect();
+    plan.tasks[index]
+        .depends_on
+        .iter()
+        .filter_map(|dependency| {
+            let dependency = dependency.trim();
+            ids.iter().position(|id| id == dependency)
+        })
+        .collect()
+}
+
 const WORKER_PREAMBLE: &str = "You are a worker in an isolated git worktree. Treat the current working directory as the repository root. Do not read or write the source checkout outside this worktree. If you cannot finish without a user decision or information only the user can provide, stop and end your reply with exactly one line formatted as `BATON_QUESTION: <question>`. Do not guess. Otherwise finish the task.";
 
 const MAX_TASK_PROMPT_BYTES: usize = 12 * 1024;
@@ -518,11 +631,30 @@ pub fn parse_plan(text: &str, max_tasks: usize) -> Result<Plan> {
         if ProviderId::parse(task.provider.trim()).is_none() {
             anyhow::bail!("planner returned unknown provider {}", task.provider);
         }
+        let id = task.id.take();
+        task.id = match id {
+            Some(id) if id.trim().is_empty() => None,
+            Some(id) => Some(id.trim().to_string()),
+            None => None,
+        };
+        for dependency in &mut task.depends_on {
+            *dependency = dependency.trim().to_string();
+        }
+        task.depends_on.retain(|dependency| !dependency.is_empty());
     }
+    validate_plan_dependencies(&plan)?;
     Ok(plan)
 }
 
-fn parse_exec_output(stdout: &[u8], stderr: &[u8]) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
+fn parse_exec_output(
+    stdout: &[u8],
+    stderr: &[u8],
+) -> (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+) {
     let value: Option<serde_json::Value> = serde_json::from_slice(stdout).ok();
     if let Some(value) = value {
         return (
@@ -702,11 +834,13 @@ fn fallback_plan(goal: &str, provider: ProviderId) -> Plan {
         summary: Some("direct task".to_string()),
         role_defaults_applied: false,
         tasks: vec![PlanTask {
+            id: None,
             title: "answer".to_string(),
             provider: provider.as_str().to_string(),
             model: None,
             effort: None,
             prompt: goal.to_string(),
+            depends_on: Vec::new(),
         }],
     }
 }
@@ -722,11 +856,13 @@ pub fn single_task_plan(
         summary: Some("single subagent".to_string()),
         role_defaults_applied: true,
         tasks: vec![PlanTask {
+            id: None,
             title: crate::handoff::derive_title(prompt),
             provider: provider.as_str().to_string(),
             model: Some(model),
             effort,
             prompt: prompt.to_string(),
+            depends_on: Vec::new(),
         }],
     }
 }
@@ -3056,6 +3192,133 @@ mod tests {
     use super::*;
     use crate::store::BatonStore;
 
+    fn plan_json(tasks: &str) -> String {
+        format!("{{\"tasks\":[{tasks}]}}")
+    }
+
+    fn task_json(id: &str, depends: &str) -> String {
+        format!(
+            "{{\"id\":\"{id}\",\"title\":\"{id}\",\"provider\":\"codex\",\"prompt\":\"do {id}\",\"dependsOn\":[{depends}]}}"
+        )
+    }
+
+    #[test]
+    fn parse_plan_keeps_task_dependencies() {
+        let plan = parse_plan(
+            &plan_json(&format!(
+                "{},{}",
+                task_json("design", ""),
+                task_json("build", "\"design\"")
+            )),
+            4,
+        )
+        .unwrap();
+        assert_eq!(plan.tasks[0].id.as_deref(), Some("design"));
+        assert!(plan.tasks[0].depends_on.is_empty());
+        assert_eq!(plan.tasks[1].depends_on, vec!["design".to_string()]);
+        assert_eq!(plan_task_dependencies(&plan, 1), vec![0]);
+        assert!(plan_task_dependencies(&plan, 0).is_empty());
+    }
+
+    #[test]
+    fn parse_plan_addresses_an_unnamed_task_by_its_position() {
+        let plan = parse_plan(
+            &plan_json(
+                r#"{"title":"first","provider":"codex","prompt":"one"},
+                   {"title":"second","provider":"codex","prompt":"two","dependsOn":["1"]}"#,
+            ),
+            4,
+        )
+        .unwrap();
+        assert!(plan.tasks[0].id.is_none());
+        assert_eq!(plan_task_dependencies(&plan, 1), vec![0]);
+    }
+
+    #[test]
+    fn parse_plan_rejects_a_dependency_on_an_unknown_task() {
+        let error = parse_plan(
+            &plan_json(&format!(
+                "{},{}",
+                task_json("design", ""),
+                task_json("build", "\"missing\"")
+            )),
+            4,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("unknown task missing"), "{error}");
+    }
+
+    #[test]
+    fn parse_plan_rejects_a_dependency_cycle() {
+        let error = parse_plan(
+            &plan_json(&format!(
+                "{},{}",
+                task_json("a", "\"b\""),
+                task_json("b", "\"a\"")
+            )),
+            4,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("dependency cycle"), "{error}");
+    }
+
+    #[test]
+    fn parse_plan_rejects_a_task_that_depends_on_itself() {
+        let error = parse_plan(&plan_json(&task_json("solo", "\"solo\"")), 4)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("depends on itself"), "{error}");
+    }
+
+    #[test]
+    fn parse_plan_rejects_two_tasks_with_the_same_id() {
+        let error = parse_plan(
+            &plan_json(&format!(
+                "{},{}",
+                task_json("dup", ""),
+                task_json("dup", "")
+            )),
+            4,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("reused task id dup"), "{error}");
+    }
+
+    #[test]
+    fn parse_plan_rejects_a_dependency_dropped_by_the_task_limit() {
+        // The limit keeps the first task, which depends on the second. Running
+        // the survivor would skip the work it said must happen first.
+        let error = parse_plan(
+            &plan_json(&format!(
+                "{},{}",
+                task_json("a", "\"b\""),
+                task_json("b", "")
+            )),
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("unknown task b"),
+            "a truncated prerequisite must fail rather than leave the dependent unguarded: {error}"
+        );
+    }
+
+    #[test]
+    fn a_plan_without_dependencies_serializes_without_the_new_fields() {
+        let plan = parse_plan(
+            &plan_json(r#"{"title":"one","provider":"codex","prompt":"do it"}"#),
+            4,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&plan).unwrap();
+        assert!(!json.contains("dependsOn"), "{json}");
+        assert!(!json.contains("\"id\""), "{json}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_failing_before_plan_hook_aborts_the_plan() {
@@ -3160,6 +3423,8 @@ mod tests {
             model: None,
             effort: None,
             prompt: "do the work".to_string(),
+            id: None,
+            depends_on: Vec::new(),
         }
     }
 
@@ -3248,6 +3513,8 @@ mod tests {
                 model: Some("model".into()),
                 effort: None,
                 prompt: "do one".into(),
+                id: None,
+                depends_on: Vec::new(),
             }],
         });
         assert_eq!(plan["schema_version"], SCHEMA_VERSION);
@@ -4669,6 +4936,8 @@ printf 'worker\n' > worker.txt",
                     model: None,
                     effort: None,
                     prompt: "a".to_string(),
+                    id: None,
+                    depends_on: Vec::new(),
                 },
                 PlanTask {
                     title: "b".to_string(),
@@ -4676,6 +4945,8 @@ printf 'worker\n' > worker.txt",
                     model: None,
                     effort: None,
                     prompt: "b".to_string(),
+                    id: None,
+                    depends_on: Vec::new(),
                 },
             ],
         });

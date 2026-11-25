@@ -163,6 +163,8 @@ needs = Array(verify["needs"]).map(&:to_s)
 expected = jobs.keys.map(&:to_s) - ["verify"]
 missing_needs = expected - needs
 fail!("CI005", "verify is missing needs: #{missing_needs.join(", ")}") unless missing_needs.empty?
+unknown_needs = needs - expected
+fail!("CI005", "verify needs jobs that do not exist: #{unknown_needs.join(", ")}") unless unknown_needs.empty?
 
 changes = jobs["changes"]
 fail!("CI009", "missing changes job") unless changes.is_a?(Hash)
@@ -193,9 +195,13 @@ if debt_job.is_a?(Hash)
   condition = debt_job["if"].to_s
   fail!("CI010", "debt must read changes.outputs.debt_needed") unless condition.include?("debt_needed")
 else
+  # No debt job: `check` must run the ratchet commands (CI014 enforces that) and
+  # keep reading only check_needed. Requiring it to read debt_needed as well would
+  # be a job-level wiring change, and CI013 forbids wiring drift even with
+  # --allow-change, so the two rules together would make the merge impossible.
   check_condition = jobs["check"]["if"].to_s
-  unless check_condition.include?("check_needed") && check_condition.include?("debt_needed")
-    fail!("CI010", "without a debt job, check must read changes.outputs.check_needed and debt_needed")
+  unless check_condition.include?("check_needed")
+    fail!("CI010", "without a debt job, check must read changes.outputs.check_needed")
   end
 end
 
@@ -209,16 +215,22 @@ if changes_text.include?("--files")
   end
 end
 
-required_commands = {
+# Every job name the linter knows, and what it must run, independent of which
+# shape the head workflow uses. `required_commands` below is the subset that must
+# exist in this workflow; `known_commands` also answers for a job that a head
+# workflow removed.
+known_commands = {
   "changes" => ["classify-paths.sh"],
   "selection" => ["classify-paths.sh", "check-ci.sh", "--base", "selftest.sh", "gate-integrity.sh"],
   "check" => ["cargo check --locked"],
   "build" => ["cargo build --locked"],
   "test" => ["cargo test --locked"],
+  "debt" => DEBT_COMMANDS,
   "verify" => ["check_gate"],
 }
-required_commands["debt"] = DEBT_COMMANDS if jobs["debt"].is_a?(Hash)
-DEBT_COMMANDS.each { |command| required_commands["check"] << command } unless jobs["debt"].is_a?(Hash)
+required_commands = known_commands.dup
+required_commands["check"] = required_commands["check"] + DEBT_COMMANDS unless jobs["debt"].is_a?(Hash)
+required_commands.delete("debt") unless jobs["debt"].is_a?(Hash)
 job_text = {}
 required_commands.each do |job_name, commands|
   job = jobs[job_name]
@@ -248,10 +260,31 @@ elsif File.file?(base_path)
 
   head_jobs = jobs.keys.map(&:to_s).sort
   base_keys = base_jobs.keys.map(&:to_s).sort
-  fail!("CI013", "job list changed: #{head_jobs} != #{base_keys}") unless head_jobs == base_keys
+  # A job may be removed only when every command it was required to run still
+  # runs in the head workflow. Removing a job to skip its checks stays forbidden,
+  # and adding a job is always forbidden, so the guard keeps its purpose while a
+  # merge of two compile jobs into one stays possible.
+  added = head_jobs - base_keys
+  fail!("CI013", "job added: #{added.join(", ")}") unless added.empty?
+  removed = base_keys - head_jobs
+  unless removed.empty?
+    surviving = head_jobs.map { |name| job_text[name].to_s }.join("\n")
+    removed.each do |name|
+      commands = known_commands[name]
+      fail!("CI013", "job #{name} was removed and is not a known job") if commands.nil?
+      still_run = commands.reject do |command|
+        command == "check_gate" || command.start_with?("--") || surviving.include?(command)
+      end
+      unless still_run.empty?
+        fail!("CI013", "job #{name} was removed and its commands are gone: #{still_run.join(", ")}")
+      end
+      puts "CI013 job #{name} removed; its required commands still run in the head workflow"
+    end
+  end
 
   changed = []
   head_jobs.each do |name|
+    next unless base_jobs.key?(name)
     unless canonical_job_shell(jobs[name]) == canonical_job_shell(base_jobs[name])
       fail!("CI013", "job #{name} wiring changed; job wiring is never allowed to drift")
     end

@@ -4664,12 +4664,7 @@ fn handle_key(
             mut selected,
             native,
         } => {
-            let user_messages: Vec<(i64, String)> = state
-                .history
-                .iter()
-                .filter(|message| message.role == "user")
-                .map(|message| (message.turn, message.text.clone()))
-                .collect();
+            let user_messages = rewind_choices(state);
             match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Up => {
@@ -6354,6 +6349,16 @@ fn handle_key(
             handle_composer_key(state, store, engine_command_sender, key);
         }
     }
+}
+
+fn rewind_choices(state: &TuiState) -> Vec<(i64, String)> {
+    state
+        .history
+        .iter()
+        .rev()
+        .filter(|message| message.role == "user")
+        .map(|message| (message.turn, message.text.clone()))
+        .collect()
 }
 
 fn start_native_rewind(
@@ -14064,13 +14069,15 @@ fn draw_rewind_picker(
     selected: usize,
     native: bool,
 ) {
-    let user_messages: Vec<(&i64, &String)> = state
-        .history
-        .iter()
-        .filter(|message| message.role == "user")
-        .map(|message| (&message.turn, &message.text))
-        .collect();
-    let newest_first: Vec<&(&i64, &String)> = user_messages.iter().rev().collect();
+    let user_messages = rewind_choices(state);
+    let visible = 8usize.min((area.height as usize).saturating_sub(2)).max(1);
+    let start = if user_messages.len() <= visible {
+        0
+    } else {
+        selected
+            .saturating_sub(visible / 2)
+            .min(user_messages.len() - visible)
+    };
     let mut lines: Vec<Line> = vec![Line::styled(
         if native {
             "rewind to message · native history · enter select · esc cancel"
@@ -14079,8 +14086,9 @@ fn draw_rewind_picker(
         },
         Style::default().fg(COLORS.muted),
     )];
-    for (index, (turn, text)) in newest_first.iter().take(8).enumerate() {
+    for (index, (turn, text)) in user_messages.iter().enumerate().skip(start).take(visible) {
         let summary: String = text.lines().next().unwrap_or("").chars().take(60).collect();
+        let marker = if index == selected { "❯" } else { " " };
         let style = if index == selected {
             Style::default()
                 .fg(COLORS.accent)
@@ -14088,7 +14096,10 @@ fn draw_rewind_picker(
         } else {
             Style::default().fg(COLORS.muted)
         };
-        lines.push(Line::styled(format!("❯ turn {turn}: {summary}"), style));
+        lines.push(Line::styled(
+            format!("{marker} turn {turn}: {summary}"),
+            style,
+        ));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -25867,6 +25878,85 @@ exit 1
         ));
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(text.contains("native history"), "{text}");
+    }
+
+    #[test]
+    fn rewind_picker_uses_the_visible_newest_first_order_and_enter_matches_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        {
+            let guard = store.lock().unwrap();
+            for turn in 1..=10 {
+                guard
+                    .add_message(
+                        &thread_id,
+                        turn,
+                        "user",
+                        None,
+                        None,
+                        &format!("prompt {turn}"),
+                    )
+                    .unwrap();
+                guard
+                    .add_message(
+                        &thread_id,
+                        turn,
+                        "assistant",
+                        None,
+                        None,
+                        &format!("answer {turn}"),
+                    )
+                    .unwrap();
+            }
+        }
+        state.history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        state.overlay = Overlay::RewindPicker {
+            selected: 0,
+            native: false,
+        };
+
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        let newest = text.find("turn 10:").expect("newest row");
+        let older = text.find("turn 3:").expect("oldest visible row");
+        assert!(newest < older, "newest row must render first: {text}");
+        assert!(
+            !text.contains("turn 2:"),
+            "the window shows eight rows: {text}"
+        );
+        assert_eq!(text.matches("❯ turn").count(), 1, "{text}");
+
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let user_turns: Vec<i64> = state
+            .history
+            .iter()
+            .filter(|message| message.role == "user")
+            .map(|message| message.turn)
+            .collect();
+        assert_eq!(user_turns, (1..=9).collect::<Vec<_>>());
+
+        state.history = store.lock().unwrap().list_messages(&thread_id).unwrap();
+        state.overlay = Overlay::RewindPicker {
+            selected: 8,
+            native: false,
+        };
+        let text = buffer_lines(&render_state(&state, 100, 24)).join("\n");
+        assert!(
+            text.contains("turn 1:"),
+            "selected oldest row stays visible: {text}"
+        );
+        assert!(
+            !text.contains("turn 10:"),
+            "the window follows the selection: {text}"
+        );
+        assert_eq!(text.matches("❯ turn").count(), 1, "{text}");
     }
 
     #[test]

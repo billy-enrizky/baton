@@ -90,8 +90,6 @@ def run(binary: str, timeout: float, evidence: Path) -> dict:
         os.write(master, b"/rewind --native\r")
         probe.pump(master, 0.8, transcript)
         picker = screen_text()
-        os.write(master, b"\x1b[B")
-        probe.pump(master, 0.2, transcript)
         os.write(master, b"\r")
 
         deadline = time.time() + 45
@@ -112,6 +110,7 @@ def run(binary: str, timeout: float, evidence: Path) -> dict:
 
         result = {
             "picker_showed_user_messages": "first" in picker and "second" in picker,
+            "picker_newest_first": picker.find("turn 2") < picker.find("turn 1"),
             "rewind_reported": done,
             "composer_prefilled": "second" in final,
         }
@@ -128,7 +127,15 @@ def run(binary: str, timeout: float, evidence: Path) -> dict:
         result["turns"] = turns
         result["user_messages"] = users
         passed = (
-            all(result[key] for key in ["picker_showed_user_messages", "rewind_reported", "composer_prefilled"])
+            all(
+                result[key]
+                for key in [
+                    "picker_showed_user_messages",
+                    "picker_newest_first",
+                    "rewind_reported",
+                    "composer_prefilled",
+                ]
+            )
             and result["exit_code"] == 0
             and len(turns) == 1
             and len(users) == 1

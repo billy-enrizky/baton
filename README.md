@@ -181,7 +181,7 @@ Every editing turn leaves a checkpoint. `/rewind` restores the conversation and 
 
 ### 2.5 Agent-readable state
 
-`baton status`, `threads`, `turns`, `queue`, `activity`, `agents`, `exec`, and `orchestrate` offer JSON output. `exec --stream-json` and `orchestrate --stream-json` emit one event per line. `baton mcp` exposes the same store over MCP stdio for other agents.
+`baton status`, `threads`, `turns`, `queue`, `activity`, `agents`, `exec`, and `orchestrate` offer JSON output. An `exec --json` result carries the last plan the harness reported, when there is one. `exec --stream-json` and `orchestrate --stream-json` emit one event per line. `baton mcp` exposes the same store over MCP stdio for other agents.
 
 ## 3. Install
 
@@ -340,7 +340,7 @@ Some providers also ask a question before continuing. The same overlay lists the
 
 Most commands open a picker instead of requiring memorized syntax. Pickers show their keys, the current selection, and the relevant detail. Remote actions open a preview first and recheck the live state before they run. When the terminal bell is enabled in settings, Baton rings once when a turn finishes, an approval arrives, or a provider asks a question. A two-second limiter mutes repeats.
 
-`/plan` opens a scrollable overlay of the last plan the current harness reported, with `✓`, `▸`, and `·` markers. Long steps and explanations wrap instead of being cut off, and the header names the turn that reported the plan when the harness supplies one. The overlay never edits the plan. The last plan for each thread and harness is saved with the thread, so `/plan` still works after a restart; new work, `/multi`, orchestration, and a rewind clear it. In plan mode (`/mode plan`) Enter accepts the plan, switches the thread to the default permission mode, and sends nothing, while Esc closes the view and pre-fills an empty composer with `revise the plan: `. Outside plan mode Enter says the view is read-only. Up and Down, PageUp and PageDown, Home, and End scroll; `q` always closes.
+`/plan` opens a scrollable overlay of the last plan the current harness reported, with `✓`, `▸`, and `·` markers. Long steps and explanations wrap instead of being cut off, and the header names the turn that reported the plan when the harness supplies one. The overlay never edits the plan. The last plan for each thread and harness is saved with the thread, so `/plan` still works after a restart; new work, `/multi`, orchestration, and a rewind clear it. An orchestration worker's plan is stored on that worker's thread once the worker settles. In plan mode (`/mode plan`) Enter accepts the plan, switches the thread to the default permission mode, and sends nothing, while Esc closes the view and pre-fills an empty composer with `revise the plan: `. Outside plan mode Enter says the view is read-only. Up and Down, PageUp and PageDown, Home, and End scroll; `q` always closes.
 
 ### 6.4 Transcript
 

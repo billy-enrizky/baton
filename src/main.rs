@@ -435,6 +435,7 @@ fn main_result(started: Instant) -> Result<()> {
                     text: "",
                     worker_followup: None,
                     review: None,
+                    plan: stream.plan.as_ref(),
                 });
                 if stream_json {
                     value["type"] = serde_json::json!("result");
@@ -472,6 +473,7 @@ fn main_result(started: Instant) -> Result<()> {
                     text,
                     worker_followup: worker_followup.as_ref(),
                     review: followup_review.as_ref(),
+                    plan: stream.plan.as_ref(),
                 });
                 if stream_json {
                     value["type"] = serde_json::json!("result");

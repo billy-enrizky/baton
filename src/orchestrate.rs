@@ -190,6 +190,14 @@ pub enum OrchestrationProgress {
         commit: Option<String>,
         error: Option<String>,
     },
+    WorkerPlanReported {
+        thread_id: String,
+        provider: ProviderId,
+        plan_id: Option<String>,
+        turn_id: Option<String>,
+        entries: Vec<crate::types::PlanEntry>,
+        explanation: Option<String>,
+    },
 }
 
 pub type ProgressFn<'a> = dyn Fn(OrchestrationProgress) + Send + Sync + 'a;
@@ -239,6 +247,13 @@ pub fn render_progress(event: &OrchestrationProgress) -> String {
                 .map(|error| format!(" · {error}"))
                 .unwrap_or_default()
         ),
+        OrchestrationProgress::WorkerPlanReported {
+            thread_id, entries, ..
+        } => format!(
+            "worker plan: {} step(s) · thread {}",
+            entries.len(),
+            &thread_id[..8.min(thread_id.len())]
+        ),
     }
 }
 
@@ -283,6 +298,29 @@ pub fn progress_json(event: &OrchestrationProgress) -> serde_json::Value {
             "status": status,
             "commit": commit,
             "error": error,
+        }),
+        OrchestrationProgress::WorkerPlanReported {
+            thread_id,
+            provider,
+            plan_id,
+            turn_id,
+            entries,
+            explanation,
+        } => serde_json::json!({
+            "type": "worker_plan",
+            "thread_id": thread_id,
+            "provider": provider.as_str(),
+            "plan_id": plan_id,
+            "turn_id": turn_id,
+            "explanation": explanation,
+            "entries": entries
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "content": entry.content,
+                    "status": entry.status,
+                    "priority": entry.priority,
+                }))
+                .collect::<Vec<_>>(),
         }),
     };
     value["schema_version"] = serde_json::json!(SCHEMA_VERSION);
@@ -647,26 +685,152 @@ pub fn parse_plan(text: &str, max_tasks: usize) -> Result<Plan> {
     Ok(plan)
 }
 
-fn parse_exec_output(
-    stdout: &[u8],
-    stderr: &[u8],
-) -> (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-) {
-    let value: Option<serde_json::Value> = serde_json::from_slice(stdout).ok();
-    if let Some(value) = value {
-        return (
-            value.get("thread_id").and_then(|value| value.as_str()).map(str::to_string),
-            value.get("text").and_then(|value| value.as_str()).map(str::to_string),
-            value.get("error").and_then(|value| value.as_str()).map(str::to_string),
-            value.get("phase").and_then(|value| value.as_str()).map(str::to_string),
-        );
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExecPlan {
+    provider: ProviderId,
+    plan_id: Option<String>,
+    turn_id: Option<String>,
+    entries: Vec<crate::types::PlanEntry>,
+    explanation: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ExecOutput {
+    thread_id: Option<String>,
+    text: Option<String>,
+    error: Option<String>,
+    phase: Option<String>,
+    plan: Option<ExecPlan>,
+}
+
+fn plan_from_row(row: &serde_json::Value) -> Option<ExecPlan> {
+    let provider = row
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ProviderId::parse)?;
+    let entries = row
+        .get("entries")
+        .and_then(serde_json::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| {
+                    Some(crate::types::PlanEntry {
+                        content: entry.get("content")?.as_str()?.to_string(),
+                        status: crate::types::normalize_plan_status(
+                            entry.get("status")?.as_str()?,
+                        ),
+                        priority: entry
+                            .get("priority")
+                            .and_then(serde_json::Value::as_str)
+                            .map(str::to_string),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(ExecPlan {
+        provider,
+        plan_id: row
+            .get("plan_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        turn_id: row
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        entries,
+        explanation: row
+            .get("explanation")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    })
+}
+
+fn parse_exec_output(stdout: &[u8], stderr: &[u8]) -> ExecOutput {
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(stdout) {
+        return ExecOutput {
+            thread_id: value
+                .get("thread_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            text: value
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            error: value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            phase: value
+                .get("phase")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            plan: value.get("plan").and_then(plan_from_row),
+        };
     }
-    let stderr = String::from_utf8_lossy(stderr).trim().to_string();
-    (None, None, (!stderr.is_empty()).then_some(stderr), None)
+    let mut output = ExecOutput::default();
+    let mut saw_result = false;
+    for line in stdout.split(|byte| *byte == b'\n') {
+        let line = std::str::from_utf8(line).unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let row_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let is_result = row_type == "result"
+            || (row_type.is_empty()
+                && value.get("thread_id").is_some()
+                && value.get("phase").is_some());
+        if is_result {
+            {
+                saw_result = true;
+                output.thread_id = value
+                    .get("thread_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                output.text = value
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                output.error = value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                output.phase = value
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+            }
+        } else if row_type == "plan_updated" {
+            if let Some(plan) = plan_from_row(&value) {
+                output.plan = Some(plan);
+            }
+        } else if row_type == "plan_removed" {
+            let provider = value
+                .get("provider")
+                .and_then(serde_json::Value::as_str)
+                .and_then(ProviderId::parse);
+            let plan_id = value.get("plan_id").and_then(serde_json::Value::as_str);
+            if output.plan.as_ref().is_some_and(|plan| {
+                Some(plan.provider) == provider && plan.plan_id.as_deref() == plan_id
+            }) {
+                output.plan = None;
+            }
+        }
+    }
+    if !saw_result && output.thread_id.is_none() {
+        let stderr = String::from_utf8_lossy(stderr).trim().to_string();
+        if !stderr.is_empty() {
+            output.error = Some(stderr);
+        }
+    }
+    output
 }
 
 fn coordinator_command(
@@ -715,14 +879,18 @@ fn run_coordinator(
     if output.cancelled {
         anyhow::bail!(CANCELLED_ERROR);
     }
-    let (_, text, error, _) = parse_exec_output(&output.stdout, &output.stderr);
-    if !output.status.success() && text.is_none() {
+    let parsed = parse_exec_output(&output.stdout, &output.stderr);
+    if !output.status.success() && parsed.text.is_none() {
         anyhow::bail!(
             "coordinator failed: {}",
-            error.unwrap_or_else(|| "no output from baton exec".to_string())
+            parsed
+                .error
+                .unwrap_or_else(|| "no output from baton exec".to_string())
         );
     }
-    text.ok_or_else(|| anyhow::anyhow!("coordinator returned no text"))
+    parsed
+        .text
+        .ok_or_else(|| anyhow::anyhow!("coordinator returned no text"))
 }
 
 pub fn is_conversational_greeting(text: &str) -> bool {
@@ -1355,20 +1523,48 @@ fn run_worker_inner(
         .env("BATON_HOME", home)
         .env("BATON_DISABLE_SKILL_DISPATCH", "1");
     let output = run_command_cancellable(command, cancel);
-    let (thread_id, text, error, _phase, cancelled) = match output {
+    let (thread_id, text, error, _phase, cancelled, plan) = match output {
         Ok(result) => {
-            let (thread_id, text, error, phase) =
-                parse_exec_output(&result.stdout, &result.stderr);
-            let ok = result.status.success() && phase.as_deref() == Some("completed");
+            let parsed = parse_exec_output(&result.stdout, &result.stderr);
+            let ok = result.status.success() && parsed.phase.as_deref() == Some("completed");
             let error = if result.cancelled || ok {
                 None
             } else {
-                error.or_else(|| Some(format!("worker exited with {}", result.status)))
+                parsed
+                    .error
+                    .or_else(|| Some(format!("worker exited with {}", result.status)))
             };
-            (thread_id, text, error, phase, result.cancelled)
+            (
+                parsed.thread_id,
+                parsed.text,
+                error,
+                parsed.phase,
+                result.cancelled,
+                parsed.plan,
+            )
         }
-        Err(error) => (None, None, Some(format!("cannot run worker: {error}")), None, false),
+        Err(error) => (
+            None,
+            None,
+            Some(format!("cannot run worker: {error}")),
+            None,
+            false,
+            None,
+        ),
     };
+    if let (Some(thread_id), Some(plan)) = (thread_id.as_deref(), plan) {
+        emit(
+            progress,
+            OrchestrationProgress::WorkerPlanReported {
+                thread_id: thread_id.to_string(),
+                provider: plan.provider,
+                plan_id: plan.plan_id,
+                turn_id: plan.turn_id,
+                entries: plan.entries,
+                explanation: plan.explanation,
+            },
+        );
+    }
     let question = text.as_deref().and_then(worker_question);
     let mut status = if cancelled {
         "cancelled"
@@ -1613,15 +1809,16 @@ fn review_task(
         .env("BATON_ROLE", "reviewer");
     let outcome = match run_command_cancellable(command, cancel) {
         Ok(result) => {
-            let (_, text, error, phase) = parse_exec_output(&result.stdout, &result.stderr);
-            if !result.status.success() || phase.as_deref() != Some("completed") {
+            let parsed = parse_exec_output(&result.stdout, &result.stderr);
+            if !result.status.success() || parsed.phase.as_deref() != Some("completed") {
                 ReviewOutcome {
                     status: REVIEW_FAILED,
-                    text: error
+                    text: parsed
+                        .error
                         .unwrap_or_else(|| format!("reviewer turn exited with {}", result.status)),
                 }
             } else {
-                let text = text.unwrap_or_default();
+                let text = parsed.text.unwrap_or_default();
                 ReviewOutcome {
                     status: parse_review_verdict(&text),
                     text,
@@ -3816,6 +4013,75 @@ esac"#;
     }
 
     #[test]
+    fn parse_exec_output_reads_a_stream_json_result_and_plan() {
+        let stdout = br#"{"type":"plan_updated","provider":"codex","turn_id":"turn-1","explanation":"check","entries":[{"content":"step one","status":"inProgress","priority":"high"}]}
+{"type":"result","thread_id":"thread-1","ok":true,"phase":"completed","error":null,"text":"done"}"#;
+        let parsed = parse_exec_output(stdout, b"");
+        assert_eq!(parsed.thread_id.as_deref(), Some("thread-1"));
+        assert_eq!(parsed.text.as_deref(), Some("done"));
+        assert_eq!(parsed.phase.as_deref(), Some("completed"));
+        let plan = parsed.plan.expect("plan row");
+        assert_eq!(plan.provider, ProviderId::Codex);
+        assert!(plan.plan_id.is_none());
+        assert_eq!(plan.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(plan.explanation.as_deref(), Some("check"));
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.entries[0].content, "step one");
+        assert_eq!(plan.entries[0].status, "in_progress");
+        assert_eq!(plan.entries[0].priority.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn parse_exec_output_keeps_the_single_json_result() {
+        let stdout = br#"{"thread_id":"t","text":"done","error":null,"phase":"completed"}"#;
+        let parsed = parse_exec_output(stdout, b"");
+        assert_eq!(parsed.thread_id.as_deref(), Some("t"));
+        assert_eq!(parsed.text.as_deref(), Some("done"));
+        assert_eq!(parsed.phase.as_deref(), Some("completed"));
+        assert!(parsed.plan.is_none());
+    }
+
+    #[test]
+    fn parse_exec_output_reads_the_plan_from_a_single_result() {
+        let stdout = br#"{"thread_id":"t","text":"done","phase":"completed","plan":{"provider":"codex","turn_id":"turn-1","explanation":"check","entries":[{"content":"step one","status":"in_progress","priority":null}]}}"#;
+        let parsed = parse_exec_output(stdout, b"");
+        assert_eq!(parsed.thread_id.as_deref(), Some("t"));
+        let plan = parsed.plan.expect("plan field");
+        assert_eq!(plan.provider, ProviderId::Codex);
+        assert_eq!(plan.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(plan.entries[0].content, "step one");
+        assert_eq!(plan.entries[0].status, "in_progress");
+        assert!(plan.entries[0].priority.is_none());
+    }
+
+    #[test]
+    fn parse_exec_output_accepts_an_untyped_result_after_other_rows() {
+        let stdout = br#"{"type":"plan_updated","provider":"codex","entries":[]}
+{"thread_id":"t","text":"done","phase":"completed"}"#;
+        let parsed = parse_exec_output(stdout, b"");
+        assert_eq!(parsed.thread_id.as_deref(), Some("t"));
+        assert_eq!(parsed.phase.as_deref(), Some("completed"));
+        assert!(parsed.plan.is_some());
+    }
+
+    #[test]
+    fn parse_exec_output_drops_a_removed_plan() {
+        let stdout = br#"{"type":"plan_updated","provider":"codex","plan_id":"plan-1","entries":[{"content":"step one","status":"in_progress"}]}
+{"type":"plan_removed","provider":"codex","plan_id":"plan-1"}
+{"type":"result","thread_id":"t","phase":"completed","ok":true,"text":"done"}"#;
+        let parsed = parse_exec_output(stdout, b"");
+        assert_eq!(parsed.thread_id.as_deref(), Some("t"));
+        assert!(parsed.plan.is_none(), "a removed plan must not be forwarded");
+    }
+
+    #[test]
+    fn parse_exec_output_reports_stderr_when_nothing_parses() {
+        let parsed = parse_exec_output(b"not json", b"provider exploded");
+        assert_eq!(parsed.error.as_deref(), Some("provider exploded"));
+        assert!(parsed.thread_id.is_none());
+    }
+
+    #[test]
     fn progress_json_covers_each_orchestration_event() {
         let plan = progress_json(&OrchestrationProgress::PlanReady {
             summary: Some("two tasks".into()),
@@ -3854,6 +4120,28 @@ esac"#;
         assert_eq!(finished["type"], "worker_finished");
         assert_eq!(finished["status"], "completed");
         assert_eq!(finished["commit"], "abc123");
+
+        let plan = progress_json(&OrchestrationProgress::WorkerPlanReported {
+            thread_id: "thread-1".into(),
+            provider: ProviderId::Codex,
+            plan_id: Some("plan-1".into()),
+            turn_id: Some("turn-1".into()),
+            entries: vec![crate::types::PlanEntry {
+                content: "step one".into(),
+                status: "in_progress".into(),
+                priority: Some("high".into()),
+            }],
+            explanation: Some("check".into()),
+        });
+        assert_eq!(plan["type"], "worker_plan");
+        assert_eq!(plan["thread_id"], "thread-1");
+        assert_eq!(plan["provider"], "codex");
+        assert_eq!(plan["plan_id"], "plan-1");
+        assert_eq!(plan["turn_id"], "turn-1");
+        assert_eq!(plan["explanation"], "check");
+        assert_eq!(plan["entries"][0]["content"], "step one");
+        assert_eq!(plan["entries"][0]["status"], "in_progress");
+        assert_eq!(plan["entries"][0]["priority"], "high");
     }
 
     #[test]
@@ -5370,6 +5658,50 @@ printf 'worker\n' > worker.txt",
         assert_eq!(tasks[0].status, "cancelled");
         let runs = store.list_orchestration_runs(10).unwrap();
         assert_eq!(runs[0].status, "cancelled");
+    }
+
+    #[test]
+    fn worker_plan_reaches_the_progress_callback() {
+        let plan = r#"{"summary":"one worker","tasks":[{"title":"first task","provider":"codex","prompt":"do one"}]}"#;
+        let events = std::sync::Mutex::new(Vec::new());
+        let progress = |event: OrchestrationProgress| {
+            events.lock().unwrap().push(event);
+        };
+        let body = "printf '%s\\n' '{\"thread_id\":\"fake-thread\",\"ok\":true,\"phase\":\"completed\",\"error\":null,\"text\":\"done\",\"plan\":{\"provider\":\"codex\",\"turn_id\":\"turn-1\",\"explanation\":\"check\",\"entries\":[{\"content\":\"step one\",\"status\":\"in_progress\",\"priority\":\"high\"}]}}'; printf 'edited by worker\\n' > worker-output.txt; exit 0";
+        let (_repo, _home, _store, report) = run_fixture_with_progress(
+            plan,
+            body,
+            Some(&progress as &ProgressFn<'_>),
+        );
+        assert_eq!(report.tasks.len(), 1);
+        let events = events.into_inner().unwrap();
+        let reported = events
+            .iter()
+            .find_map(|event| match event {
+                OrchestrationProgress::WorkerPlanReported {
+                    thread_id,
+                    provider,
+                    plan_id,
+                    turn_id,
+                    entries,
+                    explanation,
+                } => Some((
+                    thread_id.clone(),
+                    *provider,
+                    plan_id.clone(),
+                    turn_id.clone(),
+                    entries.clone(),
+                    explanation.clone(),
+                )),
+                _ => None,
+            })
+            .expect("worker plan progress");
+        assert_eq!(reported.0, "fake-thread");
+        assert_eq!(reported.1, ProviderId::Codex);
+        assert!(reported.2.is_none());
+        assert_eq!(reported.3.as_deref(), Some("turn-1"));
+        assert_eq!(reported.4[0].content, "step one");
+        assert_eq!(reported.5.as_deref(), Some("check"));
     }
 
     #[test]

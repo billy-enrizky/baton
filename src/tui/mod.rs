@@ -2070,6 +2070,25 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
                 };
                 view.error = error;
             }
+            OrchestrationProgress::WorkerPlanReported {
+                thread_id,
+                provider,
+                plan_id,
+                turn_id,
+                entries,
+                explanation,
+            } => {
+                state.plans.entry(thread_id.clone()).or_default().insert(
+                    provider,
+                    PlanSnapshot {
+                        plan_id,
+                        turn_id,
+                        entries,
+                        explanation,
+                    },
+                );
+                persist_plan(state, &thread_id, provider);
+            }
         },
         OrchestrationEvent::Integrated(report) => {
             state.orchestration_integrating = false;
@@ -29999,6 +30018,41 @@ exit 1
             .list_plans(&thread_id)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn worker_plan_progress_fills_the_worker_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let worker_id = "thread-worker".to_string();
+        apply_orchestration_event(
+            &mut state,
+            OrchestrationEvent::Progress(OrchestrationProgress::WorkerPlanReported {
+                thread_id: worker_id.clone(),
+                provider: ProviderId::Codex,
+                plan_id: Some("plan-1".into()),
+                turn_id: Some("turn-1".into()),
+                entries: vec![crate::types::PlanEntry {
+                    content: "worker step".into(),
+                    status: "in_progress".into(),
+                    priority: None,
+                }],
+                explanation: Some("check".into()),
+            }),
+        );
+        let plan = state
+            .plans
+            .get(&worker_id)
+            .and_then(|plans| plans.get(&ProviderId::Codex))
+            .expect("the worker plan snapshot");
+        assert_eq!(plan.entries[0].content, "worker step");
+        assert_eq!(plan.plan_id.as_deref(), Some("plan-1"));
+        assert_eq!(plan.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(plan.explanation.as_deref(), Some("check"));
+        let stored = store.lock().unwrap().list_plans(&worker_id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].entries[0].content, "worker step");
     }
 
     #[test]

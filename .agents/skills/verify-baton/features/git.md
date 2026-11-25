@@ -21,7 +21,7 @@ Baton could commit and push worker branches during an orchestration run, but a n
 
 Goals: one `/git` submenu that shows the repository state, prepares a deterministic commit message, confirms every exact path, commits all changes or only staged changes, pushes the current branch to a chosen remote, lists pull request checks, opens a pull request from a previewed title and body, reviews the current pull request, and merges it with a chosen method. The flow must refuse an operation, conflict, concurrent worktree work, stale plan, unpushed branch, existing pull request, or moved HEAD before it mutates the repository, remote, or forge.
 
-Non-goals: pull, fetch, draft toggling, reviewers, labels, multi-forge routing, force-push, upstream configuration, amend, rebase, hunk staging, file-level selection, issue linking, or rewriting history. The confirmation does not run an editor for the title or body. The slice does not change the orchestration worker ship path, which keeps its existing `open_prs_with_gh` implementation.
+Non-goals: pull, fetch, draft toggling, reviewer assignment, labels, multi-forge routing, force-push, upstream configuration, amend, rebase, hunk staging, file-level selection, issue linking, or rewriting history. The confirmation does not run an editor for the title or body. The slice does not change the orchestration worker ship path, which keeps its existing `open_prs_with_gh` implementation.
 
 ## Proposed architecture
 

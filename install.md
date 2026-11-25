@@ -73,12 +73,12 @@ baton doctor
 - One or more harness CLIs on `PATH`: `codex`, `claude`, `cursor-agent`, `grok`, `opencode`, or `agy`.
 - Git for checkpoints, worktrees, and `/git`.
 - `VISUAL` or `EDITOR` for Ctrl+O in `/files` and `/grep`, and for `/memory`.
-- Optional: `rg` for faster file and content search. Baton falls back to `git`.
-- Optional: authenticated `gh` for `/git checks`, `/git pr`, and opening pull requests from orchestration reports.
+- Optional: `rg` for faster file and content search. Without it, `/files` uses `git ls-files` and `/grep` uses `git grep`.
+- Optional: authenticated `gh` for `/git checks`, `/git pr`, `/git review`, `/git merge`, `/task`, and opening pull requests from orchestration reports.
 
 ## Upgrade
 
-Re-run the installer, run `brew upgrade`, or run `cargo install --path . --locked` in a source checkout. `baton doctor` will report the new version on the next start.
+Re-run the installer, run `brew upgrade billy-enrizky/baton/baton`, run `baton update` from a source checkout, or run `cargo install --path . --locked`. `baton doctor` will report the new version on the next start.
 
 ## Uninstall
 

@@ -13,7 +13,7 @@ Optional, only for the features that use them:
 | Tool or setting | Needed for |
 |---|---|
 | Authenticated `gh` | `/git checks`, `/git pr`, `/git review`, `/git merge`, `/task`, and worker pull requests from an orchestration report. The rest of `/git` works without it. |
-| `rg` | `/files` and `/grep`. Without it Baton falls back to `git grep` inside a repository. |
+| `rg` | `/files` and `/grep`. Without it, `/files` falls back to `git ls-files` and `/grep` falls back to `git grep` inside a repository. |
 | `VISUAL` or `EDITOR` | Opening a file from `/files`, `/grep`, or `/memory`. |
 | An MCP server | Whatever you add with `/mcp`; nothing is configured for you. |
 
@@ -25,7 +25,7 @@ Costs belong to the harness provider: a subscription for the harness login, or u
 baton
 ```
 
-The TUI opens in the configured default session mode, which is orchestrate until you change it with `/settings` or `/orchestrate off`. Run `baton doctor` to see every harness binary, its auth mode, the Baton config files, database size, thread count, and tracked provider processes. Run `baton login <provider>` once for each harness you want to use.
+The TUI opens in the configured default session mode, which is orchestrate until you change the global default with `/settings` or `"defaultMode": "single"` in `config.json`. `/orchestrate off` changes only the current thread. Run `baton doctor` to see every harness binary, its auth mode, the Baton config files, database size, thread count, and tracked provider processes. Run `baton login <provider>` once for each harness you want to use.
 
 ## Provider login
 
@@ -127,7 +127,7 @@ Override models in `~/.baton/roles.json`:
 }
 ```
 
-`review` defaults to `true`. Set it to `false` to skip the reviewer turn; a skipped review does not block integration or shipping. The run reports each worker's review status as `approve`, `request_changes`, `failed`, or `skipped`, and a run with a blocking review finishes as `needs_review`.
+`review` defaults to `true`. Set it to `false` to skip the reviewer turn; a skipped review does not block integration or shipping. The run reports each worker's review status as `approve`, `request_changes`, `pending`, `failed`, or `skipped`, and a run with a blocking review finishes as `needs_review`. A follow-up commit marks the review `pending` until the reviewer reads the new commit.
 
 A role must set `provider` and `model` together. `effort` is accepted only for a provider that supports reasoning effort. Malformed JSON, a partial provider/model pair, an unknown provider, an unknown hook event, an empty hook command, or a timeout outside 1 to 300 seconds fails closed. Declared `before_plan`, `after_plan`, `before_implement`, and `after_implement` hooks run in that order with the declared timeout: a failing plan hook aborts the run, a failing `before_implement` hook fails the task before the worker starts, and a failing `after_implement` hook fails the task before its commit. `before_review` runs before the reviewer turn and `after_review` runs after the verdict; a failing review hook records `failed` for that worker and blocks integration and shipping.
 

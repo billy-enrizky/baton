@@ -416,6 +416,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/orchestrate on`, `/orchestrate off` | Switch this thread between orchestrate and single mode |
 | `/orchestrate --plan-only <goal>` | Preview the plan before workers start |
 | `/multi` | Fan one prompt across providers, or use isolated worktrees |
+| `/questions` | List open worker questions and open the worker thread to answer |
 | `/runs` | List, reopen, or include archived runs |
 | `/agents` | Inspect subagent calls, live and persisted |
 

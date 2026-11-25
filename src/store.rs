@@ -127,6 +127,18 @@ pub struct OrchestrationTaskRow {
     pub finished_at: Option<String>,
 }
 
+/// One worker that cannot continue without a person. The question is already
+/// extracted from the worker's last message so a caller never has to parse it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerQuestionRow {
+    pub task_id: String,
+    pub run_id: String,
+    pub thread_id: String,
+    pub title: String,
+    pub question: String,
+    pub created_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReviewNoteRow {
     pub id: i64,
@@ -2646,6 +2658,36 @@ impl BatonStore {
             .query_row(params![thread_id], map_orchestration_task)
             .optional()?;
         Ok(row)
+    }
+
+    /// Every running worker that is waiting for an answer, newest run first.
+    /// Tasks without a thread cannot be answered from the TUI, so they are not
+    /// offered; the run report still names them.
+    pub fn list_worker_questions(&self) -> Result<Vec<WorkerQuestionRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT task.id, task.run_id, task.thread_id, task.title, task.text, task.created_at
+             FROM orchestration_tasks task
+             JOIN orchestration_runs run ON run.id = task.run_id
+             WHERE task.status = 'needs_input'
+               AND task.thread_id IS NOT NULL
+               AND run.archived_at IS NULL
+             ORDER BY task.created_at DESC, task.position",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let text: Option<String> = row.get(4)?;
+            Ok(WorkerQuestionRow {
+                task_id: row.get(0)?,
+                run_id: row.get(1)?,
+                thread_id: row.get(2)?,
+                title: row.get(3)?,
+                question: text
+                    .as_deref()
+                    .and_then(crate::orchestrate::worker_question)
+                    .unwrap_or_else(|| "worker needs input".to_string()),
+                created_at: row.get(5)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Record the reviewer verdict for one task. Reviews are written after the

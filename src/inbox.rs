@@ -195,4 +195,86 @@ mod tests {
         assert_eq!(completed_item.status, "completed");
         assert_eq!(completed_item.reasons, vec!["worker complete".to_string()]);
     }
+
+    #[test]
+    fn worker_questions_extract_the_text_and_skip_unanswerable_rows() {
+        let store = BatonStore::memory().unwrap();
+        let waiting = thread(&store, "waiting worker");
+        let done = thread(&store, "done worker");
+        store
+            .create_orchestration_run(
+                "run-questions",
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+            )
+            .unwrap();
+        fn add(
+            store: &BatonStore,
+            id: &str,
+            position: i64,
+            status: &str,
+            thread_id: Option<&str>,
+            text: Option<&str>,
+        ) {
+            store
+                .add_orchestration_task(
+                    id,
+                    "run-questions",
+                    position,
+                    "task",
+                    ProviderId::Codex,
+                    "model",
+                    "prompt",
+                    None,
+                    None,
+                    None,
+                    thread_id,
+                    status,
+                    text,
+                    None,
+                    "2026-11-22T00:00:00Z",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        add(
+            &store,
+            "task-waiting",
+            1,
+            "needs_input",
+            Some(&waiting.id),
+            Some("working\nBATON_QUESTION: choose a database"),
+        );
+        add(
+            &store,
+            "task-complete",
+            2,
+            "completed",
+            Some(&done.id),
+            Some("done"),
+        );
+        add(
+            &store,
+            "task-orphan",
+            3,
+            "needs_input",
+            None,
+            Some("BATON_QUESTION: nobody can answer this"),
+        );
+
+        let rows = store.list_worker_questions().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].task_id, "task-waiting");
+        assert_eq!(rows[0].run_id, "run-questions");
+        assert_eq!(rows[0].thread_id, waiting.id);
+        assert_eq!(rows[0].title, "task");
+        assert_eq!(rows[0].question, "choose a database");
+    }
 }

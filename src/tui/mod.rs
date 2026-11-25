@@ -109,6 +109,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ("/threads", "list threads in this directory"),
     ("/pin", "pin, unpin, or move a pinned thread"),
     ("/inbox", "all threads that need attention"),
+    (
+        "/questions",
+        "open worker questions; enter opens the worker thread",
+    ),
     ("/open", "open a thread by id prefix"),
     (
         "/files",
@@ -673,6 +677,10 @@ enum Overlay {
     InboxPicker {
         selected: usize,
         items: Vec<InboxItem>,
+    },
+    QuestionInboxPicker {
+        selected: usize,
+        items: Vec<crate::store::WorkerQuestionRow>,
     },
     GrepPicker {
         selected: usize,
@@ -3296,6 +3304,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/roles", _) => Some("roles (no arguments)"),
         ("/threads", _) => Some("threads (no arguments)"),
         ("/inbox", _) => Some("inbox (no arguments)"),
+        ("/questions", _) => Some("questions (no arguments)"),
         ("/usage", _) => Some("usage (no arguments)"),
         ("/checkpoints", _) => Some("checkpoints (no arguments)"),
         ("/turns", _) => Some("turns (no arguments)"),
@@ -6018,6 +6027,39 @@ fn handle_key(
             }
             _ => {
                 state.overlay = Overlay::InboxPicker { selected, items };
+            }
+        },
+        Overlay::QuestionInboxPicker { selected, items } => match key.code {
+            KeyCode::Esc => {}
+            KeyCode::Up => {
+                if !items.is_empty() {
+                    let new_selected = (selected + items.len() - 1) % items.len();
+                    state.overlay = Overlay::QuestionInboxPicker {
+                        selected: new_selected,
+                        items,
+                    };
+                }
+            }
+            KeyCode::Down => {
+                if !items.is_empty() {
+                    let new_selected = (selected + 1) % items.len();
+                    state.overlay = Overlay::QuestionInboxPicker {
+                        selected: new_selected,
+                        items,
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(item) = items.get(selected) {
+                    open_thread_by_id(state, store, &item.thread_id);
+                    state.notice = Some(format!(
+                        "opened {} for its question; type the answer",
+                        item.title
+                    ));
+                }
+            }
+            _ => {
+                state.overlay = Overlay::QuestionInboxPicker { selected, items };
             }
         },
         Overlay::GrepPicker {
@@ -9412,6 +9454,15 @@ fn handle_command(
                 state.overlay = Overlay::InboxPicker { selected: 0, items };
             }
         }
+        "/questions" => match store.lock().unwrap().list_worker_questions() {
+            Ok(items) if items.is_empty() => state.notice = Some("no open worker questions".into()),
+            Ok(items) => {
+                state.overlay = Overlay::QuestionInboxPicker { selected: 0, items };
+            }
+            Err(error) => {
+                state.notice = Some(format!("cannot read worker questions: {error}"));
+            }
+        },
         "/open" => {
             if let Some(prefix) = args.first() {
                 let found = {
@@ -10644,6 +10695,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::ThreadPicker { threads, .. } => threads.len().min(8) + 4,
             Overlay::InboxPicker { items, .. } => items.len().min(8) + 4,
+            Overlay::QuestionInboxPicker { items, .. } => items.len().min(8) + 4,
             Overlay::GrepPicker {
                 filtered, loading, ..
             } => {
@@ -10811,6 +10863,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             } => draw_thread_picker(frame, chunks[1], threads, *selected, *action),
             Overlay::InboxPicker { selected, items } => {
                 draw_inbox_picker(frame, chunks[1], items, *selected)
+            }
+            Overlay::QuestionInboxPicker { selected, items } => {
+                draw_question_inbox(frame, chunks[1], items, *selected)
             }
             Overlay::GrepPicker {
                 selected,
@@ -13565,6 +13620,42 @@ fn draw_inbox_picker(frame: &mut ratatui::Frame, area: Rect, items: &[InboxItem]
                 item.status,
                 item.reasons.join(" · ")
             ),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_question_inbox(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    items: &[crate::store::WorkerQuestionRow],
+    selected: usize,
+) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        "worker questions · enter open · esc close",
+        Style::default().fg(COLORS.muted),
+    )];
+    let (start, visible) = picker_window(items.len(), selected, 8);
+    for (index, item) in items.iter().enumerate().skip(start).take(visible) {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let run: String = item.run_id.chars().take(8).collect();
+        let title = crate::sanitize::sanitize_terminal_text(&item.title);
+        let question = crate::sanitize::sanitize_terminal_text(
+            item.question.lines().next().unwrap_or_default(),
+        );
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(
+            format!("{cursor} {title} · run {run} · {question}"),
             style,
         ));
     }
@@ -27370,6 +27461,94 @@ exit 1
         assert_eq!(state.thread.id, target.id);
         assert!(matches!(state.overlay, Overlay::None));
         assert_eq!(state.notice.as_deref(), Some("opened failed task"));
+    }
+
+    #[test]
+    fn questions_lists_open_workers_and_opens_the_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let worker = {
+            let guard = store.lock().unwrap();
+            let worker = guard
+                .create_thread(NewThread {
+                    title: "waiting worker".to_string(),
+                    cwd: home.path().to_string_lossy().to_string(),
+                    current_provider: ProviderId::Codex,
+                    current_model: None,
+                })
+                .unwrap();
+            guard
+                .create_orchestration_run(
+                    "run-questions-1234",
+                    "goal",
+                    ProviderId::Codex,
+                    "model",
+                    None,
+                    "{}",
+                    false,
+                )
+                .unwrap();
+            guard
+                .add_orchestration_task(
+                    "task-waiting",
+                    "run-questions-1234",
+                    1,
+                    "choose a database",
+                    ProviderId::Codex,
+                    "model",
+                    "prompt",
+                    None,
+                    None,
+                    None,
+                    Some(&worker.id),
+                    "needs_input",
+                    Some("BATON_QUESTION: Postgres or SQLite?"),
+                    None,
+                    "2026-11-22T00:00:00Z",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            worker
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/questions");
+        let Overlay::QuestionInboxPicker { items, .. } = &state.overlay else {
+            panic!("expected the question inbox");
+        };
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].thread_id, worker.id);
+        assert_eq!(items[0].question, "Postgres or SQLite?");
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("worker questions"), "{text}");
+        assert!(text.contains("choose a database"), "{text}");
+        assert!(text.contains("Postgres or SQLite?"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(state.thread.id, worker.id);
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(notice.contains("type the answer"), "{notice}");
+    }
+
+    #[test]
+    fn questions_reports_an_empty_inbox() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/questions");
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(state.notice.as_deref(), Some("no open worker questions"));
     }
 
     #[test]

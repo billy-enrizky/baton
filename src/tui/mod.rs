@@ -553,6 +553,7 @@ struct FileRefCache {
 
 enum NativeRewindEvent {
     Done {
+        thread_id: String,
         turn: i64,
         text: String,
         provider_retry_skipped: bool,
@@ -900,6 +901,7 @@ pub struct TuiState {
     questions: Vec<QuestionState>,
     review: Option<ReviewState>,
     plans: std::collections::HashMap<String, std::collections::HashMap<ProviderId, PlanSnapshot>>,
+    plan_scroll_max: std::cell::Cell<usize>,
     activity: Option<ActivityView>,
     multi: Option<MultiView>,
     notice: Option<String>,
@@ -1045,6 +1047,7 @@ pub fn run_tui(
         questions: Vec::new(),
         review: None,
         plans: std::collections::HashMap::new(),
+        plan_scroll_max: std::cell::Cell::new(0),
         activity: None,
         multi: None,
         notice: None,
@@ -1655,7 +1658,6 @@ fn apply_engine_event(
             state
                 .questions
                 .retain(|question| question.thread_id != thread_id);
-            state.plans.remove(&thread_id);
             if let Some(child) = state.multi.as_mut().and_then(|multi| {
                 multi
                     .children
@@ -5089,14 +5091,8 @@ fn handle_key(
             }
         }
         Overlay::PlanView { mut scroll } => {
-            let max = current_plan(state)
-                .map(|plan| {
-                    plan.entries
-                        .len()
-                        .saturating_add(usize::from(plan.explanation.is_some()))
-                        .saturating_sub(1)
-                })
-                .unwrap_or(0);
+            let max = state.plan_scroll_max.get();
+            scroll = scroll.min(max);
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {}
                 KeyCode::Up | KeyCode::Char('k') => {
@@ -7025,6 +7021,7 @@ fn start_native_rewind(
     ));
     let home = state.home.clone();
     let source = state.thread.clone();
+    let source_thread_id = source.id.clone();
     let sender = state.native_rewind_sender.clone();
     std::thread::spawn(move || {
         let result = (|| -> Result<bool> {
@@ -7042,6 +7039,7 @@ fn start_native_rewind(
         })();
         let event = match result {
             Ok(provider_retry_skipped) => NativeRewindEvent::Done {
+                thread_id: source_thread_id,
                 turn,
                 text,
                 provider_retry_skipped,
@@ -7308,11 +7306,20 @@ fn apply_native_rewind_event(
 ) {
     match event {
         NativeRewindEvent::Done {
+            thread_id,
             turn,
             text,
             provider_retry_skipped,
         } => {
             state.native_rewind_running = false;
+            state.plans.remove(&thread_id);
+            if thread_id != state.thread.id {
+                state.notice = Some(format!(
+                    "native rewind finished for another thread ({})",
+                    &thread_id[..8.min(thread_id.len())]
+                ));
+                return;
+            }
             let checkpoint = {
                 let guard = store.lock().unwrap();
                 state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
@@ -7323,7 +7330,6 @@ fn apply_native_rewind_event(
                     .get_checkpoint(&state.thread.id, turn - 1)
                     .unwrap_or(None)
             };
-            state.plans.remove(&state.thread.id);
             state.scroll_offset = 0;
             state.set_input(text);
             state.overlay = match checkpoint {
@@ -8533,6 +8539,7 @@ fn dispatch_submit(
     let thread_id = state.thread.id.clone();
     let permission_mode = state.permission_mode;
     state.persist_thread_state(store);
+    state.plans.remove(&state.thread.id);
     let _ = engine_command_sender.send(EngineCommand::Submit {
         thread_id,
         text,
@@ -14252,6 +14259,17 @@ fn current_plan(state: &TuiState) -> Option<&PlanSnapshot> {
 
 fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scroll: usize) {
     let Some(plan) = current_plan(state) else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(COLORS.muted));
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled("no plan available for this thread", Style::default().fg(COLORS.muted)),
+                Line::styled("esc close", Style::default().fg(COLORS.muted)),
+            ])
+            .block(block),
+            area,
+        );
         return;
     };
     let total = plan.entries.len();
@@ -14293,6 +14311,9 @@ fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scro
         ));
     }
     let visible = inner.height.saturating_sub(1) as usize;
+    state
+        .plan_scroll_max
+        .set(content.len().saturating_sub(visible));
     let start = if visible == 0 || content.len() <= visible {
         0
     } else {
@@ -16477,6 +16498,7 @@ mod tests {
             questions: Vec::new(),
             review: None,
             plans: std::collections::HashMap::new(),
+            plan_scroll_max: std::cell::Cell::new(0),
             activity: None,
             multi: None,
             notice: None,
@@ -28246,6 +28268,7 @@ exit 1
             &mut state,
             &store,
             NativeRewindEvent::Done {
+                thread_id: thread_id.clone(),
                 turn: 2,
                 text: "retry prompt".to_string(),
                 provider_retry_skipped: true,
@@ -29361,6 +29384,142 @@ exit 1
             receiver.try_recv().is_ok(),
             "the multi command must still submit its child work"
         );
+    }
+
+    #[test]
+    fn dispatch_submit_clears_the_previous_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let provider = state.thread.current_provider;
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                entries: vec![crate::types::PlanEntry {
+                    content: "old plan".into(),
+                    status: "pending".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        dispatch_submit(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "new work".into(),
+            false,
+            None,
+            false,
+        );
+        assert!(current_plan(&state).is_none());
+    }
+
+    #[test]
+    fn late_turn_started_does_not_erase_the_new_plan() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let provider = state.thread.current_provider;
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                entries: vec![crate::types::PlanEntry {
+                    content: "current plan".into(),
+                    status: "in_progress".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnStarted { thread_id },
+            &engine_command_sender,
+        );
+        assert!(current_plan(&state).is_some());
+    }
+
+    #[test]
+    fn plan_scroll_end_uses_the_rendered_viewport_limit() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let provider = state.thread.current_provider;
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                entries: (0..30)
+                    .map(|index| crate::types::PlanEntry {
+                        content: format!("step {index}"),
+                        status: "pending".into(),
+                        priority: None,
+                    })
+                    .collect(),
+                explanation: None,
+            },
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        let _ = render_state(&state, 120, 20);
+        let max = state.plan_scroll_max.get();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::End),
+        );
+        assert!(matches!(
+            state.overlay,
+            Overlay::PlanView { scroll } if scroll == max && scroll < 29
+        ));
+    }
+
+    #[test]
+    fn removing_an_open_plan_renders_the_empty_state() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let provider = state.thread.current_provider;
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: Some("plan-1".into()),
+                entries: vec![crate::types::PlanEntry {
+                    content: "temporary".into(),
+                    status: "pending".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::PlanRemoved {
+                provider,
+                plan_id: "plan-1".into(),
+            },
+        );
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("no plan available for this thread"), "{text}");
+        assert!(text.contains("esc close"), "{text}");
     }
 
     #[test]

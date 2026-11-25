@@ -994,6 +994,11 @@ impl BatonAdapter for AcpAdapter {
                                 if method != "session/update" {
                                     continue;
                                 }
+                                if params.get("sessionId").and_then(Value::as_str)
+                                    != Some(session_id.as_str())
+                                {
+                                    continue;
+                                }
                                 let update = params.get("update").cloned().unwrap_or(Value::Null);
                                 let variant = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or("");
                                 if variant == "state_update" {

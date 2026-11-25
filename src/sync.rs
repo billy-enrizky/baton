@@ -172,10 +172,41 @@ pub struct DiscoveredSkill {
     pub name: String,
     pub path: PathBuf,
     pub source: String,
+    pub description: Option<String>,
 }
 
 fn is_skill_dir(path: &Path) -> bool {
     path.join("SKILL.md").is_file() || path.join("skill.md").is_file()
+}
+
+/// Reads the frontmatter description from a skill file. Only the first few
+/// kilobytes are read, and only a single-line scalar is recognized.
+fn skill_description(path: &Path) -> Option<String> {
+    let file = if path.join("SKILL.md").is_file() {
+        path.join("SKILL.md")
+    } else {
+        path.join("skill.md")
+    };
+    let bytes = std::fs::read(&file).ok()?;
+    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]);
+    let mut lines = text.lines();
+    if lines.next()?.trim() != "---" {
+        return None;
+    }
+    for line in lines.take(60) {
+        let line = line.trim();
+        if line == "---" {
+            break;
+        }
+        if let Some(rest) = line.strip_prefix("description:") {
+            let value = rest.trim().trim_matches('"').trim_matches('\'').trim();
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value.chars().take(160).collect());
+        }
+    }
+    None
 }
 
 fn collect_skill_dirs(path: &Path, source: &str, depth: usize, skills: &mut Vec<DiscoveredSkill>) {
@@ -188,6 +219,7 @@ fn collect_skill_dirs(path: &Path, source: &str, depth: usize, skills: &mut Vec<
                 name: name.to_string(),
                 path: path.to_path_buf(),
                 source: source.to_string(),
+                description: skill_description(path),
             });
         }
         return;
@@ -301,6 +333,63 @@ mod tests {
         let path = root.join(name);
         std::fs::create_dir_all(&path).unwrap();
         std::fs::write(path.join(file), "---\nname: test\n---\n").unwrap();
+    }
+
+    #[test]
+    fn skill_descriptions_come_from_frontmatter() {
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        let path = claude.path().join("described");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("SKILL.md"),
+            "---\nname: described\ndescription: \"Summarize a change quickly\"\n---\nbody\n",
+        )
+        .unwrap();
+        let path = claude.path().join("plain");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("SKILL.md"), "---\nname: plain\n---\n").unwrap();
+        let path = claude.path().join("no-frontmatter");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(path.join("SKILL.md"), "body only\n").unwrap();
+
+        let skills = scan_skill_roots(claude.path(), codex.path());
+        let described = skills
+            .iter()
+            .find(|skill| skill.name == "described")
+            .unwrap();
+        assert_eq!(
+            described.description.as_deref(),
+            Some("Summarize a change quickly")
+        );
+        assert!(skills
+            .iter()
+            .find(|skill| skill.name == "plain")
+            .unwrap()
+            .description
+            .is_none());
+        assert!(skills
+            .iter()
+            .find(|skill| skill.name == "no-frontmatter")
+            .unwrap()
+            .description
+            .is_none());
+    }
+
+    #[test]
+    fn skill_description_is_capped_and_reads_the_lowercase_file() {
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        let path = claude.path().join("long");
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::write(
+            path.join("skill.md"),
+            format!("---\ndescription: {}\n---\n", "x".repeat(200)),
+        )
+        .unwrap();
+        let skills = scan_skill_roots(claude.path(), codex.path());
+        let description = skills[0].description.as_ref().unwrap();
+        assert_eq!(description.chars().count(), 160);
     }
 
     #[test]

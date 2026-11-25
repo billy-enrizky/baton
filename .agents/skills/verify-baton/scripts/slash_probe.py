@@ -188,7 +188,7 @@ def main() -> int:
     )
     (codex_config / "skills" / "codex-demo").mkdir(parents=True)
     (codex_config / "skills" / "codex-demo" / "SKILL.md").write_text(
-        "---\nname: codex-demo\n---\n"
+        "---\nname: codex-demo\ndescription: Run the demo checks\n---\n"
     )
     (Path(home) / "roles.json").write_text(
         json.dumps(
@@ -329,7 +329,7 @@ def main() -> int:
         skills_picker = screen_text(transcript, args.width, args.height)
         skills_required = ["skills (2)", "enter insert", "claude-demo (claude)"]
         missing.extend(value for value in skills_required if value not in skills_picker)
-        if "codex-demo (codex)" not in skills_picker:
+        if "codex-demo (codex) · Run the demo checks" not in skills_picker:
             missing.append("codex skill row")
         (evidence / "skills-picker-screen.txt").write_text(skills_picker + "\n")
         os.write(master, b"\x1b[B")

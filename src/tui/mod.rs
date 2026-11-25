@@ -427,6 +427,13 @@ struct PlanSnapshot {
     explanation: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct SkillChoice {
+    name: String,
+    source: String,
+    description: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PaletteAction {
     Command(&'static str),
@@ -650,7 +657,7 @@ enum Overlay {
     },
     SkillsPicker {
         selected: usize,
-        skills: Vec<(String, String)>,
+        skills: Vec<SkillChoice>,
     },
     MemoryPicker {
         selected: usize,
@@ -5756,7 +5763,7 @@ fn handle_key(
             KeyCode::Enter => {
                 let inserted = skills
                     .get(selected)
-                    .map(|(name, source)| insert_skill(state, name, source))
+                    .map(|skill| insert_skill(state, &skill.name, &skill.source))
                     .unwrap_or(false);
                 if !inserted {
                     state.overlay = Overlay::SkillsPicker { selected, skills };
@@ -9666,10 +9673,14 @@ fn handle_command(
             }
         }
         "/skills" => {
-            let skills: Vec<(String, String)> =
+            let skills: Vec<SkillChoice> =
                 sync::scan_skills_in(std::path::Path::new(&state.thread.cwd))
                     .into_iter()
-                    .map(|skill| (skill.name, skill.source))
+                    .map(|skill| SkillChoice {
+                        name: skill.name,
+                        source: skill.source,
+                        description: skill.description,
+                    })
                     .collect();
             if skills.is_empty() {
                 state.notice = Some(
@@ -12600,7 +12611,7 @@ fn insert_skill(state: &mut TuiState, name: &str, source: &str) -> bool {
 fn draw_skills_picker(
     frame: &mut ratatui::Frame,
     area: Rect,
-    skills: &[(String, String)],
+    skills: &[SkillChoice],
     selected: usize,
 ) {
     let visible = (area.height.saturating_sub(3) as usize).min(8);
@@ -12624,7 +12635,8 @@ fn draw_skills_picker(
         ),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, (name, source)) in skills.iter().enumerate().skip(start).take(visible) {
+    let description_budget = (area.width as usize).saturating_sub(34).clamp(8, 80);
+    for (index, skill) in skills.iter().enumerate().skip(start).take(visible) {
         let style = if index == selected {
             Style::default()
                 .fg(COLORS.accent)
@@ -12633,9 +12645,19 @@ fn draw_skills_picker(
             Style::default().fg(COLORS.muted)
         };
         let cursor = if index == selected { "❯" } else { " " };
-        let name = skill_label(name, 64);
-        let source = skill_label(source, 16);
-        lines.push(Line::styled(format!("{cursor} {name} ({source})"), style));
+        let name = skill_label(&skill.name, 32);
+        let source = skill_label(&skill.source, 16);
+        let description = skill
+            .description
+            .as_deref()
+            .map(|description| skill_label(description, description_budget))
+            .filter(|description| !description.is_empty())
+            .map(|description| format!(" · {description}"))
+            .unwrap_or_default();
+        lines.push(Line::styled(
+            format!("{cursor} {name} ({source}){description}"),
+            style,
+        ));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -16599,6 +16621,14 @@ impl TuiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn skill_choice(name: &str, source: &str) -> SkillChoice {
+        SkillChoice {
+            name: name.into(),
+            source: source.into(),
+            description: None,
+        }
+    }
     use crate::types::QuestionOption;
     use ratatui::backend::TestBackend;
 
@@ -21171,7 +21201,7 @@ mod tests {
         assert!(
             skills
                 .iter()
-                .any(|(name, source)| name == "project-skill" && source == "claude"),
+                .any(|skill| skill.name == "project-skill" && skill.source == "claude"),
             "project skill missing: {skills:?}"
         );
     }
@@ -21189,7 +21219,7 @@ mod tests {
         state.input_cursor = state.input.chars().count();
         state.overlay = Overlay::SkillsPicker {
             selected: 0,
-            skills: vec![("review".into(), "codex".into())],
+            skills: vec![skill_choice("review", "codex")],
         };
         handle_key(
             &mut state,
@@ -21206,7 +21236,7 @@ mod tests {
         state.set_input("explain this".into());
         state.overlay = Overlay::SkillsPicker {
             selected: 0,
-            skills: vec![("brainstorm".into(), "claude".into())],
+            skills: vec![skill_choice("brainstorm", "claude")],
         };
         handle_key(
             &mut state,
@@ -21233,7 +21263,7 @@ mod tests {
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         state.overlay = Overlay::SkillsPicker {
             selected: 0,
-            skills: vec![("brainstorm".into(), "claude".into())],
+            skills: vec![skill_choice("brainstorm", "claude")],
         };
         handle_key(
             &mut state,
@@ -21251,7 +21281,7 @@ mod tests {
         state.thread.session_mode = SessionMode::Orchestrate;
         state.overlay = Overlay::SkillsPicker {
             selected: 0,
-            skills: vec![("review".into(), "codex".into())],
+            skills: vec![skill_choice("review", "codex")],
         };
         handle_key(
             &mut state,
@@ -21276,7 +21306,7 @@ mod tests {
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         state.overlay = Overlay::SkillsPicker {
             selected: 0,
-            skills: vec![("memories".into(), "codex".into())],
+            skills: vec![skill_choice("memories", "codex")],
         };
         handle_key(
             &mut state,
@@ -21293,7 +21323,7 @@ mod tests {
 
         state.overlay = Overlay::SkillsPicker {
             selected: 0,
-            skills: vec![("bad\n\u{1b}]0;spoof".into(), "codex".into())],
+            skills: vec![skill_choice("bad\n\u{1b}]0;spoof", "codex")],
         };
         handle_key(
             &mut state,
@@ -21314,6 +21344,47 @@ mod tests {
     }
 
     #[test]
+    fn skills_picker_shows_sanitized_descriptions() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![
+                SkillChoice {
+                    name: "review".into(),
+                    source: "codex".into(),
+                    description: Some("Review the current diff".into()),
+                },
+                SkillChoice {
+                    name: "spoof".into(),
+                    source: "claude".into(),
+                    description: Some("safe\u{1b}]0;title".into()),
+                },
+                SkillChoice {
+                    name: "long".into(),
+                    source: "codex".into(),
+                    description: Some("x".repeat(200)),
+                },
+            ],
+        };
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(
+            text.contains("review (codex) · Review the current diff"),
+            "{text}"
+        );
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(text.contains("safe\u{fffd}]0;title"), "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.contains("long (codex)"))
+                .count(),
+            1
+        );
+        assert!(text.contains('…'), "{text}");
+    }
+
+    #[test]
     fn skills_picker_window_follows_selection_past_eight() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -21321,7 +21392,11 @@ mod tests {
         state.overlay = Overlay::SkillsPicker {
             selected: 9,
             skills: (0..10)
-                .map(|index| (format!("skill-{index}"), "codex".into()))
+                .map(|index| SkillChoice {
+                    name: format!("skill-{index}"),
+                    source: "codex".into(),
+                    description: None,
+                })
                 .collect(),
         };
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
@@ -21352,7 +21427,11 @@ mod tests {
         state.overlay = Overlay::SkillsPicker {
             selected: 9,
             skills: (0..10)
-                .map(|index| (format!("skill-{index}"), "codex".into()))
+                .map(|index| SkillChoice {
+                    name: format!("skill-{index}"),
+                    source: "codex".into(),
+                    description: None,
+                })
                 .collect(),
         };
         let text = buffer_lines(&render_state(&state, 80, 16)).join("\n");

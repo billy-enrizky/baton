@@ -137,6 +137,7 @@ pub struct ExecResult<'a> {
     pub error: Option<&'a str>,
     pub text: &'a str,
     pub worker_followup: Option<&'a crate::orchestrate::WorkerFollowupOutcome>,
+    pub review: Option<&'a crate::orchestrate::FollowupReview>,
 }
 
 /// One result shape for normal completion and timeout. Callers add
@@ -157,6 +158,12 @@ pub fn result_json(result: &ExecResult<'_>) -> Value {
             "commit": outcome.commit,
             "question": outcome.question,
             "error": outcome.error,
+        })),
+        "review": result.review.map(|review| json!({
+            "run_id": review.run_id,
+            "task_id": review.task_id,
+            "status": review.status,
+            "text": review.text,
         })),
     })
 }
@@ -307,6 +314,7 @@ mod tests {
             error: None,
             text: "done",
             worker_followup: None,
+            review: None,
         });
         let timeout = result_json(&ExecResult {
             thread_id: "thread-1",
@@ -316,10 +324,35 @@ mod tests {
             error: Some("exec timed out after 300s"),
             text: "",
             worker_followup: None,
+            review: None,
         });
         let normal_keys: Vec<&String> = normal.as_object().unwrap().keys().collect();
         let timeout_keys: Vec<&String> = timeout.as_object().unwrap().keys().collect();
         assert_eq!(normal_keys, timeout_keys);
         assert!(normal["worker_followup"].is_null());
+    }
+
+    #[test]
+    fn result_json_includes_the_followup_review() {
+        let review = crate::orchestrate::FollowupReview {
+            run_id: "run-1".into(),
+            task_id: "task-1".into(),
+            status: "approve".into(),
+            text: "APPROVE".into(),
+        };
+        let value = result_json(&ExecResult {
+            thread_id: "thread-1",
+            effort: None,
+            ok: true,
+            phase: "completed",
+            error: None,
+            text: "done",
+            worker_followup: None,
+            review: Some(&review),
+        });
+        assert_eq!(value["review"]["run_id"], "run-1");
+        assert_eq!(value["review"]["task_id"], "task-1");
+        assert_eq!(value["review"]["status"], "approve");
+        assert_eq!(value["review"]["text"], "APPROVE");
     }
 }

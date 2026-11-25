@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Drive a Codex user-input question through the TUI and prove the answers are sent."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

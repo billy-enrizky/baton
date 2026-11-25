@@ -95,6 +95,10 @@ impl ProviderId {
         matches!(self, ProviderId::Codex | ProviderId::Claude)
     }
 
+    pub fn supports_native_rewind(self) -> bool {
+        matches!(self, ProviderId::Codex | ProviderId::OpenCode)
+    }
+
     pub fn all() -> &'static [ProviderId] {
         &[
             ProviderId::Claude,

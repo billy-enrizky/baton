@@ -655,9 +655,15 @@ async fn codex_adapter_maps_plan_updates() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            baton::adapters::TurnEvent::PlanUpdated { provider, plan_id, entries, explanation }
-                if *provider == ProviderId::Codex
+            baton::adapters::TurnEvent::PlanUpdated {
+                provider,
+                plan_id,
+                turn_id,
+                entries,
+                explanation,
+            } if *provider == ProviderId::Codex
                     && plan_id.is_none()
+                    && turn_id.as_deref() == Some("turn-plan")
                     && explanation.as_deref() == Some("Two checks")
                     && entries.len() == 2
                     && entries[0].content == "Inspect the parser"

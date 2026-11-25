@@ -339,7 +339,7 @@ Some providers also ask a question before continuing. The same overlay lists the
 
 Most commands open a picker instead of requiring memorized syntax. Pickers show their keys, the current selection, and the relevant detail. Remote actions open a preview first and recheck the live state before they run. When the terminal bell is enabled in settings, Baton rings once when a turn finishes, an approval arrives, or a provider asks a question. A two-second limiter mutes repeats.
 
-`/plan` opens a scrollable read-only overlay of the last plan the current harness reported, with `✓`, `▸`, and `·` markers. Up and Down, PageUp and PageDown, Home, and End scroll; Esc or `q` closes it.
+`/plan` opens a scrollable read-only overlay of the last plan the current harness reported, with `✓`, `▸`, and `·` markers. Long steps and explanations wrap instead of being cut off, and the header names the turn that reported the plan when the harness supplies one. Up and Down, PageUp and PageDown, Home, and End scroll; Esc or `q` closes it.
 
 ### 6.4 Transcript
 
@@ -598,7 +598,7 @@ It is read-only except for `baton_queue` clear and `baton_fork`, which creates a
 
 ### 11.3 JSON streams
 
-`baton exec --stream-json` and `baton orchestrate --stream-json` emit one compact JSON object per line. Events include provider and turn ids, text deltas, tool start and finish, approvals, provider questions, plan updates and removals, usage, turn completion, subagent start and finish, and a final `type: "result"` row. A `plan_updated` row carries `entries` with `content`, `status`, `priority`, and an optional `explanation`.
+`baton exec --stream-json` and `baton orchestrate --stream-json` emit one compact JSON object per line. Events include provider and turn ids, text deltas, tool start and finish, approvals, provider questions, plan updates and removals, usage, turn completion, subagent start and finish, and a final `type: "result"` row. A `plan_updated` row carries `entries` with `content`, `status`, `priority`, an optional `explanation`, and the reporting `turn_id` when the harness supplies one.
 
 ## 12. Command-line reference
 

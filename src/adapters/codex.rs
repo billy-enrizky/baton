@@ -508,6 +508,10 @@ impl CodexAdapter {
             let _ = emit.send(TurnEvent::PlanUpdated {
                 provider: crate::types::ProviderId::Codex,
                 plan_id: None,
+                turn_id: params
+                    .get("turnId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 entries,
                 explanation,
             });

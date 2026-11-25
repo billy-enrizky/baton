@@ -23,9 +23,10 @@ Non-goals:
 ## Sub-features
 
 - `/plan` opens the last plan reported for the current thread and current harness.
-- The header reads `plan · <done>/<total> done` and names the scroll and close keys.
+- The header reads `plan · <done>/<total> done` and names the scroll and close keys. When the harness supplied a turn id for the report, the header also names that turn.
 - The body lists the explanation when one was supplied, then one row per step.
 - Each step uses a stable marker: `✓` completed, `▸` in progress, and `·` pending, cancelled, or unknown.
+- Long explanations and steps wrap onto continuation lines that align under the step text. Nothing is clipped with an ellipsis, and the scroll maximum counts the wrapped rows.
 - Step content, the explanation, and priority are sanitized before rendering.
 - Up, Down, PageUp, PageDown, Home, and End scroll; `j`, `k`, `q`, and Esc are also accepted.
 - With no plan for the current thread and harness, the command keeps the composer open and says `no plan available for this thread`.
@@ -33,7 +34,7 @@ Non-goals:
 
 ## Approach
 
-The Codex and ACP adapters translate their native plan event to `TurnEvent::PlanUpdated`. Codex supplies `plan[].step`, `plan[].status`, and an optional explanation; its `inProgress` status is normalized to `in_progress`. ACP v2 supplies `plan_update` with an item list and stable `planId`, `plan_removed` carries that id, and the v1 `plan` frame remains a compatibility input. ACP entries supply `content`, `status`, and `priority`.
+The Codex and ACP adapters translate their native plan event to `TurnEvent::PlanUpdated`. Codex supplies `plan[].step`, `plan[].status`, an optional explanation, and the reporting `turnId`; its `inProgress` status is normalized to `in_progress`. ACP v2 supplies `plan_update` with an item list and stable `planId`, `plan_removed` carries that id, and the v1 `plan` frame remains a compatibility input. ACP entries supply `content`, `status`, and `priority`; the ACP session update carries no turn id, so its snapshot turn id stays empty. The turn id is carried on the snapshot, shown in the overlay header, and projected as `turn_id` by `exec --stream-json`.
 
 The TUI keeps an in-memory snapshot per thread and provider. `/plan` reads only the snapshot for the visible thread and current harness, and an ACP removal clears a snapshot only when its plan id matches. New work clears the previous snapshots before the submit leaves the TUI; a later `TurnStarted` does not remove a plan already emitted by that turn. `/multi` and orchestration clear at their shared start paths, a rewind clears its completed thread, and a restart clears the map. ACP drain frames from another session are filtered before dispatch.
 
@@ -64,10 +65,10 @@ The overlay is read-only. It does not change plan mode, send a provider message,
 | A foreign ACP session update reaches the active turn during reply drain | Drained `session/update` frames are filtered by `sessionId` before plan, usage, or text handling. |
 | A harness reports an empty list | The same empty-state notice is used for a missing report and a deliberately empty plan. It states that no plan is available rather than pretending steps exist. |
 | A plan is treated as approval | The overlay is read-only and never changes mode or sends a message. Accept and reject require their own confirmation and provider transition. |
-| A long explanation or step is silently clipped | The overlay renders one terminal line per item with `truncate_chars`. Wrapping is left to the action slice, which owns the taller layout and scroll math. |
+| A long explanation or step is silently clipped | The overlay wraps each explanation and step at the rendered width, indents continuation rows under the step text, and keeps the scroll maximum in wrapped rows. |
 | End scrolls past the rendered viewport | Rendering records the viewport-aware maximum, and keyboard handling clamps the stored offset to it before every key. |
 | A matching plan removal leaves a blank open overlay | The view renders the same `no plan available for this thread` empty state when the current plan disappears. |
-| A plan is shown without its reporting turn | The snapshot is cleared when a new turn starts, so it describes the current or most recently settled turn. The header does not name a turn number. |
+| A plan is shown without its reporting turn | The snapshot is cleared when a new turn starts, and the header names the reporting turn whenever the harness supplied one. ACP reports no turn id, so those plans show the header without a turn. |
 | Provider snapshots accumulate in memory | The map is bounded by the threads and harnesses observed in one TUI process, and a restart clears it. A cap becomes necessary if a future background service retains them. |
 | An agent cannot read the plan through CLI or MCP | This slice is TUI-only. The event is present in `exec --stream-json`, but no durable reader exists. |
 
@@ -96,6 +97,8 @@ Run a turn on a harness that reports plans, then type `/plan`. A Codex app serve
 - `dispatch_submit_clears_the_previous_plan`
 - `late_turn_started_does_not_erase_the_new_plan`
 - `plan_scroll_end_uses_the_rendered_viewport_limit`
+- `plan_step_wraps_instead_of_clipping`
+- `plan_header_names_the_reporting_turn`
 - `removing_an_open_plan_renders_the_empty_state`
 - `plan_events_keep_the_entries_and_explanation`
 - `plan_statuses_use_one_vocabulary`

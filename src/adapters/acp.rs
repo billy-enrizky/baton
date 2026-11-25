@@ -640,6 +640,7 @@ fn handle_session_update(
             let _ = emit.send(TurnEvent::PlanUpdated {
                 provider,
                 plan_id: None,
+                turn_id: None,
                 entries: plan_entries(update.get("entries")),
                 explanation: None,
             });
@@ -657,6 +658,7 @@ fn handle_session_update(
                         .and_then(|plan| plan.get("planId"))
                         .and_then(Value::as_str)
                         .map(str::to_string),
+                    turn_id: None,
                     entries: plan_entries(plan.and_then(|plan| plan.get("entries"))),
                     explanation: None,
                 });

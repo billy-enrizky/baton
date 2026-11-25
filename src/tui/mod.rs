@@ -421,6 +421,7 @@ struct ReviewSearch {
 #[derive(Debug, Clone)]
 struct PlanSnapshot {
     plan_id: Option<String>,
+    turn_id: Option<String>,
     entries: Vec<crate::types::PlanEntry>,
     explanation: Option<String>,
 }
@@ -2761,6 +2762,7 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
         TurnEvent::PlanUpdated {
             provider,
             plan_id,
+            turn_id,
             entries,
             explanation,
         } => {
@@ -2772,6 +2774,7 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                     provider,
                     PlanSnapshot {
                         plan_id,
+                        turn_id,
                         entries,
                         explanation,
                     },
@@ -2944,6 +2947,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
         TurnEvent::PlanUpdated {
             provider,
             plan_id,
+            turn_id,
             entries,
             explanation,
         } => {
@@ -2951,6 +2955,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
                 provider,
                 PlanSnapshot {
                     plan_id,
+                    turn_id,
                     entries,
                     explanation,
                 },
@@ -10950,6 +10955,40 @@ fn draw_multi(frame: &mut ratatui::Frame, area: Rect, multi: &MultiView) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn wrap_plan_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word;
+        while word.chars().count() > width {
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            let cut = word
+                .char_indices()
+                .nth(width)
+                .map(|(index, _)| index)
+                .unwrap_or(word.len());
+            lines.push(word[..cut].to_string());
+            word = &word[cut..];
+        }
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.chars().count() + 1 + word.chars().count() <= width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut current));
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() || lines.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
 fn truncate_chars(text: &str, limit: usize) -> String {
     if limit == 0 {
         return String::new();
@@ -14310,10 +14349,9 @@ fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scro
     let mut content: Vec<Line> = Vec::new();
     if let Some(explanation) = &plan.explanation {
         let safe = crate::sanitize::sanitize_terminal_text(explanation);
-        content.push(Line::styled(
-            truncate_chars(&safe, width),
-            Style::default().fg(COLORS.muted),
-        ));
+        for row in wrap_plan_text(&safe, width) {
+            content.push(Line::styled(row, Style::default().fg(COLORS.muted)));
+        }
     }
     for entry in &plan.entries {
         let (marker, color) = match entry.status.as_str() {
@@ -14321,16 +14359,26 @@ fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scro
             "in_progress" => ("▸", COLORS.accent),
             _ => ("·", COLORS.muted),
         };
-        let safe = crate::sanitize::sanitize_terminal_text(&entry.content);
-        let priority = entry
-            .priority
-            .as_deref()
-            .map(|priority| format!(" ({})", crate::sanitize::sanitize_terminal_text(priority)))
-            .unwrap_or_default();
-        content.push(Line::styled(
-            truncate_chars(&format!("{marker} {safe}{priority}"), width),
-            Style::default().fg(color),
-        ));
+        let mut safe = crate::sanitize::sanitize_terminal_text(&entry.content).into_owned();
+        if let Some(priority) = entry.priority.as_deref() {
+            safe.push_str(&format!(
+                " ({})",
+                crate::sanitize::sanitize_terminal_text(priority)
+            ));
+        }
+        let indent = " ".repeat(marker.chars().count() + 1);
+        let rows = wrap_plan_text(&safe, width.saturating_sub(indent.len()));
+        for (index, row) in rows.into_iter().enumerate() {
+            let prefix = if index == 0 {
+                format!("{marker} ")
+            } else {
+                indent.clone()
+            };
+            content.push(Line::styled(
+                format!("{prefix}{row}"),
+                Style::default().fg(color),
+            ));
+        }
     }
     let visible = inner.height.saturating_sub(1) as usize;
     state
@@ -14341,10 +14389,12 @@ fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scro
     } else {
         scroll.min(content.len() - visible)
     };
-    let mut lines = vec![Line::styled(
-        format!("plan · {done}/{total} done · ↑↓ scroll · esc close"),
-        Style::default().fg(COLORS.muted),
-    )];
+    let mut header = format!("plan · {done}/{total} done");
+    if let Some(turn_id) = plan.turn_id.as_deref() {
+        header.push_str(&format!(" · turn {}", truncate_chars(turn_id, 12)));
+    }
+    header.push_str(" · ↑↓ scroll · esc close");
+    let mut lines = vec![Line::styled(header, Style::default().fg(COLORS.muted))];
     for line in content.iter().skip(start).take(visible) {
         lines.push(line.clone());
     }
@@ -29270,6 +29320,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider,
                 plan_id: None,
+                turn_id: None,
                 entries: vec![
                     crate::types::PlanEntry {
                         content: "first".into(),
@@ -29344,6 +29395,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider,
                 plan_id: None,
+                turn_id: None,
                 entries: vec![crate::types::PlanEntry {
                     content: "private to thread a".into(),
                     status: "pending".into(),
@@ -29378,6 +29430,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider: crate::types::ProviderId::Claude,
                 plan_id: None,
+                turn_id: None,
                 entries: vec![crate::types::PlanEntry {
                     content: "private to claude".into(),
                     status: "pending".into(),
@@ -29414,6 +29467,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider,
                 plan_id: None,
+                turn_id: None,
                 entries: vec![crate::types::PlanEntry {
                     content: "worker step".into(),
                     status: "pending".into(),
@@ -29445,6 +29499,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider,
                 plan_id: Some("plan-1".into()),
+                turn_id: None,
                 entries: vec![crate::types::PlanEntry {
                     content: "first plan".into(),
                     status: "pending".into(),
@@ -29490,6 +29545,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider,
                 plan_id: None,
+                turn_id: None,
                 entries: vec![crate::types::PlanEntry {
                     content: "old plan".into(),
                     status: "pending".into(),
@@ -29523,6 +29579,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider,
                 plan_id: None,
+                turn_id: None,
                 entries: vec![crate::types::PlanEntry {
                     content: "old plan".into(),
                     status: "pending".into(),
@@ -29557,6 +29614,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider,
                 plan_id: None,
+                turn_id: None,
                 entries: vec![crate::types::PlanEntry {
                     content: "current plan".into(),
                     status: "in_progress".into(),
@@ -29576,6 +29634,71 @@ exit 1
     }
 
     #[test]
+    fn plan_step_wraps_instead_of_clipping() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let provider = state.thread.current_provider;
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                turn_id: None,
+                entries: vec![crate::types::PlanEntry {
+                    content: "inspect every parser entry before touching the serializer and keep the tail-marker"
+                        .into(),
+                    status: "in_progress".into(),
+                    priority: None,
+                }],
+                explanation: Some(
+                    "the explanation keeps its own verbatim wording and ends with tail-explanation".into(),
+                ),
+            },
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        let text = buffer_lines(&render_state(&state, 50, 24)).join("\n");
+        for value in ["tail-explanation", "plan · 0/1 done"] {
+            assert!(text.contains(value), "{value} missing: {text}");
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::End),
+        );
+        let text = buffer_lines(&render_state(&state, 50, 24)).join("\n");
+        assert!(text.contains("tail-marker"), "tail-marker missing: {text}");
+    }
+
+    #[test]
+    fn plan_header_names_the_reporting_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let provider = state.thread.current_provider;
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: None,
+                turn_id: Some("turn-plan".into()),
+                entries: vec![crate::types::PlanEntry {
+                    content: "one step".into(),
+                    status: "pending".into(),
+                    priority: None,
+                }],
+                explanation: None,
+            },
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("plan · 0/1 done · turn turn-plan"), "{text}");
+    }
+
+    #[test]
     fn plan_scroll_end_uses_the_rendered_viewport_limit() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -29586,6 +29709,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider,
                 plan_id: None,
+                turn_id: None,
                 entries: (0..30)
                     .map(|index| crate::types::PlanEntry {
                         content: format!("step {index}"),
@@ -29625,6 +29749,7 @@ exit 1
             TurnEvent::PlanUpdated {
                 provider,
                 plan_id: Some("plan-1".into()),
+                turn_id: None,
                 entries: vec![crate::types::PlanEntry {
                     content: "temporary".into(),
                     status: "pending".into(),

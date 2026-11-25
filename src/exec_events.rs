@@ -112,12 +112,14 @@ pub fn turn_event_json(thread_id: &str, event: &TurnEvent) -> Value {
         TurnEvent::PlanUpdated {
             provider,
             plan_id,
+            turn_id,
             entries,
             explanation,
         } => json!({
             "type": "plan_updated",
             "provider": provider.as_str(),
             "plan_id": plan_id,
+            "turn_id": turn_id,
             "explanation": explanation,
             "entries": entries
                 .iter()
@@ -375,6 +377,7 @@ mod tests {
             &TurnEvent::PlanUpdated {
                 provider: crate::types::ProviderId::Codex,
                 plan_id: Some("plan-1".into()),
+                turn_id: Some("turn-plan".into()),
                 entries: vec![PlanEntry {
                     content: "Inspect the parser".into(),
                     status: "in_progress".into(),
@@ -386,6 +389,7 @@ mod tests {
         assert_eq!(value["type"], "plan_updated");
         assert_eq!(value["provider"], "codex");
         assert_eq!(value["plan_id"], "plan-1");
+        assert_eq!(value["turn_id"], "turn-plan");
         assert_eq!(value["explanation"], "One check");
         assert_eq!(value["entries"][0]["content"], "Inspect the parser");
         assert_eq!(value["entries"][0]["status"], "in_progress");

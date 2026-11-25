@@ -488,9 +488,10 @@ async fn acp_adapter_maps_plan_updates() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            baton::adapters::TurnEvent::PlanUpdated { provider, plan_id, entries, explanation }
+            baton::adapters::TurnEvent::PlanUpdated { provider, plan_id, turn_id, entries, explanation }
                 if *provider == ProviderId::Antigravity
                     && plan_id.as_deref() == Some("plan-1")
+                    && turn_id.is_none()
                     && explanation.is_none()
                     && entries.len() == 2
                     && entries[0].content == "Read the request"

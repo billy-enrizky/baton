@@ -253,6 +253,7 @@ pub enum TurnEvent {
     PlanUpdated {
         provider: crate::types::ProviderId,
         plan_id: Option<String>,
+        turn_id: Option<String>,
         entries: Vec<PlanEntry>,
         explanation: Option<String>,
     },

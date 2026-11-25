@@ -373,6 +373,14 @@ Merge-candidate proof without a merge queue: when branch protection requires bra
 
 ## Open decisions
 
+- **Merging the Debt ratchet into Check needs a policy decision.** It is the measured lever: on run
+  45599904468 the ratchet was the critical path at 48 seconds, 22 of them cache restores, while Check took 20
+  with the same shape of setup. `ci/check-ci.sh` now allows a job to be removed when every command it was
+  required to run still runs in the head workflow. Two guards still block the merge, by design: `CI013` refuses
+  any `if`, `timeout-minutes`, or `needs` drift even with `--allow-change`, and removing a job forces
+  `verify.needs` to change. The repo owner has to decide whether `verify.needs` may shrink when a job is removed,
+  which is the same rule that stops a PR from redirecting a gate.
+
 | Decision | Current state |
 |---|---|
 | Runner size | `ubuntu-24.04` hosted. No paid runner is approved; the free ARM runner was rejected for removing pre-merge x64 runtime coverage |

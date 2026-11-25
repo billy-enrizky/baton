@@ -4,11 +4,21 @@ use crate::adapters::TurnEvent;
 use crate::status::SCHEMA_VERSION;
 use serde_json::{json, Value};
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StreamPlan {
+    pub provider: Option<crate::types::ProviderId>,
+    pub plan_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub entries: Vec<crate::types::PlanEntry>,
+    pub explanation: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct TurnStreamState {
     pub streamed_text: String,
     pub final_text: String,
     pub saw_output: bool,
+    pub plan: Option<StreamPlan>,
 }
 
 /// Applies one turn event to the stream state. Both the live loop and the
@@ -26,6 +36,29 @@ pub fn apply_turn_event(state: &mut TurnStreamState, event: &TurnEvent) {
         TurnEvent::TurnCompleted { final_text, .. } if !final_text.is_empty() => {
             state.final_text = final_text.clone();
             state.saw_output = true;
+        }
+        TurnEvent::PlanUpdated {
+            provider,
+            plan_id,
+            turn_id,
+            entries,
+            explanation,
+        } => {
+            state.plan = Some(StreamPlan {
+                provider: Some(*provider),
+                plan_id: plan_id.clone(),
+                turn_id: turn_id.clone(),
+                entries: entries.clone(),
+                explanation: explanation.clone(),
+            });
+        }
+        TurnEvent::PlanRemoved { provider, plan_id }
+            if state.plan.as_ref().is_some_and(|plan| {
+                plan.provider == Some(*provider)
+                    && plan.plan_id.as_deref() == Some(plan_id.as_str())
+            }) =>
+        {
+            state.plan = None;
         }
         _ => {}
     }
@@ -174,6 +207,7 @@ pub struct ExecResult<'a> {
     pub text: &'a str,
     pub worker_followup: Option<&'a crate::orchestrate::WorkerFollowupOutcome>,
     pub review: Option<&'a crate::orchestrate::FollowupReview>,
+    pub plan: Option<&'a StreamPlan>,
 }
 
 /// One result shape for normal completion and timeout. Callers add
@@ -200,6 +234,17 @@ pub fn result_json(result: &ExecResult<'_>) -> Value {
             "task_id": review.task_id,
             "status": review.status,
             "text": review.text,
+        })),
+        "plan": result.plan.map(|plan| json!({
+            "provider": plan.provider.map(|provider| provider.as_str()),
+            "plan_id": plan.plan_id,
+            "turn_id": plan.turn_id,
+            "explanation": plan.explanation,
+            "entries": plan.entries.iter().map(|entry| json!({
+                "content": entry.content,
+                "status": entry.status,
+                "priority": entry.priority,
+            })).collect::<Vec<_>>(),
         })),
     })
 }
@@ -371,6 +416,79 @@ mod tests {
     }
 
     #[test]
+    fn stream_state_keeps_the_last_plan_and_clears_on_removal() {
+        let mut state = TurnStreamState::default();
+        apply_turn_event(
+            &mut state,
+            &TurnEvent::PlanUpdated {
+                provider: crate::types::ProviderId::Codex,
+                plan_id: Some("plan-1".into()),
+                turn_id: Some("turn-1".into()),
+                entries: vec![crate::types::PlanEntry {
+                    content: "step one".into(),
+                    status: "in_progress".into(),
+                    priority: None,
+                }],
+                explanation: Some("check".into()),
+            },
+        );
+        let plan = state.plan.as_ref().expect("the last plan");
+        assert_eq!(plan.provider, Some(crate::types::ProviderId::Codex));
+        assert_eq!(plan.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(plan.entries[0].content, "step one");
+        assert_eq!(plan.explanation.as_deref(), Some("check"));
+
+        apply_turn_event(
+            &mut state,
+            &TurnEvent::PlanRemoved {
+                provider: crate::types::ProviderId::Codex,
+                plan_id: "other-plan".into(),
+            },
+        );
+        assert!(state.plan.is_some(), "another plan id must not clear it");
+        apply_turn_event(
+            &mut state,
+            &TurnEvent::PlanRemoved {
+                provider: crate::types::ProviderId::Codex,
+                plan_id: "plan-1".into(),
+            },
+        );
+        assert!(state.plan.is_none());
+    }
+
+    #[test]
+    fn result_json_carries_the_plan() {
+        let plan = StreamPlan {
+            provider: Some(crate::types::ProviderId::Codex),
+            plan_id: None,
+            turn_id: Some("turn-1".into()),
+            entries: vec![crate::types::PlanEntry {
+                content: "step one".into(),
+                status: "completed".into(),
+                priority: Some("high".into()),
+            }],
+            explanation: Some("check".into()),
+        };
+        let value = result_json(&ExecResult {
+            thread_id: "thread-1",
+            effort: None,
+            ok: true,
+            phase: "completed",
+            error: None,
+            text: "done",
+            worker_followup: None,
+            review: None,
+            plan: Some(&plan),
+        });
+        assert_eq!(value["plan"]["provider"], "codex");
+        assert_eq!(value["plan"]["turn_id"], "turn-1");
+        assert_eq!(value["plan"]["explanation"], "check");
+        assert_eq!(value["plan"]["entries"][0]["content"], "step one");
+        assert_eq!(value["plan"]["entries"][0]["status"], "completed");
+        assert_eq!(value["plan"]["entries"][0]["priority"], "high");
+    }
+
+    #[test]
     fn plan_events_keep_the_entries_and_explanation() {
         let value = turn_event_json(
             "thread-1",
@@ -421,6 +539,7 @@ mod tests {
             text: "done",
             worker_followup: None,
             review: None,
+            plan: None,
         });
         let timeout = result_json(&ExecResult {
             thread_id: "thread-1",
@@ -431,6 +550,7 @@ mod tests {
             text: "",
             worker_followup: None,
             review: None,
+            plan: None,
         });
         let normal_keys: Vec<&String> = normal.as_object().unwrap().keys().collect();
         let timeout_keys: Vec<&String> = timeout.as_object().unwrap().keys().collect();
@@ -455,6 +575,7 @@ mod tests {
             text: "done",
             worker_followup: None,
             review: Some(&review),
+            plan: None,
         });
         assert_eq!(value["review"]["run_id"], "run-1");
         assert_eq!(value["review"]["task_id"], "task-1");

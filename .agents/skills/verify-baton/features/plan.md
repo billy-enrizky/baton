@@ -20,7 +20,8 @@ Non-goals:
 - Sending a provider message on accept; acceptance changes the permission mode only.
 - Persisting plans for threads the user has never opened or for providers that are no longer known.
 - Reconstructing a plan from prose or transcript tool rows.
-- Rendering ACP file or markdown plans, adding a CLI or MCP reader for the snapshot, and forwarding orchestration worker plans into the parent TUI.
+- Rendering ACP file or markdown plans and adding a CLI or MCP reader for the snapshot.
+- Forwarding a worker's plan while the worker is still running; the parent receives it when the worker settles.
 
 ## Sub-features
 
@@ -35,6 +36,7 @@ Non-goals:
 - A plan from another thread or another harness is never shown.
 - The last plan for each thread and harness is stored in SQLite and rehydrated when the TUI starts or the thread is opened, so `/plan` survives a restart.
 - A new submit, `/multi`, orchestration preview, orchestration start, transcript rewind, or native rewind clears the thread's stored plans as well as the in-memory ones.
+- An orchestration worker's final plan reaches the parent TUI, the worker thread's snapshot, and the `plans` table after the worker settles.
 - In plan mode the header offers `enter accept` and `esc revise`; outside plan mode it offers `esc close`.
 - Enter in plan mode switches the thread to the `default` permission mode, closes the overlay, and says `plan accepted`. Enter outside plan mode keeps the overlay open and states that the plan is read-only.
 - Esc in plan mode closes the overlay and pre-fills an empty composer with `revise the plan: `; an existing draft is left untouched. `q` always closes without touching the composer.
@@ -45,7 +47,7 @@ The Codex and ACP adapters translate their native plan event to `TurnEvent::Plan
 
 The TUI keeps an in-memory snapshot per thread and provider. `/plan` reads only the snapshot for the visible thread and current harness, and an ACP removal clears a snapshot only when its plan id matches. New work clears the previous snapshots before the submit leaves the TUI; a later `TurnStarted` does not remove a plan already emitted by that turn. `/multi` and orchestration clear at their shared start paths, a rewind clears its completed thread, and a restart clears the map. ACP drain frames from another session are filtered before dispatch.
 
-The retention path covers events handled by the TUI process, including the in-process multi-provider children. Each accepted plan is written to the `plans` table keyed by thread and harness; `hydrate_plans` loads that thread's rows when the TUI starts and when `load_thread_state` opens a thread, and the whole-thread clear paths delete both the memory and the row. Orchestration workers run as separate `baton exec` subprocesses, so their plan events are not forwarded to the parent TUI snapshot map yet.
+The retention path covers events handled by the TUI process, including the in-process multi-provider children. Each accepted plan is written to the `plans` table keyed by thread and harness; `hydrate_plans` loads that thread's rows when the TUI starts and when `load_thread_state` opens a thread, and the whole-thread clear paths delete both the memory and the row. Orchestration workers run as `baton exec --json` subprocesses. The exec stream keeps the last plan, including clearing it on a matching `plan_removed`, and adds a `plan` object to the final `--json` result; the parent parses that object (and still accepts JSONL rows from an older worker), emits `WorkerPlanReported`, stores the plan under the worker thread, and the TUI inserts it into that thread's snapshot and the `plans` table.
 
 The overlay never edits the plan and never sends a provider message. Accept is one permission-mode transition: in plan mode Enter calls the same `apply_permission_mode` path `/mode default` uses, persists the thread, and closes the overlay, so the next turn runs with the accepted mode. Esc returns control to the composer with a `revise the plan: ` draft when the composer is empty, which lets the user describe the change and send it as the next turn. Rejecting without feedback stays out of scope.
 
@@ -69,7 +71,7 @@ The overlay never edits the plan and never sends a provider message. Accept is o
 | A provider sends control characters in step text, priority, or explanation | All three pass through `sanitize_terminal_text`; the status is normalized to a known vocabulary before rendering. |
 | A stale plan is shown after new work, rewind, thread switch, or harness switch | The TUI removes the visible thread's snapshots before submitting a turn, at the `/multi` and orchestration start paths, and on rewind. A later `TurnStarted` does not clear a plan already emitted for that turn. The thread id and provider must both match before `/plan` opens or the overlay draws. |
 | A restart shows a stale plan | Plans are stored per thread and harness and cleared by every new-work path. A plan from the last settled turn is intentionally kept, and the header names its reporting turn when the harness supplied one. |
-| An orchestration worker's plan never reaches the parent TUI | Workers run as `baton exec --json` subprocesses. Their plan event is consumed and discarded: it is not written by `--json`, not persisted, and not inserted into the parent snapshot map. Opening that worker thread reports the empty state. Forwarding it is an explicit non-goal and tracked follow-up. |
+| An orchestration worker's plan never reaches the parent TUI | Workers run as `baton exec --json` subprocesses. The final result carries the last plan, and after a worker settles the parent emits `WorkerPlanReported` and stores it under the worker thread. A worker that reports no plan opens with the empty state, and a plan reported mid-run is not shown until the worker settles. |
 | ACP file or markdown `plan_update` arrives and the view stays stale | Those payload types are ignored rather than approximated. A later `plan_removed` clears the item plan; a live ACP plan event has not been recorded yet. |
 | A `plan_removed` for another plan clears the visible plan | The snapshot carries its ACP `planId`, and only a removal with the same id clears it. A removal for an ignored file or markdown plan is a no-op. |
 | A foreign ACP session update reaches the active turn during reply drain | Drained `session/update` frames are filtered by `sessionId` before plan, usage, or text handling. |
@@ -123,6 +125,12 @@ Run a turn on a harness that reports plans, then type `/plan`. A Codex app serve
 - `submit_clears_the_persisted_plan`
 - `plan_removal_clears_the_persisted_plan`
 - `thread_switch_hydrates_its_own_plan`
+- `parse_exec_output_reads_a_stream_json_result_and_plan`
+- `parse_exec_output_keeps_the_single_json_result`
+- `parse_exec_output_accepts_an_untyped_result_after_other_rows`
+- `parse_exec_output_reports_stderr_when_nothing_parses`
+- `worker_plan_reaches_the_progress_callback`
+- `worker_plan_progress_fills_the_worker_snapshot`
 - `removing_an_open_plan_renders_the_empty_state`
 - `plan_events_keep_the_entries_and_explanation`
 - `plan_statuses_use_one_vocabulary`
@@ -135,5 +143,5 @@ Run a turn on a harness that reports plans, then type `/plan`. A Codex app serve
 - The legacy ACP `plan` frame is still accepted, but the adapter cannot prove which protocol version the peer negotiated. The v2 item path is covered directly.
 - ACP file and markdown plans are ignored. Only a `plan_removed` with the snapshot's own `planId` clears it.
 - A plan is cleared when the thread submits new work, runs `/multi` or orchestration, and when it rewinds. A retained plan names its reporting turn when the harness supplied one, and it survives a restart through the `plans` table.
-- Orchestration workers run outside the TUI process, so their plan events are discarded and opening the worker thread shows the empty state.
+- Orchestration workers run outside the TUI process, so their plan is forwarded only after the worker settles; a plan reported mid-run is not live.
 - The populated path is PTY-tested against a fake Codex server. No live provider plan event has been recorded yet.

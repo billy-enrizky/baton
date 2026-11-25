@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::Command;
 
+use crate::store::{BatonStore, ThreadRow};
+
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 pub fn checkpoint_ref(thread_id: &str, turn: i64) -> String {
@@ -148,9 +150,51 @@ pub fn diff_checkpoints(cwd: &Path, ref_a: &str, ref_b: &str) -> Result<String> 
     Ok(git(cwd, &["--no-pager", "diff", ref_a, ref_b], &[])?)
 }
 
-pub fn restore_checkpoint(cwd: &Path, reference: &str) -> Result<()> {
+pub const SHARED_RESTORE_MESSAGE: &str =
+    "file restore requires an isolated worktree; this is the repository's main checkout. Rewind the conversation only, or pass --force";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestoreConsent {
+    /// CLI default: refuse a shared main checkout and a dirty worktree.
+    Safe,
+    /// The TUI already asked. A dirty worktree is allowed; a shared checkout
+    /// is not, because its files may belong to another thread.
+    Confirmed,
+    /// Explicit `--force`: allow a shared checkout and a dirty worktree.
+    Force,
+}
+
+/// Rewrites the checkout from `reference`. The guard is deliberately in this
+/// function rather than only in the callers, so a new caller cannot skip it.
+pub fn restore_checkpoint(cwd: &Path, reference: &str, consent: RestoreConsent) -> Result<()> {
+    if consent != RestoreConsent::Force {
+        if crate::git_workflow::is_main_worktree(cwd)? {
+            anyhow::bail!(SHARED_RESTORE_MESSAGE);
+        }
+        if consent == RestoreConsent::Safe && !worktree_state(cwd)?.clean {
+            anyhow::bail!(
+                "working tree has uncommitted changes; commit or stash them, then retry, or pass --force"
+            );
+        }
+    }
     git(cwd, &["read-tree", "-u", "--reset", reference], &[])?;
     Ok(())
+}
+
+/// Refuses the restore when any thread under the same repository has durable
+/// open work, then applies the checkout guard and restores `reference`.
+pub fn restore_thread_checkpoint(
+    store: &BatonStore,
+    thread: &ThreadRow,
+    reference: &str,
+    consent: RestoreConsent,
+) -> Result<()> {
+    let cwd = Path::new(&thread.cwd);
+    let root = crate::git_workflow::repository_root(cwd)?;
+    if let Some((id, work)) = store.open_work_under(&root)? {
+        anyhow::bail!("thread {id} has {work:?} open; finish or stop it before restoring");
+    }
+    restore_checkpoint(cwd, reference, consent)
 }
 
 #[cfg(test)]
@@ -222,5 +266,112 @@ mod tests {
         let state = worktree_state(root.path()).unwrap();
         assert!(!state.clean);
         assert_eq!(state.head, None);
+    }
+
+    #[test]
+    fn restore_refuses_the_main_checkout_unless_forced() {
+        let root = repo();
+        std::fs::write(root.path().join("a.txt"), "one\n").unwrap();
+        git(root.path(), &["add", "."], &[]).unwrap();
+        git(root.path(), &["commit", "-qm", "init"], &[]).unwrap();
+
+        std::fs::write(root.path().join("a.txt"), "two\n").unwrap();
+        let reference = capture_checkpoint(root.path(), "main-guard", 1).unwrap();
+        std::fs::write(root.path().join("a.txt"), "three\n").unwrap();
+
+        for consent in [RestoreConsent::Safe, RestoreConsent::Confirmed] {
+            let error = restore_checkpoint(root.path(), &reference, consent).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("isolated worktree"),
+                "{consent:?}: {error:#}"
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "three\n",
+            "a refused restore must not touch the file"
+        );
+
+        restore_checkpoint(root.path(), &reference, RestoreConsent::Force).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("a.txt")).unwrap(),
+            "two\n"
+        );
+    }
+
+    #[test]
+    fn restore_allows_a_dirty_linked_worktree_after_confirmation() {
+        let root = repo();
+        std::fs::write(root.path().join("a.txt"), "one\n").unwrap();
+        git(root.path(), &["add", "."], &[]).unwrap();
+        git(root.path(), &["commit", "-qm", "init"], &[]).unwrap();
+
+        let base = tempfile::tempdir().unwrap();
+        let side = base.path().join("side");
+        git(
+            root.path(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                side.to_str().unwrap(),
+            ],
+            &[],
+        )
+        .unwrap();
+
+        std::fs::write(side.join("a.txt"), "two\n").unwrap();
+        let reference = capture_checkpoint(&side, "side-guard", 1).unwrap();
+        std::fs::write(side.join("a.txt"), "three\n").unwrap();
+
+        let error = restore_checkpoint(&side, &reference, RestoreConsent::Safe).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("uncommitted changes"),
+            "{error:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(side.join("a.txt")).unwrap(),
+            "three\n"
+        );
+
+        restore_checkpoint(&side, &reference, RestoreConsent::Confirmed).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(side.join("a.txt")).unwrap(),
+            "two\n"
+        );
+    }
+
+    #[test]
+    fn restore_refuses_when_another_thread_shares_the_repository() {
+        use crate::store::{NewThread, ThreadOpenWork};
+        use crate::types::ProviderId;
+
+        let root = repo();
+        std::fs::write(root.path().join("a.txt"), "one\n").unwrap();
+        git(root.path(), &["add", "."], &[]).unwrap();
+        git(root.path(), &["commit", "-qm", "init"], &[]).unwrap();
+
+        let store = BatonStore::memory().unwrap();
+        let new_thread = |title: &str| NewThread {
+            title: title.to_string(),
+            cwd: root.path().to_string_lossy().to_string(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        };
+        let owner = store.create_thread(new_thread("owner")).unwrap();
+        let other = store.create_thread(new_thread("other")).unwrap();
+        let reference = capture_checkpoint(root.path(), &owner.id, 1).unwrap();
+        store.enqueue_message(&other.id, "queued").unwrap();
+
+        let error = restore_thread_checkpoint(&store, &owner, &reference, RestoreConsent::Force)
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(text.contains(&other.id), "{text}");
+        assert!(
+            text.contains(&format!("{:?}", ThreadOpenWork::Queue)),
+            "{text}"
+        );
     }
 }

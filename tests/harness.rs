@@ -1,5 +1,8 @@
 use base64::Engine as _;
-use baton::checkpoints::{capture_checkpoint, checkpoint_ref, diff_checkpoint_against_worktree, restore_checkpoint};
+use baton::checkpoints::{
+    capture_checkpoint, checkpoint_ref, diff_checkpoint_against_worktree, restore_checkpoint,
+    RestoreConsent,
+};
 use baton::config::{
     auth_signature, load_config_file, provider_auth_env, save_config_file, AuthMode,
 };
@@ -45,7 +48,7 @@ fn checkpoints_capture_diff_restore() {
     assert!(diff.contains("-changed"));
     assert!(diff.contains("+version 2"));
 
-    restore_checkpoint(repo.path(), &reference).unwrap();
+    restore_checkpoint(repo.path(), &reference, RestoreConsent::Force).unwrap();
     assert_eq!(std::fs::read_to_string(repo.path().join("a.txt")).unwrap(), "changed\n");
 }
 

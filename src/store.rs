@@ -1820,6 +1820,24 @@ impl BatonStore {
         })
     }
 
+    /// The first thread under `root` with durable open work. A file restore
+    /// rewrites a whole checkout, so it must see work that belongs to another
+    /// thread in the same repository rather than only the thread being restored.
+    pub fn open_work_under(&self, root: &Path) -> Result<Option<(String, ThreadOpenWork)>> {
+        let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        for thread in self.list_threads(None)? {
+            let cwd = Path::new(&thread.cwd);
+            let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+            if !cwd.starts_with(&root) {
+                continue;
+            }
+            if let Some(work) = self.thread_open_work(&thread.id)? {
+                return Ok(Some((thread.id, work)));
+            }
+        }
+        Ok(None)
+    }
+
     /// A process that starts after a crash must not show a running turn as
     /// live. Mark unfinished turns in this project as unverified.
     pub fn reconcile_running_turns(&self, cwd: Option<&str>) -> Result<Vec<TurnRow>> {

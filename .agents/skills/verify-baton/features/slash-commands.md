@@ -7,6 +7,7 @@
 - Partial command and argument text filters the same list.
 - Tab completes the selected choice; Enter runs the line when it already names something the handler acts on and completes it otherwise.
 - An exact registered command runs even when the composer has trailing whitespace, so `/auth `, `/model `, `/git review`, and `/git merge` open their submenus instead of completing the first row.
+- Every picker paints the cursor on the selected row only. The switch, model, settings, MCP, roles, mode, effort, and retry pickers painted `❯` on every row, so the list looked entirely selected.
 - Dynamic pickers window around the selected row instead of always drawing the first eight or ten. With more entries than the window, the hidden rows scroll out of view and only the selected row carries the `❯` cursor, so `/runs`, `/copy`, `/agents`, `/queue`, `/inbox`, and `/checkpoints` stay usable deep in a long list.
 - `/auth <provider>` opens a scoped billing picker and `/switch <provider>` switches that harness. Enter runs them, so a billing or harness query is never rewritten into `/auth <provider> subscription` or `/switch <provider> <model>`.
 - Every command answers after a space with a completion list, an argument syntax hint, or an explicit no-arguments hint. A command with no choices says `enter runs it` instead of claiming a choice will complete.
@@ -70,4 +71,5 @@ Installed-binary proof: the slash probe and the 50-command sweep passed against 
 - The same prefix rule also swallowed the trailing space from Tab completion for bare picker commands. `is_complete_command` now treats every exact `SLASH_COMMANDS` entry as complete, plus `/git review` and `/git merge`, so the picker opens on the first Enter.
 - A command whose usage string was missing showed nothing after a space. `command_usage` now covers every entry in `SLASH_COMMANDS`, and `every_slash_command_offers_a_hint_after_a_space` enforces that invariant.
 - `trailing_space_opens_the_bare_auth_picker` and `picker_commands_are_complete_without_an_argument` cover the exact-command path.
+- `every_remaining_picker_paints_one_cursor` renders each of those eight pickers and requires exactly one `❯`, which fails when any of them reverts to the always-on cursor.
 - The dynamic pickers drew `❯` on every row and stopped at eight or ten entries, so a selection past the cap had no visible cursor and no visible row. `picker_window` now centers the window on the selection and clamps it to the list end, and `dynamic_pickers_window_around_the_selection_and_show_one_cursor` asserts each picker hides the first row, shows the selected row, and paints exactly one cursor.

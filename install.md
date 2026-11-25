@@ -33,7 +33,7 @@ Windows on ARM is not published yet. Use an x64 Windows machine, or build from a
 brew install billy-enrizky/baton/baton
 ```
 
-Upgrade with `brew upgrade billy-enrizky/baton/baton`.
+Upgrade with `brew upgrade billy-enrizky/baton/baton`. The formula is maintained in the `billy-enrizky/baton` tap, outside this repository.
 
 ## From source
 

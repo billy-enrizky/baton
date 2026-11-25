@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Drive a live ACP permission request through the TUI and prove the choice is sent."""
 
+from __future__ import annotations
+
 import argparse
 import json
 import os

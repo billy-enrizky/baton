@@ -14,7 +14,9 @@ use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 use crate::adapters::{standard_approval_choices, AdapterLifecycle, TurnEvent};
-use crate::checkpoints::{diff_checkpoint_against_worktree, restore_checkpoint};
+use crate::checkpoints::{
+    diff_checkpoint_against_worktree, restore_thread_checkpoint, RestoreConsent,
+};
 use crate::config::{describe_auth, load_config_file_strict, resolve_config, save_config_file};
 use crate::handoff::git_branch_label;
 use crate::inbox::{self, InboxItem};
@@ -6341,11 +6343,23 @@ fn handle_key(
         },
         Overlay::CodeConfirm { turn, git_ref } => match key.code {
             KeyCode::Char('y') | KeyCode::Enter => {
-                let cwd = std::path::PathBuf::from(&state.thread.cwd);
-                match restore_checkpoint(&cwd, &git_ref) {
+                let result = {
+                    let guard = store.lock().unwrap();
+                    restore_thread_checkpoint(
+                        &guard,
+                        &state.thread,
+                        &git_ref,
+                        RestoreConsent::Confirmed,
+                    )
+                };
+                match result {
                     Ok(()) => state.notice = Some(format!("restored code to turn {}", turn - 1)),
                     Err(error) => state.notice = Some(format!("restore failed: {error}")),
                 }
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                state.overlay = Overlay::None;
+                state.notice = Some(format!("kept files for turn {}", turn - 1));
             }
             _ => {}
         },
@@ -26871,6 +26885,74 @@ exit 1
                 .unwrap_or("")
                 .contains("Codex and OpenCode-only"),
             "notice: {:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn code_confirm_refuses_a_main_checkout_and_keeps_the_files() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?}");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "tui@example.com"]);
+        git(&["config", "user.name", "tui"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.path().join("a.txt"), "one\n").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(repo.path().join("a.txt"), "two\n").unwrap();
+        let reference =
+            crate::checkpoints::capture_checkpoint(repo.path(), "tui-guard", 1).unwrap();
+        std::fs::write(repo.path().join("a.txt"), "three\n").unwrap();
+
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        state.overlay = Overlay::CodeConfirm {
+            turn: 2,
+            git_ref: reference.clone(),
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()),
+        );
+        let notice = state.notice.as_deref().unwrap_or("");
+        assert!(
+            crate::git_workflow::is_main_worktree(repo.path()).unwrap(),
+            "the fixture must be the main checkout"
+        );
+        assert!(notice.contains("isolated worktree"), "{notice}");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
+            "three\n",
+            "a refused restore must not touch the checkout"
+        );
+
+        state.overlay = Overlay::CodeConfirm {
+            turn: 2,
+            git_ref: reference,
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("kept files"),
+            "{:?}",
             state.notice
         );
     }

@@ -1583,6 +1583,30 @@ fn repo_root(cwd: &Path) -> Result<PathBuf> {
     Ok(PathBuf::from(root))
 }
 
+/// The repository root for a path, including a linked worktree.
+pub fn repository_root(cwd: &Path) -> Result<PathBuf> {
+    repo_root(cwd)
+}
+
+/// True when `cwd` is the repository's main worktree. A file restore in the
+/// main worktree can overwrite another thread's edits, because every thread
+/// that opens the same checkout shares those files.
+pub fn is_main_worktree(cwd: &Path) -> Result<bool> {
+    let root = repo_root(cwd)?;
+    let listing = git_text(&root, &["worktree", "list", "--porcelain"])?;
+    let main = listing
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from);
+    let root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    Ok(match main {
+        Some(main) => std::fs::canonicalize(&main).unwrap_or(main) == root,
+        // No listing means git could not name the main checkout; treat the
+        // checkout as shared rather than risk another thread's files.
+        None => true,
+    })
+}
+
 fn revision_counts(root: &Path, upstream: &str) -> Result<(usize, usize)> {
     let value = git_text(
         root,

@@ -1676,13 +1676,22 @@ fn main_result(started: Instant) -> Result<()> {
             }
             Ok(())
         }
-        cli::Commands::Restore { thread_id, turn } => {
+        cli::Commands::Restore {
+            thread_id,
+            turn,
+            force,
+        } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = resolve_thread(&store, &thread_id)?;
             let checkpoint = store
                 .get_checkpoint(&thread.id, turn)?
                 .ok_or_else(|| anyhow::anyhow!("no checkpoint for turn {turn}"))?;
-            checkpoints::restore_checkpoint(Path::new(&thread.cwd), &checkpoint.git_ref)?;
+            let consent = if force {
+                checkpoints::RestoreConsent::Force
+            } else {
+                checkpoints::RestoreConsent::Safe
+            };
+            checkpoints::restore_thread_checkpoint(&store, &thread, &checkpoint.git_ref, consent)?;
             println!("restored {} to {}", thread.cwd, checkpoint.git_ref);
             Ok(())
         }

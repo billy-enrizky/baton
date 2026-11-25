@@ -171,7 +171,7 @@ In orchestrate mode, one prompt becomes a plan. Independent tasks run in separat
 
 ### 2.3 Recovery and review
 
-Every editing turn leaves a checkpoint. `/rewind` restores the conversation and optionally the code. `/retry` retries a failed or unverified turn on the same harness. `/review` shows the turn diff and sends line notes back as a steer or the next prompt.
+Every editing turn leaves a checkpoint. `/rewind` restores the conversation and optionally the code. A file restore refuses the repository's main checkout, where another thread can share the same files, and refuses any checkout with open work from another thread. The conversation rewind still completes, so you can continue without restoring files. `/retry` retries a failed or unverified turn on the same harness. `/review` shows the turn diff and sends line notes back as a steer or the next prompt.
 
 ### 2.4 A complete git loop
 
@@ -651,7 +651,7 @@ baton queue [-t id] [--clear] [--json]
 baton auth [provider] [subscription|api]
 baton roles [--json]
 baton diff <id> [turn]
-baton restore <id> <turn>
+baton restore <id> <turn> [--force]
 baton import [--dry-run]
 baton mcp
 baton bench startup [--json] [--repeat N]

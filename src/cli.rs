@@ -250,6 +250,9 @@ pub enum Commands {
     Restore {
         thread_id: String,
         turn: i64,
+        /// Allow a restore in the main checkout or over uncommitted changes
+        #[arg(long)]
+        force: bool,
     },
     /// Show token usage and cache hit rates
     Usage {

@@ -338,6 +338,12 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | v0.4.1 curl install | Local `install.sh` with `BATON_VERSION=v0.4.1` into a clean `bin`, `baton 0.4.1`, no source fallback | Passed 2026-11-24 |
 | v0.4.1 installed feature smoke | PTY slash probe passed against the Homebrew and curl binaries; the 50-command sweep passed against the Homebrew binary; `/auth`, `/model`, `/agents`, `/git`, `/memory`, and `/roles` present | Passed 2026-11-24 |
 | v0.4.1 formal gates | All 15 suites at `afab876`; log `local_docs/verification/evidence/formal-afab876-20261124-200523.log` | Passed 2026-11-24 |
+| v0.4.2 version bump | PR #245, PR run 45551608346: full suite, Test 51 seconds | Passed 2026-11-25 |
+| v0.4.2 release assets and checksums | Release run [45551789917](https://github.com/billy-enrizky/baton/actions/runs/45551789917), tag `v0.4.2`, five archives plus `SHA256SUMS`; all five sums verified | Passed 2026-11-25 |
+| v0.4.2 immutable latest release | `isDraft=false`, `isPrerelease=false`, `isImmutable=true`, `releases/latest=v0.4.2` | Passed 2026-11-25 |
+| v0.4.2 Homebrew formula | Tap commit `1fa3223`, `brew audit --strict --online`, upgrade, `brew test`, version 0.4.2 | Passed 2026-11-25 |
+| v0.4.2 curl install | Local `install.sh` with `BATON_VERSION=v0.4.2` into a clean `bin`, `baton 0.4.2`, no source fallback | Passed 2026-11-25 |
+| v0.4.2 installed feature smoke | PTY question probe passed against the Homebrew, Cargo, and curl binaries; slash probe and 50-command sweep passed against the Homebrew binary; focused `/auth` and `/model` probes passed | Passed 2026-11-25 |
 
 ## v0.4.0 release assets
 
@@ -366,6 +372,20 @@ Published 2026-11-24 from tag `v0.4.1` at `afab876ca4390c5e29c6f5ad4562e6ab1ce19
 | `baton-x86_64-unknown-linux-gnu.tar.gz` | `34b20966a76521f5f22e4b22fadb0d412661ef525cbaf7694308f222e64f392a` |
 
 The tap formula pins the four Unix archives to these values. The v0.4.1 Homebrew binary and the v0.4.1 curl install both passed the PTY slash probe.
+
+## v0.4.2 release assets
+
+Published 2026-11-25 from tag `v0.4.2` at `21c1b739788d5c8989928c2a526f6981fc585f13`.
+
+| Asset | SHA-256 |
+|---|---|
+| `baton-aarch64-apple-darwin.tar.gz` | `a0b3e8968df7b1b66376b18357ca797afa66e804fcb3d6eace31bfee0c53f143` |
+| `baton-aarch64-unknown-linux-gnu.tar.gz` | `80228e04072c81bc40f10c98de0464afafaa939100d4a15d602deb0c7311fd94` |
+| `baton-x86_64-apple-darwin.tar.gz` | `ec50fcd0a1e31d88c96e0fa5145482ed9cbdc6bccb941ac7eb6f656ace6350af` |
+| `baton-x86_64-pc-windows-msvc.zip` | `b03c68c7aa7dd81a41caa1940de6fec703ede719590bba8131ff974528a258fd` |
+| `baton-x86_64-unknown-linux-gnu.tar.gz` | `989743557881ef706f2fdb1e87532be04707a54d5a72b4b1980e3b42fc9be2ae` |
+
+The tap formula pins the four Unix archives to these values. The v0.4.2 Homebrew, Cargo, and curl binaries all passed the PTY question probe; the Homebrew binary passed the slash probe and the 50-command sweep.
 
 Installed performance on the 0.4.1 Homebrew binary: typing p50 7.9 ms and p95 8.0 ms, `/` suggestion p50 0.7 ms and p95 0.9 ms, and process start p50 20.5 ms on a 13.9 ms control spawn (ratio 1.34 against the 1.36 baseline). `startup.store` at 0.52 ms and slash p50 at 0.7 ms exceed the recorded 0.32 ms and 0.35 ms baselines. The 0.4.0 and 0.4.1 binaries measure the same values and the process ratio is flat, so the sub-millisecond baselines need a fresh host record or a wider absolute slack. That decision is open.
 

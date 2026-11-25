@@ -103,6 +103,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "open a side chat from this thread; /btw <prompt> prefills it",
     ),
     (
+        "/merge-back",
+        "bring a side chat's delta into its source thread",
+    ),
+    (
         "/worktree",
         "fork this conversation into an isolated git worktree",
     ),
@@ -3314,6 +3318,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/new", _) => Some("new [title]"),
         ("/fork", _) => Some("fork [--turn N] [title]"),
         ("/btw", _) => Some("btw [prompt]"),
+        ("/merge-back", _) => Some("merge-back [prompt]"),
         ("/worktree", _) => Some("worktree [title]"),
         ("/task", _) => Some("task [issue number]"),
         ("/open", _) => Some("open <thread id prefix>"),
@@ -9558,6 +9563,102 @@ fn handle_command(
                     }
                 }
                 Err(error) => state.notice = Some(format!("cannot start side chat: {error}")),
+            }
+        }
+        "/merge-back" => {
+            let side_id = state.thread.id.clone();
+            let side_title = state.thread.title.clone();
+            let prompt = args.join(" ");
+            let marker = match store.lock().unwrap().side_chat_forked_at(&side_id) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    state.notice = Some(format!("cannot inspect the side chat: {error}"));
+                    return;
+                }
+            };
+            let Some(forked_at) = marker else {
+                state.notice = Some("not a side chat; /btw opens one".into());
+                return;
+            };
+            let source = match store.lock().unwrap().side_chat_source(&side_id) {
+                Ok(source) => source,
+                Err(error) => {
+                    state.notice = Some(format!("cannot find the source thread: {error}"));
+                    return;
+                }
+            };
+            let Some(source) = source else {
+                state.notice = Some("the source thread no longer exists".into());
+                return;
+            };
+            if let Some(work) = store
+                .lock()
+                .unwrap()
+                .thread_open_work(&source.id)
+                .ok()
+                .flatten()
+            {
+                state.notice = Some(format!(
+                    "the source thread has {work:?} open; finish it before merging back"
+                ));
+                return;
+            }
+            let messages = store
+                .lock()
+                .unwrap()
+                .list_messages(&side_id)
+                .unwrap_or_default();
+            let delta: Vec<crate::store::MessageRow> = messages
+                .into_iter()
+                .filter(|message| message.created_at > forked_at)
+                .collect();
+            if delta.is_empty() {
+                state.notice =
+                    Some("nothing to merge back yet; send a message in the side chat first".into());
+                return;
+            }
+            let config = resolve_config(&state.home, std::path::Path::new(&state.thread.cwd));
+            let secrets = crate::redact::collect(
+                config
+                    .providers
+                    .values()
+                    .filter_map(|provider| provider.api_key.as_deref()),
+            );
+            let redacted: Vec<crate::store::MessageRow> = delta
+                .into_iter()
+                .map(|mut message| {
+                    message.text = crate::redact::redact(&message.text, &secrets).into_owned();
+                    message
+                })
+                .collect();
+            let summary =
+                crate::side_chat::merge_back_summary(&source.id, &side_id, &side_title, &redacted);
+            let turn = store
+                .lock()
+                .unwrap()
+                .next_turn_number(&source.id)
+                .unwrap_or(1);
+            let added = store
+                .lock()
+                .unwrap()
+                .add_message(&source.id, turn, "user", None, None, &summary);
+            match added {
+                Ok(_) => {
+                    load_thread_state(state, store, source);
+                    if prompt.is_empty() {
+                        state.notice = Some(
+                            "merged the side chat into the source; review the delta, then continue"
+                                .into(),
+                        );
+                    } else {
+                        state.set_input(prompt);
+                        state.notice = Some(
+                            "merged the side chat into the source; review the prompt, then press enter"
+                                .into(),
+                        );
+                    }
+                }
+                Err(error) => state.notice = Some(format!("cannot merge back: {error}")),
             }
         }
         "/task" => match args.first() {
@@ -27700,6 +27801,105 @@ exit 1
 
         open_thread_by_id(&mut state, &store, &source_id);
         assert!(state.side_chat_of.is_none());
+    }
+
+    #[test]
+    fn merge_back_moves_the_delta_and_redacts_keys() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let source_id = state.thread.id.clone();
+        store
+            .lock()
+            .unwrap()
+            .add_message(
+                &source_id,
+                1,
+                "user",
+                Some("claude"),
+                None,
+                "source context",
+            )
+            .unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            r#"{"claude":{"api_key":"sk-merge-secret-123456"}}"#,
+        )
+        .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/btw");
+        assert_ne!(state.thread.id, source_id);
+        let side_id = state.thread.id.clone();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        store
+            .lock()
+            .unwrap()
+            .add_message(
+                &side_id,
+                1,
+                "assistant",
+                Some("claude"),
+                None,
+                "the answer is sk-merge-secret-123456",
+            )
+            .unwrap();
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/merge-back check the delta",
+        );
+        assert_eq!(state.thread.id, source_id);
+        assert!(state.side_chat_of.is_none());
+        assert_eq!(state.input, "check the delta");
+        let messages = store.lock().unwrap().list_messages(&source_id).unwrap();
+        let merged = messages
+            .iter()
+            .find(|message| message.text.contains("Merge-back context"))
+            .expect("merge-back summary");
+        assert!(merged.text.contains("Fork delta: 1 new message(s)"));
+        assert!(
+            merged.text.contains("the answer is [redacted]"),
+            "{}",
+            merged.text
+        );
+        assert!(!merged.text.contains("sk-merge-secret-123456"));
+    }
+
+    #[test]
+    fn merge_back_requires_a_side_chat_and_a_delta() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/merge-back");
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("not a side chat"),
+            "{:?}",
+            state.notice
+        );
+
+        handle_command(&mut state, &store, &engine_command_sender, "/btw");
+        let side_id = state.thread.id.clone();
+        handle_command(&mut state, &store, &engine_command_sender, "/merge-back");
+        assert_eq!(
+            state.thread.id, side_id,
+            "an empty merge keeps the side chat open"
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("nothing to merge back yet"),
+            "{:?}",
+            state.notice
+        );
     }
 
     #[test]

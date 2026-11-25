@@ -970,6 +970,19 @@ impl BatonStore {
         }
     }
 
+    /// When the side chat was forked. Messages created after this time are the
+    /// fork delta that `/merge-back` transfers to the source.
+    pub fn side_chat_forked_at(&self, thread_id: &str) -> Result<Option<String>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT created_at FROM side_chats WHERE thread_id = ?1",
+                params![thread_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     pub fn draft_thread(&self, input: NewThread) -> ThreadRow {
         let now = now_iso();
         ThreadRow {

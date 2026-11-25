@@ -49,6 +49,7 @@ def record(value):
 
 
 prompt_id = None
+turn_count = 0
 for line in sys.stdin:
     try:
         frame = json.loads(line)
@@ -69,36 +70,56 @@ for line in sys.stdin:
     }:
         send({"jsonrpc": "2.0", "id": request_id, "result": {}})
     elif method == "session/prompt":
+        turn_count += 1
         prompt_id = request_id
-        send({
-            "jsonrpc": "2.0",
-            "method": "session/update",
-            "params": {
-                "sessionId": "acp-approval-1",
-                "update": {
-                    "sessionUpdate": "tool_call",
-                    "toolCallId": "tc-approval",
-                    "title": "bash touch approval.txt",
-                    "status": "in_progress",
+        if turn_count == 1:
+            send({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "acp-approval-1",
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-approval",
+                        "title": "bash touch approval.txt",
+                        "status": "in_progress",
+                    },
                 },
-            },
-        })
-        send({
-            "jsonrpc": "2.0",
-            "id": 9001,
-            "method": "session/request_permission",
-            "params": {
-                "sessionId": "acp-approval-1",
-                "toolCall": {"toolCallId": "tc-approval", "title": "bash touch approval.txt"},
-                "options": [
-                    {"optionId": "opt-allow", "name": "Allow once", "kind": "allow_once"},
-                    {"optionId": "opt-always", "name": "Always allow", "kind": "allow_always"},
-                    {"optionId": "opt-reject", "name": "Reject", "kind": "reject_once"},
-                ],
-            },
-        })
-    elif request_id == 9001:
+            })
+            send({
+                "jsonrpc": "2.0",
+                "id": 9001,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "acp-approval-1",
+                    "toolCall": {"toolCallId": "tc-approval", "title": "bash touch approval.txt"},
+                    "options": [
+                        {"optionId": "opt-allow", "name": "Allow once", "kind": "allow_once"},
+                        {"optionId": "opt-always", "name": "Always allow", "kind": "allow_always"},
+                        {"optionId": "opt-reject", "name": "Reject", "kind": "reject_once"},
+                    ],
+                },
+            })
+        else:
+            send({
+                "jsonrpc": "2.0",
+                "id": 9002,
+                "method": "session/request_permission",
+                "params": {
+                    "sessionId": "acp-approval-1",
+                    "toolCall": {
+                        "toolCallId": "interaction_9960062f",
+                        "title": "Which database should the service use?",
+                    },
+                    "options": [
+                        {"optionId": "opt-postgres", "name": "Postgres", "kind": "allow_once"},
+                        {"optionId": "opt-sqlite", "name": "SQLite", "kind": "allow_once"},
+                    ],
+                },
+            })
+    elif request_id in {9001, 9002}:
         record(frame)
+        text = "approval handled" if request_id == 9001 else "question handled"
         send({
             "jsonrpc": "2.0",
             "method": "session/update",
@@ -106,7 +127,7 @@ for line in sys.stdin:
                 "sessionId": "acp-approval-1",
                 "update": {
                     "sessionUpdate": "agent_message_chunk",
-                    "content": {"type": "text", "text": "approval handled"},
+                    "content": {"type": "text", "text": text},
                 },
             },
         })
@@ -195,6 +216,7 @@ def main() -> int:
     passed = False
     error = None
     selected = None
+    question_selected = None
     try:
         if not wait_for_screen(
             master, "Ask anything", args.timeout, args.width, args.height, transcript
@@ -227,6 +249,39 @@ def main() -> int:
         after_text = "\n".join(after.lines())
         (evidence / "screen-after.txt").write_text(after_text + "\n")
 
+        os.write(master, b"ask which database\r")
+        if not wait_for_screen(
+            master,
+            "Which database should the service use?",
+            args.timeout,
+            args.width,
+            args.height,
+            transcript,
+        ):
+            raise RuntimeError("TUI did not show the Antigravity question")
+        if not wait_for_screen(
+            master, "SQLite", 8.0, args.width, args.height, transcript
+        ):
+            raise RuntimeError("question overlay did not list the provider options")
+        pump(master, 0.3, transcript)
+        question = Screen(args.width, args.height)
+        question.feed(bytes(transcript).decode("utf-8", "replace"))
+        question_text = "\n".join(question.lines())
+        (evidence / "screen-question.txt").write_text(question_text + "\n")
+
+        os.write(master, b"\x1b[B\r")
+        if not wait_for_screen(
+            master, "question handled", args.timeout, args.width, args.height, transcript
+        ):
+            raise RuntimeError("the fake ACP agent did not receive the question answer")
+        pump(master, 0.5, transcript)
+        question_after = Screen(args.width, args.height)
+        question_after.feed(bytes(transcript).decode("utf-8", "replace"))
+        question_after_text = "\n".join(question_after.lines())
+        (evidence / "screen-question-after.txt").write_text(
+            question_after_text + "\n"
+        )
+
         if state_path.is_file():
             for line in state_path.read_text().splitlines():
                 try:
@@ -234,21 +289,35 @@ def main() -> int:
                 except json.JSONDecodeError:
                     continue
                 outcome = frame.get("result", {}).get("outcome", {})
-                if outcome.get("outcome") == "selected":
+                if frame.get("id") == 9001 and outcome.get("outcome") == "selected":
                     selected = outcome.get("optionId")
+                if frame.get("id") == 9002 and outcome.get("outcome") == "selected":
+                    question_selected = outcome.get("optionId")
         choices = ["Allow once", "Always allow", "Reject"]
         missing = [choice for choice in choices if choice not in before_text]
+        question_choices = ["Which database should the service use?", "Postgres", "SQLite"]
+        missing.extend(
+            choice for choice in question_choices if choice not in question_text
+        )
         passed = (
             not missing
             and selected == "opt-reject"
+            and question_selected == "opt-sqlite"
             and "approval handled" in after_text
+            and "question handled" in question_after_text
         )
         if missing:
             error = f"missing choices: {missing}"
         elif selected != "opt-reject":
             error = f"selected option was {selected!r}, expected 'opt-reject'"
+        elif question_selected != "opt-sqlite":
+            error = (
+                f"question option was {question_selected!r}, expected 'opt-sqlite'"
+            )
         elif "approval handled" not in after_text:
             error = "the completed turn is missing from the final screen"
+        elif "question handled" not in question_after_text:
+            error = "the answered question is missing from the final screen"
     except Exception as caught:  # noqa: BLE001
         error = str(caught)
     finally:
@@ -265,6 +334,7 @@ def main() -> int:
             "passed": passed and exit_code == 0 and error is None,
             "binary": binary_identity(binary),
             "selected": selected,
+            "question_selected": question_selected,
             "error": error,
             "exit_code": exit_code,
             "evidence": str(evidence),

@@ -6,7 +6,10 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
-use crate::adapters::{standard_approval_choices, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineReader, LineWriter, ModelListInput, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
+use crate::adapters::{
+    standard_approval_choices, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, LineReader,
+    LineWriter, ModelListInput, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput,
+};
 use crate::config::auth_signature;
 use crate::types::{
     ApprovalChoice, ApprovalDecision, NativeSessionRef, ProviderId, QuestionAnswer, QuestionOption,
@@ -119,6 +122,13 @@ async fn handle_server_request(
     if matches!(method, "x.ai/ask_user_question" | "_x.ai/ask_user_question") {
         handle_xai_question(runtime, id, &params).await;
         return;
+    }
+    if method == "session/request_permission" {
+        let questions = antigravity_question_prompts(&params);
+        if !questions.is_empty() {
+            handle_antigravity_question(runtime, id, &params, questions).await;
+            return;
+        }
     }
     if method != "session/request_permission" {
         let response = json!({
@@ -283,6 +293,139 @@ async fn handle_xai_question(runtime: &Arc<AcpRuntime>, id: Value, params: &Valu
             .and_then(Value::as_str)
             .unwrap_or("")
     );
+    handle_question_request(runtime, id, request_id, questions, xai_question_response).await;
+}
+
+fn antigravity_question_prompts(params: &Value) -> Vec<QuestionPrompt> {
+    let Some(tool_call_id) = params
+        .get("toolCall")
+        .and_then(|tool_call| tool_call.get("toolCallId"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| id.starts_with("interaction_"))
+    else {
+        return Vec::new();
+    };
+    let question = params
+        .get("toolCall")
+        .and_then(|tool_call| tool_call.get("title"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .unwrap_or("Choose an option.");
+    let options: Vec<QuestionOption> = params
+        .get("options")
+        .and_then(Value::as_array)
+        .map(|options| {
+            options
+                .iter()
+                .filter_map(|option| {
+                    let id = option.get("optionId").and_then(Value::as_str)?.trim();
+                    if id.is_empty() {
+                        return None;
+                    }
+                    let label = option
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(id);
+                    Some(QuestionOption {
+                        label: label.to_string(),
+                        description: label.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if options.is_empty() {
+        return Vec::new();
+    }
+    vec![QuestionPrompt {
+        id: tool_call_id.to_string(),
+        header: "Question".into(),
+        question: question.to_string(),
+        options,
+        allow_custom: false,
+        secret: false,
+    }]
+}
+
+fn antigravity_question_response(
+    params: &Value,
+    questions: &[QuestionPrompt],
+    answers: &[QuestionAnswer],
+) -> Value {
+    let cancelled = json!({ "outcome": { "outcome": "cancelled" } });
+    let Some(question) = questions.first() else {
+        return cancelled;
+    };
+    let Some(answer) = answers
+        .iter()
+        .find(|answer| answer.id == question.id)
+        .and_then(|answer| answer.answers.first())
+        .map(String::as_str)
+    else {
+        return cancelled;
+    };
+    let Some(options) = params.get("options").and_then(Value::as_array) else {
+        return cancelled;
+    };
+    let mut matched = options.iter().filter_map(|option| {
+        let id = option.get("optionId").and_then(Value::as_str)?.trim();
+        if id.is_empty() {
+            return None;
+        }
+        let label = option
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(id);
+        (label == answer || id == answer).then(|| id.to_string())
+    });
+    let Some(option_id) = matched.next() else {
+        return cancelled;
+    };
+    if matched.next().is_some() {
+        return cancelled;
+    }
+    json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
+}
+
+async fn handle_antigravity_question(
+    runtime: &Arc<AcpRuntime>,
+    id: Value,
+    params: &Value,
+    questions: Vec<QuestionPrompt>,
+) {
+    let request_id = format!(
+        "antigravity:{}",
+        questions
+            .first()
+            .map(|question| question.id.as_str())
+            .unwrap_or("")
+    );
+    let params = params.clone();
+    handle_question_request(
+        runtime,
+        id,
+        request_id,
+        questions,
+        move |questions, answers| antigravity_question_response(&params, questions, answers),
+    )
+    .await;
+}
+
+async fn handle_question_request<F>(
+    runtime: &Arc<AcpRuntime>,
+    id: Value,
+    request_id: String,
+    questions: Vec<QuestionPrompt>,
+    response: F,
+) where
+    F: FnOnce(&[QuestionPrompt], &[QuestionAnswer]) -> Value + Send + 'static,
+{
     let (respond, receiver) = oneshot::channel::<Vec<QuestionAnswer>>();
     {
         let emit = runtime.current_emit.lock().await;
@@ -297,7 +440,7 @@ async fn handle_xai_question(runtime: &Arc<AcpRuntime>, id: Value, params: &Valu
     let runtime = runtime.clone();
     tokio::spawn(async move {
         let answers = receiver.await.unwrap_or_default();
-        send_acp_result(&runtime, id, xai_question_response(&questions, &answers)).await;
+        send_acp_result(&runtime, id, response(&questions, &answers)).await;
     });
 }
 
@@ -840,8 +983,8 @@ impl BatonAdapter for AcpAdapter {
 #[cfg(test)]
 mod tests {
     use super::{
-        antigravity_model_family, permission_choices, pick_permission_option, xai_question_prompts,
-        xai_question_response,
+        antigravity_model_family, antigravity_question_prompts, antigravity_question_response,
+        permission_choices, pick_permission_option, xai_question_prompts, xai_question_response,
     };
     use crate::types::{ApprovalDecision, QuestionAnswer, QuestionPrompt};
     use serde_json::json;
@@ -866,6 +1009,98 @@ mod tests {
         assert_eq!(choices[0].label, "Allow");
         assert_eq!(choices[1].kind, "allow_always");
         assert_eq!(choices[2].label, "Reject");
+    }
+
+    #[test]
+    fn antigravity_interactions_become_question_prompts() {
+        let params = json!({
+            "sessionId": "session-1",
+            "toolCall": {
+                "toolCallId": "interaction_9960062f",
+                "title": "Which database should the service use?"
+            },
+            "options": [
+                { "optionId": "opt-postgres", "name": "Postgres", "kind": "allow_once" },
+                { "optionId": "opt-sqlite", "name": "SQLite", "kind": "allow_once" },
+                { "optionId": "opt-cancel", "name": "Cancel", "kind": "reject_once" }
+            ]
+        });
+        let questions = antigravity_question_prompts(&params);
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].id, "interaction_9960062f");
+        assert_eq!(
+            questions[0].question,
+            "Which database should the service use?"
+        );
+        assert_eq!(questions[0].options.len(), 3);
+        assert_eq!(questions[0].options[1].label, "SQLite");
+        assert!(!questions[0].allow_custom);
+
+        let permission = json!({
+            "toolCall": { "toolCallId": "tc-1", "title": "bash rm" },
+            "options": [{ "optionId": "opt-allow", "name": "Allow" }]
+        });
+        assert!(antigravity_question_prompts(&permission).is_empty());
+    }
+
+    #[test]
+    fn antigravity_question_response_maps_a_unique_label_to_its_option_id() {
+        let params = json!({
+            "options": [
+                { "optionId": "opt-postgres", "name": "Postgres" },
+                { "optionId": "opt-sqlite", "name": "SQLite" }
+            ]
+        });
+        let questions = vec![QuestionPrompt {
+            id: "interaction_1".into(),
+            header: "Question".into(),
+            question: "Which database?".into(),
+            options: Vec::new(),
+            allow_custom: false,
+            secret: false,
+        }];
+        let answers = vec![QuestionAnswer {
+            id: "interaction_1".into(),
+            answers: vec!["SQLite".into()],
+        }];
+        let response = antigravity_question_response(&params, &questions, &answers);
+        assert_eq!(response["outcome"]["outcome"], "selected");
+        assert_eq!(response["outcome"]["optionId"], "opt-sqlite");
+
+        let unknown = vec![QuestionAnswer {
+            id: "interaction_1".into(),
+            answers: vec!["MySQL".into()],
+        }];
+        assert_eq!(
+            antigravity_question_response(&params, &questions, &unknown)["outcome"]["outcome"],
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn antigravity_question_response_refuses_an_ambiguous_label() {
+        let params = json!({
+            "options": [
+                { "optionId": "opt-one", "name": "Same label" },
+                { "optionId": "opt-two", "name": "Same label" }
+            ]
+        });
+        let questions = vec![QuestionPrompt {
+            id: "interaction_1".into(),
+            header: "Question".into(),
+            question: "Pick".into(),
+            options: Vec::new(),
+            allow_custom: false,
+            secret: false,
+        }];
+        let answers = vec![QuestionAnswer {
+            id: "interaction_1".into(),
+            answers: vec!["Same label".into()],
+        }];
+        assert_eq!(
+            antigravity_question_response(&params, &questions, &answers)["outcome"]["outcome"],
+            "cancelled"
+        );
     }
 
     #[test]

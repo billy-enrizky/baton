@@ -114,7 +114,7 @@ fn main_result(started: Instant) -> Result<()> {
             }
             return Ok(());
         }
-        cli::Commands::Exec { prompt, json, stream_json } => {
+        cli::Commands::Exec { prompt, json, stream_json, no_review } => {
             if cli.mode.is_some() {
                 anyhow::bail!(
                     "--mode applies to the interactive TUI; use `baton orchestrate` for a non-interactive run"
@@ -383,6 +383,38 @@ fn main_result(started: Instant) -> Result<()> {
                 None => None,
             };
 
+            let followup_review = if no_review {
+                None
+            } else {
+                match &worker_followup {
+                    Some(outcome)
+                        if outcome.status == "completed"
+                            && outcome.commit.is_some()
+                            && outcome.error.is_none()
+                            && outcome.question.is_none() =>
+                    {
+                        match BatonStore::open(&paths::baton_db_path()).and_then(|review_store| {
+                            orchestrate::auto_review_followup(
+                                &review_store,
+                                &home,
+                                &cwd,
+                                outcome,
+                                permission_override,
+                            )
+                        }) {
+                            Ok(review) => review,
+                            Err(error) => {
+                                if !machine {
+                                    eprintln!("auto-review failed: {error}");
+                                }
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                }
+            };
+
             // Providers that do not emit deltas only deliver final text here.
             // If deltas were streamed, do not print the same answer twice.
             if stream.streamed_text.is_empty() && !stream.final_text.is_empty() {
@@ -402,6 +434,7 @@ fn main_result(started: Instant) -> Result<()> {
                     error: Some("exec timed out after 300s"),
                     text: "",
                     worker_followup: None,
+                    review: None,
                 });
                 if stream_json {
                     value["type"] = serde_json::json!("result");
@@ -438,6 +471,7 @@ fn main_result(started: Instant) -> Result<()> {
                     error: machine_error.as_deref(),
                     text,
                     worker_followup: worker_followup.as_ref(),
+                    review: followup_review.as_ref(),
                 });
                 if stream_json {
                     value["type"] = serde_json::json!("result");
@@ -449,6 +483,13 @@ fn main_result(started: Instant) -> Result<()> {
                 eprintln!("no output from provider");
             }
             if !machine {
+                if let Some(review) = &followup_review {
+                    eprintln!(
+                        "auto-review: {} · {}",
+                        review.status,
+                        review.text.lines().next().unwrap_or("")
+                    );
+                }
                 if let Some(outcome) = &worker_followup {
                     let run = &outcome.run_id[..8.min(outcome.run_id.len())];
                     let label = if outcome.question.is_some() {

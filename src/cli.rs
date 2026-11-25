@@ -86,6 +86,9 @@ pub enum Commands {
         /// Emit one JSON event per line, then the final result object
         #[arg(long, conflicts_with = "json")]
         stream_json: bool,
+        /// Do not run the reviewer after a worker follow-up commit
+        #[arg(long = "no-review")]
+        no_review: bool,
     },
     /// Run one task in an isolated worktree and return the worker thread
     Spawn {
@@ -584,6 +587,15 @@ mod tests {
                 assert_eq!(text, vec!["Use", "tabs"]);
             }
             _ => panic!("expected memories add"),
+        }
+    }
+
+    #[test]
+    fn exec_accepts_no_review() {
+        let cli = Cli::try_parse_from(["baton", "exec", "--no-review", "hi"]).unwrap();
+        match cli.command {
+            Some(Commands::Exec { no_review, .. }) => assert!(no_review),
+            _ => panic!("expected the exec command"),
         }
     }
 

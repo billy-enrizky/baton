@@ -1466,6 +1466,70 @@ fn review_run_with_bin(
     report_from_rows(store, cwd, &run_id)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowupReview {
+    pub run_id: String,
+    pub task_id: String,
+    pub status: String,
+    pub text: String,
+}
+
+/// Runs the reviewer for one worker follow-up commit. Returns None when the
+/// reviewer role is disabled or the task is not part of the run.
+pub fn auto_review_followup(
+    store: &BatonStore,
+    home: &Path,
+    cwd: &Path,
+    outcome: &WorkerFollowupOutcome,
+    permission_override: Option<PermissionMode>,
+) -> Result<Option<FollowupReview>> {
+    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("baton"));
+    auto_review_followup_with_bin(
+        store,
+        home,
+        cwd,
+        outcome,
+        permission_override,
+        Some(&binary),
+    )
+}
+
+fn auto_review_followup_with_bin(
+    store: &BatonStore,
+    home: &Path,
+    cwd: &Path,
+    outcome: &WorkerFollowupOutcome,
+    permission_override: Option<PermissionMode>,
+    binary: Option<&Path>,
+) -> Result<Option<FollowupReview>> {
+    let registry = crate::roles::load(home)?;
+    if !registry.review {
+        return Ok(None);
+    }
+    let tasks = store.list_orchestration_tasks(&outcome.run_id)?;
+    let Some(position) = tasks.iter().position(|task| task.id == outcome.task_id) else {
+        return Ok(None);
+    };
+    let report = review_run_with_bin(
+        store,
+        home,
+        cwd,
+        &outcome.run_id,
+        &[position + 1],
+        permission_override,
+        binary,
+    )?;
+    Ok(report.tasks.get(position).map(|task| FollowupReview {
+        run_id: outcome.run_id.clone(),
+        task_id: outcome.task_id.clone(),
+        status: task
+            .review_status
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string()),
+        text: task.review_text.clone().unwrap_or_default(),
+    }))
+}
+
 #[derive(Debug, Clone)]
 pub struct IntegratedTask {
     pub index: usize,
@@ -5311,6 +5375,73 @@ printf 'worker\n' > worker.txt",
         assert_eq!(refreshed.status, "completed");
         let integrated = integrate(&store, repo.path(), &report.run_id, &[]).unwrap();
         assert_eq!(integrated.merged.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_review_followup_approves_a_pending_task() {
+        let (repo, home, store, report) = review_fixture(None, "APPROVE", false);
+        let worktree = report.tasks[0].worktree.clone().expect("worktree");
+        std::fs::write(worktree.path.join("followup.txt"), "new work\n").unwrap();
+        let outcome =
+            record_worker_followup(&store, "worker-thread", true, None, TurnPhase::Completed)
+                .unwrap()
+                .expect("follow-up outcome");
+        let harness = home.path().join("review-harness");
+        let review = auto_review_followup_with_bin(
+            &store,
+            home.path(),
+            repo.path(),
+            &outcome,
+            None,
+            Some(&harness),
+        )
+        .unwrap()
+        .expect("auto review runs");
+        assert_eq!(review.status, REVIEW_APPROVE);
+        assert_eq!(review.task_id, report.tasks[0].id);
+        assert_eq!(review.run_id, report.run_id);
+        let rows = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert_eq!(rows[0].review_status.as_deref(), Some(REVIEW_APPROVE));
+
+        let mut missing = outcome.clone();
+        missing.task_id = "missing-task".to_string();
+        let none = auto_review_followup_with_bin(
+            &store,
+            home.path(),
+            repo.path(),
+            &missing,
+            None,
+            Some(&harness),
+        )
+        .unwrap();
+        assert!(none.is_none(), "an unknown task does not start a review");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_review_followup_honors_the_review_setting() {
+        let (repo, home, store, report) =
+            review_fixture(Some(r#"{"review":false}"#), "APPROVE", false);
+        let worktree = report.tasks[0].worktree.clone().expect("worktree");
+        std::fs::write(worktree.path.join("followup.txt"), "new work\n").unwrap();
+        let outcome =
+            record_worker_followup(&store, "worker-thread", true, None, TurnPhase::Completed)
+                .unwrap()
+                .expect("follow-up outcome");
+        let harness = home.path().join("review-harness");
+        let none = auto_review_followup_with_bin(
+            &store,
+            home.path(),
+            repo.path(),
+            &outcome,
+            None,
+            Some(&harness),
+        )
+        .unwrap();
+        assert!(none.is_none());
+        let rows = store.list_orchestration_tasks(&report.run_id).unwrap();
+        assert_eq!(rows[0].review_status.as_deref(), Some(REVIEW_PENDING));
     }
 
     #[cfg(unix)]

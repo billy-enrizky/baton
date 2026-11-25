@@ -1,6 +1,6 @@
 ---
 name: verify-baton
-description: "Drive baton's Rust CLI, TUI, and MCP stdio server through isolated state and prove user-visible behavior. Use after changing slash commands, adapter lifecycle/status, doctor, fork, queue, review, rewind, steering, paste, greeting, approval choices, subagent rows, git review or merge, auto-review, MCP tools, turn phases, or any TUI rendering. Also use when a provider readiness or process-leak claim needs live evidence."
+description: "Drive baton's Rust CLI, TUI, and MCP stdio server through isolated state and prove user-visible behavior. Use after changing slash commands, adapter lifecycle/status, doctor, fork, queue, review, rewind, steering, paste, greeting, approval choices, provider questions, subagent rows, git review or merge, auto-review, MCP tools, turn phases, or any TUI rendering. Also use when a provider readiness or process-leak claim needs live evidence."
 ---
 
 # Verify baton
@@ -93,6 +93,7 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 | Retry a failed turn (`/retry`) | `scripts/retry_probe.py` | zero, uses a fake Claude harness |
 | Greeting in default orchestrate mode | `scripts/greeting_probe.py` | one small Codex turn |
 | Provider approval choices | `scripts/approval_probe.py` | zero, fake ACP agent |
+| Codex user-input questions | `scripts/question_probe.py` | zero, fake Codex app-server |
 | MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, seeds an empty thread with `baton new` |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |
 | Slash argument choices and completion | `scripts/slash_probe.py` | zero |
@@ -137,7 +138,7 @@ Run the installed binary by the path `command -v baton` returns, not a relative 
 
 ## Feature map
 
-Start with `features/README.md`. Each file names the user path, the drive command, and the observable end state. The files for `/agents`, `/queue`, `/git review` and `/git merge`, `/auth <provider>`, approval choices, `baton agents -t`, and `baton_agents` cover the surfaces added after the first feature map. Add a feature file when a new user-facing command or state is added; do not weaken a journey to make it pass.
+Start with `features/README.md`. Each file names the user path, the drive command, and the observable end state. The files for `/agents`, `/queue`, `/git review` and `/git merge`, `/auth <provider>`, approval choices, provider questions, `baton agents -t`, and `baton_agents` cover the surfaces added after the first feature map. Add a feature file when a new user-facing command or state is added; do not weaken a journey to make it pass.
 
 ## Gotchas
 

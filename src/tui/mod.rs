@@ -24,7 +24,7 @@ use crate::store::{BatonStore, MessageRow, NewThread, PinMoveOutcome, ThreadOpen
 use crate::sync;
 use crate::types::{
     normalize_reasoning_effort, ApprovalChoice, ApprovalDecision, PermissionMode, ProviderId,
-    SessionMode, TurnPhase,
+    QuestionAnswer, QuestionPrompt, SessionMode, TurnPhase,
 };
 use crate::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 
@@ -395,6 +395,16 @@ struct ApprovalState {
     choices: Vec<ApprovalChoice>,
     selected: usize,
     respond: tokio::sync::oneshot::Sender<ApprovalDecision>,
+}
+
+struct QuestionState {
+    thread_id: String,
+    questions: Vec<QuestionPrompt>,
+    index: usize,
+    selected: usize,
+    custom: Option<String>,
+    answers: Vec<QuestionAnswer>,
+    respond: tokio::sync::oneshot::Sender<Vec<QuestionAnswer>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -794,6 +804,7 @@ pub struct TuiState {
     live_subagents: Vec<AgentEntry>,
     overlay: Overlay,
     approvals: Vec<ApprovalState>,
+    questions: Vec<QuestionState>,
     review: Option<ReviewState>,
     activity: Option<ActivityView>,
     multi: Option<MultiView>,
@@ -921,6 +932,7 @@ pub fn run_tui(
         live_subagents: Vec::new(),
         overlay: Overlay::None,
         approvals: Vec::new(),
+        questions: Vec::new(),
         review: None,
         activity: None,
         multi: None,
@@ -1488,6 +1500,9 @@ fn apply_engine_event(
             state
                 .approvals
                 .retain(|approval| approval.thread_id != thread_id);
+            state
+                .questions
+                .retain(|question| question.thread_id != thread_id);
             if let Some(child) = state.multi.as_mut().and_then(|multi| {
                 multi
                     .children
@@ -1517,6 +1532,9 @@ fn apply_engine_event(
             state
                 .approvals
                 .retain(|approval| approval.thread_id != thread_id);
+            state
+                .questions
+                .retain(|question| question.thread_id != thread_id);
             if let Some(child) = state.multi.as_mut().and_then(|multi| {
                 multi
                     .children
@@ -2709,6 +2727,7 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
         // Approval requests need their thread id, so the run loop routes them
         // through apply_turn_event_for_thread before calling this function.
         TurnEvent::ApprovalRequest { .. } => {}
+        TurnEvent::QuestionRequest { .. } => {}
         TurnEvent::TurnCompleted { .. }
         | TurnEvent::TurnInterrupted { .. }
         | TurnEvent::TurnFailed { .. } => {
@@ -2756,6 +2775,25 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
                 selected: 0,
                 respond,
             });
+        }
+        TurnEvent::QuestionRequest {
+            id: _,
+            questions,
+            respond,
+        } => {
+            if questions.is_empty() {
+                let _ = respond.send(Vec::new());
+            } else {
+                state.questions.push(QuestionState {
+                    thread_id,
+                    questions,
+                    index: 0,
+                    selected: 0,
+                    custom: None,
+                    answers: Vec::new(),
+                    respond,
+                });
+            }
         }
         event if thread_id == state.thread.id => apply_turn_event(state, event),
         _ => {}
@@ -4528,6 +4566,17 @@ fn handle_key(
                     state.approvals.len()
                 ));
             }
+        }
+        return;
+    }
+
+    if !state.questions.is_empty() {
+        let outcome = {
+            let question = state.questions.last_mut().expect("question checked above");
+            question_key(question, key)
+        };
+        if let QuestionKey::Answer(answer) = outcome {
+            finish_question_answer(state, answer);
         }
         return;
     }
@@ -10332,20 +10381,33 @@ fn draw_orchestration_report(
     );
 }
 
-fn draw_floating_approval(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
-    let Some(approval) = state.approvals.last() else {
-        return;
-    };
-    if area.height < 4 {
+fn draw_floating_request(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
+    if let Some(approval) = state.approvals.last() {
+        if area.height < 4 {
+            return;
+        }
+        let height = approval_rows(approval).min(area.height as usize) as u16;
+        let approval_area = Rect {
+            y: area.y + area.height.saturating_sub(height),
+            height,
+            ..area
+        };
+        draw_approval(frame, approval_area, state, approval);
         return;
     }
-    let height = approval_rows(approval).min(area.height as usize) as u16;
-    let approval_area = Rect {
+    let Some(question) = state.questions.last() else {
+        return;
+    };
+    if area.height < 5 {
+        return;
+    }
+    let height = question_rows(question, area.width).min(area.height as usize) as u16;
+    let question_area = Rect {
         y: area.y + area.height.saturating_sub(height),
         height,
         ..area
     };
-    draw_approval(frame, approval_area, state, approval);
+    draw_question(frame, question_area, state, question);
 }
 
 fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
@@ -10353,24 +10415,24 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     if let Some(report) = &state.orchestration_report {
         hide_transcript_view(state);
         draw_orchestration_report(frame, area, state, report);
-        draw_floating_approval(frame, area, state);
+        draw_floating_request(frame, area, state);
         return;
     }
     if let Some(multi) = &state.multi {
         draw_multi(frame, area, multi);
-        draw_floating_approval(frame, area, state);
+        draw_floating_request(frame, area, state);
         return;
     }
     if let Some(review) = &state.review {
         hide_transcript_view(state);
         draw_review(frame, area, state, review);
-        draw_floating_approval(frame, area, state);
+        draw_floating_request(frame, area, state);
         return;
     }
     if let Some(activity) = &state.activity {
         hide_transcript_view(state);
         draw_activity(frame, area, state, activity);
-        draw_floating_approval(frame, area, state);
+        draw_floating_request(frame, area, state);
         return;
     }
     let suggestions = suggestions_for(state);
@@ -10389,6 +10451,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         .unwrap_or(0);
     let overlay_rows = if let Some(approval) = state.approvals.last() {
         approval_rows(approval)
+    } else if let Some(question) = state.questions.last() {
+        question_rows(question, area.width)
     } else {
         match &state.overlay {
             Overlay::None => 0,
@@ -10515,6 +10579,8 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     draw_transcript(frame, state, chunks[0], spinner_frame);
     if let Some(approval) = state.approvals.last() {
         draw_approval(frame, chunks[1], state, approval);
+    } else if let Some(question) = state.questions.last() {
+        draw_question(frame, chunks[1], state, question);
     } else {
         match &state.overlay {
             Overlay::RewindPicker { selected, native } => {
@@ -13683,8 +13749,236 @@ fn decision_for_choice(choice: &ApprovalChoice) -> ApprovalDecision {
     }
 }
 
+enum QuestionKey {
+    None,
+    Answer(String),
+}
+
+fn question_key(question: &mut QuestionState, key: KeyEvent) -> QuestionKey {
+    if let Some(mut custom) = question.custom.take() {
+        match key.code {
+            KeyCode::Esc => return QuestionKey::None,
+            KeyCode::Enter => {
+                let answer = custom.trim().to_string();
+                if answer.is_empty() {
+                    question.custom = Some(custom);
+                    return QuestionKey::None;
+                }
+                return QuestionKey::Answer(answer);
+            }
+            KeyCode::Backspace => {
+                custom.pop();
+                question.custom = Some(custom);
+                return QuestionKey::None;
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                custom.push(character);
+                question.custom = Some(custom);
+                return QuestionKey::None;
+            }
+            _ => {
+                question.custom = Some(custom);
+                return QuestionKey::None;
+            }
+        }
+    }
+    let (options_len, allow_custom) = {
+        let prompt = &question.questions[question.index];
+        (prompt.options.len(), prompt.allow_custom)
+    };
+    let row_count = options_len + usize::from(allow_custom);
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => {
+            question.selected = question.selected.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            question.selected = (question.selected + 1).min(row_count.saturating_sub(1));
+        }
+        KeyCode::PageUp => {
+            question.selected = question.selected.saturating_sub(5);
+        }
+        KeyCode::PageDown => {
+            question.selected = (question.selected + 5).min(row_count.saturating_sub(1));
+        }
+        KeyCode::Home => {
+            question.selected = 0;
+        }
+        KeyCode::End => {
+            question.selected = row_count.saturating_sub(1);
+        }
+        KeyCode::Enter => {
+            let label = question.questions[question.index]
+                .options
+                .get(question.selected)
+                .map(|option| option.label.clone());
+            if let Some(label) = label {
+                return QuestionKey::Answer(label);
+            }
+            if allow_custom {
+                question.custom = Some(String::new());
+            }
+        }
+        KeyCode::Esc if allow_custom => {
+            question.custom = Some(String::new());
+        }
+        _ => {}
+    }
+    QuestionKey::None
+}
+
+fn finish_question_answer(state: &mut TuiState, answer: String) {
+    let Some(question) = state.questions.last_mut() else {
+        return;
+    };
+    let prompt_id = question.questions[question.index].id.clone();
+    question.answers.push(QuestionAnswer {
+        id: prompt_id,
+        answers: vec![answer],
+    });
+    if question.index + 1 < question.questions.len() {
+        question.index += 1;
+        question.selected = 0;
+        question.custom = None;
+        return;
+    }
+    let question = state.questions.pop().expect("question checked above");
+    let count = question.answers.len();
+    if question.respond.send(question.answers).is_err() {
+        state.notice = Some("question request expired".into());
+    } else if state.questions.is_empty() {
+        state.notice = Some(format!("answered {count} question(s)"));
+    } else {
+        state.notice = Some(format!(
+            "answered {count} question(s) · {} request(s) still waiting",
+            state.questions.len()
+        ));
+    }
+}
+
 fn approval_rows(approval: &ApprovalState) -> usize {
     approval.choices.len().min(8) + 4
+}
+
+fn question_rows(question: &QuestionState, width: u16) -> usize {
+    let prompt = &question.questions[question.index];
+    let text_rows = wrap_text_rows(&prompt.question, width.saturating_sub(2) as usize)
+        .len()
+        .max(1);
+    let visible_options = prompt.options.len().min(6);
+    let custom_row = usize::from(prompt.allow_custom);
+    let custom_input = usize::from(question.custom.is_some());
+    let description_rows = usize::from(
+        question.custom.is_none()
+            && prompt
+                .options
+                .get(question.selected)
+                .is_some_and(|option| !option.description.is_empty()),
+    );
+    2 + 1 + text_rows + visible_options + custom_row + custom_input + description_rows + 1
+}
+
+fn draw_question(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    question: &QuestionState,
+) {
+    let prompt = &question.questions[question.index];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.secondary));
+    let width = area.width.saturating_sub(2) as usize;
+    let target = if question.thread_id == state.thread.id {
+        String::new()
+    } else {
+        format!(
+            " for thread {}",
+            &question.thread_id[..question.thread_id.len().min(8)]
+        )
+    };
+    let header = format!(
+        "question {}/{} · {}{}",
+        question.index + 1,
+        question.questions.len(),
+        prompt.header,
+        target
+    );
+    let mut lines = vec![Line::styled(
+        truncate_chars(&header, width),
+        Style::default().fg(COLORS.secondary),
+    )];
+    for row in wrap_text_rows(&prompt.question, width) {
+        lines.push(Line::styled(row, Style::default().fg(COLORS.text)));
+    }
+    let visible = 6usize;
+    let start = if prompt.options.len() <= visible {
+        0
+    } else {
+        question
+            .selected
+            .saturating_sub(visible / 2)
+            .min(prompt.options.len() - visible)
+    };
+    for (index, option) in prompt.options.iter().enumerate().skip(start).take(visible) {
+        let marker = if index == question.selected {
+            "❯"
+        } else {
+            " "
+        };
+        let style = if index == question.selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(
+            truncate_chars(&format!("{marker} {}", option.label), width),
+            style,
+        ));
+    }
+    if prompt.allow_custom {
+        let selected = question.selected == prompt.options.len();
+        let marker = if selected { "❯" } else { " " };
+        let style = if selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        lines.push(Line::styled(
+            format!("{marker} Other (type an answer)"),
+            style,
+        ));
+    }
+    if let Some(custom) = &question.custom {
+        let shown = if prompt.secret {
+            "*".repeat(custom.chars().count())
+        } else {
+            custom.clone()
+        };
+        lines.push(Line::styled(
+            truncate_chars(&format!("answer: {shown}_"), width),
+            Style::default().fg(COLORS.accent),
+        ));
+    } else if let Some(option) = prompt.options.get(question.selected) {
+        if !option.description.is_empty() {
+            lines.push(Line::styled(
+                truncate_chars(&option.description, width),
+                Style::default().fg(COLORS.muted),
+            ));
+        }
+    }
+    let footer = if question.custom.is_some() {
+        "type an answer · enter submit · esc back"
+    } else if prompt.allow_custom {
+        "up/down select · enter answer · esc type an answer"
+    } else {
+        "up/down select · enter answer"
+    };
+    lines.push(Line::styled(footer, Style::default().fg(COLORS.muted)));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_approval(
@@ -14583,6 +14877,7 @@ impl TuiState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::QuestionOption;
     use ratatui::backend::TestBackend;
 
     static EDITOR_ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -14701,6 +14996,7 @@ mod tests {
             live_subagents: Vec::new(),
             overlay: Overlay::None,
             approvals: Vec::new(),
+            questions: Vec::new(),
             review: None,
             activity: None,
             multi: None,
@@ -16686,6 +16982,251 @@ mod tests {
         assert!(screen.contains("Always allow"), "{screen}");
         assert!(screen.contains("Reject"), "{screen}");
         assert!(screen.contains("[y] once"), "{screen}");
+    }
+
+    #[test]
+    fn question_picker_answers_each_question_in_order() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::QuestionRequest {
+                id: "question-request".into(),
+                questions: vec![
+                    QuestionPrompt {
+                        id: "first".into(),
+                        header: "One".into(),
+                        question: "Pick one".into(),
+                        options: vec![
+                            QuestionOption {
+                                label: "Strict".into(),
+                                description: "Tight validation".into(),
+                            },
+                            QuestionOption {
+                                label: "Flexible".into(),
+                                description: "Loose validation".into(),
+                            },
+                        ],
+                        allow_custom: false,
+                        secret: false,
+                    },
+                    QuestionPrompt {
+                        id: "second".into(),
+                        header: "Two".into(),
+                        question: "Pick two".into(),
+                        options: vec![
+                            QuestionOption {
+                                label: "A".into(),
+                                description: String::new(),
+                            },
+                            QuestionOption {
+                                label: "B".into(),
+                                description: String::new(),
+                            },
+                        ],
+                        allow_custom: false,
+                        secret: false,
+                    },
+                ],
+                respond: sender,
+            },
+        );
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        assert_eq!(state.questions[0].index, 1);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let answers = receiver.try_recv().unwrap();
+        assert_eq!(answers.len(), 2);
+        assert_eq!(answers[0].id, "first");
+        assert_eq!(answers[0].answers, vec!["Flexible".to_string()]);
+        assert_eq!(answers[1].id, "second");
+        assert_eq!(answers[1].answers, vec!["B".to_string()]);
+        assert!(state.questions.is_empty());
+        assert!(state.notice.as_deref().unwrap_or("").contains("answered 2"));
+    }
+
+    #[test]
+    fn question_picker_accepts_a_custom_answer() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::QuestionRequest {
+                id: "custom-question".into(),
+                questions: vec![QuestionPrompt {
+                    id: "choice".into(),
+                    header: "Fixture".into(),
+                    question: "Pick one".into(),
+                    options: vec![QuestionOption {
+                        label: "A".into(),
+                        description: String::new(),
+                    }],
+                    allow_custom: true,
+                    secret: false,
+                }],
+                respond: sender,
+            },
+        );
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Down),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        for character in "custom answer".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Char(character)),
+            );
+        }
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        let answers = receiver.try_recv().unwrap();
+        assert_eq!(answers[0].answers, vec!["custom answer".to_string()]);
+        assert!(state.questions.is_empty());
+    }
+
+    #[test]
+    fn child_question_overlay_names_the_child_and_lists_options() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        apply_turn_event_for_thread(
+            &mut state,
+            "child-thread".into(),
+            TurnEvent::QuestionRequest {
+                id: "child-question".into(),
+                questions: vec![QuestionPrompt {
+                    id: "choice".into(),
+                    header: "Fixture".into(),
+                    question: "Pick one".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "Strict".into(),
+                            description: "Tight validation".into(),
+                        },
+                        QuestionOption {
+                            label: "Flexible".into(),
+                            description: "Loose validation".into(),
+                        },
+                    ],
+                    allow_custom: true,
+                    secret: false,
+                }],
+                respond: sender,
+            },
+        );
+        let screen = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(screen.contains("for thread child-th"), "{screen}");
+        assert!(screen.contains("question 1/1"), "{screen}");
+        assert!(screen.contains("Strict"), "{screen}");
+        assert!(screen.contains("Flexible"), "{screen}");
+        assert!(screen.contains("Other (type an answer)"), "{screen}");
+    }
+
+    #[test]
+    fn secret_question_masks_the_custom_answer() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, _receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::QuestionRequest {
+                id: "secret-question".into(),
+                questions: vec![QuestionPrompt {
+                    id: "secret".into(),
+                    header: "Secret".into(),
+                    question: "Token?".into(),
+                    options: Vec::new(),
+                    allow_custom: true,
+                    secret: true,
+                }],
+                respond: sender,
+            },
+        );
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Enter),
+        );
+        for character in "secret".chars() {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Char(character)),
+            );
+        }
+        let screen = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(screen.contains("answer: ******"), "{screen}");
+        assert!(!screen.contains("answer: secret"), "{screen}");
     }
 
     #[test]

@@ -104,6 +104,11 @@ pub fn turn_event_json(thread_id: &str, event: &TurnEvent) -> Value {
             "summary": summary,
             "choices": choices,
         }),
+        TurnEvent::QuestionRequest { id, questions, .. } => json!({
+            "type": "question_request",
+            "id": id,
+            "questions": questions,
+        }),
         TurnEvent::Usage { usage } => json!({
             "type": "usage",
             "usage": usage,
@@ -176,7 +181,7 @@ pub fn result_json(result: &ExecResult<'_>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ApprovalChoice, TurnUsage};
+    use crate::types::{ApprovalChoice, QuestionPrompt, TurnUsage};
 
     fn completed(final_text: &str) -> TurnEvent {
         TurnEvent::TurnCompleted {
@@ -312,6 +317,29 @@ mod tests {
         assert_eq!(value["type"], "approval_request");
         assert_eq!(value["id"], "approval-1");
         assert_eq!(value["choices"][0]["label"], "Allow once");
+        assert!(value.get("respond").is_none());
+    }
+
+    #[test]
+    fn question_events_do_not_leak_the_responder() {
+        let (respond, _receiver) = tokio::sync::oneshot::channel();
+        let value = turn_event_json(
+            "thread-1",
+            &TurnEvent::QuestionRequest {
+                id: "question-1".into(),
+                questions: vec![QuestionPrompt {
+                    id: "choice".into(),
+                    header: "Fixture".into(),
+                    question: "Pick one".into(),
+                    options: Vec::new(),
+                    allow_custom: true,
+                    secret: false,
+                }],
+                respond,
+            },
+        );
+        assert_eq!(value["type"], "question_request");
+        assert_eq!(value["questions"][0]["header"], "Fixture");
         assert!(value.get("respond").is_none());
     }
 

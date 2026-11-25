@@ -5,7 +5,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Child;
 use tokio::sync::oneshot;
 
-use crate::types::{ApprovalChoice, ApprovalDecision, NativeSessionRef, PermissionMode, TurnUsage};
+use crate::types::{
+    ApprovalChoice, ApprovalDecision, NativeSessionRef, PermissionMode, QuestionAnswer,
+    QuestionPrompt, TurnUsage,
+};
 
 /// Explicit lifecycle for one provider adapter. The engine can read this
 /// without taking the adapter mutex, so a busy or stuck turn remains
@@ -241,6 +244,11 @@ pub enum TurnEvent {
         summary: String,
         choices: Vec<ApprovalChoice>,
         respond: oneshot::Sender<ApprovalDecision>,
+    },
+    QuestionRequest {
+        id: String,
+        questions: Vec<QuestionPrompt>,
+        respond: oneshot::Sender<Vec<QuestionAnswer>>,
     },
     Usage { usage: TurnUsage },
     /// A child agent started. The id is the provider's tool call or child

@@ -9,7 +9,10 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use crate::adapters::{standard_approval_choices, ActiveTurn, AdapterLifecycle, AdapterTurnGuard, BatonAdapter, ForkSessionInput, LineReader, LineWriter, ModelListInput, RevertSessionInput, SteerFuture, SteerHandle, SteerOutcome, SteerRequest, TransportHalves, TurnEvent, TurnEventSender, TurnStartInput};
 use crate::config::auth_signature;
-use crate::types::{ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, TurnUsage};
+use crate::types::{
+    ApprovalDecision, NativeSessionRef, PermissionMode, ProviderId, QuestionAnswer, QuestionOption,
+    QuestionPrompt, TurnUsage,
+};
 
 struct CodexRuntime {
     reader: AsyncMutex<Box<dyn LineReader>>,
@@ -164,6 +167,10 @@ async fn handle_server_request(
     method: &str,
     params: Value,
 ) {
+    if method == "item/tool/requestUserInput" {
+        handle_user_input_request(runtime, id, &params).await;
+        return;
+    }
     let kind = match approval_kind(method) {
         Some(kind) => kind,
         None => {
@@ -254,6 +261,122 @@ async fn handle_server_request(
             let _ = writer.write_line(&serialized).await;
         }
     });
+}
+
+async fn handle_user_input_request(runtime: &Arc<CodexRuntime>, id: Value, params: &Value) {
+    let questions = question_prompts(params);
+    if questions.is_empty() {
+        send_server_result(runtime, id, json!({ "answers": {} })).await;
+        return;
+    }
+    let request_id = format!(
+        "codex:{}",
+        params.get("itemId").and_then(Value::as_str).unwrap_or("")
+    );
+    let (respond, receiver) = oneshot::channel::<Vec<QuestionAnswer>>();
+    {
+        let emit = runtime.current_emit.lock().await;
+        if let Some(emit) = emit.as_ref() {
+            let _ = emit.send(TurnEvent::QuestionRequest {
+                id: request_id,
+                questions: questions.clone(),
+                respond,
+            });
+        }
+    }
+    let runtime = runtime.clone();
+    tokio::spawn(async move {
+        let answers = receiver.await.unwrap_or_default();
+        send_server_result(&runtime, id, question_response(&questions, &answers)).await;
+    });
+}
+
+async fn send_server_result(runtime: &Arc<CodexRuntime>, id: Value, result: Value) {
+    let response = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    if let Ok(serialized) = serde_json::to_string(&response) {
+        let mut writer = runtime.writer.lock().await;
+        let _ = writer.write_line(&serialized).await;
+    }
+}
+
+fn question_prompts(params: &Value) -> Vec<QuestionPrompt> {
+    let Some(questions) = params.get("questions").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    questions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, question)| {
+            let text = question.get("question").and_then(Value::as_str)?.trim();
+            if text.is_empty() {
+                return None;
+            }
+            let id = question
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("question-{}", index + 1));
+            let header = question
+                .get("header")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|header| !header.is_empty())
+                .unwrap_or("Question")
+                .to_string();
+            let options = question
+                .get("options")
+                .and_then(Value::as_array)
+                .map(|options| {
+                    options
+                        .iter()
+                        .filter_map(|option| {
+                            let label = option.get("label").and_then(Value::as_str)?.trim();
+                            if label.is_empty() {
+                                return None;
+                            }
+                            let description = option
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .unwrap_or(label)
+                                .to_string();
+                            Some(QuestionOption {
+                                label: label.to_string(),
+                                description,
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(QuestionPrompt {
+                id,
+                header,
+                question: text.to_string(),
+                options,
+                allow_custom: question
+                    .get("isOther")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                secret: question
+                    .get("isSecret")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn question_response(questions: &[QuestionPrompt], answers: &[QuestionAnswer]) -> Value {
+    let mut map = serde_json::Map::new();
+    for prompt in questions {
+        if let Some(answer) = answers.iter().find(|answer| answer.id == prompt.id) {
+            if !answer.answers.is_empty() {
+                map.insert(prompt.id.clone(), json!({ "answers": answer.answers }));
+            }
+        }
+    }
+    json!({ "answers": map })
 }
 
 impl CodexAdapter {
@@ -923,6 +1046,75 @@ mod tests {
             ApprovalDecision::Deny,
         );
         assert_eq!(deny["decision"], "decline", "deny is not a v2 decision value");
+    }
+
+    #[test]
+    fn user_input_questions_keep_labels_custom_and_secret() {
+        let params = json!({
+            "questions": [
+                {
+                    "id": "schema_preference",
+                    "header": "Fixture",
+                    "question": "Strict schemas or UI flexibility?",
+                    "isOther": true,
+                    "isSecret": false,
+                    "options": [
+                        { "label": "Strict schemas", "description": "Tight validation" },
+                        { "label": "UI flexibility", "description": "Looser validation" }
+                    ]
+                },
+                {
+                    "header": "Secret",
+                    "question": "Token?",
+                    "isOther": false,
+                    "isSecret": true
+                }
+            ]
+        });
+        let questions = question_prompts(&params);
+        assert_eq!(questions.len(), 2);
+        assert_eq!(questions[0].id, "schema_preference");
+        assert_eq!(questions[0].options[0].label, "Strict schemas");
+        assert_eq!(questions[0].options[1].description, "Looser validation");
+        assert!(questions[0].allow_custom);
+        assert!(!questions[1].allow_custom);
+        assert!(questions[1].secret);
+        assert_eq!(questions[1].id, "question-2");
+    }
+
+    #[test]
+    fn user_input_response_maps_native_ids_and_custom_answers() {
+        let questions = vec![
+            QuestionPrompt {
+                id: "first".into(),
+                header: "One".into(),
+                question: "Pick".into(),
+                options: Vec::new(),
+                allow_custom: true,
+                secret: false,
+            },
+            QuestionPrompt {
+                id: "second".into(),
+                header: "Two".into(),
+                question: "Pick again".into(),
+                options: Vec::new(),
+                allow_custom: true,
+                secret: false,
+            },
+        ];
+        let answers = vec![
+            QuestionAnswer {
+                id: "first".into(),
+                answers: vec!["option one".into()],
+            },
+            QuestionAnswer {
+                id: "second".into(),
+                answers: vec!["custom answer".into()],
+            },
+        ];
+        let response = question_response(&questions, &answers);
+        assert_eq!(response["answers"]["first"]["answers"][0], "option one");
+        assert_eq!(response["answers"]["second"]["answers"][0], "custom answer");
     }
 
     #[test]

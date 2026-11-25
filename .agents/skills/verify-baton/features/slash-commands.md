@@ -51,7 +51,7 @@ requires `/retry 1` and `/retry 10` with their failed-turn descriptions, then
 types the exact `/retry 1` form to prove it wins over the longer completion
 prefix, opens the picker, and completes the retry through the fake harness.
 
-Installed-binary proof: the same slash probe passed against the v0.4.0 default curl install and the v0.4.0 Homebrew binary. The stable summaries live in the gitignored `v0.4.0-release/curl/summary.json` and `v0.4.0-release/brew/summary.json` evidence directories.
+Installed-binary proof: the slash probe passed against the v0.4.1 Homebrew and curl installs, and the 50-command sweep passed against the v0.4.1 Homebrew binary. The summaries live under the gitignored `local_docs/verification/evidence/` directories. The earlier v0.4.0 Homebrew binary predates `/memory`, `/roles`, `/git`, and the newer `/auth` picker, so compare `baton --version` before judging a command missing.
 
 ## Gotchas
 - `/model` merges the live list with the static known catalog, so a short or degraded live probe still shows every known model.

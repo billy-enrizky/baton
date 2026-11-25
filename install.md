@@ -11,7 +11,7 @@ curl -fsSL https://raw.githubusercontent.com/billy-enrizky/baton/main/install.sh
 The script installs to `~/.local/bin` by default. Set `BATON_INSTALL_DIR` to another bin directory, or `BATON_VERSION` to pin a release:
 
 ```sh
-BATON_VERSION=v0.4.1 BATON_INSTALL_DIR="$HOME/bin" \
+BATON_VERSION=v0.4.2 BATON_INSTALL_DIR="$HOME/bin" \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/billy-enrizky/baton/main/install.sh)"
 ```
 

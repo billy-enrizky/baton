@@ -66,6 +66,8 @@ baton doctor
 
 `baton doctor` reports each harness binary, auth readiness, config files, database size, thread count, and tracked provider processes.
 
+`command -v baton` names the binary that will run. When a Homebrew install and a Cargo install both exist, the earlier `PATH` entry wins. Run `baton --version` when a command seems missing, because an older install will not have the newer commands.
+
 ## Requirements
 
 - One or more harness CLIs on `PATH`: `codex`, `claude`, `cursor-agent`, `grok`, `opencode`, or `agy`.

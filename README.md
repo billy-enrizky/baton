@@ -205,6 +205,8 @@ The installer downloads the release for your OS and checks its SHA-256. If no re
 brew install billy-enrizky/baton/baton
 ```
 
+Upgrade an existing install with `brew upgrade billy-enrizky/baton/baton`.
+
 ### 3.3 From source
 
 ```sh
@@ -700,6 +702,7 @@ Baton sends no telemetry and has no hosted service. Prompts go to the harness yo
 | Symptom | What to try |
 |---|---|
 | `no harness` or a missing binary | Install the harness CLI and put it on `PATH` |
+| A command is missing or `/auth` looks different | Run `baton --version`. `command -v baton` names the install that runs; upgrade that one |
 | `/auth` says `missing <VARIABLE>` | Set that variable, then reopen `/auth` |
 | `/auth` says `cannot read config` | Fix `~/.baton/config.json`; the picker did not overwrite it |
 | A turn fails immediately | Run `baton doctor` and read the harness error |

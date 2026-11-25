@@ -331,6 +331,13 @@ Superseded runs 44981081994 and 44981120796 were cancelled without changing a de
 | Clippy ratchet color and count | `CARGO_TERM_COLOR=never` in the ratchet; compiler summary lines excluded; one-lint fixture passes a one-entry baseline | Passed locally and in 45119247835 |
 | First post-merge main push | Push 45119477704: 59 seconds, Test 43, head tools, debt self-test, Clippy 61 <= 61 | Passed 2026-11-23 |
 | First post-merge meta PR | Pull request 45119777637: 52 seconds, Test 35, full suite selected | Passed 2026-11-23 |
+| v0.4.1 version bump | PR #238, PR run 45522919344: full suite, Test 43 seconds | Passed 2026-11-24 |
+| v0.4.1 release assets and checksums | Release run [45523844591](https://github.com/billy-enrizky/baton/actions/runs/45523844591), tag `v0.4.1`, five archives plus `SHA256SUMS`; all five sums verified | Passed 2026-11-24 |
+| v0.4.1 immutable latest release | `isDraft=false`, `isPrerelease=false`, `isImmutable=true`, `releases/latest=v0.4.1` | Passed 2026-11-24 |
+| v0.4.1 Homebrew formula | Tap commit `8ccbead`, `brew audit --strict --online`, upgrade, `brew test`, version 0.4.1 | Passed 2026-11-24 |
+| v0.4.1 curl install | Local `install.sh` with `BATON_VERSION=v0.4.1` into a clean `bin`, `baton 0.4.1`, no source fallback | Passed 2026-11-24 |
+| v0.4.1 installed feature smoke | PTY slash probe passed against the Homebrew and curl binaries; the 50-command sweep passed against the Homebrew binary; `/auth`, `/model`, `/agents`, `/git`, `/memory`, and `/roles` present | Passed 2026-11-24 |
+| v0.4.1 formal gates | All 15 suites at `afab876`; log `local_docs/verification/evidence/formal-afab876-20261124-200523.log` | Passed 2026-11-24 |
 
 ## v0.4.0 release assets
 
@@ -345,6 +352,20 @@ Published 2026-11-22 from tag `v0.4.0` at `b26b8824388159cf26a2539175e6d1a867d7c
 | `baton-x86_64-unknown-linux-gnu.tar.gz` | `b9b769772a67986961a68d3eda69b6cd4e788c0747b29d1f8e5f6a604df7275d` |
 
 The tap formula pins the four Unix archives to these values, and `shasum -a 256 -c SHA256SUMS` reported OK for all five downloads.
+
+## v0.4.1 release assets
+
+Published 2026-11-24 from tag `v0.4.1` at `afab876ca4390c5e29c6f5ad4562e6ab1ce194e7`.
+
+| Asset | SHA-256 |
+|---|---|
+| `baton-aarch64-apple-darwin.tar.gz` | `82ad334c902ed132557f75f6f820a3651385efef6d6ff8e92e0d0299a0e0ce3d` |
+| `baton-aarch64-unknown-linux-gnu.tar.gz` | `6c7c044120c0a0f7dd2abe496a58cb96cc8ee2e68601c513538134fd764f73af` |
+| `baton-x86_64-apple-darwin.tar.gz` | `6c9f6269f440e6833f12acc9de20358329c2a8ee08d1ccb4ad71df82d7015a99` |
+| `baton-x86_64-pc-windows-msvc.zip` | `69a4c1ed350331ba8aee27f0f089806d37b1f76723f0148b2874caa93a4d3d9c` |
+| `baton-x86_64-unknown-linux-gnu.tar.gz` | `34b20966a76521f5f22e4b22fadb0d412661ef525cbaf7694308f222e64f392a` |
+
+The tap formula pins the four Unix archives to these values. The v0.4.1 Homebrew binary and the v0.4.1 curl install both passed the PTY slash probe.
 
 ## Review record
 

@@ -27,6 +27,7 @@ pub mod resume;
 pub mod roles;
 pub mod runtime;
 pub mod sanitize;
+pub mod side_chat;
 pub mod scanner;
 pub mod skill_dispatch;
 pub mod status;

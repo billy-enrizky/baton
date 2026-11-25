@@ -33,6 +33,7 @@ COMMANDS = [
     ("/switch", ["switch harness", "antigravity"]),
     ("/model", ["models ·", "enter", "esc"]),
     ("/btw", ["side chat of"]),
+    ("/merge-back", ["nothing to merge back yet"]),
     ("/effort", ["reasoning effort", "xhigh", "max"]),
     ("/mode", ["permission mode", "acceptEdits", "plan"]),
     ("/auth", ["billing mode", "1/12", "enter apply"]),

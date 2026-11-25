@@ -35,4 +35,4 @@ The Claude adapter emits `SubagentStarted`/`SubagentFinished` for `Task` and `Ag
 - `claude_adapter_reports_task_subagents`
 - `codex_adapter_reports_collab_and_subagent_activity`
 - `agents_json_reports_subagent_rows_for_a_thread`
-- The 51-command sweep runs `/agents` and requires the empty-state notice.
+- The 52-command sweep runs `/agents` and requires the empty-state notice.

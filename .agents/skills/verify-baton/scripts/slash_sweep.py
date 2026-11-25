@@ -45,6 +45,7 @@ COMMANDS = [
     ("/threads", ["threads ·", "New thread"]),
     ("/pin", ["pin ·", "New thread"]),
     ("/inbox", ["inbox empty"]),
+    ("/questions", ["no open worker questions"]),
     ("/open", ["threads ·"]),
     ("/runs", ["no active orchestration runs"]),
     ("/checkpoints", ["no checkpoints yet"]),

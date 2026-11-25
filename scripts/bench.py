@@ -9,7 +9,9 @@ measures the host, not the change.
 busy host can slow every process by 20 percent or more while the product is
 unchanged. Each sample times a control process next to `baton --version`, and
 the compared number is their minimum ratio, which rejects noise that only adds
-time. Phase checks compare the minimum of every sample and add `--slack-ms` so a
+time. The whole sample repeats three times by default and the minimum ratio and
+phase values across repeats are compared, because one batch can catch a
+transient slow or fast control spawn. Phase checks add `--slack-ms` so a
 sub-millisecond phase is not gated inside its own measurement noise.
 """
 
@@ -84,6 +86,12 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", type=Path, default=Path("target/debug/baton"))
     parser.add_argument("--runs", type=int, default=9)
+    parser.add_argument(
+        "--repeat",
+        type=int,
+        default=3,
+        help="whole-sample repetitions; the minimum ratio and phases are compared",
+    )
     parser.add_argument("--check", type=Path, help="baseline JSON to compare against")
     parser.add_argument("--tolerance", type=float, default=0.10)
     parser.add_argument(
@@ -109,40 +117,86 @@ def main() -> int:
         return 2
 
     machine = f"{platform.system()}-{platform.machine()}"
-    with tempfile.TemporaryDirectory() as tmp:
-        home = Path(tmp)
-        starts = [run_once([str(args.binary), "--version"], home) for _ in range(args.runs)]
-        control = control_command()
-        controls = [run_once(control, home) for _ in range(args.runs)] if control else []
-        phase_samples = [startup_sample(args.binary, home) for _ in range(args.runs)]
-        startup = summarise(phase_samples)
-        startup_min = summarise_min(phase_samples)
+    control = control_command()
+    repeats = []
 
-    process_start_ms = statistics.median(starts)
-    process_start_min_ms = min(starts)
-    control_start_ms = statistics.median(controls) if controls else None
-    control_start_min_ms = min(controls) if controls else None
-    spawn_overhead_ratio = (
-        process_start_ms / control_start_ms if control_start_ms else None
+    def measure() -> dict[str, object]:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            starts = [
+                run_once([str(args.binary), "--version"], home)
+                for _ in range(args.runs)
+            ]
+            controls = (
+                [run_once(control, home) for _ in range(args.runs)] if control else []
+            )
+            phase_samples = [
+                startup_sample(args.binary, home) for _ in range(args.runs)
+            ]
+            startup = summarise(phase_samples)
+            startup_min = summarise_min(phase_samples)
+
+        process_start_ms = statistics.median(starts)
+        process_start_min_ms = min(starts)
+        control_start_ms = statistics.median(controls) if controls else None
+        control_start_min_ms = min(controls) if controls else None
+        spawn_overhead_ratio = (
+            process_start_ms / control_start_ms if control_start_ms else None
+        )
+        spawn_overhead_min_ratio = (
+            process_start_min_ms / control_start_min_ms
+            if control_start_min_ms
+            else None
+        )
+        return {
+            "machine": machine,
+            "binary": str(args.binary),
+            "runs": args.runs,
+            "repeats": args.repeat,
+            "process_start_ms": process_start_ms,
+            "process_start_min_ms": process_start_min_ms,
+            "process_start_p95_ms": sorted(starts)[
+                max(0, int(len(starts) * 0.95) - 1)
+            ],
+            "control_command": control[0] if control else None,
+            "control_start_ms": control_start_ms,
+            "control_start_min_ms": control_start_min_ms,
+            "spawn_overhead_ratio": spawn_overhead_ratio,
+            "spawn_overhead_min_ratio": spawn_overhead_min_ratio,
+            "startup_ms": startup,
+            "startup_min_ms": startup_min,
+        }
+
+    for _ in range(max(1, args.repeat)):
+        repeats.append(measure())
+
+    ratios = [
+        sample["spawn_overhead_min_ratio"]
+        for sample in repeats
+        if sample["spawn_overhead_min_ratio"] is not None
+    ]
+    best = (
+        min(
+            repeats,
+            key=lambda sample: sample["spawn_overhead_min_ratio"]
+            if sample["spawn_overhead_min_ratio"] is not None
+            else float("inf"),
+        )
+        if ratios
+        else repeats[0]
     )
-    spawn_overhead_min_ratio = (
-        process_start_min_ms / control_start_min_ms if control_start_min_ms else None
-    )
-    result = {
-        "machine": machine,
-        "binary": str(args.binary),
-        "runs": args.runs,
-        "process_start_ms": process_start_ms,
-        "process_start_min_ms": process_start_min_ms,
-        "process_start_p95_ms": sorted(starts)[max(0, int(len(starts) * 0.95) - 1)],
-        "control_command": control[0] if control else None,
-        "control_start_ms": control_start_ms,
-        "control_start_min_ms": control_start_min_ms,
-        "spawn_overhead_ratio": spawn_overhead_ratio,
-        "spawn_overhead_min_ratio": spawn_overhead_min_ratio,
-        "startup_ms": startup,
-        "startup_min_ms": startup_min,
+    result = dict(best)
+    result["spawn_overhead_min_ratio"] = min(ratios) if ratios else None
+    result["startup_min_ms"] = {
+        phase: min(sample["startup_min_ms"][phase] for sample in repeats)
+        for phase in PHASES
     }
+    process_start_ms = result["process_start_ms"]
+    process_start_min_ms = result["process_start_min_ms"]
+    control_start_min_ms = result["control_start_min_ms"]
+    spawn_overhead_min_ratio = result["spawn_overhead_min_ratio"]
+    startup = result["startup_ms"]
+    startup_min = result["startup_min_ms"]
 
     if args.write_baseline:
         args.write_baseline.write_text(json.dumps(result, indent=2) + "\n")

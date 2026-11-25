@@ -11316,6 +11316,16 @@ fn draw_roles_picker(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn picker_window(len: usize, selected: usize, max_visible: usize) -> (usize, usize) {
+    let visible = len.min(max_visible.max(1));
+    let start = if len <= visible {
+        0
+    } else {
+        selected.saturating_sub(visible / 2).min(len - visible)
+    };
+    (start, visible)
+}
+
 fn draw_run_picker(frame: &mut ratatui::Frame, area: Rect, runs: &[RunChoice], selected: usize) {
     let mut lines: Vec<Line> = vec![Line::styled(
         format!(
@@ -11324,7 +11334,8 @@ fn draw_run_picker(frame: &mut ratatui::Frame, area: Rect, runs: &[RunChoice], s
         ),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, run) in runs.iter().take(8).enumerate() {
+    let (start, visible) = picker_window(runs.len(), selected, 8);
+    for (index, run) in runs.iter().enumerate().skip(start).take(visible) {
         let style = if index == selected {
             Style::default()
                 .fg(COLORS.accent)
@@ -11332,7 +11343,8 @@ fn draw_run_picker(frame: &mut ratatui::Frame, area: Rect, runs: &[RunChoice], s
         } else {
             Style::default().fg(COLORS.muted)
         };
-        lines.push(Line::styled(format!("❯ {}", run.label), style));
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(format!("{cursor} {}", run.label), style));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -11350,7 +11362,8 @@ fn draw_copy_picker(
         format!("copy reply ({}) · enter copies · esc close", replies.len()),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, reply) in replies.iter().take(8).enumerate() {
+    let (start, visible) = picker_window(replies.len(), selected, 8);
+    for (index, reply) in replies.iter().enumerate().skip(start).take(visible) {
         let style = if index == selected {
             Style::default()
                 .fg(COLORS.accent)
@@ -11366,8 +11379,9 @@ fn draw_copy_picker(
             .chars()
             .take(70)
             .collect();
+        let cursor = if index == selected { "❯" } else { " " };
         lines.push(Line::styled(
-            format!("❯ {} · {preview}", reply.position),
+            format!("{cursor} {} · {preview}", reply.position),
             style,
         ));
     }
@@ -12254,7 +12268,8 @@ fn draw_agents_picker(
         ),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, entry) in entries.iter().take(10).enumerate() {
+    let (start, visible) = picker_window(entries.len(), selected, 10);
+    for (index, entry) in entries.iter().enumerate().skip(start).take(visible) {
         let marker = match entry.status.as_str() {
             "done" => "✓",
             "failed" => "✗",
@@ -12635,7 +12650,14 @@ fn draw_queue_picker(
             COLORS.muted
         }),
     )];
-    for (index, message) in state.queued_messages.iter().take(8).enumerate() {
+    let (start, visible) = picker_window(count, selected, 8);
+    for (index, message) in state
+        .queued_messages
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+    {
         let preview: String = message
             .lines()
             .next()
@@ -13341,7 +13363,8 @@ fn draw_inbox_picker(frame: &mut ratatui::Frame, area: Rect, items: &[InboxItem]
         "inbox · enter open · esc close",
         Style::default().fg(COLORS.muted),
     )];
-    for (index, item) in items.iter().take(8).enumerate() {
+    let (start, visible) = picker_window(items.len(), selected, 8);
+    for (index, item) in items.iter().enumerate().skip(start).take(visible) {
         let style = if index == selected {
             Style::default()
                 .fg(COLORS.accent)
@@ -13350,9 +13373,10 @@ fn draw_inbox_picker(frame: &mut ratatui::Frame, area: Rect, items: &[InboxItem]
             Style::default().fg(COLORS.muted)
         };
         let id: String = item.thread_id.chars().take(8).collect();
+        let cursor = if index == selected { "❯" } else { " " };
         lines.push(Line::styled(
             format!(
-                "❯ {id}  {}  [{}]  {}",
+                "{cursor} {id}  {}  [{}]  {}",
                 item.title,
                 item.status,
                 item.reasons.join(" · ")
@@ -13376,7 +13400,8 @@ fn draw_checkpoint_picker(
         "checkpoints · enter diff · esc close",
         Style::default().fg(COLORS.muted),
     )];
-    for (index, (turn, _)) in checkpoints.iter().take(8).enumerate() {
+    let (start, visible) = picker_window(checkpoints.len(), selected, 8);
+    for (index, (turn, _)) in checkpoints.iter().enumerate().skip(start).take(visible) {
         let style = if index == selected {
             Style::default()
                 .fg(COLORS.accent)
@@ -13384,7 +13409,8 @@ fn draw_checkpoint_picker(
         } else {
             Style::default().fg(COLORS.muted)
         };
-        lines.push(Line::styled(format!("❯ turn {turn}"), style));
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(format!("{cursor} turn {turn}"), style));
     }
     let block = Block::default()
         .borders(Borders::ALL)
@@ -21095,6 +21121,98 @@ mod tests {
         );
         assert!(text.contains("thread 9"), "{text}");
         assert!(!text.contains("thread 1  "), "{text}");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+    }
+
+    #[test]
+    fn dynamic_pickers_window_around_the_selection_and_show_one_cursor() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+
+        state.overlay = Overlay::RunPicker {
+            selected: 9,
+            runs: (0..10)
+                .map(|index| RunChoice {
+                    id: format!("run-{index}"),
+                    label: format!("run {index:02}"),
+                })
+                .collect(),
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("run 09"), "{text}");
+        assert!(!text.contains("run 00"), "{text}");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+
+        state.overlay = Overlay::CopyPicker {
+            selected: 9,
+            replies: (0..10)
+                .map(|index| ReplyChoice {
+                    position: index + 1,
+                    text: format!("reply {index:02}"),
+                })
+                .collect(),
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("reply 09"), "{text}");
+        assert!(!text.contains("reply 00"), "{text}");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+
+        state.overlay = Overlay::AgentsPicker {
+            selected: 11,
+            entries: (0..12)
+                .map(|index| AgentEntry {
+                    id: None,
+                    label: format!("agent {index:02}"),
+                    status: "done".into(),
+                    turn: index as i64,
+                    live: false,
+                })
+                .collect(),
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("agent 11"), "{text}");
+        assert!(!text.contains("agent 00"), "{text}");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+
+        for index in 0..10 {
+            enqueue_message(&mut state, &store, format!("queued {index:02}"));
+        }
+        state.overlay = Overlay::QueuePicker {
+            selected: 9,
+            clear_armed: false,
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("queued 09"), "{text}");
+        assert!(!text.contains("queued 00"), "{text}");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+
+        state.overlay = Overlay::InboxPicker {
+            selected: 9,
+            items: (0..10)
+                .map(|index| crate::inbox::InboxItem {
+                    thread_id: format!("thread-{index}"),
+                    title: format!("inbox {index:02}"),
+                    status: "failed".into(),
+                    reasons: vec!["turn failed".into()],
+                    updated_at: String::new(),
+                })
+                .collect(),
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("inbox 09"), "{text}");
+        assert!(!text.contains("inbox 00"), "{text}");
+        assert_eq!(text.matches('❯').count(), 1, "{text}");
+
+        state.overlay = Overlay::CheckpointPicker {
+            selected: 9,
+            checkpoints: (0..10)
+                .map(|index| (index as i64, format!("refs/baton/checkpoints/{index}")))
+                .collect(),
+        };
+        let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
+        assert!(text.contains("turn 9"), "{text}");
+        assert!(!text.contains("turn 0"), "{text}");
         assert_eq!(text.matches('❯').count(), 1, "{text}");
     }
 

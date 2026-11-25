@@ -2229,7 +2229,7 @@ fn usage_by_model_reads_recorded_history() {
                 title: "usage thread".to_string(),
                 cwd: home.path().to_string_lossy().to_string(),
                 current_provider: ProviderId::Codex,
-                current_model: None,
+                current_model: Some("gpt-6.1-sol".to_string()),
             })
             .unwrap();
         store

@@ -22,6 +22,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Attention inbox | TUI | `/inbox` lists failed, unverified, interrupted, needs-input, and queued work and opens the selected thread |
 | Thread pins | TUI; CLI read | `/pin` toggles a durable pin, Ctrl+Up/Ctrl+Down or `/pin move` orders pinned threads, pinned rows sort first, and `baton threads --json` exposes `pinned` and `pin_order_key` |
 | File navigation | TUI; CLI | `/files [--ignored]` inserts a selected project path or `path:line` and warns when ignored files are included; Ctrl+O launches that target or a selected `/grep` match in `VISUAL` or `EDITOR`; `/grep` and `baton grep` search file contents with sorted previews; `baton files` ranks project paths with ripgrep or git; and `baton open` launches the editor with `-C`-directory containment |
+| Shell command | TUI | a `!` line runs one command in the thread cwd, captures stdout and stderr, sanitizes and caps the output, shows the exit code, and is not sent to the harness |
 | Command palette | TUI | Ctrl+K filters built-in actions, threads, and recent files; Enter runs the action, opens the thread, or inserts the path; an open picker keeps the key |
 | Composer file mentions | TUI | typing `@path` offers ranked project files and Tab or Enter replaces only the mention token; ordinary text and addresses never start an index load |
 | Shell completions | CLI | `baton completions <shell>` generates from the clap command graph and handles a broken pipe |

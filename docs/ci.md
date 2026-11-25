@@ -317,15 +317,20 @@ Phase 1 values are three times a conservative local cold estimate. They are caps
 
 ## Debt ratchet job shape
 
-`ci/check-ci.sh` accepts two shapes: the ratchet as its own `debt` job, or its three commands inside the `check`
-job. Both are enforced, not waved through: with a `debt` job the linter requires `debt_needed` on that job, and
-without one it requires `check` to read both `check_needed` and `debt_needed` and to run `fmt-debt.sh`,
-`clippy-debt.sh`, and `debt-selftest.sh` under `ci/budget.sh`. Removing the commands from the merged job fails
+The ratchet runs inside the `check` job. `ci/check-ci.sh` still accepts the older shape, a separate `debt` job,
+and enforces both: a `debt` job must read `debt_needed`, and a `check` job that owns the ratchet must run
+`fmt-debt.sh`, `clippy-debt.sh`, and `debt-selftest.sh` under `ci/budget.sh`. Removing a ratchet command fails
 CI014.
 
-The two shapes exist because the linter always runs from the trusted base. A workflow that merges the jobs
-cannot pass until the base already allows the merged shape, so the acceptance lands first and the workflow
-change second.
+The merge was worth doing because the ratchet was the critical path. On run 45599904468 it took 48 seconds
+against Check's 20, and 22 of those 48 were cache restores against ten seconds of fmt and clippy. Two jobs
+meant two checkouts, two toolchain restores, and two cargo restores to do ten seconds of checking. Check now
+uses the lint toolchain and saves it, and one job runs all three checks with separate budgeted steps so a
+failure still names format, clippy, or self-test.
+
+The trusted-base rule shaped how this landed. The linter runs from the base, so the acceptance for a merged
+shape had to land before the workflow that uses it, and the job-removal and `verify.needs` rules had to land
+before a removal could be expressed at all.
 
 ## Debt ratchets
 

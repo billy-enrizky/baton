@@ -245,11 +245,20 @@ jobs:
           path: |
             ~/.rustup/toolchains/1.100.0-*
             ~/.rustup/update-hashes/1.100.0-*
-          key: rustup-min-1.100.0-${{ runner.os }}-${{ runner.arch }}
+          key: rustup-lint-1.100.0-${{ runner.os }}-${{ runner.arch }}
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.100.0
+          components: rustfmt, clippy
+      - name: Save Rust toolchain cache
+        if: github.job == 'check' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && steps.rustup-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.rustup/toolchains/1.100.0-*
+            ~/.rustup/update-hashes/1.100.0-*
+          key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
         with:
@@ -260,6 +269,22 @@ jobs:
         run: |
           set -euo pipefail
           "$RUNNER_TEMP/trusted-ci/budget.sh" 120 cargo check --locked --all-targets
+      - name: Format debt
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/fmt-debt.sh" . "$RUNNER_TEMP/trusted-ci/fmt-baseline.txt"
+      - name: Clippy debt
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 300 "$RUNNER_TEMP/trusted-ci/clippy-debt.sh" . "$RUNNER_TEMP/trusted-ci/clippy-baseline.txt"
+      - name: Debt self-test
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/debt-selftest.sh"
+      - name: Verify trusted tools are unchanged
+        run: |
+          set -euo pipefail
+          (cd "$RUNNER_TEMP/trusted-ci" && sha256sum -c "$RUNNER_TEMP/trusted-ci.sha256" --quiet)
       - name: Verify trusted tools are unchanged
         run: |
           set -euo pipefail
@@ -441,98 +466,10 @@ jobs:
           path: ${{ runner.temp }}/test-timings.tsv
           retention-days: 30
 
-  debt:
-    name: Debt ratchet
-    needs: changes
-    if: needs.changes.outputs.debt_needed == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 15
-    steps:
-      - name: Checkout head
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          fetch-depth: 2
-          persist-credentials: false
-      - name: Resolve trusted base ref
-        id: base
-        run: |
-          set -euo pipefail
-          ref='${{ github.event.pull_request.base.sha }}'
-          if [ -z "$ref" ]; then ref='${{ github.event.merge_group.base_sha }}'; fi
-          if [ -z "$ref" ]; then ref='${{ github.event.before }}'; fi
-          if [ -z "$ref" ] || [ "$ref" = "0000000000000000000000000000000000000000" ]; then
-            ref=$(git rev-parse HEAD~1)
-          fi
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-      - name: Checkout trusted base tools
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
-        with:
-          ref: ${{ steps.base.outputs.ref }}
-          fetch-depth: 1
-          path: base
-          persist-credentials: false
-          sparse-checkout: /ci/
-          sparse-checkout-cone-mode: false
-      - name: Stage trusted tools
-        run: |
-          set -euo pipefail
-          dest="$RUNNER_TEMP/trusted-ci"
-          rm -rf "$dest"
-          if [ '${{ github.event_name }}' = "push" ] || [ '${{ github.event_name }}' = "workflow_dispatch" ]; then
-            cp -R ci "$dest"
-          else
-            cp -R base/ci "$dest"
-          fi
-          chmod -R a-w "$dest"
-          (cd "$dest" && find . -type f -print0 | sort -z | xargs -0 sha256sum) > "$RUNNER_TEMP/trusted-ci.sha256"
-      - name: Restore Rust toolchain cache
-        id: rustup-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            ~/.rustup/toolchains/1.100.0-*
-            ~/.rustup/update-hashes/1.100.0-*
-          key: rustup-lint-1.100.0-${{ runner.os }}-${{ runner.arch }}
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
-        with:
-          toolchain: 1.100.0
-          components: rustfmt, clippy
-      - name: Save Rust toolchain cache
-        if: github.job == 'debt' && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && steps.rustup-cache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
-        with:
-          path: |
-            ~/.rustup/toolchains/1.100.0-*
-            ~/.rustup/update-hashes/1.100.0-*
-          key: ${{ steps.rustup-cache.outputs.cache-primary-key }}
-      - name: Restore Cargo cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0
-        with:
-          shared-key: baton-v2-${{ runner.os }}-${{ runner.arch }}-${{ github.job }}
-          key: ${{ hashFiles('Cargo.lock') }}-${{ hashFiles('Cargo.toml') }}-${{ hashFiles('rust-toolchain.toml') }}
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Format debt
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/fmt-debt.sh" . "$RUNNER_TEMP/trusted-ci/fmt-baseline.txt"
-      - name: Clippy debt
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 300 "$RUNNER_TEMP/trusted-ci/clippy-debt.sh" . "$RUNNER_TEMP/trusted-ci/clippy-baseline.txt"
-      - name: Debt self-test
-        run: |
-          set -euo pipefail
-          "$RUNNER_TEMP/trusted-ci/budget.sh" 60 "$RUNNER_TEMP/trusted-ci/debt-selftest.sh"
-      - name: Verify trusted tools are unchanged
-        run: |
-          set -euo pipefail
-          (cd "$RUNNER_TEMP/trusted-ci" && sha256sum -c "$RUNNER_TEMP/trusted-ci.sha256" --quiet)
-
   verify:
     name: Verify
     if: always()
-    needs: [changes, selection, check, build, test, debt]
+    needs: [changes, selection, check, build, test]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
@@ -560,7 +497,6 @@ jobs:
           check_gate check '${{ needs.changes.outputs.check_needed }}' '${{ needs.check.result }}'
           check_gate build '${{ needs.changes.outputs.build_needed }}' '${{ needs.build.result }}'
           check_gate test '${{ needs.changes.outputs.test_needed }}' '${{ needs.test.result }}'
-          check_gate debt '${{ needs.changes.outputs.debt_needed }}' '${{ needs.debt.result }}'
           if [ '${{ needs.changes.outputs.test_needed }}' = "true" ]; then
             [ '${{ needs.changes.outputs.has_tests }}' = "true" ] || fail "test was selected but the classifier reported no tests"
             count='${{ needs.test.outputs.test_count }}'

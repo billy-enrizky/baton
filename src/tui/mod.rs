@@ -1667,12 +1667,7 @@ fn apply_engine_event(
                 return;
             }
             state.suggestion_cache.borrow_mut().take();
-            if state
-                .bell
-                .fire(state.bell_enabled, std::time::Instant::now())
-            {
-                let _ = crate::notify::emit_bell(&mut std::io::stdout());
-            }
+            state.ring_attention();
             state.running = false;
             state.queued_provider = None;
             state.streaming_text.clear();
@@ -2873,6 +2868,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
                 selected: 0,
                 respond,
             });
+            state.ring_attention();
         }
         TurnEvent::QuestionRequest {
             id: _,
@@ -2892,6 +2888,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
                     answers: Vec::new(),
                     respond,
                 });
+                state.ring_attention();
             }
         }
         event if thread_id == state.thread.id => apply_turn_event(state, event),
@@ -15684,6 +15681,14 @@ impl TuiState {
 
     fn overlay_is_code_confirm(&self) -> bool {
         matches!(self.overlay, Overlay::CodeConfirm { .. })
+    }
+
+    /// The one place attention rings. The limiter mutes bursts, so an approval
+    /// followed by a question does not ping twice within the interval.
+    fn ring_attention(&mut self) {
+        if self.bell.fire(self.bell_enabled, std::time::Instant::now()) {
+            let _ = crate::notify::emit_bell(&mut std::io::stdout());
+        }
     }
 
     fn set_session_mode(&mut self, store: &Arc<Mutex<BatonStore>>, mode: SessionMode) {

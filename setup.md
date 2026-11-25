@@ -108,7 +108,7 @@ Useful top-level keys:
 }
 ```
 
-`defaultMode` accepts `orchestrate` or `single`. Provider keys use the provider name as the key. Unknown provider and notification fields survive a write.
+`defaultMode` accepts `orchestrate` or `single`. Provider keys use the provider name as the key. Unknown provider and notification fields survive a write. With `notifications.bell` on, Baton rings on turn end, an approval, and a provider question; a two-second limiter mutes a burst.
 
 ## Roles
 

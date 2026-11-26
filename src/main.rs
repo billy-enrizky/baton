@@ -694,10 +694,14 @@ fn main_result(started: Instant) -> Result<()> {
             let store = BatonStore::open(&paths::baton_db_path())?;
             mcp::run_stdio(mcp::McpServer::new(store, home.clone(), cwd.clone()))
         }
-        cli::Commands::Threads { json } => {
+        cli::Commands::Threads { json, all } => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let resolved = resolve_config(&home, &cwd);
-            let threads = store.list_threads_for_path_display(&cwd)?;
+            let threads = if all {
+                store.list_threads_for_path_display_all(&cwd)?
+            } else {
+                store.list_threads_for_path_display(&cwd)?
+            };
             if threads.is_empty() {
                 println!("no threads in this directory yet. Run baton to start one.");
                 return Ok(());
@@ -736,6 +740,7 @@ fn main_result(started: Instant) -> Result<()> {
                         "pinned": thread.pinned,
                         "pin_order_key": thread.pin_order_key,
                         "snoozed_until": thread.snoozed_until,
+                        "archived_at": thread.archived_at,
                         "goal": thread.goal,
                         "goal_paused": thread.goal_paused,
                         "phase": phase,
@@ -775,7 +780,7 @@ fn main_result(started: Instant) -> Result<()> {
                     .unwrap_or_else(|| "idle".to_string());
                 let queued = store.list_queued_messages(&thread.id)?.len();
                 println!(
-                    "{}{}  {}/{}{}  session:{}  {}  turns:{}  queue:{}  {}",
+                    "{}{}  {}/{}{}  session:{}  {}  turns:{}  queue:{}  {}{}",
                     if thread.pinned { "* " } else { "" },
                     &thread.id[..8],
                     thread.current_provider,
@@ -789,7 +794,12 @@ fn main_result(started: Instant) -> Result<()> {
                     phase,
                     turn_count,
                     queued,
-                    thread.title
+                    thread.title,
+                    if thread.archived_at.is_some() {
+                        "  [archived]"
+                    } else {
+                        ""
+                    }
                 );
             }
             if has_open {

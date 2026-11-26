@@ -207,6 +207,18 @@ mod tests {
     }
 
     #[test]
+    fn archived_threads_stay_out_of_the_inbox() {
+        let store = BatonStore::memory().unwrap();
+        let failed = thread(&store, "failed work");
+        fail_turn(&store, &failed.id, 1);
+        assert_eq!(items(&store).unwrap().len(), 1);
+        store.archive_thread(&failed.id).unwrap();
+        assert!(items(&store).unwrap().is_empty());
+        store.unarchive_thread(&failed.id).unwrap();
+        assert_eq!(items(&store).unwrap().len(), 1);
+    }
+
+    #[test]
     fn attention_newer_than_the_snooze_wakes_a_thread_early() {
         let store = BatonStore::memory().unwrap();
         let failed = thread(&store, "failed work");

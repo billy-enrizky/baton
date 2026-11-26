@@ -22,7 +22,9 @@ use crate::handoff::git_branch_label;
 use crate::inbox::{self, InboxItem};
 use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
-use crate::store::{BatonStore, MessageRow, NewThread, PinMoveOutcome, ThreadOpenWork, ThreadRow};
+use crate::store::{
+    ArchiveOutcome, BatonStore, MessageRow, NewThread, PinMoveOutcome, ThreadOpenWork, ThreadRow,
+};
 use crate::sync;
 use crate::types::{
     normalize_reasoning_effort, ApprovalChoice, ApprovalDecision, PermissionMode, ProviderId,
@@ -164,12 +166,17 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "/task",
         "start a GitHub issue in a new worktree; /task <number> or no argument to pick",
     ),
-    ("/threads", "list threads in this directory"),
+    ("/threads", "list threads in this directory; /threads all includes archived"),
     ("/pin", "pin, unpin, or move a pinned thread"),
     (
         "/snooze",
         "hide this thread from the inbox: /snooze [1h|4h|tomorrow|week|off]",
     ),
+    (
+        "/archive",
+        "hide a thread from the default lists and the inbox: /archive [id prefix]",
+    ),
+    ("/unarchive", "restore an archived thread: /unarchive [id prefix]"),
     ("/inbox", "all threads that need attention"),
     (
         "/questions",
@@ -363,6 +370,7 @@ struct ThreadChoice {
     pinned: bool,
     /// `Some("14:32")` while a snooze is still running.
     snoozed_until: Option<String>,
+    archived: bool,
 }
 
 fn thread_choice(thread: ThreadRow, latest_phase: Option<TurnPhase>) -> ThreadChoice {
@@ -376,14 +384,27 @@ fn thread_choice(thread: ThreadRow, latest_phase: Option<TurnPhase>) -> ThreadCh
         status,
         pinned: thread.pinned,
         snoozed_until,
+        archived: thread.archived_at.is_some(),
     }
 }
 
 fn project_thread_choices(state: &TuiState, store: &Arc<Mutex<BatonStore>>) -> Vec<ThreadChoice> {
+    project_thread_choices_matching(state, store, false)
+}
+
+fn project_thread_choices_matching(
+    state: &TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    include_archived: bool,
+) -> Vec<ThreadChoice> {
     let guard = store.lock().unwrap();
-    let threads = guard
-        .list_threads_for_path_display(std::path::Path::new(&state.thread.cwd))
-        .unwrap_or_default();
+    let path = std::path::Path::new(&state.thread.cwd);
+    let threads = if include_archived {
+        guard.list_threads_for_path_display_all(path)
+    } else {
+        guard.list_threads_for_path_display(path)
+    }
+    .unwrap_or_default();
     let ids = threads
         .iter()
         .map(|thread| thread.id.clone())
@@ -3601,6 +3622,9 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/grep", _) => Some("grep [--case|--case-sensitive] [--word] [--regex] <query>"),
         ("/pin", "move") => Some("pin move <id> up or down"),
         ("/snooze", _) => Some("snooze [1h|4h|tomorrow|week|off]"),
+        ("/archive", _) => Some("archive [thread]"),
+        ("/unarchive", _) => Some("unarchive [thread]"),
+        ("/threads", "all") => Some("threads all"),
         ("/review", _) => Some("review [turn]"),
         ("/diff", _) => Some("diff [turn]"),
         ("/rewind", _) => Some("rewind [--native]"),
@@ -3999,6 +4023,43 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 push_suggestion(&mut suggestions, command, &id, thread.title);
             }
         }
+        "/threads" => {
+            push_suggestion(&mut suggestions, command, "all", "include archived threads");
+        }
+        "/archive" => {
+            let threads = state
+                .store
+                .lock()
+                .unwrap()
+                .list_threads_for_path_display(std::path::Path::new(&state.thread.cwd))
+                .unwrap_or_default();
+            for thread in &threads {
+                let id = thread.id[..8.min(thread.id.len())].to_string();
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &id,
+                    format!("archive {}", thread.title),
+                );
+            }
+        }
+        "/unarchive" => {
+            let threads = state
+                .store
+                .lock()
+                .unwrap()
+                .list_threads_for_path_display_all(std::path::Path::new(&state.thread.cwd))
+                .unwrap_or_default();
+            for thread in threads.iter().filter(|thread| thread.archived_at.is_some()) {
+                let id = thread.id[..8.min(thread.id.len())].to_string();
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &id,
+                    format!("unarchive {}", thread.title),
+                );
+            }
+        }
         "/snooze" => {
             for preset in crate::snooze::PRESETS {
                 push_suggestion(
@@ -4059,10 +4120,32 @@ fn resolve_project_thread(
     cwd: &str,
     thread_id: &str,
 ) -> std::result::Result<ThreadRow, String> {
-    let matches = store
-        .list_threads_for_path(std::path::Path::new(cwd))
-        .unwrap_or_default()
+    resolve_project_thread_matching(store, cwd, thread_id, false)
+}
+
+fn resolve_project_thread_matching(
+    store: &BatonStore,
+    cwd: &str,
+    thread_id: &str,
+    include_archived: bool,
+) -> std::result::Result<ThreadRow, String> {
+    let path = std::path::Path::new(cwd);
+    let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let rows = if include_archived {
+        store.list_threads_all(None).unwrap_or_default()
+    } else {
+        store.list_threads_for_path(path).unwrap_or_default()
+    };
+    let matches = rows
         .into_iter()
+        .filter(|thread| {
+            let stored = std::path::Path::new(&thread.cwd);
+            stored == path
+                || stored
+                    .canonicalize()
+                    .map(|stored| stored == canon)
+                    .unwrap_or(false)
+        })
         .filter(|thread| thread.id == thread_id || thread.id.starts_with(thread_id))
         .collect::<Vec<_>>();
     match matches.len() {
@@ -4134,6 +4217,93 @@ fn move_pinned_thread(
         action: ThreadPickerAction::Pin,
     };
     Some(())
+}
+
+fn apply_archive_command(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    archive: bool,
+    value: Option<&str>,
+) {
+    let current_id = state.thread.id.clone();
+    let target = match value {
+        Some(prefix) => {
+            let guard = store.lock().unwrap();
+            match resolve_project_thread_matching(&guard, &state.thread.cwd, prefix, true) {
+                Ok(thread) => thread,
+                Err(notice) => {
+                    state.notice = Some(notice);
+                    return;
+                }
+            }
+        }
+        None => {
+            let guard = store.lock().unwrap();
+            match guard.get_thread(&current_id) {
+                Ok(Some(thread)) => thread,
+                Ok(None) => {
+                    state.notice = Some(if archive {
+                        "send a message before archiving this thread".into()
+                    } else {
+                        "send a message before unarchiving this thread".to_string()
+                    });
+                    return;
+                }
+                Err(error) => {
+                    state.notice = Some(format!("cannot inspect thread: {error}"));
+                    return;
+                }
+            }
+        }
+    };
+    let outcome = if archive {
+        store.lock().unwrap().archive_thread(&target.id)
+    } else {
+        store.lock().unwrap().unarchive_thread(&target.id)
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            state.notice = Some(format!(
+                "cannot {} thread: {error}",
+                if archive { "archive" } else { "unarchive" }
+            ));
+            return;
+        }
+    };
+    match outcome {
+        ArchiveOutcome::Archived => {
+            if target.id == current_id {
+                handle_command(state, store, engine_command_sender, "/new");
+            }
+            state.notice = Some(format!(
+                "archived {} · /threads all to find it",
+                target.title
+            ));
+        }
+        ArchiveOutcome::Unarchived => {
+            state.notice = Some(format!("unarchived {}", target.title));
+            if target.id == current_id {
+                state.thread.archived_at = None;
+            }
+        }
+        ArchiveOutcome::AlreadyArchived => {
+            state.notice = Some(format!("{} is already archived", target.title));
+        }
+        ArchiveOutcome::NotArchived => {
+            state.notice = Some(format!("{} is not archived", target.title));
+        }
+        ArchiveOutcome::RunningTurn => {
+            state.notice = Some(format!(
+                "cannot archive {} while a turn is running",
+                target.title
+            ));
+        }
+        ArchiveOutcome::NotFound => {
+            state.notice = Some("thread not found".into());
+        }
+    }
 }
 
 fn apply_snooze_command(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, value: Option<&str>) {
@@ -4944,6 +5114,13 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.goal = thread.goal.clone();
     state.goal_paused = thread.goal_paused;
     state.thread = thread.clone();
+    // Finish the archive write before taking the read guard. A lock taken in a
+    // match or if-let scrutinee stays alive for the arm.
+    let unarchived = thread.archived_at.is_some()
+        && matches!(
+            store.lock().unwrap().unarchive_thread(&thread.id),
+            Ok(crate::store::ArchiveOutcome::Unarchived)
+        );
     let guard = store.lock().unwrap();
     state.side_chat_of = guard
         .side_chat_source(&thread.id)
@@ -4956,7 +5133,12 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.diff_output = None;
     state.shell_output = None;
     state.scroll_offset = 0;
-    state.notice = Some(format!("opened {}", thread.title));
+    state.notice = Some(if unarchived {
+        state.thread.archived_at = None;
+        format!("opened {} · unarchived", thread.title)
+    } else {
+        format!("opened {}", thread.title)
+    });
     state.overlay = Overlay::None;
 }
 
@@ -10510,7 +10692,19 @@ fn handle_command(
             ));
         }
         "/threads" => {
-            let threads = project_thread_choices(state, store);
+            let include_archived = match (args.first().map(String::as_str), args.len()) {
+                (None, _) => false,
+                (Some("all"), 1) => true,
+                (Some(other), 1) => {
+                    state.notice = Some(format!("use /threads or /threads all, not {other}"));
+                    return;
+                }
+                _ => {
+                    state.notice = Some("use /threads or /threads all".into());
+                    return;
+                }
+            };
+            let threads = project_thread_choices_matching(state, store, include_archived);
             if threads.is_empty() {
                 state.notice = Some("no threads in this directory".into());
             } else {
@@ -10541,6 +10735,32 @@ fn handle_command(
                         action: ThreadPickerAction::Pin,
                     };
                 }
+            }
+        }
+        "/archive" => {
+            if args.len() > 1 {
+                state.notice = Some("use /archive [thread]".into());
+            } else {
+                apply_archive_command(
+                    state,
+                    store,
+                    engine_command_sender,
+                    true,
+                    args.first().map(String::as_str),
+                );
+            }
+        }
+        "/unarchive" => {
+            if args.len() > 1 {
+                state.notice = Some("use /unarchive [thread]".into());
+            } else {
+                apply_archive_command(
+                    state,
+                    store,
+                    engine_command_sender,
+                    false,
+                    args.first().map(String::as_str),
+                );
             }
         }
         "/snooze" => {
@@ -14500,11 +14720,12 @@ fn draw_thread_picker(
             Some(until) => format!("  snoozed until {until}"),
             None => String::new(),
         };
+        let archived = if choice.archived { "  archived" } else { "" };
         let cursor = if index == selected { "❯" } else { " " };
         lines.push(Line::styled(
             format!(
-                "{cursor} {}  {}  [{}]{}{}",
-                choice.full_id, choice.title, choice.status, pinned, snoozed,
+                "{cursor} {}  {}  [{}]{}{}{}",
+                choice.full_id, choice.title, choice.status, pinned, snoozed, archived,
             ),
             style,
         ));
@@ -23287,6 +23508,7 @@ mod tests {
                 status: "new".to_string(),
                 pinned: false,
                 snoozed_until: None,
+                archived: false,
             }],
             action: ThreadPickerAction::Open,
         };
@@ -23497,6 +23719,7 @@ mod tests {
                 status: "failed".to_string(),
                 pinned: true,
                 snoozed_until: None,
+                archived: false,
             }],
             action: ThreadPickerAction::Open,
         };
@@ -23647,6 +23870,140 @@ mod tests {
     }
 
     #[test]
+    fn archive_command_hides_the_thread_and_starts_a_new_one() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let archived_id = state.thread.id.clone();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/archive");
+        let notice = state.notice.clone().expect("a notice");
+        assert!(notice.starts_with("archived test"), "{notice}");
+        assert_ne!(state.thread.id, archived_id, "a new thread opens");
+        assert!(store.lock().unwrap().list_threads(None).unwrap().is_empty());
+        let archived = store
+            .lock()
+            .unwrap()
+            .list_threads_all(None)
+            .unwrap()
+            .remove(0);
+        assert_eq!(archived.id, archived_id);
+        assert!(archived.archived_at.is_some());
+    }
+
+    #[test]
+    fn archive_refuses_a_draft_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread = store.lock().unwrap().draft_thread(NewThread {
+            title: "draft".into(),
+            cwd: state.thread.cwd.clone(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        });
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/archive");
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("send a message before archiving this thread")
+        );
+    }
+
+    #[test]
+    fn threads_all_marks_archived_threads() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "shelved".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store.lock().unwrap().archive_thread(&other.id).unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/threads");
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(
+            !text.contains("shelved"),
+            "the default list hides it: {text}"
+        );
+        handle_command(&mut state, &store, &engine_command_sender, "/threads all");
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("shelved"), "{text}");
+        assert!(text.contains("archived"), "{text}");
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/threads all extra",
+        );
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("use /threads or /threads all")
+        );
+    }
+
+    #[test]
+    fn unarchive_command_restores_a_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "shelved".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store.lock().unwrap().archive_thread(&other.id).unwrap();
+        let prefix = other.id[..8].to_string();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            &format!("/unarchive {prefix}"),
+        );
+        assert_eq!(state.notice.as_deref(), Some("unarchived shelved"));
+        assert_eq!(store.lock().unwrap().list_threads(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn opening_an_archived_thread_unarchives_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "shelved".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store.lock().unwrap().archive_thread(&other.id).unwrap();
+        open_thread_by_id(&mut state, &store, &other.id);
+        assert_eq!(state.thread.id, other.id);
+        assert!(state.thread.archived_at.is_none());
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("unarchived"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
     fn pin_picker_toggles_without_opening_the_thread() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -23757,6 +24114,7 @@ mod tests {
                     status: "ready".to_string(),
                     pinned: false,
                     snoozed_until: None,
+                    archived: false,
                 })
                 .collect(),
             action: ThreadPickerAction::Pin,

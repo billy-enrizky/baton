@@ -7694,7 +7694,7 @@ fn apply_shell_event(state: &mut TuiState, event: ShellEvent) {
             };
             state.notice = Some(format!(
                 "!{} · {}{}",
-                result.command,
+                crate::sanitize::sanitize_terminal_text(&result.command),
                 exit,
                 if result.truncated {
                     " · truncated"
@@ -18791,6 +18791,68 @@ mod tests {
             std::fs::read_to_string(crate::config::config_path(home.path())).unwrap(),
             malformed
         );
+    }
+
+    #[test]
+    fn shell_overlay_never_emits_child_control_sequences() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let output = crate::shell::run_with_shell(
+            std::path::Path::new("/bin/sh"),
+            home.path(),
+            "printf 'ok\\033]0;spoofed\\007 \u{202e}gnp\\n'",
+            std::time::Duration::from_secs(5),
+        )
+        .unwrap();
+        state.shell_output = Some(crate::shell::ShellResult {
+            command: "printf \u{202e}".into(),
+            ..output
+        });
+        let rendered: String = buffer_lines(&render_state(&state, 80, 24)).join("\n");
+        assert!(
+            !rendered.contains('\u{1b}'),
+            "escape reached the shell overlay"
+        );
+        assert!(
+            !rendered.contains('\u{7}'),
+            "bell reached the shell overlay"
+        );
+        assert!(
+            !rendered.contains('\u{202e}'),
+            "a bidi override reached the shell overlay"
+        );
+        assert!(
+            rendered.contains('\u{fffd}'),
+            "the output was not sanitized"
+        );
+        assert!(rendered.contains("spoofed"), "{rendered}");
+    }
+
+    #[test]
+    fn shell_notice_sanitizes_the_command() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.shell_request = 7;
+        apply_shell_event(
+            &mut state,
+            ShellEvent {
+                request: 7,
+                result: Ok(crate::shell::ShellResult {
+                    command: "echo \u{202e}evil".into(),
+                    output: String::new(),
+                    exit_code: Some(0),
+                    truncated: false,
+                }),
+            },
+        );
+        let notice = state.notice.expect("the notice is set");
+        assert!(
+            !notice.contains('\u{202e}'),
+            "the notice kept a bidi override: {notice}"
+        );
+        assert!(notice.contains("evil"), "{notice}");
     }
 
     #[test]

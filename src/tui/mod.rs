@@ -173,6 +173,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "hide this thread from the inbox: /snooze [1h|4h|tomorrow|week|off]",
     ),
     (
+        "/changes",
+        "every diff in this thread in one scrollable view: /changes [turn]",
+    ),
+    (
         "/archive",
         "hide a thread from the default lists and the inbox: /archive [id prefix]",
     ),
@@ -700,6 +704,10 @@ enum Overlay {
     PlanView {
         scroll: usize,
     },
+    ChangesView {
+        scroll: usize,
+        turn: Option<i64>,
+    },
     RewindPicker {
         selected: usize,
         native: bool,
@@ -997,6 +1005,8 @@ pub struct TuiState {
     review: Option<ReviewState>,
     plans: std::collections::HashMap<String, std::collections::HashMap<ProviderId, PlanSnapshot>>,
     plan_scroll_max: std::cell::Cell<usize>,
+    changes_scroll_max: std::cell::Cell<usize>,
+    changes_offsets: std::cell::RefCell<Vec<usize>>,
     activity: Option<ActivityView>,
     multi: Option<MultiView>,
     notice: Option<String>,
@@ -1146,6 +1156,8 @@ pub fn run_tui(
         review: None,
         plans: std::collections::HashMap::new(),
         plan_scroll_max: std::cell::Cell::new(0),
+        changes_scroll_max: std::cell::Cell::new(0),
+        changes_offsets: std::cell::RefCell::new(Vec::new()),
         activity: None,
         multi: None,
         notice: None,
@@ -3622,6 +3634,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/grep", _) => Some("grep [--case|--case-sensitive] [--word] [--regex] <query>"),
         ("/pin", "move") => Some("pin move <id> up or down"),
         ("/snooze", _) => Some("snooze [1h|4h|tomorrow|week|off]"),
+        ("/changes", _) => Some("changes [turn]"),
         ("/archive", _) => Some("archive [thread]"),
         ("/unarchive", _) => Some("unarchive [thread]"),
         ("/threads", "all") => Some("threads all"),
@@ -3948,6 +3961,16 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                     command,
                     &format!("--turn {turn}"),
                     format!("fork through turn {turn}"),
+                );
+            }
+        }
+        "/changes" => {
+            for turn in turn_choices(state, Some("diff"), 6) {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &turn.to_string(),
+                    format!("changes in turn {turn}"),
                 );
             }
         }
@@ -5578,6 +5601,56 @@ fn handle_key(
                 }
                 _ => {
                     state.overlay = Overlay::PlanView { scroll };
+                }
+            }
+        }
+        Overlay::ChangesView { mut scroll, turn } => {
+            let max = state.changes_scroll_max.get();
+            scroll = scroll.min(max);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    state.overlay = Overlay::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    scroll = scroll.saturating_sub(1);
+                    state.overlay = Overlay::ChangesView { scroll, turn };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    scroll = (scroll + 1).min(max);
+                    state.overlay = Overlay::ChangesView { scroll, turn };
+                }
+                KeyCode::PageUp => {
+                    scroll = scroll.saturating_sub(10);
+                    state.overlay = Overlay::ChangesView { scroll, turn };
+                }
+                KeyCode::PageDown => {
+                    scroll = (scroll + 10).min(max);
+                    state.overlay = Overlay::ChangesView { scroll, turn };
+                }
+                KeyCode::Home => {
+                    state.overlay = Overlay::ChangesView { scroll: 0, turn };
+                }
+                KeyCode::End => {
+                    state.overlay = Overlay::ChangesView { scroll: max, turn };
+                }
+                KeyCode::Char('[') => {
+                    let offsets = state.changes_offsets.borrow();
+                    if let Some(previous) = offsets.iter().rev().find(|offset| **offset < scroll) {
+                        scroll = *previous;
+                    }
+                    drop(offsets);
+                    state.overlay = Overlay::ChangesView { scroll, turn };
+                }
+                KeyCode::Char(']') => {
+                    let offsets = state.changes_offsets.borrow();
+                    if let Some(next) = offsets.iter().find(|offset| **offset > scroll) {
+                        scroll = *next;
+                    }
+                    drop(offsets);
+                    state.overlay = Overlay::ChangesView { scroll, turn };
+                }
+                _ => {
+                    state.overlay = Overlay::ChangesView { scroll, turn };
                 }
             }
         }
@@ -10958,6 +11031,32 @@ fn handle_command(
         "/usage" => {
             state.overlay = Overlay::UsagePicker { selected: 0 };
         }
+        "/changes" => {
+            let requested = match args.first() {
+                None => Ok(None),
+                Some(value) => value
+                    .parse::<i64>()
+                    .map(Some)
+                    .map_err(|_| "use /changes [turn]".to_string()),
+            };
+            match requested {
+                Err(_) if args.len() > 1 => state.notice = Some("use /changes [turn]".into()),
+                Err(notice) => state.notice = Some(notice),
+                Ok(turn) => {
+                    let found = state.history.iter().any(|message| {
+                        message.role == "diff" && turn.is_none_or(|turn| message.turn == turn)
+                    });
+                    if found {
+                        state.overlay = Overlay::ChangesView { scroll: 0, turn };
+                    } else {
+                        state.notice = Some(match turn {
+                            Some(turn) => format!("no diff in turn {turn}"),
+                            None => "no diff recorded yet".into(),
+                        });
+                    }
+                }
+            }
+        }
         "/plan" => {
             let has_plan = current_plan(state).is_some_and(|plan| !plan.entries.is_empty());
             if has_plan {
@@ -12029,6 +12128,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::PlanView { .. } => current_plan(state)
                 .map(|plan| plan.entries.len().min(12) + 4 + usize::from(plan.explanation.is_some()))
                 .unwrap_or(4),
+            Overlay::ChangesView { .. } => area.height.saturating_sub(8).max(8) as usize,
             Overlay::RewindPicker { .. } => {
                 state
                     .history
@@ -12378,6 +12478,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 scroll,
             } => draw_usage_report(frame, chunks[1], title, lines, *scroll),
             Overlay::PlanView { scroll } => draw_plan_view(frame, chunks[1], state, *scroll),
+            Overlay::ChangesView { scroll, turn } => {
+                draw_changes_view(frame, chunks[1], state, *scroll, *turn)
+            }
             Overlay::None => {}
         }
     }
@@ -14965,6 +15068,74 @@ fn current_plan(state: &TuiState) -> Option<&PlanSnapshot> {
         .and_then(|plans| plans.get(&state.thread.current_provider))
 }
 
+fn draw_changes_view(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    scroll: usize,
+    turn: Option<i64>,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.accent));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let width = inner.width.max(1) as usize;
+    let mut content: Vec<Line> = Vec::new();
+    let mut offsets: Vec<usize> = Vec::new();
+    for message in state
+        .history
+        .iter()
+        .filter(|message| message.role == "diff" && turn.is_none_or(|turn| message.turn == turn))
+    {
+        offsets.push(content.len());
+        if turn.is_none() {
+            content.push(Line::styled(
+                format!("turn {}", message.turn),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        let rendered = state.diff_cache.borrow_mut().render(&message.text, width);
+        content.extend(rendered.iter().cloned());
+        content.push(Line::from(""));
+    }
+    *state.changes_offsets.borrow_mut() = offsets.clone();
+    if offsets.is_empty() {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    match turn {
+                        Some(turn) => format!("no diff in turn {turn}"),
+                        None => "no diff recorded yet".to_string(),
+                    },
+                    Style::default().fg(COLORS.muted),
+                ),
+                Line::styled("esc close", Style::default().fg(COLORS.muted)),
+            ]),
+            inner,
+        );
+        state.changes_scroll_max.set(0);
+        return;
+    }
+    let visible = inner.height.saturating_sub(1) as usize;
+    let max = content.len().saturating_sub(visible);
+    state.changes_scroll_max.set(max);
+    let start = scroll.min(max);
+    let hint = match turn {
+        Some(turn) => format!(
+            "changes · turn {turn} · {} diff block(s) · [ ] jump · esc close",
+            offsets.len()
+        ),
+        None => format!(
+            "changes · {} diff block(s) · [ ] jump · esc close",
+            offsets.len()
+        ),
+    };
+    let mut lines = vec![Line::styled(hint, Style::default().fg(COLORS.muted))];
+    lines.extend(content.into_iter().skip(start).take(visible));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scroll: usize) {
     let Some(plan) = current_plan(state) else {
         let block = Block::default()
@@ -17334,6 +17505,8 @@ mod tests {
             review: None,
             plans: std::collections::HashMap::new(),
             plan_scroll_max: std::cell::Cell::new(0),
+            changes_scroll_max: std::cell::Cell::new(0),
+            changes_offsets: std::cell::RefCell::new(Vec::new()),
             activity: None,
             multi: None,
             notice: None,
@@ -23867,6 +24040,129 @@ mod tests {
             "the thread picker hides the snooze: {text}"
         );
         assert!(text.contains("later"), "{text}");
+    }
+
+    fn diff_message_for_turn(thread_id: &str, turn: i64, marker: &str) -> MessageRow {
+        MessageRow {
+            id: 200 + turn,
+            thread_id: thread_id.to_string(),
+            turn,
+            role: "diff".to_string(),
+            provider: None,
+            model: None,
+            text: format!(
+                "diff --git a/{marker}.txt b/{marker}.txt\n--- a/{marker}.txt\n+++ b/{marker}.txt\n@@ -1 +1 @@\n-old {marker}\n+new {marker}\n"
+            ),
+            created_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn changes_view_lists_every_diff_and_filters_by_turn() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        state.history = vec![
+            diff_message_for_turn(&thread_id, 1, "first"),
+            diff_message_for_turn(&thread_id, 2, "second"),
+        ];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/changes");
+        assert!(matches!(
+            state.overlay,
+            Overlay::ChangesView {
+                scroll: 0,
+                turn: None
+            }
+        ));
+        let text = buffer_lines(&render_state(&state, 100, 40)).join("\n");
+        assert!(text.contains("turn 1"), "{text}");
+        assert!(text.contains("turn 2"), "{text}");
+        assert!(text.contains("new first"), "{text}");
+        assert!(text.contains("new second"), "{text}");
+        assert!(text.contains("2 diff block(s)"), "{text}");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/changes 2");
+        assert!(matches!(
+            state.overlay,
+            Overlay::ChangesView {
+                scroll: 0,
+                turn: Some(2)
+            }
+        ));
+        let text = buffer_lines(&render_state(&state, 100, 40)).join("\n");
+        assert!(text.contains("new second"), "{text}");
+        assert!(!text.contains("new first"), "{text}");
+        assert!(text.contains("turn 2"), "{text}");
+
+        handle_command(&mut state, &store, &engine_command_sender, "/changes 9");
+        assert_eq!(state.notice.as_deref(), Some("no diff in turn 9"));
+        handle_command(&mut state, &store, &engine_command_sender, "/changes one");
+        assert_eq!(state.notice.as_deref(), Some("use /changes [turn]"));
+    }
+
+    #[test]
+    fn changes_view_scrolls_to_the_end_and_jumps_between_diffs() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let added = (0..30)
+            .map(|index| format!("+line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut long = diff_message_for_turn(&thread_id, 1, "long");
+        long.text = format!(
+            "diff --git a/long.txt b/long.txt\n--- a/long.txt\n+++ b/long.txt\n@@ -1 +1,30 @@\n{added}\n"
+        );
+        state.history = vec![long, diff_message_for_turn(&thread_id, 2, "second")];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/changes");
+        let text = buffer_lines(&render_state(&state, 100, 24)).join("\n");
+        assert!(!text.contains("line-29"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+        );
+        let text = buffer_lines(&render_state(&state, 100, 24)).join("\n");
+        assert!(text.contains("new second"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+        );
+        let Overlay::ChangesView { scroll, .. } = state.overlay else {
+            panic!("the changes view closed");
+        };
+        assert!(scroll > 0, "the jump moved to the second diff");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn changes_reports_an_empty_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/changes");
+        assert_eq!(state.notice.as_deref(), Some("no diff recorded yet"));
+        assert!(matches!(state.overlay, Overlay::None));
     }
 
     #[test]

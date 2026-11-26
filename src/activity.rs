@@ -269,6 +269,8 @@ mod tests {
             session_mode: crate::types::SessionMode::Single,
             pinned: false,
             pin_order_key: None,
+            snoozed_at: None,
+            snoozed_until: None,
             created_at: String::new(),
             updated_at: String::new(),
         }

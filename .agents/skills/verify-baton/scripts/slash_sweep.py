@@ -49,6 +49,7 @@ COMMANDS = [
     ("/memory", ["Memory ·", "Auto-memory"]),
     ("/threads", ["threads ·", "New thread"]),
     ("/pin", ["pin ·", "New thread"]),
+    ("/snooze", ["send a message before snoozing this thread"]),
     ("/inbox", ["inbox empty"]),
     ("/questions", ["no open worker questions"]),
     ("/open", ["threads ·"]),

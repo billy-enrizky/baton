@@ -31,6 +31,7 @@ pub mod shell;
 pub mod side_chat;
 pub mod scanner;
 pub mod skill_dispatch;
+pub mod snooze;
 pub mod status;
 pub mod store;
 pub mod sync;

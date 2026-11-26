@@ -1,9 +1,10 @@
 //! Read-only aggregation of threads that need a person.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-use crate::store::BatonStore;
+use crate::store::{BatonStore, ThreadRow};
 use crate::types::TurnPhase;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -18,6 +19,12 @@ pub struct InboxItem {
 /// One row per thread with failed, unverified, interrupted, needs-input, or
 /// queued work. The newest thread comes first.
 pub fn items(store: &BatonStore) -> Result<Vec<InboxItem>> {
+    items_at(store, Utc::now())
+}
+
+/// The snooze check needs one clock reading for the whole listing, and tests
+/// need to move that clock.
+pub fn items_at(store: &BatonStore, now: DateTime<Utc>) -> Result<Vec<InboxItem>> {
     let mut items = Vec::new();
     for thread in store.list_threads(None)? {
         let turns = store.list_turn_records(&thread.id).unwrap_or_default();
@@ -51,6 +58,17 @@ pub fn items(store: &BatonStore) -> Result<Vec<InboxItem>> {
         if reasons.is_empty() {
             continue;
         }
+        let snooze_active =
+            crate::snooze::active_until(thread.snoozed_until.as_deref(), now).is_some();
+        if snooze_active {
+            let snoozed_at = thread
+                .snoozed_at
+                .as_deref()
+                .and_then(crate::snooze::parse_timestamp);
+            if !wakes_during_snooze(snoozed_at, attention_at(&thread, &turns, task.as_ref())) {
+                continue;
+            }
+        }
 
         let status = task
             .map(|task| task.status)
@@ -66,6 +84,46 @@ pub fn items(store: &BatonStore) -> Result<Vec<InboxItem>> {
     }
     items.sort_by(|left, right| right.updated_at.cmp(&left.updated_at));
     Ok(items)
+}
+
+/// A snoozed thread stays out of the inbox until something asks for the person
+/// after the snooze was set. A failure or a worker state that predates the
+/// snooze is what the person already chose to put down.
+fn wakes_during_snooze(
+    snoozed_at: Option<DateTime<Utc>>,
+    attention_at: Option<DateTime<Utc>>,
+) -> bool {
+    match (snoozed_at, attention_at) {
+        (Some(snoozed), Some(attention)) => attention > snoozed,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+fn attention_at(
+    thread: &ThreadRow,
+    turns: &[crate::store::TurnRow],
+    task: Option<&crate::store::OrchestrationTaskRow>,
+) -> Option<DateTime<Utc>> {
+    let turn_at = turns
+        .iter()
+        .rev()
+        .find(|turn| {
+            matches!(
+                turn.phase,
+                TurnPhase::Failed | TurnPhase::Unverified | TurnPhase::Interrupted
+            )
+        })
+        .and_then(|turn| {
+            crate::snooze::parse_timestamp(turn.ended_at.as_deref().unwrap_or(&turn.started_at))
+        });
+    let task_at = task
+        .filter(|task| matches!(task.status.as_str(), "needs_input" | "failed" | "completed"))
+        .and_then(|task| {
+            crate::snooze::parse_timestamp(task.finished_at.as_deref().unwrap_or(&task.created_at))
+        });
+    let thread_at = crate::snooze::parse_timestamp(&thread.updated_at);
+    [turn_at, task_at, thread_at].into_iter().flatten().max()
 }
 
 #[cfg(test)]
@@ -115,6 +173,86 @@ mod tests {
             listed[0].reasons,
             vec!["turn failed".to_string(), "1 queued".to_string()]
         );
+    }
+
+    fn fail_turn(store: &BatonStore, thread_id: &str, turn: i64) {
+        store
+            .start_turn_record(thread_id, turn, ProviderId::Codex, None)
+            .unwrap();
+        store
+            .finish_turn_record(thread_id, turn, TurnPhase::Failed, Some("boom"))
+            .unwrap();
+    }
+
+    #[test]
+    fn a_snoozed_thread_leaves_the_inbox_until_its_wake_time() {
+        let store = BatonStore::memory().unwrap();
+        let failed = thread(&store, "failed work");
+        fail_turn(&store, &failed.id, 1);
+        let now = Utc::now();
+        let until = now + chrono::Duration::hours(1);
+        store
+            .set_thread_snoozed_at(
+                &failed.id,
+                &(now + chrono::Duration::seconds(1)).to_rfc3339(),
+                &until.to_rfc3339(),
+            )
+            .unwrap();
+        assert!(
+            items_at(&store, now).unwrap().is_empty(),
+            "the snooze hides it"
+        );
+        let later = items_at(&store, until + chrono::Duration::seconds(1)).unwrap();
+        assert_eq!(later.len(), 1, "the wake time brings it back");
+    }
+
+    #[test]
+    fn attention_newer_than_the_snooze_wakes_a_thread_early() {
+        let store = BatonStore::memory().unwrap();
+        let failed = thread(&store, "failed work");
+        fail_turn(&store, &failed.id, 1);
+        let snoozed_at = "2020-01-01T00:00:00Z";
+        let until = "2099-01-01T00:00:00Z";
+        store
+            .set_thread_snoozed_at(&failed.id, snoozed_at, until)
+            .unwrap();
+        let listed = items_at(&store, Utc::now()).unwrap();
+        assert_eq!(listed.len(), 1, "the failure came after the snooze");
+        assert_eq!(listed[0].thread_id, failed.id);
+    }
+
+    #[test]
+    fn a_failure_older_than_the_snooze_stays_hidden() {
+        let store = BatonStore::memory().unwrap();
+        let failed = thread(&store, "failed work");
+        fail_turn(&store, &failed.id, 1);
+        let now = Utc::now();
+        store
+            .set_thread_snoozed_at(
+                &failed.id,
+                &(now + chrono::Duration::minutes(5)).to_rfc3339(),
+                &(now + chrono::Duration::hours(1)).to_rfc3339(),
+            )
+            .unwrap();
+        assert!(items_at(&store, now).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_wake_rule_handles_each_timestamp_combination() {
+        let base = chrono::DateTime::parse_from_rfc3339("2026-11-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(wakes_during_snooze(None, Some(base)));
+        assert!(!wakes_during_snooze(Some(base), None));
+        assert!(wakes_during_snooze(
+            Some(base),
+            Some(base + chrono::Duration::seconds(1))
+        ));
+        assert!(!wakes_during_snooze(Some(base), Some(base)));
+        assert!(!wakes_during_snooze(
+            Some(base),
+            Some(base - chrono::Duration::seconds(1))
+        ));
     }
 
     #[test]

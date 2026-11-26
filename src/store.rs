@@ -73,6 +73,47 @@ pub struct TurnRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantRow {
+    pub grant_id: String,
+    pub installation_id: String,
+    pub secret_hash: String,
+    pub scopes: Vec<String>,
+    pub permission_ceiling: String,
+    pub project_allowlist: Vec<String>,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub revoked_at: Option<String>,
+    pub label: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantSummary {
+    pub grant_id: String,
+    pub scopes: Vec<String>,
+    pub permission_ceiling: String,
+    pub project_allowlist: Vec<String>,
+    pub issued_at: String,
+    pub expires_at: String,
+    pub revoked_at: Option<String>,
+    pub label: Option<String>,
+}
+
+impl GrantRow {
+    pub fn summary(&self) -> GrantSummary {
+        GrantSummary {
+            grant_id: self.grant_id.clone(),
+            scopes: self.scopes.clone(),
+            permission_ceiling: self.permission_ceiling.clone(),
+            project_allowlist: self.project_allowlist.clone(),
+            issued_at: self.issued_at.clone(),
+            expires_at: self.expires_at.clone(),
+            revoked_at: self.revoked_at.clone(),
+            label: self.label.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HostClaimRow {
     pub host_id: String,
     pub kind: String,
@@ -432,7 +473,7 @@ pub struct NewThread {
     pub current_model: Option<String>,
 }
 
-fn now_iso() -> String {
+pub(crate) fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -442,7 +483,10 @@ fn store_home(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
+/// The first schema with the `host_claim` table. A client can check ownership
+/// only from this version on, before it runs any migration DDL.
+const HOST_CLAIM_SCHEMA_VERSION: i64 = 2;
 
 pub struct BatonStore {
     db: Connection,
@@ -678,6 +722,18 @@ CREATE TABLE IF NOT EXISTS provider_rate_limits (
   provider TEXT PRIMARY KEY,
   info TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS grants (
+  grant_id TEXT PRIMARY KEY,
+  installation_id TEXT NOT NULL,
+  secret_hash TEXT NOT NULL,
+  scopes TEXT NOT NULL,
+  permission_ceiling TEXT NOT NULL,
+  project_allowlist TEXT NOT NULL,
+  issued_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  revoked_at TEXT,
+  label TEXT
 );
 CREATE TABLE IF NOT EXISTS host_claim (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -1072,7 +1128,24 @@ impl BatonStore {
             );
         }
         if version < SCHEMA_VERSION {
+            // A schema that predates host_claim cannot be host-owned. For
+            // later schemas, read the claim before running DDL, so a new
+            // binary never migrates a store an older host still owns.
+            let claim = if version >= HOST_CLAIM_SCHEMA_VERSION {
+                Self::get_host_claim_from(&db)?
+            } else {
+                None
+            };
             drop(db);
+            if let Some(claim) = claim.filter(|claim| {
+                crate::process::process_identity_alive(claim.pid, Some(&claim.process_start))
+            }) {
+                return Err(ClientRefusal {
+                    owner_pid: claim.pid,
+                    owner_start: claim.process_start,
+                }
+                .into());
+            }
             return Self::open(path);
         }
         let claim = Self::get_host_claim_from(&db)?;
@@ -2784,6 +2857,73 @@ impl BatonStore {
         )?;
         write.commit()?;
         Ok(changed == 1)
+    }
+
+    pub fn insert_grant(&self, grant: &GrantRow) -> Result<()> {
+        self.write_execute(
+            "INSERT INTO grants (grant_id, installation_id, secret_hash, scopes, permission_ceiling, project_allowlist, issued_at, expires_at, revoked_at, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                grant.grant_id,
+                grant.installation_id,
+                grant.secret_hash,
+                serde_json::to_string(&grant.scopes)?,
+                grant.permission_ceiling,
+                serde_json::to_string(&grant.project_allowlist)?,
+                grant.issued_at,
+                grant.expires_at,
+                grant.revoked_at,
+                grant.label,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_grant_rows(&self) -> Result<Vec<GrantRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT grant_id, installation_id, secret_hash, scopes, permission_ceiling, project_allowlist, issued_at, expires_at, revoked_at, label FROM grants ORDER BY issued_at, rowid",
+        )?;
+        let rows = statement
+            .query_map([], Self::map_grant)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn find_grant_row(&self, grant_id: &str) -> Result<Option<GrantRow>> {
+        self.db
+            .query_row(
+                "SELECT grant_id, installation_id, secret_hash, scopes, permission_ceiling, project_allowlist, issued_at, expires_at, revoked_at, label FROM grants WHERE grant_id = ?",
+                params![grant_id],
+                Self::map_grant,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn revoke_grant_row(&self, grant_id: &str) -> Result<bool> {
+        let changed = self.write_execute(
+            "UPDATE grants SET revoked_at = COALESCE(revoked_at, ?) WHERE grant_id = ?",
+            params![now_iso(), grant_id],
+        )?;
+        Ok(changed == 1)
+    }
+
+    fn map_grant(row: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
+        let scopes: String = row.get(3)?;
+        let allowlist: String = row.get(5)?;
+        // A corrupt list fails closed to no scopes rather than granting
+        // authority the row does not describe.
+        Ok(GrantRow {
+            grant_id: row.get(0)?,
+            installation_id: row.get(1)?,
+            secret_hash: row.get(2)?,
+            scopes: serde_json::from_str(&scopes).unwrap_or_default(),
+            permission_ceiling: row.get(4)?,
+            project_allowlist: serde_json::from_str(&allowlist).unwrap_or_default(),
+            issued_at: row.get(6)?,
+            expires_at: row.get(7)?,
+            revoked_at: row.get(8)?,
+            label: row.get(9)?,
+        })
     }
 
     /// A process that starts after a crash must not show a running turn as
@@ -4729,6 +4869,69 @@ mod tests {
         assert_eq!(turn.owner_grant_id.as_deref(), Some("grant-1"));
         let listed = store.list_turn_records(&thread.id).unwrap();
         assert_eq!(listed[0].owner_grant_id.as_deref(), Some("grant-1"));
+    }
+
+    #[test]
+    fn a_version_four_store_gains_the_grants_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", 4).unwrap();
+        drop(db);
+
+        let store = BatonStore::open(&path).unwrap();
+        drop(store);
+        let db = Connection::open(&path).unwrap();
+        let table: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'grants'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "the migration creates the grants table");
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_client_open_refuses_an_old_store_with_a_live_host_without_running_ddl() {
+        use crate::claim::{acquire, ClaimOutcome, SystemProbe};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let host_id = uuid::Uuid::new_v4().to_string();
+        let host = BatonStore::open_hosted(&path, &host_id).unwrap();
+        assert!(matches!(
+            acquire(&host, dir.path(), &host_id, &SystemProbe).unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        {
+            let db = Connection::open(&path).unwrap();
+            db.pragma_update(None, "user_version", 4).unwrap();
+        }
+        let error = match BatonStore::open_client(&path, None) {
+            Ok(_) => panic!("a live host must refuse the client"),
+            Err(error) => error,
+        };
+        assert!(error.downcast_ref::<ClientRefusal>().is_some(), "{error}");
+        {
+            let db = Connection::open(&path).unwrap();
+            let version: i64 = db
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 4, "a refused client does not migrate the store");
+        }
+        assert!(host.release_host_claim(&host_id).unwrap());
+        drop(BatonStore::open_client(&path, None).unwrap());
+        let db = Connection::open(&path).unwrap();
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

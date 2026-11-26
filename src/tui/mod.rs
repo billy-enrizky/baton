@@ -243,7 +243,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "configure global preferences and inspect harness settings",
     ),
     ("/mcp", "manage MCP servers and sync across harnesses"),
-    ("/skills", "insert, install, or update a skill"),
+    ("/skills", "insert, install, update, or remove a skill"),
     ("/copy", "copy the latest assistant reply to the clipboard"),
     ("/clear", "clear panels and notices"),
     ("/quit", "exit baton"),
@@ -748,6 +748,10 @@ enum Overlay {
         selected: usize,
     },
     SkillsPicker {
+        selected: usize,
+        skills: Vec<SkillChoice>,
+    },
+    SkillRemoveConfirm {
         selected: usize,
         skills: Vec<SkillChoice>,
     },
@@ -3742,7 +3746,9 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/init", _) => Some("init (no arguments)"),
         ("/export", _) => Some("export (no arguments)"),
         ("/settings", _) => Some("settings (no arguments)"),
-        ("/skills", _) => Some("skills (enter insert · i install · u update)"),
+        ("/skills", _) => {
+            Some("skills (enter insert · i install · u update · d remove)")
+        }
         ("/clear", _) => Some("clear (no arguments)"),
         ("/quit", _) => Some("quit (no arguments)"),
         ("/exit", _) => Some("exit (no arguments)"),
@@ -5311,7 +5317,11 @@ fn open_command_palette(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
         ("Billing mode", "subscription or API per harness", "/auth"),
         ("Sign in", "run a harness login", "/login"),
         ("Memory", "open instruction and rule files", "/memory"),
-        ("Skills", "insert, install, or update a skill", "/skills"),
+        (
+            "Skills",
+            "insert, install, update, or remove a skill",
+            "/skills",
+        ),
         ("Settings", "global mode and bell", "/settings"),
         ("MCP servers", "list, add, remove, sync", "/mcp"),
         ("Review", "diff the latest turn", "/review"),
@@ -6397,8 +6407,41 @@ fn handle_key(
                     state.overlay = Overlay::SkillsPicker { selected, skills };
                 }
             }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                let refusal = skills.get(selected).and_then(|skill| {
+                    (!skill.project).then(|| {
+                        format!(
+                            "${} is a global skill; remove it from its source directory",
+                            skill.name
+                        )
+                    })
+                });
+                if let Some(notice) = refusal {
+                    state.notice = Some(notice);
+                    state.overlay = Overlay::SkillsPicker { selected, skills };
+                } else {
+                    state.overlay = Overlay::SkillRemoveConfirm { selected, skills };
+                }
+            }
             _ => {
                 state.overlay = Overlay::SkillsPicker { selected, skills };
+            }
+        },
+        Overlay::SkillRemoveConfirm { selected, skills } => match key.code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                state.overlay = Overlay::SkillsPicker { selected, skills };
+            }
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let removed = skills
+                    .get(selected)
+                    .map(|skill| remove_selected_skill(state, skill))
+                    .unwrap_or(false);
+                if !removed {
+                    state.overlay = Overlay::SkillsPicker { selected, skills };
+                }
+            }
+            _ => {
+                state.overlay = Overlay::SkillRemoveConfirm { selected, skills };
             }
         },
         Overlay::MemoryPicker {
@@ -12334,6 +12377,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::SettingsPicker { categories, .. } => categories.len().min(5) + 5,
             Overlay::McpPicker { .. } => 8,
             Overlay::SkillsPicker { skills, .. } => skills.len().min(8) + 4,
+            Overlay::SkillRemoveConfirm { .. } => 5,
             Overlay::MemoryPicker { listing, .. } => {
                 let warning_lines =
                     listing.warnings.len().min(3) + usize::from(listing.warnings.len() > 3);
@@ -12491,6 +12535,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::SkillsPicker { selected, skills } => {
                 draw_skills_picker(frame, chunks[1], skills, *selected)
+            }
+            Overlay::SkillRemoveConfirm { selected, skills } => {
+                draw_skill_remove_confirm(frame, chunks[1], skills.get(*selected))
             }
             Overlay::MemoryPicker { selected, listing } => {
                 draw_memory_picker(frame, chunks[1], listing, *selected)
@@ -13399,6 +13446,68 @@ fn install_selected_skill(
     }
 }
 
+fn remove_selected_skill(state: &mut TuiState, skill: &SkillChoice) -> bool {
+    use crate::skills::SkillRemoveOutcome;
+
+    if !skill.project {
+        state.notice = Some(format!(
+            "${} is a global skill; remove it from its source directory",
+            skill.name
+        ));
+        return false;
+    }
+    let cwd = std::path::PathBuf::from(&state.thread.cwd);
+    match crate::skills::remove_skill(&cwd, &skill.source, &skill.name) {
+        Ok(SkillRemoveOutcome::Removed(destination)) => {
+            state.overlay = Overlay::None;
+            let relative = destination
+                .strip_prefix(&cwd)
+                .unwrap_or(&destination)
+                .display()
+                .to_string();
+            state.notice = Some(format!("removed ${} from {relative}", skill.name));
+            true
+        }
+        Ok(SkillRemoveOutcome::NotInstalled(_)) => {
+            state.notice = Some(format!(
+                "${} is not installed in this project; press i to install",
+                skill.name
+            ));
+            false
+        }
+        Err(error) => {
+            state.notice = Some(format!("cannot remove ${}: {error}", skill.name));
+            false
+        }
+    }
+}
+
+fn draw_skill_remove_confirm(frame: &mut ratatui::Frame, area: Rect, skill: Option<&SkillChoice>) {
+    let Some(skill) = skill else {
+        return;
+    };
+    let lines = vec![
+        Line::styled(
+            format!("remove ${} from this project?", skill.name),
+            Style::default()
+                .fg(COLORS.warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Line::styled(
+            format!("path: {}/skills/{}", skill.source, skill.name),
+            Style::default().fg(COLORS.muted),
+        ),
+        Line::styled(
+            "the global copy is unchanged · y remove · esc cancel",
+            Style::default().fg(COLORS.muted),
+        ),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.warning));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn draw_skills_picker(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -13421,7 +13530,7 @@ fn draw_skills_picker(
     };
     let mut lines: Vec<Line> = vec![Line::styled(
         format!(
-            "skills ({}){position} · ↑↓ · enter insert · i install · u update · esc",
+            "skills ({}){position} · ↑↓ · enter insert · i install · u update · d remove · esc",
             skills.len()
         ),
         Style::default().fg(COLORS.muted),
@@ -22592,6 +22701,98 @@ mod tests {
     }
 
     #[test]
+    fn skills_picker_removes_a_project_copy_after_confirmation() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        state.thread.session_mode = SessionMode::Single;
+        let project = home.path().join(".codex").join("skills").join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("SKILL.md"), "project\n").unwrap();
+        let choice = SkillChoice {
+            name: "demo".into(),
+            source: "codex".into(),
+            description: None,
+            path: project.clone(),
+            project: true,
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![choice.clone()],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::SkillRemoveConfirm { .. }));
+        assert!(project.join("SKILL.md").is_file());
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::SkillsPicker { .. }));
+        assert!(project.join("SKILL.md").is_file());
+
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![choice],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("remove $demo from this project?"), "{text}");
+        assert!(text.contains("path: codex/skills/demo"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(!project.exists());
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("removed $demo from .codex/skills/demo"));
+    }
+
+    #[test]
+    fn skills_picker_refuses_to_remove_a_global_row() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![skill_choice("demo", "codex")],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::SkillsPicker { .. }));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("is a global skill"));
+    }
+
+    #[test]
     fn skills_picker_window_follows_selection_past_eight() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -22616,6 +22817,7 @@ mod tests {
         assert!(text.contains("enter insert"), "{text}");
         assert!(text.contains("i install"), "{text}");
         assert!(text.contains("u update"), "{text}");
+        assert!(text.contains("d remove"), "{text}");
 
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_key(

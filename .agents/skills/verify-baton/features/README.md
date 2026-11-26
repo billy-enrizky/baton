@@ -15,7 +15,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Provider questions | TUI | Codex `requestUserInput` and Grok `x.ai/ask_user_question` walk each question, answer an option or a custom Other text, mask secret input, and batch the native answers map |
 | Worker questions list | TUI | `/questions` lists open worker questions and opens the worker thread to answer |
 | Roles | TUI and CLI | `/roles` shows the four resolved role rows and detail; `baton roles --json` also returns effort, prompt source/path, and parsed hook declarations |
-| Skills | TUI | `/skills` lists Claude and Codex skills, marks project and global copies, scrolls past eight rows, inserts the source-specific invocation on Enter, installs a global copy on `i`, and updates the project copy on `u` |
+| Skills | TUI | `/skills` lists Claude and Codex skills, marks project and global copies, scrolls past eight rows, inserts the source-specific invocation on Enter, installs a global copy on `i`, updates the project copy on `u`, and removes a project copy on `d` after confirmation |
 | Status next action | CLI | `baton status` and `--json` answer what to do now; a directory with no threads exits 0 with a null-thread JSON shape and `start a thread with baton` |
 | Model catalog | TUI | `/model` merges the live list, the last recorded full list, and the known catalog; a short or failed probe keeps the older models |
 | Provider readiness | CLI and TUI | doctor summarizes ready/missing; pickers mark missing harnesses |

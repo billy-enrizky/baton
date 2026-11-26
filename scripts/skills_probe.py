@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prove install and update for a project skill in the real TUI."""
+"""Prove install, update, and removal for a project skill in the real TUI."""
 
 from __future__ import annotations
 
@@ -165,6 +165,48 @@ def main() -> int:
         if "version two" not in project.read_text():
             raise RuntimeError("project skill content was not updated")
         (evidence / "update-screen.txt").write_text(updated + "\n")
+
+        os.write(master, b"/skills\r")
+        project_picker = wait_for_screen(
+            master,
+            "demo (claude · project)",
+            args.timeout,
+            args.width,
+            args.height,
+            transcript,
+        )
+        if project_picker is None:
+            raise RuntimeError("project skill row did not render before removal")
+        os.write(master, b"d")
+        confirm = wait_for_screen(
+            master,
+            "remove $demo from this project?",
+            args.timeout,
+            args.width,
+            args.height,
+            transcript,
+        )
+        if confirm is None:
+            raise RuntimeError("remove confirmation did not render")
+        if not project.is_file():
+            raise RuntimeError("removal confirmation deleted the project skill")
+        (evidence / "remove-confirm-screen.txt").write_text(confirm + "\n")
+        os.write(master, b"y")
+        removed = wait_for_screen(
+            master,
+            "removed $demo from .claude/skills/demo",
+            args.timeout,
+            args.width,
+            args.height,
+            transcript,
+        )
+        if removed is None:
+            raise RuntimeError("remove notice did not render")
+        if project.exists():
+            raise RuntimeError("project skill was not removed")
+        if not (source / "SKILL.md").is_file():
+            raise RuntimeError("global skill was removed with the project copy")
+        (evidence / "remove-screen.txt").write_text(removed + "\n")
 
         os.write(master, b"\x1b")
         pump(master, 0.2, transcript)

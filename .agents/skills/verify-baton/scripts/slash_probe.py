@@ -332,6 +332,7 @@ def main() -> int:
             "enter insert",
             "i install",
             "u update",
+            "d remove",
             "claude-demo (claude · global)",
         ]
         missing.extend(value for value in skills_required if value not in skills_picker)

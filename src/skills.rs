@@ -20,6 +20,12 @@ pub enum SkillInstallOutcome {
     SourceInProject,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillRemoveOutcome {
+    Removed(PathBuf),
+    NotInstalled(PathBuf),
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CopyLimits {
     files: usize,
@@ -58,6 +64,10 @@ pub fn is_safe_skill_name(name: &str) -> bool {
     valid && has_letter
 }
 
+pub fn is_reserved_skill_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("memories")
+}
+
 pub fn install_skill(
     cwd: &Path,
     source: &Path,
@@ -82,6 +92,9 @@ fn install_skill_with_limits(
         .and_then(|name| name.to_str())
         .filter(|name| is_safe_skill_name(name))
         .ok_or_else(|| anyhow::anyhow!("skill directory name cannot be installed"))?;
+    if is_reserved_skill_name(name) {
+        bail!("skill name is reserved");
+    }
     let source_meta = fs::symlink_metadata(source)
         .with_context(|| format!("cannot inspect skill source {}", source.display()))?;
     if source_meta.file_type().is_symlink() {
@@ -199,6 +212,68 @@ fn install_skill_with_limits(
         destination,
         updated: true,
     })
+}
+
+pub fn remove_skill(cwd: &Path, harness: &str, name: &str) -> Result<SkillRemoveOutcome> {
+    if !matches!(harness, "claude" | "codex") {
+        bail!("skill harness must be claude or codex");
+    }
+    if !is_safe_skill_name(name) {
+        bail!("skill directory name cannot be removed");
+    }
+    if is_reserved_skill_name(name) {
+        bail!("skill name is reserved");
+    }
+    let cwd_meta = fs::metadata(cwd)
+        .with_context(|| format!("cannot inspect project directory {}", cwd.display()))?;
+    if !cwd_meta.is_dir() {
+        bail!("project directory is not a directory");
+    }
+
+    let harness_dir = if harness == "claude" {
+        ".claude"
+    } else {
+        ".codex"
+    };
+    let root = cwd.join(harness_dir).join("skills");
+    reject_symlinked_destination(&cwd.join(harness_dir))?;
+    reject_symlinked_destination(&root)?;
+    let destination = root.join(name);
+    let destination_meta = match fs::symlink_metadata(&destination) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SkillRemoveOutcome::NotInstalled(destination))
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("cannot inspect {}", destination.display()))
+        }
+    };
+    if destination_meta.file_type().is_symlink() || !destination_meta.is_dir() {
+        bail!("project skill destination is not a regular directory");
+    }
+    if !destination.join("SKILL.md").is_file() && !destination.join("skill.md").is_file() {
+        bail!("project skill has no SKILL.md");
+    }
+
+    let trash = root.join(format!(".baton-trash-{}", uuid::Uuid::new_v4().simple()));
+    fs::rename(&destination, &trash).with_context(|| {
+        format!(
+            "cannot stage project skill {} for removal",
+            destination.display()
+        )
+    })?;
+    if let Err(error) = fs::remove_dir_all(&trash) {
+        let restore = fs::rename(&trash, &destination);
+        if let Err(restore_error) = restore {
+            bail!(
+                "cannot remove the project skill and cannot restore it; the previous copy is at {}: {error}; restore error: {restore_error}",
+                trash.display()
+            );
+        }
+        return Err(error)
+            .with_context(|| format!("cannot remove staged skill {}", trash.display()));
+    }
+    Ok(SkillRemoveOutcome::Removed(destination))
 }
 
 fn reject_symlinked_destination(path: &Path) -> Result<()> {
@@ -386,6 +461,17 @@ mod tests {
     }
 
     #[test]
+    fn a_reserved_skill_name_is_not_installable() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let source = skill(&root.path().join("global"), "memories", "reserved\n");
+        let error = install_skill(&cwd, &source, "codex", SkillInstallMode::Install).unwrap_err();
+        assert!(error.to_string().contains("reserved"), "{error}");
+        assert!(!cwd.join(".codex/skills/memories").exists());
+    }
+
+    #[test]
     fn a_source_without_a_skill_file_is_refused() {
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().join("project");
@@ -470,5 +556,80 @@ mod tests {
             "{error}"
         );
         assert!(!outside.join("skills/demo").exists());
+    }
+
+    #[test]
+    fn remove_project_skill_stages_then_deletes() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let project = skill(&cwd.join(".codex/skills"), "demo", "project\n");
+        let global = skill(&root.path().join("global"), "demo", "global\n");
+
+        let outcome = remove_skill(&cwd, "codex", "demo").unwrap();
+        assert_eq!(outcome, SkillRemoveOutcome::Removed(project.clone()));
+        assert!(!project.exists());
+        assert!(global.join("SKILL.md").is_file());
+        assert!(fs::read_dir(cwd.join(".codex/skills"))
+            .unwrap()
+            .next()
+            .is_none());
+    }
+
+    #[test]
+    fn remove_requires_an_existing_project_copy() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        let outcome = remove_skill(&cwd, "claude", "demo").unwrap();
+        assert_eq!(
+            outcome,
+            SkillRemoveOutcome::NotInstalled(cwd.join(".claude/skills/demo"))
+        );
+    }
+
+    #[test]
+    fn remove_refuses_a_directory_without_a_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let project = cwd.join(".claude/skills/demo");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("notes.txt"), "keep\n").unwrap();
+
+        let error = remove_skill(&cwd, "claude", "demo").unwrap_err();
+        assert!(error.to_string().contains("SKILL.md"), "{error}");
+        assert!(project.join("notes.txt").is_file());
+    }
+
+    #[test]
+    fn remove_refuses_an_unsafe_name() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        fs::create_dir_all(&cwd).unwrap();
+        for name in ["", ".", "..", "../outside", "memories"] {
+            assert!(remove_skill(&cwd, "claude", name).is_err(), "{name:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_refuses_a_symlinked_skill_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&cwd).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        let project = skill(&outside, "demo", "outside\n");
+        symlink(&outside, cwd.join(".codex")).unwrap();
+
+        let error = remove_skill(&cwd, "codex", "demo").unwrap_err();
+        assert!(
+            error.to_string().contains("symlink")
+                || error.to_string().contains("regular directory"),
+            "{error}"
+        );
+        assert!(project.join("SKILL.md").is_file());
     }
 }

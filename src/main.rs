@@ -23,6 +23,10 @@ use usage::{cache_hit_rate, format_usage_line, group_usage, sum_usage, UsageGrou
 fn main() {
     let started = Instant::now();
     if let Err(error) = main_result(started) {
+        if let Some(refusal) = error.downcast_ref::<store::ClientRefusal>() {
+            eprintln!("baton: {refusal}");
+            std::process::exit(refusal.exit_code());
+        }
         eprintln!("{error}");
         std::process::exit(1);
     }
@@ -601,7 +605,7 @@ fn main_result(started: Instant) -> Result<()> {
             std::fs::create_dir_all(&home)?;
             let plan_path = home.join(format!("spawn-{}.json", uuid::Uuid::new_v4()));
             std::fs::write(&plan_path, serde_json::to_string(&plan)?)?;
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let result = orchestrate::run(
                 &prompt,
                 &cwd,
@@ -701,11 +705,11 @@ fn main_result(started: Instant) -> Result<()> {
         ),
         cli::Commands::Serve { stdio } => run_serve(&home, stdio),
         cli::Commands::Mcp => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             mcp::run_stdio(mcp::McpServer::new(store, home.clone(), cwd.clone()))
         }
         cli::Commands::Threads { json, all } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let resolved = resolve_config(&home, &cwd);
             let threads = if all {
                 store.list_threads_for_path_display_all(&cwd)?
@@ -818,7 +822,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Inbox { json } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let items = inbox::items(&store)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&items)?);
@@ -853,7 +857,7 @@ fn main_result(started: Instant) -> Result<()> {
             return Ok(());
         }
         cli::Commands::New { title } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let resolved = resolve_config(&home, &cwd);
             let provider = cli
                 .provider
@@ -911,7 +915,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Fork { title, turn, native, json } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let source = match cli.thread.as_deref() {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
@@ -933,7 +937,7 @@ fn main_result(started: Instant) -> Result<()> {
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()?;
-                let recorder_store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
+                let recorder_store = Arc::new(Mutex::new(open_store(None)?));
                 let recorder = process::ProcessRecorder::new(recorder_store, source.cwd.clone());
                 native_session = runtime.block_on(provider_runtime::fork_native_session(
                     &store,
@@ -1027,7 +1031,7 @@ fn main_result(started: Instant) -> Result<()> {
                     "orchestrate uses role settings; set provider, model, and effort in roles.json instead of --provider, --model, or --effort"
                 );
             }
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             if list {
                 let runs = orchestrate::run_rows(&store, 20)?
                     .into_iter()
@@ -1378,10 +1382,15 @@ fn main_result(started: Instant) -> Result<()> {
         }
         cli::Commands::Worktrees { clean, force, run, json } => {
             let (shipped_branches, store_warning) =
-                match BatonStore::open(&paths::baton_db_path())
+                match open_store(None)
                     .and_then(|store| store.shipped_worktree_branches())
                 {
                     Ok(branches) => (branches, None),
+                    Err(error)
+                        if clean && error.downcast_ref::<store::ClientRefusal>().is_some() =>
+                    {
+                        return Err(error);
+                    }
                     Err(error) => (
                         Vec::new(),
                         Some(format!("could not read shipped PR markers: {error}")),
@@ -1523,7 +1532,7 @@ fn main_result(started: Instant) -> Result<()> {
             if turn < 1 {
                 anyhow::bail!("--turn must be at least 1");
             }
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let source = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
@@ -1538,7 +1547,7 @@ fn main_result(started: Instant) -> Result<()> {
                     .enable_all()
                     .build()?;
                 let recorder_store =
-                    Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
+                    Arc::new(Mutex::new(open_store(None)?));
                 let recorder = process::ProcessRecorder::new(recorder_store, source.cwd.clone());
                 let outcome = runtime.block_on(provider_runtime::rewind_to_turn(
                     &store,
@@ -1585,7 +1594,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Import => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let resolved = resolve_config(&home, &cwd);
             let claude_dir = cli
                 .claude_home
@@ -1663,7 +1672,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Checkpoints { thread_id } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let thread = resolve_thread(&store, &thread_id)?;
             let checkpoints = store.list_checkpoints(&thread.id)?;
             if checkpoints.is_empty() {
@@ -1676,7 +1685,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Diff { thread_id, turn } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let thread = resolve_thread(&store, &thread_id)?;
             let checkpoints = store.list_checkpoints(&thread.id)?;
             if checkpoints.is_empty() {
@@ -1705,7 +1714,7 @@ fn main_result(started: Instant) -> Result<()> {
             turn,
             force,
         } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let thread = resolve_thread(&store, &thread_id)?;
             let checkpoint = store
                 .get_checkpoint(&thread.id, turn)?
@@ -1724,7 +1733,7 @@ fn main_result(started: Instant) -> Result<()> {
             by,
             json,
         } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             if let Some(group) = by {
                 let group = match group {
                     cli::UsageGroupBy::Day => UsageGroup::Day,
@@ -1838,7 +1847,7 @@ fn main_result(started: Instant) -> Result<()> {
             if cli.thread.is_some() {
                 anyhow::bail!("memories uses -C/--cwd for a project; -t/--thread is only for threads");
             }
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let project = baton::memory::project_key(&cwd.to_string_lossy());
             match action {
                 None => {
@@ -2028,7 +2037,7 @@ fn main_result(started: Instant) -> Result<()> {
             if query.trim().is_empty() {
                 anyhow::bail!("usage: baton search <query> [--all] [--json]");
             }
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let cwd_filter = (!all).then(|| cwd.to_string_lossy().to_string());
             let results = store.search_messages(cwd_filter.as_deref(), &query, cli.limit)?;
             if json {
@@ -2084,7 +2093,7 @@ fn main_result(started: Instant) -> Result<()> {
                 anyhow::anyhow!("cannot resolve -C directory {}: {error}", cwd.display())
             })?;
             let project = files::recent_project_key(&root.to_string_lossy());
-            let recent = BatonStore::open(&paths::baton_db_path())
+            let recent = open_store(None)
                 .and_then(|store| {
                     let _ = store.prune_missing_recent_projects();
                     store.list_recent_files(&project, crate::store::RECENT_FILE_LIMIT)
@@ -2191,7 +2200,7 @@ fn main_result(started: Instant) -> Result<()> {
             let root = std::fs::canonicalize(&cwd).unwrap_or_else(|_| cwd.clone());
             if let Ok(relative) = target.strip_prefix(&root) {
                 let project = files::recent_project_key(&root.to_string_lossy());
-                if let Ok(store) = BatonStore::open(&paths::baton_db_path()) {
+                if let Ok(store) = open_store(None) {
                     let relative = relative.to_string_lossy().replace('\\', "/");
                     let _ = store.record_recent_file(&project, &relative);
                 }
@@ -2210,7 +2219,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Activity { json } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let thread = match cli.thread.as_deref() {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
@@ -2236,7 +2245,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Turns { thread_id, json } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
@@ -2312,7 +2321,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Queue { thread_id, clear, json } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
@@ -2370,7 +2379,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Doctor { json } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let report = doctor::build(&home, &cwd, &store)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&doctor::to_json(&report))?);
@@ -2383,7 +2392,7 @@ fn main_result(started: Instant) -> Result<()> {
             let Some(thread_id) = cli.thread.as_deref() else {
                 anyhow::bail!("agents needs a thread id: baton agents -t <thread-id> [--json]");
             };
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let thread = resolve_thread(&store, thread_id)?;
             let rows = store.list_subagents(&thread.id)?;
             if json {
@@ -2436,7 +2445,7 @@ fn main_result(started: Instant) -> Result<()> {
             return Ok(());
         }
         cli::Commands::Ps { json } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let rows = store.list_provider_processes()?;
             if json {
                 let processes = rows
@@ -2499,7 +2508,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Status { thread_id, json } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => match store.list_threads_for_path(&cwd)?.into_iter().next() {
@@ -2561,7 +2570,7 @@ fn main_result(started: Instant) -> Result<()> {
             Ok(())
         }
         cli::Commands::Resume { fork, print, force } => {
-            let store = BatonStore::open(&paths::baton_db_path())?;
+            let store = open_store(None)?;
             let thread = match &cli.thread {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
                 None => store
@@ -2710,7 +2719,7 @@ fn run_bench(home: &Path, started: Instant, target: &str, json: bool, repeat: u3
         let config_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();
-        let store = BatonStore::open(&paths::baton_db_path())?;
+        let store = open_store(None)?;
         let store_ms = phase.elapsed().as_secs_f64() * 1000.0;
 
         let phase = Instant::now();
@@ -2776,15 +2785,11 @@ fn run_bench(home: &Path, started: Instant, target: &str, json: bool, repeat: u3
 }
 
 fn open_store(host_id: Option<&str>) -> Result<BatonStore> {
-    let path = paths::baton_db_path();
-    match host_id {
-        Some(host_id) => BatonStore::open_hosted(&path, host_id),
-        None => BatonStore::open(&path),
-    }
+    BatonStore::open_client(&paths::baton_db_path(), host_id)
 }
 
 fn reconcile_startup_orchestrations() {
-    let Ok(store) = BatonStore::open(&paths::baton_db_path()) else {
+    let Ok(store) = open_store(None) else {
         return;
     };
     match orchestrate::reconcile_abandoned_runs(&store) {
@@ -2811,7 +2816,7 @@ fn reconcile_startup_orchestrations() {
 }
 
 fn reap_startup_processes() {
-    let Ok(store) = BatonStore::open(&paths::baton_db_path()) else {
+    let Ok(store) = open_store(None) else {
         return;
     };
     let Ok(report) = process::reap_orphans(&store) else {
@@ -3072,7 +3077,8 @@ fn run_chat(
     initial_prompt: Option<String>,
     requested_effort: Option<String>,
 ) -> Result<()> {
-    let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
+    let (store, client_refusal) = claim::open_tui_store(&paths::baton_db_path())?;
+    let store = Arc::new(Mutex::new(store));
     let resolved = resolve_config(home, cwd);
     let requested_mode = match cli.mode.as_deref() {
         Some(value) => Some(SessionMode::parse(value).ok_or_else(|| {
@@ -3114,20 +3120,20 @@ fn run_chat(
         }
         thread.reasoning_effort = Some(effort.to_string());
         let guard = store.lock().unwrap();
-        if guard.get_thread(&thread.id)?.is_some() {
+        if client_refusal.is_none() && guard.get_thread(&thread.id)?.is_some() {
             guard.set_thread_effort(&thread.id, Some(effort))?;
         }
     } else if cli.effort.is_some() {
         thread.reasoning_effort = None;
         let guard = store.lock().unwrap();
-        if guard.get_thread(&thread.id)?.is_some() {
+        if client_refusal.is_none() && guard.get_thread(&thread.id)?.is_some() {
             guard.set_thread_effort(&thread.id, None)?;
         }
     }
     if let Some(mode) = requested_mode {
         thread.session_mode = mode;
         let guard = store.lock().unwrap();
-        if guard.get_thread(&thread.id)?.is_some() {
+        if client_refusal.is_none() && guard.get_thread(&thread.id)?.is_some() {
             guard.set_thread_session_mode(&thread.id, mode)?;
         }
     }
@@ -3187,6 +3193,7 @@ fn run_chat(
         turn_event_receiver,
         initial_prompt,
         permission_override,
+        client_refusal,
     );
 
     let _ = engine_task.join();

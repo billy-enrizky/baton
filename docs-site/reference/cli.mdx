@@ -47,7 +47,7 @@ baton serve [--stdio]              # claim the store and idle until stopped
 
 A directory with no threads is not an error. `baton status` exits 0 and reports `thread_id: null` with `next_action: "start a thread with baton"`.
 
-`baton serve` claims the local store for one host process, runs provider and turn recovery, and holds the claim until SIGINT, SIGTERM, or, with `--stdio`, stdin EOF. It does not accept commands yet. A second host is refused with exit code 3 and the owning process.
+`baton serve` claims the local store for one host process, runs provider and turn recovery, and holds the claim until SIGINT, SIGTERM, or, with `--stdio`, stdin EOF. It does not accept commands yet. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and takeover hint. The TUI opens read-only with the same notice.
 
 ## Turns and execution
 

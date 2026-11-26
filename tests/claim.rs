@@ -170,9 +170,36 @@ fn a_child_without_the_flag_is_refused_while_the_host_is_live() {
         .expect("child stderr")
         .read_to_string(&mut stderr)
         .unwrap();
-    assert!(!status.success());
-    assert!(stderr.contains("not_the_host"), "{stderr}");
+    assert_eq!(status.code(), Some(4), "{stderr}");
+    assert!(stderr.contains("owns this store"), "{stderr}");
     assert!(!home.path().join("provider-started").exists());
+    drop(host);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_plain_client_exits_four_and_names_the_owner() {
+    let home = tempfile::tempdir().unwrap();
+    let (host, _host_id) = start_host(home.path());
+    for args in [["threads"].as_slice(), ["mcp"].as_slice()] {
+        let output = Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(args)
+            .env("BATON_HOME", home.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(4), "{output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("baton: pid {} started ", host.child.id())),
+            "{stderr}"
+        );
+        assert!(stderr.contains("owns this store"), "{stderr}");
+        assert!(
+            stderr.contains(&format!("baton host takeover --pid {}", host.child.id())),
+            "{stderr}"
+        );
+    }
     drop(host);
 }
 

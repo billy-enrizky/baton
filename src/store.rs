@@ -486,6 +486,11 @@ CREATE TABLE IF NOT EXISTS plans (
   updated_at TEXT NOT NULL,
   PRIMARY KEY (thread_id, provider)
 );
+CREATE TABLE IF NOT EXISTS provider_rate_limits (
+  provider TEXT PRIMARY KEY,
+  info TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 "#;
 
 /// One schema path for on-disk and in-memory stores. A test store that skips a
@@ -1214,6 +1219,41 @@ impl BatonStore {
             anyhow::bail!("thread {id} not found");
         }
         Ok(())
+    }
+
+    /// One snapshot per provider. A restart keeps the last windows the harness
+    /// reported until a newer snapshot replaces them.
+    pub fn save_rate_limits(
+        &self,
+        provider: ProviderId,
+        info: &crate::types::RateLimitInfo,
+    ) -> Result<()> {
+        self.db.execute(
+            "INSERT INTO provider_rate_limits (provider, info, updated_at) VALUES (?, ?, ?)
+             ON CONFLICT(provider) DO UPDATE SET info = excluded.info, updated_at = excluded.updated_at",
+            params![provider.as_str(), serde_json::to_string(info)?, now_iso()],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_rate_limits(&self) -> Result<HashMap<ProviderId, crate::types::RateLimitInfo>> {
+        let mut statement = self
+            .db
+            .prepare("SELECT provider, info FROM provider_rate_limits")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut limits = HashMap::new();
+        for row in rows {
+            let (provider, info) = row?;
+            let Some(provider) = ProviderId::parse(&provider) else {
+                continue;
+            };
+            if let Ok(info) = serde_json::from_str(&info) {
+                limits.insert(provider, info);
+            }
+        }
+        Ok(limits)
     }
 
     /// Hides a thread from the default lists and the inbox. A thread with a
@@ -3166,6 +3206,71 @@ mod tests {
                 current_model: None,
             })
             .unwrap()
+    }
+
+    fn sample_rate_limits() -> crate::types::RateLimitInfo {
+        crate::types::RateLimitInfo {
+            plan_type: Some("plus".into()),
+            primary: Some(crate::types::RateLimitWindow {
+                used_percent: 12,
+                window_duration_mins: Some(300),
+                resets_at: Some(1_767_000_000),
+            }),
+            secondary: None,
+            credits_balance: Some("12.50".into()),
+            credits_unlimited: false,
+            reported_at: "2026-11-26T03:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn rate_limits_round_trip_and_skip_invalid_rows() {
+        let store = BatonStore::memory().unwrap();
+        let info = sample_rate_limits();
+        store.save_rate_limits(ProviderId::Codex, &info).unwrap();
+        let loaded = store.load_rate_limits().unwrap();
+        assert_eq!(loaded.get(&ProviderId::Codex), Some(&info));
+
+        store
+            .db
+            .execute(
+                "INSERT INTO provider_rate_limits (provider, info, updated_at) VALUES ('claude', 'not json', 'now')",
+                [],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO provider_rate_limits (provider, info, updated_at) VALUES ('retired', '{}', 'now')",
+                [],
+            )
+            .unwrap();
+        let loaded = store.load_rate_limits().unwrap();
+        assert_eq!(loaded.len(), 1, "invalid and unknown providers are skipped");
+        assert_eq!(loaded.get(&ProviderId::Codex), Some(&info));
+
+        let updated = crate::types::RateLimitInfo {
+            primary: Some(crate::types::RateLimitWindow {
+                used_percent: 40,
+                window_duration_mins: Some(300),
+                resets_at: None,
+            }),
+            ..info.clone()
+        };
+        store.save_rate_limits(ProviderId::Codex, &updated).unwrap();
+        assert_eq!(
+            store
+                .load_rate_limits()
+                .unwrap()
+                .get(&ProviderId::Codex)
+                .unwrap()
+                .primary
+                .as_ref()
+                .unwrap()
+                .used_percent,
+            40,
+            "a newer snapshot replaces the row"
+        );
     }
 
     #[test]

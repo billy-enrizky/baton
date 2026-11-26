@@ -275,7 +275,7 @@ impl TurnPhase {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RateLimitWindow {
     pub used_percent: i64,
     pub window_duration_mins: Option<i64>,
@@ -283,7 +283,7 @@ pub struct RateLimitWindow {
     pub resets_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RateLimitInfo {
     pub plan_type: Option<String>,
     pub primary: Option<RateLimitWindow>,

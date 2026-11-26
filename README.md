@@ -715,7 +715,7 @@ Machine output stays on stdout and progress stays on stderr, so a pipeline can p
 
 ### 13.1 Files
 
-- `~/.baton/baton.sqlite`: threads, provider sessions, message mirror, turns, queued follow-ups, review notes, checkpoints, usage, subagents, and verified process records.
+- `~/.baton/baton.sqlite`: threads, provider sessions, message mirror, turns, queued follow-ups, review notes, checkpoints, usage, rate-limit snapshots, subagents, and verified process records.
 - `~/.baton/config.json`: explicit overrides for providers, default mode, and settings. Written with owner-only permissions on Unix.
 - `~/.baton/roles.json` and `~/.baton/roles/<role>.md`: role models and prompts.
 - `~/.baton/worktrees/`: managed orchestration and thread worktrees.

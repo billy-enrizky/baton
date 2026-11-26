@@ -14,9 +14,18 @@ unzip -q "$root/docs-export.zip" -d "$work"
 mkdir -p "$root/../site/docs"
 rsync -a --delete \
   --exclude 'README.md' \
+  --exclude '__pycache__' \
+  --exclude 'build.sh' \
+  --exclude 'postprocess.py' \
   --exclude 'serve.js' \
   --exclude 'Start Docs.command' \
   --exclude 'Start Docs.bat' \
   "$work/" "$root/../site/docs/"
 rm -f "$root/docs-export.zip"
 printf 'docs built into %s\n' "$root/../site/docs"
+
+uv run --no-project python "$root/postprocess.py" \
+  --docs-root "$root/../site/docs" \
+  --site-root "$root/../site" \
+  --site-url https://baton.openbrowser.me \
+  --base-path /docs

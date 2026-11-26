@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://baton.openbrowser.me/docs/sitemap.xml

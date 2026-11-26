@@ -237,7 +237,7 @@ fn read_installation_id(path: &Path) -> Result<String> {
     Ok(id.to_string())
 }
 
-fn create_private_dir(path: &Path) -> Result<()> {
+pub(crate) fn create_private_dir(path: &Path) -> Result<()> {
     if let Ok(metadata) = fs::symlink_metadata(path) {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             anyhow::bail!("Baton home is not a directory: {}", path.display());
@@ -261,7 +261,7 @@ fn create_private_dir(path: &Path) -> Result<()> {
         .with_context(|| format!("create Baton home {}", path.display()))
 }
 
-fn open_private_new(path: &Path) -> std::io::Result<File> {
+pub(crate) fn open_private_new(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]

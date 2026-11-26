@@ -1010,6 +1010,9 @@ pub struct TuiState {
     plans: std::collections::HashMap<String, std::collections::HashMap<ProviderId, PlanSnapshot>>,
     plan_scroll_max: std::cell::Cell<usize>,
     rate_limits: std::collections::HashMap<ProviderId, crate::types::RateLimitInfo>,
+    limits_request_id: u64,
+    limits_refreshing: Option<ProviderId>,
+    limits_error: Option<(ProviderId, String)>,
     changes_scroll_max: std::cell::Cell<usize>,
     changes_offsets: std::cell::RefCell<Vec<usize>>,
     activity: Option<ActivityView>,
@@ -1162,6 +1165,9 @@ pub fn run_tui(
         plans: std::collections::HashMap::new(),
         plan_scroll_max: std::cell::Cell::new(0),
         rate_limits: store.lock().unwrap().load_rate_limits().unwrap_or_default(),
+        limits_request_id: 0,
+        limits_refreshing: None,
+        limits_error: None,
         changes_scroll_max: std::cell::Cell::new(0),
         changes_offsets: std::cell::RefCell::new(Vec::new()),
         activity: None,
@@ -1995,6 +2001,42 @@ fn apply_engine_event(
                     format!("loaded {live} live and {cached} cached model(s) for {provider}")
                 }
             });
+        }
+        EngineEvent::RateLimitsLoaded {
+            provider,
+            request_id,
+            info,
+            error,
+        } => {
+            if request_id != state.limits_request_id {
+                return;
+            }
+            state.limits_refreshing = None;
+            match (info, error) {
+                (Some(info), _) => {
+                    if let Ok(guard) = state.store.lock() {
+                        let _ = guard.save_rate_limits(provider, &info);
+                    }
+                    state.rate_limits.insert(provider, info);
+                    state.limits_error = None;
+                    state.notice = None;
+                }
+                (None, Some(error)) => {
+                    state.limits_error = Some((provider, error.clone()));
+                    state.notice = Some(format!("{provider} rate-limit refresh failed: {error}"));
+                }
+                (None, None) => {
+                    let reason = "the harness has no live rate-limit endpoint".to_string();
+                    state.limits_error = Some((provider, reason.clone()));
+                    state.notice = Some(format!("{provider}: {reason}"));
+                }
+            }
+            if matches!(&state.overlay, Overlay::UsageReport { title, .. } if title == "limits") {
+                let lines = rate_limit_lines(state);
+                if let Overlay::UsageReport { lines: current, .. } = &mut state.overlay {
+                    *current = lines;
+                }
+            }
         }
         EngineEvent::TurnRejected {
             thread_id,
@@ -3074,6 +3116,13 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                 let _ = guard.save_rate_limits(provider, &info);
             }
             state.rate_limits.insert(provider, info);
+            state.limits_error = None;
+            if matches!(&state.overlay, Overlay::UsageReport { title, .. } if title == "limits") {
+                let lines = rate_limit_lines(state);
+                if let Overlay::UsageReport { lines: current, .. } = &mut state.overlay {
+                    *current = lines;
+                }
+            }
         }
         TurnEvent::ProviderTurnId { .. }
         | TurnEvent::ProviderSession { .. }
@@ -4313,6 +4362,12 @@ fn rate_limit_lines(state: &TuiState) -> Vec<String> {
     }
     if !seen {
         lines.insert(0, "no rate-limit data yet".into());
+    }
+    if let Some(provider) = state.limits_refreshing {
+        lines.push(format!("refreshing rate limits from {provider}"));
+    }
+    if let Some((provider, error)) = state.limits_error.as_ref() {
+        lines.push(format!("{provider} rate-limit refresh failed · {error}"));
     }
     lines
 }
@@ -11110,6 +11165,17 @@ fn handle_command(
             if !args.is_empty() {
                 state.notice = Some("use /limits".into());
             } else {
+                let provider = state.thread.current_provider;
+                if state.limits_refreshing != Some(provider) {
+                    state.limits_request_id = state.limits_request_id.wrapping_add(1);
+                    state.limits_refreshing = Some(provider);
+                    state.limits_error = None;
+                    let _ = engine_command_sender.send(EngineCommand::ReadRateLimits {
+                        cwd: state.thread.cwd.clone(),
+                        provider,
+                        request_id: state.limits_request_id,
+                    });
+                }
                 state.overlay = Overlay::UsageReport {
                     title: "limits".into(),
                     lines: rate_limit_lines(state),
@@ -17592,6 +17658,9 @@ mod tests {
             plans: std::collections::HashMap::new(),
             plan_scroll_max: std::cell::Cell::new(0),
             rate_limits: store.lock().unwrap().load_rate_limits().unwrap_or_default(),
+            limits_request_id: 0,
+            limits_refreshing: None,
+            limits_error: None,
             changes_scroll_max: std::cell::Cell::new(0),
             changes_offsets: std::cell::RefCell::new(Vec::new()),
             activity: None,
@@ -24209,6 +24278,159 @@ mod tests {
     }
 
     #[test]
+    fn limits_requests_a_live_read_and_renders_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/limits");
+        match receiver.try_recv().expect("rate-limit read command") {
+            EngineCommand::ReadRateLimits {
+                cwd,
+                provider,
+                request_id,
+            } => {
+                assert_eq!(cwd, state.thread.cwd);
+                assert_eq!(provider, ProviderId::Codex);
+                assert_eq!(request_id, 1);
+            }
+            _ => panic!("unexpected command"),
+        }
+        let text = buffer_lines(&render_state(&state, 100, 40)).join("\n");
+        assert!(text.contains("refreshing rate limits from codex"), "{text}");
+
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::RateLimitsLoaded {
+                provider: ProviderId::Codex,
+                request_id: 1,
+                info: Some(codex_rate_limits()),
+                error: None,
+            },
+            &engine_command_sender,
+        );
+        assert!(state.limits_refreshing.is_none());
+        assert!(state.limits_error.is_none());
+        let text = buffer_lines(&render_state(&state, 100, 40)).join("\n");
+        assert!(
+            text.contains("codex · plus · reported 2026-11-26T03:00:00Z"),
+            "{text}"
+        );
+        assert!(text.contains("primary · 5h window · 12% used"), "{text}");
+        assert!(!text.contains("refreshing rate limits"), "{text}");
+        assert!(store
+            .lock()
+            .unwrap()
+            .load_rate_limits()
+            .unwrap()
+            .contains_key(&ProviderId::Codex));
+    }
+
+    #[test]
+    fn an_older_rate_limit_read_does_not_replace_a_newer_one() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/limits");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(EngineCommand::ReadRateLimits { provider: ProviderId::Codex, request_id: 1, .. })
+        ));
+        state.thread.current_provider = ProviderId::Claude;
+        handle_command(&mut state, &store, &engine_command_sender, "/limits");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(EngineCommand::ReadRateLimits { provider: ProviderId::Claude, request_id: 2, .. })
+        ));
+
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::RateLimitsLoaded {
+                provider: ProviderId::Codex,
+                request_id: 1,
+                info: Some(codex_rate_limits()),
+                error: None,
+            },
+            &engine_command_sender,
+        );
+        assert!(state.rate_limits.is_empty(), "the first response is stale");
+        assert_eq!(state.limits_refreshing, Some(ProviderId::Claude));
+
+        let mut newer = codex_rate_limits();
+        newer.primary.as_mut().unwrap().used_percent = 34;
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::RateLimitsLoaded {
+                provider: ProviderId::Claude,
+                request_id: 2,
+                info: Some(newer),
+                error: None,
+            },
+            &engine_command_sender,
+        );
+        assert_eq!(
+            state
+                .rate_limits
+                .get(&ProviderId::Claude)
+                .and_then(|info| info.primary.as_ref())
+                .map(|window| window.used_percent),
+            Some(34)
+        );
+        assert!(state.limits_refreshing.is_none());
+    }
+
+    #[test]
+    fn pressing_limits_again_does_not_start_a_second_read() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/limits");
+        handle_command(&mut state, &store, &engine_command_sender, "/limits");
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(EngineCommand::ReadRateLimits { request_id: 1, .. })
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(state.limits_request_id, 1);
+        assert_eq!(state.limits_refreshing, Some(ProviderId::Codex));
+    }
+
+    #[test]
+    fn a_failed_rate_limit_read_is_named_in_the_report() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/limits");
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::RateLimitsLoaded {
+                provider: ProviderId::Claude,
+                request_id: 1,
+                info: None,
+                error: Some("adapter is busy".into()),
+            },
+            &engine_command_sender,
+        );
+        let text = buffer_lines(&render_state(&state, 100, 40)).join("\n");
+        assert!(text.contains("claude rate-limit refresh failed"), "{text}");
+        assert!(text.contains("adapter is busy"), "{text}");
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("claude rate-limit refresh failed: adapter is busy")
+        );
+    }
+
+    #[test]
     fn a_rate_limit_event_persists_for_the_next_session() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -24240,6 +24462,10 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/limits");
+        state.limits_error = Some((ProviderId::Codex, "account auth required".into()));
         apply_turn_event(
             &mut state,
             TurnEvent::RateLimits {
@@ -24248,9 +24474,18 @@ mod tests {
             },
         );
         assert_eq!(state.rate_limits.len(), 1);
-        let lines = rate_limit_lines(&state);
+        assert!(state.limits_error.is_none());
+        let Overlay::UsageReport { lines, .. } = &state.overlay else {
+            panic!("expected the limits report");
+        };
         assert!(
             lines.iter().any(|line| line.contains("12% used")),
+            "{lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("account auth required")),
             "{lines:?}"
         );
     }

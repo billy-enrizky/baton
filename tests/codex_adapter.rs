@@ -458,6 +458,79 @@ async fn fake_server_models(read: tokio::io::DuplexStream, mut write: tokio::io:
     }
 }
 
+async fn fake_server_rate_limits(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                )
+                .await;
+            }
+            "account/rateLimits/read" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "rateLimits": {
+                                "planType": "plus",
+                                "primary": { "usedPercent": 12, "windowDurationMins": 300 }
+                            },
+                            "rateLimitsByLimitId": {
+                                "codex": {
+                                    "planType": "pro",
+                                    "primary": { "usedPercent": 34, "windowDurationMins": 300 }
+                                }
+                            },
+                            "rateLimitResetCredits": null
+                        }
+                    }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn codex_adapter_reads_rate_limits_without_a_turn() {
+    let spawner = Arc::new(
+        move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_server_rate_limits(server_read, server_write));
+            Ok(halves)
+        },
+    );
+    let mut adapter = CodexAdapter::new(spawner);
+    let info = tokio::time::timeout(Duration::from_secs(10), adapter.read_rate_limits(&[]))
+        .await
+        .expect("rate-limit read completes")
+        .expect("rate-limit read succeeds")
+        .expect("codex reports a snapshot");
+    assert_eq!(info.plan_type.as_deref(), Some("pro"));
+    assert_eq!(info.primary.expect("primary").used_percent, 34);
+    adapter.dispose().await.unwrap();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn codex_adapter_lists_visible_models_across_pages() {
     let spawner = Arc::new(move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {

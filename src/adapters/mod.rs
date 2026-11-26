@@ -512,6 +512,14 @@ pub trait BatonAdapter: Send {
     async fn list_models(&mut self, _input: ModelListInput) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+    /// Reads an account-level rate-limit snapshot without starting a turn.
+    /// Providers with no such endpoint keep the explicit unknown state.
+    async fn read_rate_limits(
+        &mut self,
+        _auth_env: &[(String, String)],
+    ) -> Result<Option<crate::types::RateLimitInfo>> {
+        Ok(None)
+    }
     /// Provider-native conversation fork. Returning None means this provider
     /// has no native fork and the caller must keep the transcript fallback.
     async fn fork_session(&mut self, _input: ForkSessionInput) -> Result<Option<String>> {

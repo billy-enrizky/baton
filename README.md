@@ -599,7 +599,7 @@ Install and update copy the whole skill directory through a staging directory. S
 }
 ```
 
-`baton serve` claims the local store for one host process, runs provider and turn recovery, and holds the claim until SIGINT, SIGTERM, or, with `--stdio`, stdin EOF. It does not accept commands yet. A second host is refused with exit code 3 and the owning process.
+`baton serve` claims the local store for one host process, runs provider and turn recovery, and holds the claim until SIGINT, SIGTERM, or, with `--stdio`, stdin EOF. It does not accept commands yet. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and the `baton host takeover --pid <pid>` hint. The TUI opens read-only, shows the same ownership line, and refuses to send a prompt or change the store.
 
 ### 11.2 Tools
 
@@ -712,9 +712,10 @@ baton update
 | `0` | The command finished. A query that finds no threads or no work still succeeds. |
 | `1` | A runtime failure: a provider error, a missing repository, an unreadable store, or a failed turn. |
 | `2` | A usage error: an unknown flag, a missing command argument, or a missing `exec` prompt. |
+| `4` | A live host owns the store and this client does not have its host identity. Start the command after the host stops, or use the printed `baton host takeover --pid <pid>` hint. |
 | `130` | Interrupted. A cancelled orchestration exits 130; a process killed by Ctrl+C/SIGINT reports signal 2, which shells show as 130. |
 
-Machine output stays on stdout and progress stays on stderr, so a pipeline can parse `--json` without filtering log lines. The TUI itself does not use exit codes for turns; Ctrl+C interrupts a turn and a second idle Ctrl+C exits.
+Machine output stays on stdout and progress stays on stderr, so a pipeline can parse `--json` without filtering log lines. The TUI itself does not use exit codes for turns; Ctrl+C interrupts a turn and a second idle Ctrl+C exits. A TUI that finds a live host claim starts read-only and shows the same owner line instead of exiting.
 
 ## 13. Configuration and storage
 

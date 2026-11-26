@@ -126,6 +126,21 @@ fn is_store_busy(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Opens the TUI store. A live host claim makes the TUI a read-only client
+/// and returns the exact owner notice for its startup line.
+pub fn open_tui_store(path: &Path) -> Result<(BatonStore, Option<String>)> {
+    match BatonStore::open_client(path, None) {
+        Ok(store) => Ok((store, None)),
+        Err(error) => {
+            let Some(refusal) = error.downcast_ref::<crate::store::ClientRefusal>() else {
+                return Err(error);
+            };
+            let store = BatonStore::open_read_only(path)?;
+            Ok((store, Some(refusal.to_string())))
+        }
+    }
+}
+
 pub fn ensure_installation_id(home: &Path) -> Result<String> {
     create_private_dir(home)?;
     let path = home.join("installation-id");
@@ -324,6 +339,53 @@ mod tests {
 
     fn host_id() -> String {
         uuid::Uuid::new_v4().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_tui_store_returns_a_read_only_client_with_the_owner_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baton.sqlite");
+        let host_id = host_id();
+        let seed = BatonStore::open(&path).unwrap();
+        seed.create_thread(NewThread {
+            title: "host".into(),
+            cwd: "/host".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+        drop(seed);
+        let host = BatonStore::open_hosted(&path, &host_id).unwrap();
+        assert!(matches!(
+            acquire(&host, dir.path(), &host_id, &SystemProbe).unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+
+        let (client, refusal) = open_tui_store(&path).unwrap();
+        let refusal = refusal.expect("the owner notice");
+        assert!(refusal.contains("owns this store"), "{refusal}");
+        assert_eq!(client.list_threads(None).unwrap().len(), 1);
+        assert!(client
+            .create_thread(NewThread {
+                title: "refused".into(),
+                cwd: "/client".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .is_err());
+
+        assert!(host.release_host_claim(&host_id).unwrap());
+        let (client, refusal) = open_tui_store(&path).unwrap();
+        assert!(refusal.is_none());
+        client
+            .create_thread(NewThread {
+                title: "after release".into(),
+                cwd: "/client".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
     }
 
     #[cfg(unix)]

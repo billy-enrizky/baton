@@ -1033,6 +1033,9 @@ pub struct TuiState {
     activity: Option<ActivityView>,
     multi: Option<MultiView>,
     notice: Option<String>,
+    /// Set when a live host owns the store. The session stays readable and
+    /// every write path returns to this owner notice.
+    client_refusal: Option<String>,
     diff_output: Option<String>,
     diff_cache: std::cell::RefCell<diff_render::DiffCache>,
     markdown_cache: std::cell::RefCell<markdown::MarkdownCache>,
@@ -1104,6 +1107,7 @@ pub fn run_tui(
     turn_event_receiver: std::sync::mpsc::Receiver<(String, TurnEvent)>,
     initial_prompt: Option<String>,
     permission_override: Option<PermissionMode>,
+    client_refusal: Option<String>,
 ) -> Result<()> {
     capability::require_interactive_terminal()?;
     let history = store.lock().unwrap().list_messages(&thread.id)?;
@@ -1121,13 +1125,20 @@ pub fn run_tui(
     let permission_mode = permission_override.unwrap_or(thread.permission_mode);
     let goal = thread.goal.clone();
     let goal_paused = thread.goal_paused;
-    let reconciled = store
-        .lock()
-        .unwrap()
-        .reconcile_running_turns(None)
-        .unwrap_or_default();
-    let recovered_runs =
-        orchestrate::reconcile_abandoned_runs(&store.lock().unwrap()).unwrap_or_default();
+    let reconciled = if client_refusal.is_some() {
+        Vec::new()
+    } else {
+        store
+            .lock()
+            .unwrap()
+            .reconcile_running_turns(None)
+            .unwrap_or_default()
+    };
+    let recovered_runs = if client_refusal.is_some() {
+        Vec::new()
+    } else {
+        orchestrate::reconcile_abandoned_runs(&store.lock().unwrap()).unwrap_or_default()
+    };
 
     let custom_commands = discover_custom_commands(&thread.cwd);
     let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
@@ -1188,6 +1199,7 @@ pub fn run_tui(
         activity: None,
         multi: None,
         notice: None,
+        client_refusal: client_refusal.clone(),
         diff_output: None,
         diff_cache: std::cell::RefCell::new(diff_render::DiffCache::default()),
         markdown_cache: std::cell::RefCell::new(markdown::MarkdownCache::default()),
@@ -1252,6 +1264,9 @@ pub fn run_tui(
     hydrate_plans(&mut state, &visible_thread);
 
     let mut startup_notes = Vec::new();
+    if let Some(refusal) = &client_refusal {
+        startup_notes.push(refusal.clone());
+    }
     let recent_threads = {
         let guard = store.lock().unwrap();
         let is_new = guard.get_thread(&state.thread.id).ok().flatten().is_none();
@@ -1284,18 +1299,28 @@ pub fn run_tui(
     }
 
     if let Some(prompt) = initial_prompt {
-        let thread_id = state.thread.id.clone();
-        let result = {
-            let guard = store.lock().unwrap();
-            ensure_persisted(&guard, &mut state.thread)
-        };
-        if result.is_ok() {
-            {
-                let guard = store.lock().unwrap();
-                let _ = guard.set_thread_permission_mode(&thread_id, state.permission_mode);
-                let _ = guard.set_thread_goal(&thread_id, state.goal.as_deref(), state.goal_paused);
+        if state.client_refusal.is_some() {
+            let mut notice = state.notice.take().unwrap_or_default();
+            if !notice.is_empty() {
+                notice.push('\n');
             }
-            dispatch_message(&mut state, &store, &engine_command_sender, prompt, false);
+            notice.push_str("initial prompt not sent while the host owns the store");
+            state.notice = Some(notice);
+        } else {
+            let thread_id = state.thread.id.clone();
+            let result = {
+                let guard = store.lock().unwrap();
+                ensure_persisted(&guard, &mut state.thread)
+            };
+            if result.is_ok() {
+                {
+                    let guard = store.lock().unwrap();
+                    let _ = guard.set_thread_permission_mode(&thread_id, state.permission_mode);
+                    let _ =
+                        guard.set_thread_goal(&thread_id, state.goal.as_deref(), state.goal_paused);
+                }
+                dispatch_message(&mut state, &store, &engine_command_sender, prompt, false);
+            }
         }
     }
 
@@ -8329,6 +8354,8 @@ fn dispatch_message_with_drain(
     }
     if allow_commands && text.starts_with('/') {
         handle_command(state, store, engine_command_sender, &text);
+    } else if let Some(refusal) = &state.client_refusal {
+        state.notice = Some(refusal.clone());
     } else if state.thread.session_mode == SessionMode::Orchestrate {
         if state.running {
             // Orchestrate is the default mode for new threads, so a message
@@ -9628,6 +9655,11 @@ fn handle_command(
     let mut parts = raw.split_whitespace();
     let command = parts.next().unwrap_or("");
     let args: Vec<String> = parts.map(str::to_string).collect();
+    if state.client_refusal.is_some() && !matches!(command, "/quit" | "/exit" | "/help" | "/clear")
+    {
+        state.notice = state.client_refusal.clone();
+        return;
+    }
     match command {
         "/quit" | "/exit" => state.quit = true,
         "/help" => {
@@ -17962,6 +17994,7 @@ mod tests {
             activity: None,
             multi: None,
             notice: None,
+            client_refusal: None,
             diff_output: None,
             diff_cache: std::cell::RefCell::new(diff_render::DiffCache::default()),
             markdown_cache: std::cell::RefCell::new(markdown::MarkdownCache::default()),
@@ -18022,6 +18055,36 @@ mod tests {
             shell_running: false,
             shell_output: None,
         }
+    }
+
+    #[test]
+    fn a_host_owned_tui_keeps_the_owner_notice_and_refuses_a_send() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let message =
+            "pid 42 started test owns this store; stop it or use baton host takeover --pid 42"
+                .to_string();
+        state.client_refusal = Some(message.clone());
+        let (engine_command_sender, mut engine_command_receiver) =
+            tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/model");
+        assert_eq!(state.notice.as_deref(), Some(message.as_str()));
+        assert!(matches!(state.overlay, Overlay::None));
+
+        dispatch_message(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "hello".to_string(),
+            false,
+        );
+        assert!(engine_command_receiver.try_recv().is_err());
+        assert_eq!(state.notice.as_deref(), Some(message.as_str()));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/quit");
+        assert!(state.quit);
     }
 
     fn finish_files_picker_load(state: &mut TuiState) {

@@ -113,6 +113,32 @@ impl fmt::Display for NotTheHost {
 
 impl std::error::Error for NotTheHost {}
 
+/// A client found a live host claim without carrying that host's generation.
+/// The message is the operator-facing exit-4 refusal, without the `baton: `
+/// prefix that the binary adds on stderr.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientRefusal {
+    pub owner_pid: u32,
+    pub owner_start: String,
+}
+
+impl fmt::Display for ClientRefusal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&format!(
+            "pid {} started {} owns this store; stop it or use baton host takeover --pid {}",
+            self.owner_pid, self.owner_start, self.owner_pid
+        ))
+    }
+}
+
+impl std::error::Error for ClientRefusal {}
+
+impl ClientRefusal {
+    pub fn exit_code(&self) -> i32 {
+        4
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RetryableTurnRow {
     pub turn: i64,
@@ -944,6 +970,57 @@ impl BatonStore {
 
     pub fn host_id(&self) -> Option<&str> {
         self.host_id.as_deref()
+    }
+
+    /// Open a store for a CLI client. A trusted host child keeps its generation.
+    /// Every other client checks the live claim without running schema DDL, and
+    /// refuses with exit 4 while a host owns the store. The check and the
+    /// subsequent writable open share the write lock, so claim acquisition
+    /// cannot slip between them.
+    pub fn open_client(path: &Path, host_id: Option<&str>) -> Result<BatonStore> {
+        if let Some(host_id) = host_id {
+            return Self::open_hosted(path, host_id);
+        }
+        let lock = if let Some(home) = store_home(path) {
+            match crate::claim::acquire_write_lock(&home, crate::claim::LOCK_WAIT)? {
+                crate::claim::LockAttempt::Acquired(lock) => Some(lock),
+                crate::claim::LockAttempt::Busy => {
+                    anyhow::bail!("write_lock_busy: another Baton process is writing")
+                }
+                crate::claim::LockAttempt::Unsupported => None,
+            }
+        } else {
+            None
+        };
+        if !path.exists() {
+            return Self::open(path);
+        }
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "schema_too_new: store schema {version}, binary expects {SCHEMA_VERSION}"
+            );
+        }
+        if version < SCHEMA_VERSION {
+            drop(db);
+            return Self::open(path);
+        }
+        let claim = Self::get_host_claim_from(&db)?;
+        drop(db);
+        if let Some(claim) = claim.filter(|claim| {
+            crate::process::process_identity_alive(claim.pid, Some(&claim.process_start))
+        }) {
+            return Err(ClientRefusal {
+                owner_pid: claim.pid,
+                owner_start: claim.process_start,
+            }
+            .into());
+        }
+        let store = Self::open(path);
+        drop(lock);
+        store
     }
 
     /// Open an existing store without running schema migration or taking a
@@ -3734,6 +3811,92 @@ mod tests {
         let error = local.release_host_claim(&host_id).unwrap_err();
         assert!(error.downcast_ref::<NotTheHost>().is_some(), "{error}");
         assert!(host.get_host_claim().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_client_open_refuses_a_live_host_without_running_ddl() {
+        use crate::claim::{acquire, ClaimOutcome, SystemProbe};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let host_id = uuid::Uuid::new_v4().to_string();
+        let host = BatonStore::open_hosted(&path, &host_id).unwrap();
+        assert!(matches!(
+            acquire(&host, dir.path(), &host_id, &SystemProbe).unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE provider_processes").unwrap();
+        drop(db);
+
+        let error = match BatonStore::open_client(&path, None) {
+            Ok(_) => panic!("a live host must refuse a plain client"),
+            Err(error) => error,
+        };
+        let refusal = error
+            .downcast_ref::<ClientRefusal>()
+            .unwrap_or_else(|| panic!("expected ClientRefusal, got {error}"));
+        assert_eq!(refusal.owner_pid, std::process::id());
+        assert_eq!(refusal.exit_code(), 4);
+        let message = refusal.to_string();
+        assert!(message.contains("owns this store"), "{message}");
+        assert!(message.contains("baton host takeover --pid"), "{message}");
+
+        let db = Connection::open(&path).unwrap();
+        let table: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'provider_processes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 0, "a refused client must not run schema DDL");
+        drop(db);
+
+        assert!(host.release_host_claim(&host_id).unwrap());
+        let client = BatonStore::open_client(&path, None).unwrap();
+        client
+            .create_thread(NewThread {
+                title: "after release".into(),
+                cwd: "/client".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let db = Connection::open(&path).unwrap();
+        let table: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'provider_processes'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "the writable client restores the schema");
+    }
+
+    #[test]
+    fn a_client_open_migrates_an_old_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", 1).unwrap();
+        drop(db);
+
+        let store = BatonStore::open_client(&path, None).unwrap();
+        store
+            .create_thread(NewThread {
+                title: "migrated".into(),
+                cwd: "/client".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let db = Connection::open(&path).unwrap();
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]

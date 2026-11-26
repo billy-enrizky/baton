@@ -1,6 +1,8 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum ProviderId {
     Claude,
     Codex,
@@ -324,11 +326,73 @@ pub struct QuestionAnswer {
     pub answers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanKind {
+    #[default]
+    Items,
+    Markdown,
+    File,
+}
+
+impl PlanKind {
+    pub fn is_items(&self) -> bool {
+        matches!(self, PlanKind::Items)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PlanEntry {
     pub content: String,
     pub status: String,
     pub priority: Option<String>,
+    #[serde(default, skip_serializing_if = "PlanKind::is_items")]
+    pub kind: PlanKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+}
+
+impl Default for PlanEntry {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            status: "pending".to_string(),
+            priority: None,
+            kind: PlanKind::Items,
+            uri: None,
+        }
+    }
+}
+
+impl PlanEntry {
+    pub fn item(
+        content: impl Into<String>,
+        status: impl Into<String>,
+        priority: Option<String>,
+    ) -> Self {
+        Self {
+            content: content.into(),
+            status: status.into(),
+            priority,
+            ..Self::default()
+        }
+    }
+
+    pub fn markdown(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            kind: PlanKind::Markdown,
+            ..Self::default()
+        }
+    }
+
+    pub fn file(uri: impl Into<String>) -> Self {
+        Self {
+            uri: Some(uri.into()),
+            kind: PlanKind::File,
+            ..Self::default()
+        }
+    }
 }
 
 pub fn normalize_plan_status(status: &str) -> String {
@@ -419,8 +483,14 @@ mod tests {
 
     #[test]
     fn reasoning_effort_is_normalized_and_provider_gated() {
-        assert_eq!(normalize_reasoning_effort(" High "), Some("high".to_string()));
-        assert_eq!(normalize_reasoning_effort("x-high"), Some("x-high".to_string()));
+        assert_eq!(
+            normalize_reasoning_effort(" High "),
+            Some("high".to_string())
+        );
+        assert_eq!(
+            normalize_reasoning_effort("x-high"),
+            Some("x-high".to_string())
+        );
         assert_eq!(normalize_reasoning_effort(""), None);
         assert_eq!(normalize_reasoning_effort("high effort"), None);
         assert!(is_effort_clear(" default "));
@@ -439,6 +509,47 @@ mod tests {
         assert_eq!(normalize_plan_status("completed"), "completed");
         assert_eq!(normalize_plan_status("pending"), "pending");
         assert_eq!(normalize_plan_status("custom"), "custom");
+    }
+
+    #[test]
+    fn plan_kinds_round_trip_and_keep_the_items_wire_shape() {
+        let item = PlanEntry::item("step", "pending", None);
+        let value = serde_json::to_value(&item).unwrap();
+        assert!(value.get("kind").is_none(), "{value}");
+        assert!(value.get("uri").is_none(), "{value}");
+        assert_eq!(serde_json::from_value::<PlanEntry>(value).unwrap(), item);
+
+        let markdown = PlanEntry::markdown("# Ship it");
+        let value = serde_json::to_value(&markdown).unwrap();
+        assert_eq!(
+            value.get("kind").and_then(|kind| kind.as_str()),
+            Some("markdown")
+        );
+        assert_eq!(
+            serde_json::from_value::<PlanEntry>(value).unwrap(),
+            markdown
+        );
+
+        let file = PlanEntry::file("file:///workspace/PLAN.md");
+        let value = serde_json::to_value(&file).unwrap();
+        assert_eq!(
+            value.get("kind").and_then(|kind| kind.as_str()),
+            Some("file")
+        );
+        assert_eq!(
+            value.get("uri").and_then(|uri| uri.as_str()),
+            Some("file:///workspace/PLAN.md")
+        );
+        assert_eq!(serde_json::from_value::<PlanEntry>(value).unwrap(), file);
+
+        let legacy = serde_json::from_value::<PlanEntry>(serde_json::json!({
+            "content": "old",
+            "status": "pending",
+            "priority": null
+        }))
+        .unwrap();
+        assert_eq!(legacy.kind, PlanKind::Items);
+        assert_eq!(legacy.uri, None);
     }
 
     #[test]

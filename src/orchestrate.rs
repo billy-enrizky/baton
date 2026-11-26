@@ -717,13 +717,13 @@ fn plan_from_row(row: &serde_json::Value) -> Option<ExecPlan> {
                 .filter_map(|entry| {
                     Some(crate::types::PlanEntry {
                         content: entry.get("content")?.as_str()?.to_string(),
-                        status: crate::types::normalize_plan_status(
-                            entry.get("status")?.as_str()?,
-                        ),
+                        status: crate::types::normalize_plan_status(entry.get("status")?.as_str()?),
                         priority: entry
                             .get("priority")
                             .and_then(serde_json::Value::as_str)
                             .map(str::to_string),
+                        kind: crate::types::PlanKind::Items,
+                        uri: None,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -4130,6 +4130,8 @@ esac"#;
                 content: "step one".into(),
                 status: "in_progress".into(),
                 priority: Some("high".into()),
+                kind: crate::types::PlanKind::Items,
+                uri: None,
             }],
             explanation: Some("check".into()),
         });

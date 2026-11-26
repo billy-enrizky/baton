@@ -11,6 +11,7 @@ Goals:
 - Turn a Codex or ACP plan event into one Baton event shape.
 - Let `/plan` open a sanitized overlay for the plan reported by the current thread and harness.
 - Show completed, in-progress, and pending steps plus any explanation or priority.
+- Render ACP markdown plans and show the URI of an ACP file plan.
 - Let Enter accept a plan and leave plan mode, and Esc return the plan to the composer for revision.
 - Expose the same event in `exec --stream-json`.
 
@@ -20,14 +21,14 @@ Non-goals:
 - Sending a provider message on accept; acceptance changes the permission mode only.
 - Persisting plans for threads the user has never opened or for providers that are no longer known.
 - Reconstructing a plan from prose or transcript tool rows.
-- Rendering ACP file or markdown plans and adding a CLI or MCP reader for the snapshot.
+- Opening a file plan from the overlay or adding a CLI or MCP reader for the snapshot.
 - Forwarding a worker's plan while the worker is still running; the parent receives it when the worker settles.
 
 ## Sub-features
 
 - `/plan` opens the last plan reported for the current thread and current harness.
 - The header reads `plan · <done>/<total> done` and names the scroll and close keys. When the harness supplied a turn id for the report, the header also names that turn.
-- The body lists the explanation when one was supplied, then one row per step.
+- The body lists the explanation when one was supplied, then one row per step. A markdown plan renders through the transcript markdown renderer. A file plan shows `file plan: <uri>`. An unknown future kind shows an explicit placeholder.
 - Each step uses a stable marker: `✓` completed, `▸` in progress, and `·` pending, cancelled, or unknown.
 - Long explanations and steps wrap onto continuation lines that align under the step text. Nothing is clipped with an ellipsis, and the scroll maximum counts the wrapped rows.
 - Step content, the explanation, and priority are sanitized before rendering.
@@ -43,7 +44,7 @@ Non-goals:
 
 ## Approach
 
-The Codex and ACP adapters translate their native plan event to `TurnEvent::PlanUpdated`. Codex supplies `plan[].step`, `plan[].status`, an optional explanation, and the reporting `turnId`; its `inProgress` status is normalized to `in_progress`. ACP v2 supplies `plan_update` with an item list and stable `planId`, `plan_removed` carries that id, and the v1 `plan` frame remains a compatibility input. ACP entries supply `content`, `status`, and `priority`; the ACP session update carries no turn id, so its snapshot turn id stays empty. The turn id is carried on the snapshot, shown in the overlay header, and projected as `turn_id` by `exec --stream-json`.
+The Codex and ACP adapters translate their native plan event to `TurnEvent::PlanUpdated`. Codex supplies `plan[].step`, `plan[].status`, an optional explanation, and the reporting `turnId`; its `inProgress` status is normalized to `in_progress`. ACP v2 supplies `plan_update` with an item list and stable `planId`, a markdown body, or a file URI; `plan_removed` carries that id, and the v1 `plan` frame remains a compatibility input. ACP item entries supply `content`, `status`, and `priority`; markdown and file plans become one `PlanEntry` with `kind` and, for a file, `uri`. The ACP session update carries no turn id, so its snapshot turn id stays empty. The turn id is carried on the snapshot, shown in the overlay header, and projected as `turn_id` by `exec --stream-json`.
 
 The TUI keeps an in-memory snapshot per thread and provider. `/plan` reads only the snapshot for the visible thread and current harness, and an ACP removal clears a snapshot only when its plan id matches. New work clears the previous snapshots before the submit leaves the TUI; a later `TurnStarted` does not remove a plan already emitted by that turn. `/multi` and orchestration clear at their shared start paths, a rewind clears its completed thread, and a restart clears the map. ACP drain frames from another session are filtered before dispatch.
 
@@ -58,7 +59,7 @@ The overlay never edits the plan and never sends a provider message. Accept is o
 | Parse each provider payload in the TUI | Rejected | Codex and ACP use different field names. Normalizing in each adapter keeps provider spellings out of the renderer and gives `exec --stream-json` one stable shape. |
 | Persist every plan in SQLite immediately | Accepted | One row per thread and harness is enough for a restart, and the turn id from Codex is stored when present. ACP plans without a turn id still persist by thread and harness. Clearing follows the same submit, multi, orchestration, and rewind paths as the in-memory map. |
 | Reuse transcript tool rows as the plan source | Rejected | Tool rows lose ACP priority and structured status, and a provider can change the plan without emitting a matching display row. |
-| Map ACP `plan_update` items and `plan_removed` in the same slice | Accepted | The v2 item list has the same step shape as the legacy frame. The snapshot keeps `planId`, so a removal clears only the matching item plan. File and markdown plans remain a named non-goal. |
+| Map ACP `plan_update` items, markdown, and files in the same slice | Accepted | The v2 item list has the same step shape as the legacy frame. The snapshot keeps `planId`, so a removal clears only the matching plan. Markdown and file plans use the same `PlanEntry` stream with an optional `kind` and `uri`, and item plans keep their original wire shape. |
 | Keep one global snapshot slot | Rejected | A background worker's plan would be dropped, and parallel supervision is a core terminal workflow. A small per-thread/provider map keeps the plan that was actually reported. |
 | Send an implementation prompt on accept | Rejected | The plan text is already in the transcript, and an automatic turn would start spend without a user message. Accept changes the permission mode and states the next step; the user sends the prompt. |
 | Treat Esc as reject | Rejected | The plan stays in the transcript and `/plan`; Esc prepares a revision draft instead of pretending the plan is gone. A separate reject action has no provider command yet. |
@@ -72,8 +73,8 @@ The overlay never edits the plan and never sends a provider message. Accept is o
 | A stale plan is shown after new work, rewind, thread switch, or harness switch | The TUI removes the visible thread's snapshots before submitting a turn, at the `/multi` and orchestration start paths, and on rewind. A later `TurnStarted` does not clear a plan already emitted for that turn. The thread id and provider must both match before `/plan` opens or the overlay draws. |
 | A restart shows a stale plan | Plans are stored per thread and harness and cleared by every new-work path. A plan from the last settled turn is intentionally kept, and the header names its reporting turn when the harness supplied one. |
 | An orchestration worker's plan never reaches the parent TUI | Workers run as `baton exec --json` subprocesses. The final result carries the last plan, and after a worker settles the parent emits `WorkerPlanReported` and stores it under the worker thread. A worker that reports no plan opens with the empty state, and a plan reported mid-run is not shown until the worker settles. |
-| ACP file or markdown `plan_update` arrives and the view stays stale | Those payload types are ignored rather than approximated. A later `plan_removed` clears the item plan; a live ACP plan event has not been recorded yet. |
-| A `plan_removed` for another plan clears the visible plan | The snapshot carries its ACP `planId`, and only a removal with the same id clears it. A removal for an ignored file or markdown plan is a no-op. |
+| ACP file or markdown `plan_update` arrives and the view stays stale | Those payload types become a `PlanEntry` with `kind` and optional `uri`. Markdown renders through the sanitized markdown renderer, file plans show the sanitized URI, and an unknown kind becomes an explicit placeholder. A later `plan_removed` still clears the matching plan ID. A markdown or file payload without its required field is ignored, so a malformed update does not clear a valid plan. |
+| A `plan_removed` for another plan clears the visible plan | The snapshot carries its ACP `planId`, and only a removal with the same id clears it. A removal for a markdown or file plan clears it by the same plan ID rule. |
 | A foreign ACP session update reaches the active turn during reply drain | Drained `session/update` frames are filtered by `sessionId` before plan, usage, or text handling. |
 | A harness reports an empty list | The same empty-state notice is used for a missing report and a deliberately empty plan. It states that no plan is available rather than pretending steps exist. |
 | A plan is treated as approval | Accept is offered only in plan mode, runs the same permission-mode write `/mode default` uses, and sends no provider message. Outside plan mode Enter keeps the overlay open with a read-only notice. |
@@ -88,7 +89,7 @@ The overlay never edits the plan and never sends a provider message. Accept is o
 
 ## How to get to it (user POV)
 
-Run a turn on a harness that reports plans, then type `/plan`. A Codex app server sends `turn/plan/updated`; an ACP v2 agent sends `sessionUpdate: "plan_update"` with an item plan, and a v1 peer can send `sessionUpdate: "plan"`. In a clean isolated instance, `/plan` reports the empty state. The populated Codex path is driven through a fake app server in a real PTY:
+Run a turn on a harness that reports plans, then type `/plan`. A Codex app server sends `turn/plan/updated`; an ACP v2 agent sends `sessionUpdate: "plan_update"` with an item, markdown, or file plan, and a v1 peer can send `sessionUpdate: "plan"`. In a clean isolated instance, `/plan` reports the empty state. The populated Codex path is driven through a fake app server in a real PTY:
 
 ```sh
 .agents/skills/verify-baton/scripts/plan_probe.py \
@@ -101,6 +102,10 @@ Run a turn on a harness that reports plans, then type `/plan`. A Codex app serve
 - `codex_adapter_maps_plan_updates`
 - `acp_adapter_maps_plan_updates`
 - `acp_adapter_maps_the_legacy_plan_frame`
+- `acp_adapter_preserves_markdown_file_and_unknown_plan_kinds`
+- `plan_kinds_round_trip_and_keep_the_items_wire_shape`
+- `plan_view_renders_markdown_and_file_plans`
+- `plan_documents_round_trip_through_the_store`
 - `plan_event_fills_the_view_and_plan_command_opens_it`
 - `plan_command_reports_an_empty_plan`
 - `plan_from_another_thread_is_not_shown`
@@ -141,7 +146,7 @@ Run a turn on a harness that reports plans, then type `/plan`. A Codex app serve
 ## Gotchas
 
 - The legacy ACP `plan` frame is still accepted, but the adapter cannot prove which protocol version the peer negotiated. The v2 item path is covered directly.
-- ACP file and markdown plans are ignored. Only a `plan_removed` with the snapshot's own `planId` clears it.
+- ACP markdown and file plans are rendered, but a file plan is shown as a URI; the overlay does not open the file. Only a `plan_removed` with the snapshot's own `planId` clears it.
 - A plan is cleared when the thread submits new work, runs `/multi` or orchestration, and when it rewinds. A retained plan names its reporting turn when the harness supplied one, and it survives a restart through the `plans` table.
 - Orchestration workers run outside the TUI process, so their plan is forwarded only after the worker settles; a plan reported mid-run is not live.
 - The populated path is PTY-tested against a fake Codex server. No live provider plan event has been recorded yet.

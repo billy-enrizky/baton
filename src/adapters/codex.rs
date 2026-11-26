@@ -505,6 +505,8 @@ impl CodexAdapter {
                                     step.get("status")?.as_str()?,
                                 ),
                                 priority: None,
+                                kind: crate::types::PlanKind::Items,
+                                uri: None,
                             })
                         })
                         .collect()

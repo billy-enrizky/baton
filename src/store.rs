@@ -3192,6 +3192,8 @@ mod tests {
                 content: content.into(),
                 status: "in_progress".into(),
                 priority: Some("high".into()),
+                kind: crate::types::PlanKind::Items,
+                uri: None,
             }],
             explanation: Some("two steps".into()),
         }
@@ -3372,6 +3374,37 @@ mod tests {
         assert_eq!(plans[1].explanation.as_deref(), Some("two steps"));
         assert_eq!(plans[1].plan_id.as_deref(), Some("plan-1"));
         assert_eq!(plans[1].turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn plan_documents_round_trip_through_the_store() {
+        let store = BatonStore::memory().unwrap();
+        let markdown = StoredPlan {
+            provider: ProviderId::Antigravity,
+            plan_id: Some("plan-markdown".into()),
+            turn_id: None,
+            entries: vec![crate::types::PlanEntry::markdown("# Ship it")],
+            explanation: None,
+        };
+        store.save_plan("thread-1", &markdown).unwrap();
+        let stored = store.list_plans("thread-1").unwrap().remove(0);
+        assert_eq!(stored.entries[0].kind, crate::types::PlanKind::Markdown);
+        assert_eq!(stored.entries[0].content, "# Ship it");
+
+        let file = StoredPlan {
+            provider: ProviderId::Antigravity,
+            plan_id: Some("plan-file".into()),
+            turn_id: None,
+            entries: vec![crate::types::PlanEntry::file("file:///workspace/PLAN.md")],
+            explanation: None,
+        };
+        store.save_plan("thread-1", &file).unwrap();
+        let stored = store.list_plans("thread-1").unwrap().remove(0);
+        assert_eq!(stored.entries[0].kind, crate::types::PlanKind::File);
+        assert_eq!(
+            stored.entries[0].uri.as_deref(),
+            Some("file:///workspace/PLAN.md")
+        );
     }
 
     #[test]

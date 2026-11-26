@@ -2292,7 +2292,9 @@ impl BatonStore {
     }
 
     /// A process that starts after a crash must not show a running turn as
-    /// live. Mark unfinished turns in this project as unverified.
+    /// live. Mark unfinished turns in this project as unverified, but leave a
+    /// turn alone while its recorded owner is still alive with the same start
+    /// identity. Ownerless and reused-PID rows are settled.
     pub fn reconcile_running_turns(&self, cwd: Option<&str>) -> Result<Vec<TurnRow>> {
         let rows = match cwd {
             Some(cwd) => {
@@ -2317,13 +2319,28 @@ impl BatonStore {
                 rows
             }
         };
-        for row in &rows {
-            self.db.execute(
-                "UPDATE turns SET phase = 'unverified', error = COALESCE(error, 'baton exited before the turn settled'), ended_at = ? WHERE thread_id = ? AND turn = ?",
-                params![now_iso(), row.thread_id, row.turn],
+        let mut settled = Vec::new();
+        for row in rows {
+            if row.owner_pid.is_some_and(|pid| {
+                crate::process::process_identity_alive(pid, row.owner_start.as_deref())
+            }) {
+                continue;
+            }
+            let changed = self.db.execute(
+                "UPDATE turns SET phase = 'unverified', error = COALESCE(error, 'baton exited before the turn settled'), ended_at = ? WHERE thread_id = ? AND turn = ? AND phase IN ('queued', 'running', 'settling') AND owner_pid IS ? AND owner_start IS ?",
+                params![
+                    now_iso(),
+                    row.thread_id,
+                    row.turn,
+                    row.owner_pid.map(i64::from),
+                    row.owner_start.as_deref()
+                ],
             )?;
+            if changed == 1 {
+                settled.push(row);
+            }
         }
-        Ok(rows)
+        Ok(settled)
     }
 
     /// Records a provider child so a later baton process can identify and reap
@@ -4047,6 +4064,88 @@ mod tests {
             Some(&SubmitRefused(ThreadOpenWork::NativeRewind))
         );
         assert!(store.list_messages(&thread.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconcile_running_turns_keeps_a_live_owner() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "live owner".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .start_turn_record(&thread.id, 1, ProviderId::Codex, None)
+            .unwrap();
+
+        assert!(store
+            .reconcile_running_turns(Some("/work"))
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store
+                .get_turn_record(&thread.id, 1)
+                .unwrap()
+                .expect("turn")
+                .phase,
+            TurnPhase::Running
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_running_turns_settles_dead_ownerless_and_reused_rows() {
+        let store = BatonStore::memory().unwrap();
+        let mut ids = Vec::new();
+        for title in ["dead", "ownerless", "reused"] {
+            let thread = store
+                .create_thread(NewThread {
+                    title: title.into(),
+                    cwd: "/work".into(),
+                    current_provider: ProviderId::Codex,
+                    current_model: None,
+                })
+                .unwrap();
+            store
+                .start_turn_record(&thread.id, 1, ProviderId::Codex, None)
+                .unwrap();
+            ids.push(thread.id);
+        }
+        store
+            .db
+            .execute(
+                "UPDATE turns SET owner_pid = 0, owner_start = NULL WHERE thread_id = ?",
+                params![ids[0]],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE turns SET owner_pid = NULL, owner_start = NULL WHERE thread_id = ?",
+                params![ids[1]],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "UPDATE turns SET owner_pid = ?, owner_start = 'not this process' WHERE thread_id = ?",
+                params![std::process::id(), ids[2]],
+            )
+            .unwrap();
+
+        assert_eq!(
+            store.reconcile_running_turns(Some("/work")).unwrap().len(),
+            3
+        );
+        for id in ids {
+            assert_eq!(
+                store.get_turn_record(&id, 1).unwrap().expect("turn").phase,
+                TurnPhase::Unverified
+            );
+        }
     }
 
     #[test]

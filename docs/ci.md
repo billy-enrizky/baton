@@ -80,11 +80,11 @@ Measured from the cited runs. The older Rust samples were based on `be31fc5` and
 | Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
 | Warm Test job | 33 to 52 seconds; n=16 | Runs 45035044248, 45055995298, 45004705055, 45009466461, 45021604178, 45060299027, 45011836996, 45010710576, 45037001045, 45046974039, 45051808580, 45064707055, 45069517940, 45075059836, 45075683884, and 45080151770 |
 | Main push at `7f22ab5` | Whole run 66 seconds; Test job 51 seconds. Job steps: 17 seconds of checkout and cache restore, 30 seconds of Test, 4 seconds of tail. The run starts the Test job 5 seconds in because it waits only on `changes`, so the remaining lead-in is runner startup | Run 45580109649 |
-| `cargo test --lib` | 1.67 to 3.70 seconds at the cited runs; 857 library tests in the current suite | Timing runs 45009466461 and 45011836996; current count from the 2026-11-26 turn-submit run |
+| `cargo test --lib` | 1.67 to 3.70 seconds at the cited runs; 859 library tests in the current suite | Timing runs 45009466461 and 45011836996; current count from the 2026-11-26 reconcile run |
 | Integration tests | 0.40 to 0.75 seconds at the cited runs; 129 tests across nine binaries in the current suite | Timing runs 45009466461 and 45011836996; current count from the 2026-11-26 WAL/read-only run |
-| Executed test count (`ci/test-inventory.sh`) | 986 macOS after the turn-submit slice | Current source inventory; Linux runs the same suite plus the two platform-specific tests named below |
-| `ci/test-inventory-floor.txt` | 776 | Lower-bound floor; it does not shrink when the current count grows |
-| `ci/fmt-baseline.txt` | 547 | Current debt ceiling |
+| Executed test count (`ci/test-inventory.sh`) | 988 macOS after the reconcile slice | Current source inventory; Linux runs the same suite plus the two platform-specific tests named below |
+| `ci/test-inventory-floor.txt` | 988 | Lower-bound floor; it does not shrink when the current count grows |
+| `ci/fmt-baseline.txt` | 546 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |
 | Cold Rust PR | 189 seconds | Run 44982816103 |
 | Latest merged code PR at `e04c6bd` | Whole run 71 seconds; Test 54 seconds | Run 45818530800 |
@@ -98,7 +98,7 @@ Measured from the cited runs. The older Rust samples were based on `be31fc5` and
 | First post-merge meta PR | 52 seconds; `Changes` 6, `Test` 35 | Pull request 45119777637 |
 | Toolchain-cache removal | Not adopted; setup without the cache was slower than restore plus setup | Runs 45108914603, 45109176611, 45109045484, 45109314728 |
 
-The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 986 floor is a lower bound, not a per-test lock; Linux executes one additional library test and one additional non-UTF-8 integration test. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff. The Cargo cache key includes `Cargo.toml` as well as `Cargo.lock` and `rust-toolchain.toml`, so a test-profile change cannot restore incompatible compiler artifacts.
+The workflow fails if a PR raises a baseline or lowers the test inventory floor. The 988 floor is a lower bound, not a per-test lock; Linux executes one additional library test and one additional non-UTF-8 integration test. The run-mode check now sums every `running N tests` line from the captured log and requires `passed + ignored` to equal that total. It also requires the executed count to meet the floor and rejects ignored tests. Deleting tests above the floor still needs review in the diff. The Cargo cache key includes `Cargo.toml` as well as `Cargo.lock` and `rust-toolchain.toml`, so a test-profile change cannot restore incompatible compiler artifacts.
 
 Older local macOS measurements are historical and are not acceptance evidence. The acceptance record contains the Linux run-level data and the rejected experiments.
 

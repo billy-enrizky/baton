@@ -435,7 +435,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/orchestrate --plan-only <goal>` | Preview the plan before workers start |
 | `/multi` | Fan one prompt across providers, or use isolated worktrees |
 | `/questions` | List open worker questions and open the worker thread to answer |
-| `/runs` | List, reopen, or include archived runs |
+| `/runs` | List runs and open a report to settle, review, merge, ship, or archive |
 | `/agents` | Inspect subagent calls, live and persisted |
 
 ### 7.6 Git
@@ -519,6 +519,8 @@ A run whose orchestrator process stopped, or a run created before ownership was 
 baton runs settle <run-id> --status cancelled
 baton runs settle <run-id> --status partial --json
 ```
+
+Inside the workspace, `/runs` opens a run report. Press `x`, choose a status with the arrow keys, and press Enter to settle the run without leaving the app.
 
 Statuses are `completed`, `partial`, `failed`, `cancelled`, `needs_review`, and `needs_input`. `completed` is refused unless every task completed and no turn is open. Every other status closes queued and running tasks, marks their open turns unverified, and writes the final status in one transaction. A run whose recorded owner process is still alive is refused unless you pass `--force`. A short run id works when it is unambiguous.
 

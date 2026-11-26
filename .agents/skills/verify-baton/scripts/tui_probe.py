@@ -246,13 +246,19 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--binary", default="target/debug/baton")
     parser.add_argument("--command", default="/status")
+    parser.add_argument(
+        "--key",
+        action="append",
+        default=[],
+        help="Extra key after the command: enter, esc, up, down, left, right, or a literal string.",
+    )
     parser.add_argument("--expect", action="append", default=[])
     parser.add_argument("--reject", action="append", default=[])
     parser.add_argument("--arg", action="append", default=[])
     parser.add_argument("--width", type=int, default=120)
     parser.add_argument("--height", type=int, default=34)
     parser.add_argument("--ready", default="Ask anything")
-    parser.add_argument("--after-escape", action="store_true")
+    parser.add_argument("--after-escape", action="count", default=0)
     parser.add_argument("--home", default=None)
     parser.add_argument("--cwd", default=None)
     parser.add_argument("--warmup", type=float, default=3.0)
@@ -297,6 +303,18 @@ def main() -> int:
         os.write(master, f"{args.command}\r".encode())
         pump(master, 0.8, transcript)
         debug("command sent")
+        for key in args.key:
+            sequence = {
+                "enter": b"\r",
+                "esc": b"\x1b",
+                "up": b"\x1b[A",
+                "down": b"\x1b[B",
+                "left": b"\x1b[D",
+                "right": b"\x1b[C",
+            }.get(key, key.encode())
+            os.write(master, sequence)
+            pump(master, 0.3, transcript)
+        debug(f"sent {len(args.key)} extra key(s)")
         # The screen parser consumes the whole ANSI stream from startup, so it
         # reconstructs the final screen without a forced resize.
         pump(master, 0.5, transcript)
@@ -312,7 +330,7 @@ def main() -> int:
         (evidence / "screen.txt").write_text(joined + "\n")
         (evidence / "transcript.raw").write_bytes(bytes(transcript))
         debug("screen captured")
-        if args.after_escape:
+        for _ in range(args.after_escape):
             os.write(master, b"\x1b")
             pump(master, 0.4, transcript)
         os.write(master, b"/quit\r")
@@ -321,6 +339,7 @@ def main() -> int:
         (evidence / "transcript.raw").write_bytes(bytes(transcript))
         (evidence / "summary.json").write_text(json.dumps({
             "command": args.command,
+            "keys": args.key,
             "expect": expectations,
             "missing": missing,
             "rejected": rejected,

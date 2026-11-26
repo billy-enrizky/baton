@@ -23,7 +23,8 @@ use crate::inbox::{self, InboxItem};
 use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
 use crate::runtime::{ensure_persisted, EngineCommand, EngineEvent};
 use crate::store::{
-    ArchiveOutcome, BatonStore, MessageRow, NewThread, PinMoveOutcome, ThreadOpenWork, ThreadRow,
+    ArchiveOutcome, BatonStore, MessageRow, NewThread, PinMoveOutcome, RunVerdict, ThreadOpenWork,
+    ThreadRow,
 };
 use crate::sync;
 use crate::types::{
@@ -1070,6 +1071,7 @@ pub struct TuiState {
     orchestration_ship_report: Option<ShipReport>,
     orchestration_reviewing: bool,
     orchestration_confirm_review: bool,
+    orchestration_settle: Option<usize>,
     auto_review: bool,
     orchestration_sender: std::sync::mpsc::Sender<OrchestrationEvent>,
     native_rewind_sender: std::sync::mpsc::Sender<NativeRewindEvent>,
@@ -1234,6 +1236,7 @@ pub fn run_tui(
         orchestration_ship_report: None,
         orchestration_reviewing: false,
         orchestration_confirm_review: false,
+        orchestration_settle: None,
         auto_review: true,
         orchestration_sender,
         native_rewind_sender,
@@ -2139,6 +2142,7 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             state.orchestration_report = None;
             state.orchestration_scroll = 0;
             state.orchestration_selected = 0;
+            state.orchestration_settle = None;
             state.notice = Some(format!(
                 "plan ready · {} worker(s) · enter to run · esc to edit",
                 preview.plan.tasks.len()
@@ -2161,6 +2165,7 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             state.orchestration_scroll = 0;
             state.orchestration_confirm_ship = false;
             state.orchestration_ship_report = None;
+            state.orchestration_settle = None;
             let mut summary = format!(
                 "run {} · {}\n{}",
                 &report.run_id[..8.min(report.run_id.len())],
@@ -2200,6 +2205,7 @@ fn apply_orchestration_event(state: &mut TuiState, event: OrchestrationEvent) {
             state.orchestration_selected = 0;
             state.orchestration_confirm_ship = false;
             state.orchestration_ship_report = None;
+            state.orchestration_settle = None;
             if error == orchestrate::CANCELLED_ERROR {
                 record_orchestration_message(state, "run cancelled".to_string());
                 state.notice = Some("orchestration cancelled".into());
@@ -8772,6 +8778,24 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
     {
         return;
     }
+    if let Some(index) = state.orchestration_settle {
+        let count = RunVerdict::ALL.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Left | KeyCode::Char('h') => {
+                state.orchestration_settle = Some((index + count - 1) % count);
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Right | KeyCode::Char('l') => {
+                state.orchestration_settle = Some((index + 1) % count);
+            }
+            KeyCode::Enter => settle_run_from_report(state, store, index),
+            KeyCode::Esc => {
+                state.orchestration_settle = None;
+                state.notice = Some("settle cancelled".into());
+            }
+            _ => {}
+        }
+        return;
+    }
     if state.orchestration_confirm_integrate {
         match key.code {
             KeyCode::Enter => start_integration(state),
@@ -8813,6 +8837,7 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
             state.orchestration_confirm_integrate = false;
             state.orchestration_confirm_ship = false;
             state.orchestration_confirm_review = false;
+            state.orchestration_settle = None;
         }
         KeyCode::Up | KeyCode::Char('k') => {
             state.orchestration_selected = state.orchestration_selected.saturating_sub(1);
@@ -8871,6 +8896,19 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
                 ));
             }
         }
+        KeyCode::Char('x') => {
+            let status = state
+                .orchestration_report
+                .as_ref()
+                .map(|report| report.status.clone())
+                .unwrap_or_default();
+            if status != "running" {
+                state.notice = Some(format!("run is already {status}"));
+            } else {
+                state.orchestration_settle = Some(0);
+                state.notice = Some("choose a final status for this run".into());
+            }
+        }
         KeyCode::Char('a') => {
             let Some(run_id) = state
                 .orchestration_report
@@ -8898,6 +8936,7 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
                     state.orchestration_selected = 0;
                     state.orchestration_confirm_integrate = false;
                     state.orchestration_confirm_ship = false;
+                    state.orchestration_settle = None;
                     state.orchestration_confirm_review = false;
                 }
                 Err(error) => state.notice = Some(format!("cannot archive run: {error}")),
@@ -8956,6 +8995,64 @@ fn handle_orchestration_key(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>
             }
         }
         _ => {}
+    }
+}
+
+fn settle_run_from_report(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, index: usize) {
+    let Some(run_id) = state
+        .orchestration_report
+        .as_ref()
+        .map(|report| report.run_id.clone())
+    else {
+        state.orchestration_settle = None;
+        return;
+    };
+    let verdict = RunVerdict::ALL[index.min(RunVerdict::ALL.len() - 1)];
+    let result = {
+        let guard = store.lock().unwrap();
+        guard.settle_orchestration_run(&run_id, verdict, false)
+    };
+    state.orchestration_settle = None;
+    let settlement = match result {
+        Ok(settlement) => settlement,
+        Err(error) => {
+            state.notice = Some(format!("cannot settle run: {error}"));
+            return;
+        }
+    };
+    let refreshed = {
+        let guard = store.lock().unwrap();
+        orchestrate::report_from_rows(&guard, std::path::Path::new(&state.thread.cwd), &run_id)
+    };
+    let short = &run_id[..8.min(run_id.len())];
+    record_orchestration_message(
+        state,
+        format!(
+            "run {short} settled as {} · {} task(s), {} turn(s) closed",
+            verdict.as_str(),
+            settlement.tasks,
+            settlement.turns
+        ),
+    );
+    match refreshed {
+        Ok(report) => {
+            state.orchestration_report = Some(report);
+            state.orchestration_scroll = 0;
+            state.orchestration_selected = 0;
+            state.notice = Some(format!(
+                "settled run {short} as {}; closed {} task(s) and {} turn(s)",
+                verdict.as_str(),
+                settlement.tasks,
+                settlement.turns
+            ));
+        }
+        Err(error) => {
+            state.orchestration_report = None;
+            state.notice = Some(format!(
+                "settled run {short} as {}, but the report could not refresh: {error}",
+                verdict.as_str()
+            ));
+        }
     }
 }
 
@@ -11959,31 +12056,62 @@ fn draw_orchestration_report(
         "failed" => COLORS.error,
         _ => COLORS.warning,
     };
-    let header_lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("orchestration {short_run} "),
-                Style::default()
-                    .fg(COLORS.accent)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                report.status.clone(),
-                Style::default()
-                    .fg(status_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" · {} worker(s)", report.tasks.len()),
-                Style::default().fg(COLORS.muted),
-            ),
-            if report.archived_at.is_some() {
-                Span::styled(" · archived", Style::default().fg(COLORS.warning))
+    let status_line = Line::from(vec![
+        Span::styled(
+            format!("orchestration {short_run} "),
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            report.status.clone(),
+            Style::default()
+                .fg(status_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" · {} worker(s)", report.tasks.len()),
+            Style::default().fg(COLORS.muted),
+        ),
+        if report.archived_at.is_some() {
+            Span::styled(" · archived", Style::default().fg(COLORS.warning))
+        } else {
+            Span::raw("")
+        },
+    ]);
+    let mut header_lines = vec![status_line];
+    if let Some(index) = state.orchestration_settle {
+        let mut options = vec![Span::styled(
+            "settle as: ",
+            Style::default().fg(COLORS.muted),
+        )];
+        for (position, verdict) in RunVerdict::ALL.iter().enumerate() {
+            if position > 0 {
+                options.push(Span::styled(" · ", Style::default().fg(COLORS.muted)));
+            }
+            let label = if position == index {
+                format!("[{}]", verdict.as_str())
             } else {
-                Span::raw("")
-            },
-        ]),
-        if state.orchestration_confirm_integrate {
+                verdict.as_str().to_string()
+            };
+            options.push(Span::styled(
+                label,
+                if position == index {
+                    Style::default()
+                        .fg(COLORS.warning)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(COLORS.muted)
+                },
+            ));
+        }
+        header_lines.push(Line::from(options));
+        header_lines.push(Line::styled(
+            "←→ or ↑↓ choose · enter settles · esc cancels",
+            Style::default().fg(COLORS.muted),
+        ));
+    } else {
+        header_lines.push(if state.orchestration_confirm_integrate {
             Line::styled(
                 format!(
                     "merge worker branches into {}? enter confirms · esc cancels",
@@ -12026,12 +12154,25 @@ fn draw_orchestration_report(
                     .add_modifier(Modifier::BOLD),
             )
         } else {
+            let settle = if report.status == "running" {
+                " · x settle"
+            } else {
+                ""
+            };
             Line::styled(
-                "↑↓ select · enter open · r review · i merge · p PRs · a archive · PgUp/PgDn scroll · esc closes",
+                format!(
+                    "↑↓ select · enter open · r review · i merge · p PRs · a archive{settle} · PgUp/PgDn scroll · esc closes"
+                ),
                 Style::default().fg(COLORS.muted),
             )
-        },
-    ];
+        });
+    }
+    if let Some(notice) = &state.notice {
+        header_lines.push(Line::styled(
+            truncate_chars(notice, width),
+            Style::default().fg(COLORS.warning),
+        ));
+    }
 
     let mut lines: Vec<Line> = Vec::new();
     let mut task_starts: Vec<usize> = Vec::new();
@@ -12977,6 +13118,7 @@ fn open_run_report(state: &mut TuiState, report: orchestrate::RunReport) {
     state.orchestration_integrate_report = None;
     state.orchestration_confirm_ship = false;
     state.orchestration_ship_report = None;
+    state.orchestration_settle = None;
     state.notice = Some(format!("opened run {}", &id[..8.min(id.len())]));
 }
 
@@ -18029,6 +18171,7 @@ mod tests {
             orchestration_ship_report: None,
             orchestration_reviewing: false,
             orchestration_confirm_review: false,
+            orchestration_settle: None,
             auto_review: false,
             orchestration_sender: std::sync::mpsc::channel().0,
             native_rewind_sender: std::sync::mpsc::channel().0,
@@ -34140,6 +34283,194 @@ exit 1
                 .as_deref()
                 .unwrap_or("")
                 .contains("review cancelled"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    fn seed_settle_run(store: &Arc<Mutex<BatonStore>>, status: &str) {
+        let guard = store.lock().unwrap();
+        guard
+            .create_orchestration_run_owned(
+                "abcdef1234567890",
+                "split the work",
+                ProviderId::Codex,
+                "gpt-test",
+                None,
+                "{}",
+                false,
+                Some(999_999),
+                None,
+            )
+            .unwrap();
+        guard
+            .add_orchestration_task(
+                "task-1",
+                "abcdef1234567890",
+                1,
+                "worker one",
+                ProviderId::Codex,
+                "gpt-test",
+                "do one",
+                None,
+                None,
+                None,
+                None,
+                status,
+                None,
+                None,
+                "2026-11-26T00:00:00.000Z",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn orchestration_report_x_offers_every_status_and_settles_the_run() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        seed_settle_run(&store, "queued");
+        let mut report = sample_report(None);
+        report.status = "running".to_string();
+        state.orchestration_report = Some(report);
+
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Char('x')));
+        assert_eq!(state.orchestration_settle, Some(0));
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("settle as:"), "{text}");
+        assert!(text.contains("[completed]"), "{text}");
+        assert!(text.contains("needs_input"), "{text}");
+        assert!(text.contains("enter settles"), "{text}");
+
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Up));
+        assert_eq!(
+            state.orchestration_settle,
+            Some(5),
+            "up wraps to the last status"
+        );
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Down));
+        assert_eq!(
+            state.orchestration_settle,
+            Some(0),
+            "down wraps to the first status"
+        );
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Down));
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Down));
+        assert_eq!(state.orchestration_settle, Some(2));
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Enter));
+        assert_eq!(state.orchestration_settle, None);
+        let report = state.orchestration_report.as_ref().unwrap();
+        assert_eq!(report.status, "failed");
+        assert_eq!(report.tasks[0].status, "failed");
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("settled run abcdef12 as failed"),
+            "{:?}",
+            state.notice
+        );
+        let run = store
+            .lock()
+            .unwrap()
+            .find_orchestration_runs("abcdef1234567890")
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.status, "failed");
+    }
+
+    #[test]
+    fn orchestration_report_x_refuses_a_terminal_run() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let mut report = sample_report(None);
+        report.status = "completed".to_string();
+        state.orchestration_report = Some(report);
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Char('x')));
+        assert_eq!(state.orchestration_settle, None);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("run is already completed"),
+            "{:?}",
+            state.notice
+        );
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(
+            !text.contains("x settle"),
+            "a terminal run offers no settle: {text}"
+        );
+    }
+
+    #[test]
+    fn orchestration_report_settle_reports_a_refused_verdict() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        seed_settle_run(&store, "queued");
+        let mut report = sample_report(None);
+        report.status = "running".to_string();
+        state.orchestration_report = Some(report);
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Char('x')));
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Enter));
+        assert_eq!(state.orchestration_settle, None);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("cannot settle run"),
+            "{:?}",
+            state.notice
+        );
+        assert_eq!(
+            state.orchestration_report.as_ref().unwrap().status,
+            "running",
+            "the report keeps the real status"
+        );
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(
+            text.contains("cannot settle run"),
+            "the refusal is on screen: {text}"
+        );
+        let run = store
+            .lock()
+            .unwrap()
+            .find_orchestration_runs("abcdef1234567890")
+            .unwrap()
+            .remove(0);
+        assert_eq!(run.status, "running");
+    }
+
+    #[test]
+    fn orchestration_report_settle_cancels_with_escape() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let mut report = sample_report(None);
+        report.status = "running".to_string();
+        state.orchestration_report = Some(report);
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Char('x')));
+        handle_orchestration_key(&mut state, &store, key(KeyCode::Esc));
+        assert_eq!(state.orchestration_settle, None);
+        assert!(
+            state.orchestration_report.is_some(),
+            "escape keeps the report"
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("settle cancelled"),
             "{:?}",
             state.notice
         );

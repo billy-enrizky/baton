@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, status, store, tasks, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, claim, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, status, store, tasks, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -7,6 +7,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use tokio::io::AsyncReadExt;
 
 use adapters::{AcpAdapter, BatonAdapter, ClaudeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
@@ -48,8 +49,11 @@ fn main_result(started: Instant) -> Result<()> {
     let command = cli.command.clone().unwrap_or(cli::Commands::Chat);
     let cli_prompt = cli.prompt.clone();
 
-    reap_startup_processes();
-    if !matches!(&command, cli::Commands::Chat) {
+    let serving = matches!(&command, cli::Commands::Serve { .. });
+    if !serving {
+        reap_startup_processes();
+    }
+    if !matches!(&command, cli::Commands::Chat | cli::Commands::Serve { .. }) {
         reconcile_startup_orchestrations();
     }
 
@@ -691,6 +695,7 @@ fn main_result(started: Instant) -> Result<()> {
             cli_prompt,
             requested_effort,
         ),
+        cli::Commands::Serve { stdio } => run_serve(&home, stdio),
         cli::Commands::Mcp => {
             let store = BatonStore::open(&paths::baton_db_path())?;
             mcp::run_stdio(mcp::McpServer::new(store, home.clone(), cwd.clone()))
@@ -2818,6 +2823,88 @@ fn reap_startup_processes() {
                 "baton process mismatch: pid={} provider={} expected={:?} actual={:?}",
                 row.pid, row.provider, row.command, actual
             );
+        }
+    }
+}
+
+fn run_serve(home: &Path, stdio: bool) -> Result<()> {
+    let host_id = uuid::Uuid::new_v4().to_string();
+    let store = BatonStore::open_hosted(&paths::baton_db_path(), &host_id)?;
+    let claimed = match claim::acquire(&store, home, &host_id, &claim::SystemProbe)? {
+        claim::ClaimOutcome::Claimed(claim) => claim,
+        claim::ClaimOutcome::Refused(refusal) => {
+            eprintln!("baton: {refusal}");
+            std::process::exit(refusal.exit_code());
+        }
+    };
+    let reaped = process::reap_orphans(&store)?;
+    if let Some(summary) = reaped.summary() {
+        eprintln!("baton: {summary}");
+    }
+    for error in &reaped.errors {
+        eprintln!("baton: reaper: {error}");
+    }
+    let turns = store.reconcile_running_turns(None)?;
+    let runs = orchestrate::reconcile_abandoned_runs(&store)?;
+    eprintln!(
+        "baton: host ready pid {} host {} installation {}",
+        claimed.pid, claimed.host_id, claimed.installation_id
+    );
+    if !turns.is_empty() {
+        eprintln!("baton: settled {} unfinished turn(s)", turns.len());
+    }
+    if !runs.is_empty() {
+        eprintln!(
+            "baton: settled {} abandoned orchestration run(s)",
+            runs.len()
+        );
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(wait_for_host_stop(stdio))?;
+    if !store.release_host_claim(&host_id)? {
+        anyhow::bail!("host claim disappeared before shutdown");
+    }
+    eprintln!("baton: host stopped");
+    Ok(())
+}
+
+async fn wait_for_host_stop(stdio: bool) -> Result<()> {
+    let stdin_wait = async move {
+        if stdio {
+            wait_for_stdin_eof().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    {
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+            _ = stdin_wait => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = stdin_wait => {}
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_stdin_eof() {
+    let mut stdin = tokio::io::stdin();
+    let mut buffer = [0u8; 4096];
+    loop {
+        match stdin.read(&mut buffer).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
     }
 }

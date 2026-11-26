@@ -8,7 +8,7 @@ use crate::checkpoints::capture_checkpoint;
 use crate::config::{provider_auth_env, resolve_config};
 use crate::handoff::{derive_title, git_status_summary, HandoffMessage};
 use crate::store::{BatonStore, NewThread, ThreadRow};
-use crate::types::{PermissionMode, ProviderId, TurnPhase, TurnUsage};
+use crate::types::{PermissionMode, ProviderId, RateLimitInfo, TurnPhase, TurnUsage};
 
 pub type SharedStore = Arc<Mutex<BatonStore>>;
 pub type SharedAdapter = Arc<tokio::sync::Mutex<Box<dyn BatonAdapter>>>;
@@ -32,6 +32,11 @@ pub enum EngineCommand {
         provider: ProviderId,
         request_id: u64,
     },
+    ReadRateLimits {
+        cwd: String,
+        provider: ProviderId,
+        request_id: u64,
+    },
     Interrupt {
         thread_id: String,
     },
@@ -51,6 +56,12 @@ pub enum EngineEvent {
         models: Vec<String>,
         live: usize,
         cached: usize,
+        error: Option<String>,
+    },
+    RateLimitsLoaded {
+        provider: ProviderId,
+        request_id: u64,
+        info: Option<RateLimitInfo>,
         error: Option<String>,
     },
     TurnRejected {
@@ -646,6 +657,36 @@ pub async fn run_engine(
                     });
                 });
             }
+            EngineCommand::ReadRateLimits {
+                cwd,
+                provider,
+                request_id,
+            } => {
+                let home = home.clone();
+                let adapters = adapters.clone();
+                let adapter_indices = adapter_indices.clone();
+                let sender = engine_event_sender.clone();
+                tokio::spawn(async move {
+                    let result = load_provider_rate_limits(
+                        &home,
+                        &adapters,
+                        &adapter_indices,
+                        &cwd,
+                        provider,
+                    )
+                    .await;
+                    let (info, error) = match result {
+                        Ok(info) => (info, None),
+                        Err(error) => (None, Some(error.to_string())),
+                    };
+                    let _ = sender.send(EngineEvent::RateLimitsLoaded {
+                        provider,
+                        request_id,
+                        info,
+                        error,
+                    });
+                });
+            }
             EngineCommand::Interrupt { thread_id } => {
                 let provider = store
                     .lock()
@@ -888,6 +929,32 @@ async fn load_provider_models(
         cached,
         format!("{provider} is busy"),
     ))
+}
+
+/// Reads a rate-limit snapshot while the harness is idle. A busy adapter is
+/// reported instead of waited on, so a running turn never stalls the report.
+async fn load_provider_rate_limits(
+    home: &std::path::Path,
+    adapters: &[SharedAdapter],
+    adapter_indices: &HashMap<ProviderId, usize>,
+    cwd: &str,
+    provider: ProviderId,
+) -> Result<Option<RateLimitInfo>> {
+    let config = resolve_config(home, std::path::Path::new(cwd));
+    let auth_env = provider_auth_env(config.for_provider(provider));
+    let index = adapter_indices
+        .get(&provider)
+        .copied()
+        .ok_or_else(|| anyhow::anyhow!("{provider} is not available"))?;
+    let mut adapter = adapters[index]
+        .try_lock()
+        .map_err(|_| anyhow::anyhow!("{provider} is busy; try again when the harness is idle"))?;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        adapter.read_rate_limits(&auth_env),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("{provider} rate-limit read timed out"))?
 }
 
 /// A shorter live list does not replace a fuller cached one, so a degraded
@@ -2112,6 +2179,24 @@ mod tests {
             Ok(vec![format!("live:{}", input.cwd)])
         }
 
+        async fn read_rate_limits(
+            &mut self,
+            _auth_env: &[(String, String)],
+        ) -> Result<Option<RateLimitInfo>> {
+            Ok(Some(RateLimitInfo {
+                plan_type: Some("plus".into()),
+                primary: Some(crate::types::RateLimitWindow {
+                    used_percent: 12,
+                    window_duration_mins: Some(300),
+                    resets_at: None,
+                }),
+                secondary: None,
+                credits_balance: None,
+                credits_unlimited: false,
+                reported_at: "2026-11-26T03:00:00Z".into(),
+            }))
+        }
+
         async fn start_turn(
             &mut self,
             _input: TurnStartInput,
@@ -2883,9 +2968,10 @@ mod tests {
                 current_model: Some("m".into()),
             })
             .unwrap();
-        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(
-            Box::new(IdleAdapter) as Box<dyn BatonAdapter>
-        ))];
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
+            IdleAdapter,
+        )
+            as Box<dyn BatonAdapter>))];
         let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (event_sender, event_receiver) = std::sync::mpsc::channel();
         let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
@@ -2942,6 +3028,74 @@ mod tests {
                     1 + crate::models::catalog(ProviderId::Codex).len()
                 );
                 assert!(error.is_none());
+            }
+            _ => unreachable!(),
+        }
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+    }
+
+    #[tokio::test]
+    async fn engine_reads_rate_limits_without_a_turn() {
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "limits".into(),
+                cwd: "/tmp/limits".into(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        let adapters: Vec<SharedAdapter> = vec![Arc::new(tokio::sync::Mutex::new(Box::new(
+            IdleAdapter,
+        )
+            as Box<dyn BatonAdapter>))];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store,
+            std::path::PathBuf::from("/tmp"),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        command_sender
+            .send(EngineCommand::ReadRateLimits {
+                cwd: thread.cwd.clone(),
+                provider: ProviderId::Codex,
+                request_id: 9,
+            })
+            .unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(event @ EngineEvent::RateLimitsLoaded { .. }) = event_receiver.try_recv()
+                {
+                    break event;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("rate-limit event arrives");
+        match event {
+            EngineEvent::RateLimitsLoaded {
+                provider,
+                request_id,
+                info,
+                error,
+            } => {
+                assert_eq!(provider, ProviderId::Codex);
+                assert_eq!(request_id, 9);
+                assert!(error.is_none());
+                let info = info.expect("adapter returned a snapshot");
+                assert_eq!(info.plan_type.as_deref(), Some("plus"));
+                assert_eq!(info.primary.expect("primary").used_percent, 12);
             }
             _ => unreachable!(),
         }

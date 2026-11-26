@@ -807,6 +807,20 @@ impl BatonAdapter for CodexAdapter {
         Ok(models)
     }
 
+    async fn read_rate_limits(
+        &mut self,
+        auth_env: &[(String, String)],
+    ) -> Result<Option<crate::types::RateLimitInfo>> {
+        let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
+        self.lifecycle.starting("rate-limits");
+        let runtime = self.ensure_runtime(auth_env).await?;
+        self.ensure_initialized(&runtime).await?;
+        let response = self
+            .request(&runtime, "account/rateLimits/read", Value::Null)
+            .await?;
+        Ok(rate_limit_response_info(&response))
+    }
+
     async fn fork_session(&mut self, input: ForkSessionInput) -> Result<Option<String>> {
         let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
         self.lifecycle.starting("native-fork");
@@ -1110,6 +1124,17 @@ fn rate_limit_info(value: Option<&Value>) -> Option<crate::types::RateLimitInfo>
     .then_some(info)
 }
 
+/// The read response carries both a default snapshot and per-limit snapshots.
+/// Prefer the `codex` limit when present, then fall back to the default.
+fn rate_limit_response_info(response: &Value) -> Option<crate::types::RateLimitInfo> {
+    rate_limit_info(
+        response
+            .get("rateLimitsByLimitId")
+            .and_then(|limits| limits.get("codex")),
+    )
+    .or_else(|| rate_limit_info(response.get("rateLimits")))
+}
+
 #[cfg(test)]
 mod rate_limit_tests {
     use super::*;
@@ -1148,6 +1173,30 @@ mod rate_limit_tests {
         assert!(rate_limit_info(Some(&serde_json::json!({}))).is_none());
         let unknown = serde_json::json!({"primary": {"windowDurationMins": 300}});
         assert!(rate_limit_info(Some(&unknown)).is_none());
+    }
+
+    #[test]
+    fn a_rate_limit_read_prefers_the_codex_snapshot() {
+        let response = serde_json::json!({
+            "rateLimits": { "planType": "plus", "primary": { "usedPercent": 12 } },
+            "rateLimitsByLimitId": {
+                "codex": { "planType": "pro", "primary": { "usedPercent": 34 } }
+            }
+        });
+        let info = rate_limit_response_info(&response).expect("parsed");
+        assert_eq!(info.plan_type.as_deref(), Some("pro"));
+        assert_eq!(info.primary.expect("primary").used_percent, 34);
+    }
+
+    #[test]
+    fn a_rate_limit_read_falls_back_to_the_default_snapshot() {
+        let response = serde_json::json!({
+            "rateLimits": { "planType": "plus", "primary": { "usedPercent": 12 } },
+            "rateLimitsByLimitId": { "other": { "planType": "team" } }
+        });
+        let info = rate_limit_response_info(&response).expect("parsed");
+        assert_eq!(info.plan_type.as_deref(), Some("plus"));
+        assert_eq!(info.primary.expect("primary").used_percent, 12);
     }
 }
 

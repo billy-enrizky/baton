@@ -23,6 +23,9 @@ pub struct ThreadRow {
     pub session_mode: SessionMode,
     pub pinned: bool,
     pub pin_order_key: Option<String>,
+    /// Set together: when the snooze was requested and when it ends.
+    pub snoozed_at: Option<String>,
+    pub snoozed_until: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -534,6 +537,8 @@ fn ensure_thread_columns(db: &Connection) -> Result<()> {
     )?;
     ensure_column(db, "threads", "pinned", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(db, "threads", "pin_order_key", "TEXT")?;
+    ensure_column(db, "threads", "snoozed_at", "TEXT")?;
+    ensure_column(db, "threads", "snoozed_until", "TEXT")?;
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS threads_pin_order_idx ON threads(pin_order_key DESC) WHERE pin_order_key IS NOT NULL;
          CREATE INDEX IF NOT EXISTS threads_pin_backfill_idx ON threads(updated_at) WHERE pinned = 1 AND (pin_order_key IS NULL OR pin_order_key = '');",
@@ -716,6 +721,8 @@ fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
         session_mode: SessionMode::parse(&session_mode).unwrap_or(SessionMode::Single),
         pinned: row.get::<_, i64>(12)? != 0,
         pin_order_key: row.get(13)?,
+        snoozed_at: row.get(14)?,
+        snoozed_until: row.get(15)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
     })
@@ -770,7 +777,11 @@ fn map_orchestration_task(row: &rusqlite::Row) -> rusqlite::Result<Orchestration
     })
 }
 
-const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode, reasoning_effort, pinned, pin_order_key";
+const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode, reasoning_effort, pinned, pin_order_key, snoozed_at, snoozed_until";
+
+/// The same list with table aliases, for queries that join another table.
+/// Keep the order identical to `THREAD_COLUMNS`: `map_thread` reads positions.
+const THREAD_COLUMNS_ALIASED: &str = "t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode, t.reasoning_effort, t.pinned, t.pin_order_key, t.snoozed_at, t.snoozed_until";
 
 /// Per-project prompt history cap, Claude Code style.
 pub const PROMPT_HISTORY_LIMIT: i64 = 100;
@@ -835,6 +846,8 @@ impl BatonStore {
             session_mode,
             pinned: false,
             pin_order_key: None,
+            snoozed_at: None,
+            snoozed_until: None,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -1017,6 +1030,8 @@ impl BatonStore {
             session_mode: SessionMode::Single,
             pinned: false,
             pin_order_key: None,
+            snoozed_at: None,
+            snoozed_until: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -1128,6 +1143,31 @@ impl BatonStore {
             params![title, now_iso(), id],
         )?;
         Ok(())
+    }
+
+    /// Records a snooze in one write, so a thread never has one timestamp
+    /// without the other. The end time comes from `snooze::SnoozePreset`.
+    pub fn set_thread_snoozed(&self, id: &str, until: &str) -> Result<()> {
+        self.set_thread_snoozed_at(id, &now_iso(), until)
+    }
+
+    pub fn set_thread_snoozed_at(&self, id: &str, snoozed_at: &str, until: &str) -> Result<()> {
+        let changed = self.db.execute(
+            "UPDATE threads SET snoozed_at = ?, snoozed_until = ? WHERE id = ?",
+            params![snoozed_at, until, id],
+        )?;
+        if changed != 1 {
+            anyhow::bail!("thread {id} not found");
+        }
+        Ok(())
+    }
+
+    pub fn clear_thread_snooze(&self, id: &str) -> Result<bool> {
+        let changed = self.db.execute(
+            "UPDATE threads SET snoozed_at = NULL, snoozed_until = NULL WHERE id = ? AND (snoozed_at IS NOT NULL OR snoozed_until IS NOT NULL)",
+            params![id],
+        )?;
+        Ok(changed == 1)
     }
 
     pub fn set_thread_pinned(&self, id: &str, pinned: bool) -> Result<()> {
@@ -1735,7 +1775,9 @@ impl BatonStore {
     pub fn find_thread_by_native_session(&self, provider: ProviderId, native_session_id: &str) -> Result<Option<ThreadRow>> {
         self.db
             .query_row(
-                "SELECT t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode, t.reasoning_effort, t.pinned, t.pin_order_key FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?",
+                &format!(
+                    "SELECT {THREAD_COLUMNS_ALIASED} FROM threads t JOIN provider_sessions s ON s.thread_id = t.id WHERE s.provider = ? AND s.native_session_id = ?"
+                ),
                 params![provider.as_str(), native_session_id],
                 |row| {
                     let provider: String = row.get(3)?;
@@ -1756,6 +1798,8 @@ impl BatonStore {
                             .unwrap_or(SessionMode::Single),
                         pinned: row.get::<_, i64>(12)? != 0,
                         pin_order_key: row.get(13)?,
+                        snoozed_at: row.get(14)?,
+                        snoozed_until: row.get(15)?,
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
                     })

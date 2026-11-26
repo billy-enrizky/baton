@@ -396,6 +396,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | Command | What it does |
 |---|---|
 | `/threads`, `/open`, `/pin`, `/inbox` | List, open, pin, or triage threads |
+| `/snooze` | Hide this thread from `/inbox` for an hour, four hours, a day, a week, or clear the snooze with `off`; a new failure or question after the snooze wakes it early |
 | `/new`, `/fork`, `/worktree`, `/task` | Start a thread, fork one, or start from a git worktree or GitHub issue; `/task` without a number loads open issues and falls back to a clear notice when none can be read |
 | `/btw` | Open a side chat from this thread; the source thread is unchanged |
 | `/merge-back` | Append the side chat's new messages to its source as a redacted delta |

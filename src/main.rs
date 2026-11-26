@@ -735,6 +735,7 @@ fn main_result(started: Instant) -> Result<()> {
                         "permission_mode": thread.permission_mode.as_str(),
                         "pinned": thread.pinned,
                         "pin_order_key": thread.pin_order_key,
+                        "snoozed_until": thread.snoozed_until,
                         "goal": thread.goal,
                         "goal_paused": thread.goal_paused,
                         "phase": phase,

@@ -166,6 +166,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/threads", "list threads in this directory"),
     ("/pin", "pin, unpin, or move a pinned thread"),
+    (
+        "/snooze",
+        "hide this thread from the inbox: /snooze [1h|4h|tomorrow|week|off]",
+    ),
     ("/inbox", "all threads that need attention"),
     (
         "/questions",
@@ -357,15 +361,21 @@ struct ThreadChoice {
     title: String,
     status: String,
     pinned: bool,
+    /// `Some("14:32")` while a snooze is still running.
+    snoozed_until: Option<String>,
 }
 
 fn thread_choice(thread: ThreadRow, latest_phase: Option<TurnPhase>) -> ThreadChoice {
     let status = short_thread_status(latest_phase).to_string();
+    let now = chrono::Utc::now();
+    let snoozed_until = crate::snooze::active_until(thread.snoozed_until.as_deref(), now)
+        .map(|until| crate::snooze::wake_label(until, now));
     ThreadChoice {
         full_id: thread.id,
         title: thread.title,
         status,
         pinned: thread.pinned,
+        snoozed_until,
     }
 }
 
@@ -785,6 +795,9 @@ enum Overlay {
     RolesPicker {
         selected: usize,
         roles: Vec<crate::roles::RoleSpec>,
+    },
+    SnoozePicker {
+        selected: usize,
     },
     ThreadPicker {
         selected: usize,
@@ -3587,6 +3600,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/files", _) => Some("files [--ignored] [query] [:<line>]"),
         ("/grep", _) => Some("grep [--case|--case-sensitive] [--word] [--regex] <query>"),
         ("/pin", "move") => Some("pin move <id> up or down"),
+        ("/snooze", _) => Some("snooze [1h|4h|tomorrow|week|off]"),
         ("/review", _) => Some("review [turn]"),
         ("/diff", _) => Some("diff [turn]"),
         ("/rewind", _) => Some("rewind [--native]"),
@@ -3985,6 +3999,17 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 push_suggestion(&mut suggestions, command, &id, thread.title);
             }
         }
+        "/snooze" => {
+            for preset in crate::snooze::PRESETS {
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    preset.as_str(),
+                    format!("hide from the inbox {}", preset.label()),
+                );
+            }
+            push_suggestion(&mut suggestions, command, "off", "wake this thread now");
+        }
         "/pin" => {
             let threads = state
                 .store
@@ -4109,6 +4134,68 @@ fn move_pinned_thread(
         action: ThreadPickerAction::Pin,
     };
     Some(())
+}
+
+fn apply_snooze_command(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, value: Option<&str>) {
+    let thread_id = state.thread.id.clone();
+    let persisted = store
+        .lock()
+        .unwrap()
+        .get_thread(&thread_id)
+        .ok()
+        .flatten()
+        .is_some();
+    let Some(value) = value else {
+        if persisted {
+            state.overlay = Overlay::SnoozePicker { selected: 0 };
+        } else {
+            state.notice = Some("send a message before snoozing this thread".into());
+        }
+        return;
+    };
+    if value == "off" {
+        match store.lock().unwrap().clear_thread_snooze(&thread_id) {
+            Ok(true) => {
+                state.thread.snoozed_at = None;
+                state.thread.snoozed_until = None;
+                state.notice = Some("snooze cleared".into());
+            }
+            Ok(false) => state.notice = Some("this thread is not snoozed".into()),
+            Err(error) => state.notice = Some(format!("cannot clear snooze: {error}")),
+        }
+        return;
+    }
+    let preset = match crate::snooze::parse_preset(value) {
+        Ok(preset) => preset,
+        Err(error) => {
+            state.notice = Some(error.to_string());
+            return;
+        }
+    };
+    if !persisted {
+        state.notice = Some("send a message before snoozing this thread".into());
+        return;
+    }
+    let now = chrono::Utc::now();
+    let until = preset.until(now);
+    let stamp = until.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    // Finish the write before the read: a match on a lock guard keeps that
+    // guard alive for the whole arm, so nesting a second lock deadlocks.
+    let written = store.lock().unwrap().set_thread_snoozed(&thread_id, &stamp);
+    match written {
+        Ok(()) => {
+            if let Ok(Some(fresh)) = store.lock().unwrap().get_thread(&thread_id) {
+                state.thread.snoozed_at = fresh.snoozed_at;
+            }
+            state.thread.snoozed_until = Some(stamp);
+            state.notice = Some(format!(
+                "snoozed {} · until {}",
+                preset.label(),
+                crate::snooze::wake_label(until, now)
+            ));
+        }
+        Err(error) => state.notice = Some(format!("cannot snooze: {error}")),
+    }
 }
 
 fn perform_pin_move(
@@ -5479,6 +5566,38 @@ fn handle_key(
             }
             if keep {
                 state.overlay = Overlay::EffortPicker { selected };
+            }
+        }
+        Overlay::SnoozePicker { mut selected } => {
+            let choices: Vec<&str> = std::iter::once("off")
+                .chain(crate::snooze::PRESETS.iter().map(|preset| preset.as_str()))
+                .collect();
+            match key.code {
+                KeyCode::Esc => {
+                    state.overlay = Overlay::None;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    selected = (selected + choices.len() - 1) % choices.len();
+                    state.overlay = Overlay::SnoozePicker { selected };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    selected = (selected + 1) % choices.len();
+                    state.overlay = Overlay::SnoozePicker { selected };
+                }
+                KeyCode::Enter => {
+                    if let Some(value) = choices.get(selected) {
+                        handle_command(
+                            state,
+                            store,
+                            engine_command_sender,
+                            &format!("/snooze {value}"),
+                        );
+                    }
+                    state.overlay = Overlay::None;
+                }
+                _ => {
+                    state.overlay = Overlay::SnoozePicker { selected };
+                }
             }
         }
         Overlay::SwitchPicker { mut selected } => match key.code {
@@ -10424,6 +10543,13 @@ fn handle_command(
                 }
             }
         }
+        "/snooze" => {
+            if args.len() > 1 {
+                state.notice = Some("use /snooze [1h|4h|tomorrow|week|off]".into());
+            } else {
+                apply_snooze_command(state, store, args.first().map(String::as_str));
+            }
+        }
         "/inbox" => {
             let items = {
                 let guard = store.lock().unwrap();
@@ -11794,6 +11920,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                     + if *expanded { 4 } else { 0 }
             }
             Overlay::EffortPicker { .. } => 10,
+            Overlay::SnoozePicker { .. } => 9,
             Overlay::OrchestrationPreview { preview } => preview.plan.tasks.len().min(8) * 2 + 8,
             Overlay::HandoffPreview { .. } => 14,
         }
@@ -12015,6 +12142,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::EffortPicker { selected } => {
                 draw_effort_picker(frame, chunks[1], state, *selected)
+            }
+            Overlay::SnoozePicker { selected } => {
+                draw_snooze_picker(frame, chunks[1], state, *selected)
             }
             Overlay::OrchestrationPreview { preview } => {
                 draw_orchestration_preview(frame, chunks[1], state, preview)
@@ -13450,6 +13580,54 @@ fn draw_effort_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn draw_snooze_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, selected: usize) {
+    let now = chrono::Utc::now();
+    let active = crate::snooze::active_until(state.thread.snoozed_until.as_deref(), now);
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!("snooze · {} · enter apply · esc close", state.thread.title),
+        Style::default().fg(COLORS.muted),
+    )];
+    let choices: Vec<(&str, String)> = std::iter::once((
+        "off",
+        match active {
+            Some(until) => format!(
+                "wake now · currently until {}",
+                crate::snooze::wake_label(until, now)
+            ),
+            None => "wake now · not snoozed".to_string(),
+        },
+    ))
+    .chain(crate::snooze::PRESETS.iter().map(|preset| {
+        (
+            preset.as_str(),
+            format!(
+                "{} · until {}",
+                preset.label(),
+                crate::snooze::wake_label(preset.until(now), now)
+            ),
+        )
+    }))
+    .collect();
+    for (index, (value, description)) in choices.iter().enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        lines.push(Line::styled(
+            format!("{cursor} {value:<8} {description}"),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn is_agent_label(label: &str) -> bool {
     label.starts_with("Task ") || label.starts_with("Agent ")
 }
@@ -14318,11 +14496,15 @@ fn draw_thread_picker(
             Style::default().fg(COLORS.muted)
         };
         let pinned = if choice.pinned { "  pinned" } else { "" };
+        let snoozed = match choice.snoozed_until.as_deref() {
+            Some(until) => format!("  snoozed until {until}"),
+            None => String::new(),
+        };
         let cursor = if index == selected { "❯" } else { " " };
         lines.push(Line::styled(
             format!(
-                "{cursor} {}  {}  [{}]{}",
-                choice.full_id, choice.title, choice.status, pinned,
+                "{cursor} {}  {}  [{}]{}{}",
+                choice.full_id, choice.title, choice.status, pinned, snoozed,
             ),
             style,
         ));
@@ -17187,7 +17369,9 @@ mod tests {
         // Constant-backed commands: the completion must offer exactly what the
         // handler accepts, so a new provider, mode, or effort level cannot
         // appear in one place without the other.
-        for command in ["/switch", "/effort", "/mode", "/auth", "/login", "/multi"] {
+        for command in [
+            "/switch", "/effort", "/mode", "/auth", "/login", "/multi", "/snooze",
+        ] {
             state.input = format!("{command} ");
             let choices = first_args(&argument_suggestions(&state, command), command);
             let expected: Vec<String> = match command {
@@ -17199,6 +17383,14 @@ mod tests {
                     .iter()
                     .map(|v| v.to_string())
                     .collect(),
+                "/snooze" => {
+                    let mut values: Vec<String> = crate::snooze::PRESETS
+                        .iter()
+                        .map(|preset| preset.as_str().to_string())
+                        .collect();
+                    values.push("off".to_string());
+                    values
+                }
                 "/auth" => {
                     let mut providers: Vec<String> = auth_choices()
                         .map(|(provider, _)| provider.as_str().to_string())
@@ -23094,6 +23286,7 @@ mod tests {
                 title: other.title.clone(),
                 status: "new".to_string(),
                 pinned: false,
+                snoozed_until: None,
             }],
             action: ThreadPickerAction::Open,
         };
@@ -23303,6 +23496,7 @@ mod tests {
                 title: "fix login".to_string(),
                 status: "failed".to_string(),
                 pinned: true,
+                snoozed_until: None,
             }],
             action: ThreadPickerAction::Open,
         };
@@ -23311,6 +23505,145 @@ mod tests {
             text.contains("12345678-full  fix login  [failed]  pinned"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn snooze_picker_lists_every_preset_and_off() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/snooze");
+        assert!(matches!(
+            state.overlay,
+            Overlay::SnoozePicker { selected: 0 }
+        ));
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        for value in ["off", "1h", "4h", "tomorrow", "week"] {
+            assert!(text.contains(value), "the picker omits {value}: {text}");
+        }
+        assert!(text.contains("snooze · test"), "{text}");
+        assert!(text.contains("enter apply"), "{text}");
+        assert!(text.contains("wake now"), "{text}");
+    }
+
+    #[test]
+    fn snooze_command_persists_and_clears() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/snooze 1h");
+        let notice = state.notice.clone().expect("a notice");
+        assert!(notice.starts_with("snoozed in 1 hour · until "), "{notice}");
+        let stored = store
+            .lock()
+            .unwrap()
+            .get_thread(&thread_id)
+            .unwrap()
+            .unwrap();
+        let until = stored.snoozed_until.expect("stored until");
+        assert!(crate::snooze::parse_timestamp(&until).is_some(), "{until}");
+        assert!(stored.snoozed_at.is_some());
+        assert_eq!(state.thread.snoozed_until.as_deref(), Some(until.as_str()));
+
+        handle_command(&mut state, &store, &engine_command_sender, "/snooze off");
+        assert_eq!(state.notice.as_deref(), Some("snooze cleared"));
+        let stored = store
+            .lock()
+            .unwrap()
+            .get_thread(&thread_id)
+            .unwrap()
+            .unwrap();
+        assert!(stored.snoozed_until.is_none());
+        assert!(state.thread.snoozed_until.is_none());
+
+        handle_command(&mut state, &store, &engine_command_sender, "/snooze off");
+        assert_eq!(state.notice.as_deref(), Some("this thread is not snoozed"));
+        handle_command(&mut state, &store, &engine_command_sender, "/snooze 3h");
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("use 1h, 4h, tomorrow, week, or off"),
+            "{:?}",
+            state.notice
+        );
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/snooze 1h extra",
+        );
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("use /snooze [1h|4h|tomorrow|week|off]")
+        );
+    }
+
+    #[test]
+    fn a_draft_thread_cannot_be_snoozed() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let draft = store.lock().unwrap().draft_thread(NewThread {
+            title: "draft".to_string(),
+            cwd: state.thread.cwd.clone(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        });
+        state.thread = draft;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/snooze");
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("send a message before snoozing this thread")
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        handle_command(&mut state, &store, &engine_command_sender, "/snooze 1h");
+        assert_eq!(
+            state.notice.as_deref(),
+            Some("send a message before snoozing this thread")
+        );
+    }
+
+    #[test]
+    fn thread_picker_marks_a_snoozed_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "later".to_string(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let until = (chrono::Utc::now() + chrono::Duration::hours(2))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        store
+            .lock()
+            .unwrap()
+            .set_thread_snoozed(&other.id, &until)
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .set_thread_pinned(&other.id, true)
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/threads");
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(
+            text.contains("snoozed until"),
+            "the thread picker hides the snooze: {text}"
+        );
+        assert!(text.contains("later"), "{text}");
     }
 
     #[test]
@@ -23423,6 +23756,7 @@ mod tests {
                     title: format!("thread {index}"),
                     status: "ready".to_string(),
                     pinned: false,
+                    snoozed_until: None,
                 })
                 .collect(),
             action: ThreadPickerAction::Pin,

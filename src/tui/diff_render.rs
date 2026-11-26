@@ -6,15 +6,12 @@
 //! (openai/codex, Apache-2.0), simplified for baton: no syntax
 //! highlighting and the dark palette only, since baton's theme is dark.
 
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::rc::Rc;
 
 use super::COLORS;
 
-/// Muted tinted row backgrounds, dark palette (codex `#213A2B` / `#4A221D`).
-const ADD_LINE_BG: Color = Color::Rgb(33, 58, 43);
-const DEL_LINE_BG: Color = Color::Rgb(74, 34, 29);
 const TAB_REPLACEMENT: &str = "    ";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -290,8 +287,8 @@ pub fn render_diff_lines(diff: &str, width: usize) -> Vec<Line<'static>> {
             }
             for row in &hunk.rows {
                 let (line_bg, content_fg) = match row.kind {
-                    DiffLineKind::Insert => (Some(ADD_LINE_BG), COLORS.success),
-                    DiffLineKind::Delete => (Some(DEL_LINE_BG), COLORS.error),
+                    DiffLineKind::Insert => (Some(COLORS.diff_add_bg), COLORS.success),
+                    DiffLineKind::Delete => (Some(COLORS.diff_del_bg), COLORS.error),
                     DiffLineKind::Context => (None, COLORS.text),
                 };
                 let sign = match row.kind {
@@ -384,12 +381,12 @@ mod tests {
     fn added_rows_carry_green_text_on_tinted_background() {
         let lines = render_diff_lines(SAMPLE, 80);
         let added = &lines[3];
-        assert_eq!(added.style.bg, Some(ADD_LINE_BG));
+        assert_eq!(added.style.bg, Some(COLORS.diff_add_bg));
         let sign = &added.spans[1];
         assert_eq!(sign.content, "+");
         assert_eq!(sign.style.fg, Some(COLORS.success));
         let removed = &lines[2];
-        assert_eq!(removed.style.bg, Some(DEL_LINE_BG));
+        assert_eq!(removed.style.bg, Some(COLORS.diff_del_bg));
         assert_eq!(removed.spans[1].style.fg, Some(COLORS.error));
     }
 

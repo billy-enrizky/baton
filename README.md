@@ -743,7 +743,7 @@ Baton reads Claude settings, Codex config, and the OpenCode model setting. A key
 
 ### 13.6 Terminal capabilities
 
-Baton sizes the interface from the terminal and redraws when it resizes. Set `NO_COLOR` to any non-empty value, or run with `TERM=dumb`, to draw without palette colors. Selections and the composer caret switch to reverse video so they stay visible, and bold and underline still work. The interface needs an interactive terminal: when stdin or stdout is not one, Baton exits with a message and points to `baton exec` for scripts and pipes.
+Baton sizes the interface from the terminal and redraws when it resizes. It uses RGB colors only when `COLORTERM` is `truecolor` or `24bit`, or when `TERM` contains `direct`. A term that advertises `256color` without `direct` gets the nearest xterm-256 color, and every other term gets a 16-color palette picked by role, so the accent stays yellow and errors stay red instead of everything collapsing into gray. Set `NO_COLOR` to any non-empty value, or run with `TERM=dumb`, to draw without palette colors; selections and the composer caret switch to reverse video so they stay visible, and bold and underline still work. The interface needs an interactive terminal: when stdin or stdout is not one, Baton exits with a message and points to `baton exec` for scripts and pipes.
 
 ## 14. Safety and recovery
 

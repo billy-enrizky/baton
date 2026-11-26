@@ -36,7 +36,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |
 | Native rewind | CLI | `baton rewind --native` truncates Codex or OpenCode history and keeps the session |
-| Diff expansion | TUI | a diff longer than twelve rows collapses with `… N more lines · ctrl+t expand`; Ctrl+T expands every long diff inline and swaps the hint to `ctrl+t collapse`; short diffs are unchanged; `scripts/diff_expand_probe.py` proves the collapse, expand, and recollapse in the real TUI against a turn-written diff |
+| Diff expansion | TUI | a diff longer than twelve rows collapses with `… N more lines · ctrl+t expand`; a multi-file diff keeps every path and its counts, spilling to `… N more files` only when paths alone fill the rows; Ctrl+T expands every long diff inline and swaps the hint to `ctrl+t collapse`; short diffs are unchanged; `scripts/diff_expand_probe.py` proves the collapse, expand, and recollapse in the real TUI against a two-file turn-written diff |
 | Review | TUI | `/review` shows the turn diff, `/` finds text or a path, saves a line note, and leaves it unsent |
 | TUI native rewind | TUI | `/rewind --native` truncates the provider and store history and prefills the message |
 | Retry | TUI | `/retry` lists failed or unverified turns and submits the chosen prompt as a new turn |

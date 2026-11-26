@@ -915,8 +915,6 @@ const FILES_PICKER_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_SUGGESTIONS: usize = 8;
 const FILE_REF_DIRECTORY_SUGGESTIONS: usize = 4;
-/// Inline diff rows before Ctrl+T expands the rest.
-const DIFF_PREVIEW_ROWS: usize = 12;
 const GREP_PICKER_LIMIT: usize = 200;
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -15230,7 +15228,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
                 .diff_cache
                 .borrow_mut()
                 .render(&message.text, width.saturating_sub(2));
-            let clipped = rendered.len() > DIFF_PREVIEW_ROWS;
+            let clipped = rendered.len() > diff_render::PREVIEW_ROWS;
             if state.expand_diffs || !clipped {
                 all_lines.extend(rendered.iter().cloned());
                 if state.expand_diffs && clipped {
@@ -15240,11 +15238,15 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
                     ));
                 }
             } else {
-                all_lines.extend(rendered.iter().take(DIFF_PREVIEW_ROWS).cloned());
+                let preview = state
+                    .diff_cache
+                    .borrow_mut()
+                    .preview(&message.text, width.saturating_sub(2));
+                all_lines.extend(preview.iter().cloned());
                 all_lines.push(Line::styled(
                     format!(
                         "… {} more lines · ctrl+t expand",
-                        rendered.len() - DIFF_PREVIEW_ROWS
+                        rendered.len().saturating_sub(preview.len())
                     ),
                     Style::default().fg(COLORS.muted),
                 ));
@@ -21944,6 +21946,62 @@ mod tests {
         let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
         assert!(text.contains("ctrl+t expand"), "{text}");
         assert!(!text.contains("line-15"), "{text}");
+    }
+
+    #[test]
+    fn a_collapsed_multi_file_diff_names_every_file() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let mut diff = String::new();
+        for (name, prefix) in [
+            ("alpha.rs", "alpha"),
+            ("beta.rs", "beta"),
+            ("gamma.rs", "gamma"),
+        ] {
+            diff.push_str(&format!(
+                "diff --git a/{name} b/{name}\n--- a/{name}\n+++ b/{name}\n@@ -1,6 +1,14 @@\n"
+            ));
+            for index in 0..6 {
+                diff.push_str(&format!("-{prefix}-old-{index}\n"));
+            }
+            for index in 0..14 {
+                diff.push_str(&format!("+{prefix}-new-{index}\n"));
+            }
+        }
+        state.history = vec![MessageRow {
+            id: 92,
+            thread_id: state.thread.id.clone(),
+            turn: 1,
+            role: "diff".to_string(),
+            provider: None,
+            model: None,
+            text: diff,
+            created_at: String::new(),
+        }];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let text = buffer_lines(&render_state(&state, 120, 60)).join("\n");
+        assert!(text.contains("ctrl+t expand"), "{text}");
+        for name in ["alpha.rs", "beta.rs", "gamma.rs"] {
+            assert!(
+                text.contains(name),
+                "the collapsed preview dropped {name}: {text}"
+            );
+        }
+        assert!(
+            !text.contains("gamma-new-13"),
+            "the collapsed preview should stop at the row cap: {text}"
+        );
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        let text = buffer_lines(&render_state(&state, 120, 60)).join("\n");
+        assert!(text.contains("gamma-new-13"), "{text}");
+        assert!(text.contains("ctrl+t collapse"), "{text}");
     }
 
     #[test]

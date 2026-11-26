@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::store::{BatonStore, HostClaimAttempt, HostClaimRow};
 
-const LOCK_WAIT: Duration = Duration::from_secs(5);
+pub(crate) const LOCK_WAIT: Duration = Duration::from_secs(5);
 const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 pub trait ProcessProbe {
@@ -66,6 +66,9 @@ pub fn acquire(
     probe: &dyn ProcessProbe,
 ) -> Result<ClaimOutcome> {
     uuid::Uuid::parse_str(host_id).context("host id must be a UUID")?;
+    if store.host_id() != Some(host_id) {
+        anyhow::bail!("host store must be opened with open_hosted and the same host id");
+    }
     let installation_id = ensure_installation_id(home)?;
     let _lock = match acquire_write_lock(home, LOCK_WAIT)? {
         LockAttempt::Acquired(lock) => lock,
@@ -217,14 +220,14 @@ fn open_private_read(path: &Path) -> std::io::Result<File> {
 }
 
 #[allow(dead_code)]
-enum LockAttempt {
+pub(crate) enum LockAttempt {
     Acquired(WriteLock),
     Busy,
     Unsupported,
 }
 
 #[cfg(unix)]
-struct WriteLock {
+pub(crate) struct WriteLock {
     file: File,
 }
 
@@ -239,9 +242,9 @@ impl Drop for WriteLock {
 }
 
 #[cfg(not(unix))]
-struct WriteLock;
+pub(crate) struct WriteLock;
 
-fn acquire_write_lock(home: &Path, timeout: Duration) -> Result<LockAttempt> {
+pub(crate) fn acquire_write_lock(home: &Path, timeout: Duration) -> Result<LockAttempt> {
     create_private_dir(home)?;
     #[cfg(unix)]
     {
@@ -323,12 +326,13 @@ mod tests {
         uuid::Uuid::new_v4().to_string()
     }
 
+    #[cfg(unix)]
     #[test]
     fn claim_writes_the_row_and_installation_id() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BatonStore::open(&dir.path().join("baton.sqlite")).unwrap();
         let id = host_id();
-        let probe = FakeProbe::new().live(std::process::id(), "host-start");
+        let store = BatonStore::open_hosted(&dir.path().join("baton.sqlite"), &id).unwrap();
+        let probe = SystemProbe;
         let outcome = acquire(&store, dir.path(), &id, &probe).unwrap();
         let claim = match outcome {
             ClaimOutcome::Claimed(claim) => claim,
@@ -336,7 +340,10 @@ mod tests {
         };
         assert_eq!(claim.host_id, id);
         assert_eq!(claim.pid, std::process::id());
-        assert_eq!(claim.process_start, "host-start");
+        assert_eq!(
+            claim.process_start,
+            crate::process::process_start(std::process::id()).unwrap()
+        );
         assert_eq!(claim.kind, "serve");
         let installation_id = ensure_installation_id(dir.path()).unwrap();
         assert_eq!(claim.installation_id, installation_id);
@@ -367,15 +374,16 @@ mod tests {
     fn a_live_claim_refuses_a_second_host() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("baton.sqlite");
-        let first = BatonStore::open(&path).unwrap();
-        let second = BatonStore::open(&path).unwrap();
         let id = host_id();
+        let first = BatonStore::open_hosted(&path, &id).unwrap();
+        let second_id = host_id();
+        let second = BatonStore::open_hosted(&path, &second_id).unwrap();
         let probe = FakeProbe::new().live(std::process::id(), "host-start");
         assert!(matches!(
             acquire(&first, dir.path(), &id, &probe).unwrap(),
             ClaimOutcome::Claimed(_)
         ));
-        let refused = match acquire(&second, dir.path(), &host_id(), &probe).unwrap() {
+        let refused = match acquire(&second, dir.path(), &second_id, &probe).unwrap() {
             ClaimOutcome::Refused(refusal) => refusal,
             other => panic!("expected refusal, got {other:?}"),
         };
@@ -387,16 +395,18 @@ mod tests {
     #[test]
     fn a_stale_claim_is_replaced() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BatonStore::open(&dir.path().join("baton.sqlite")).unwrap();
+        let path = dir.path().join("baton.sqlite");
         let first = host_id();
+        let first_store = BatonStore::open_hosted(&path, &first).unwrap();
         let first_probe = FakeProbe::new().live(std::process::id(), "old-start");
         assert!(matches!(
-            acquire(&store, dir.path(), &first, &first_probe).unwrap(),
+            acquire(&first_store, dir.path(), &first, &first_probe).unwrap(),
             ClaimOutcome::Claimed(_)
         ));
         let second = host_id();
+        let second_store = BatonStore::open_hosted(&path, &second).unwrap();
         let second_probe = FakeProbe::new().live(std::process::id(), "new-start");
-        let claim = match acquire(&store, dir.path(), &second, &second_probe).unwrap() {
+        let claim = match acquire(&second_store, dir.path(), &second, &second_probe).unwrap() {
             ClaimOutcome::Claimed(claim) => claim,
             other => panic!("expected replacement claim, got {other:?}"),
         };
@@ -408,8 +418,11 @@ mod tests {
     #[test]
     fn a_live_local_turn_blocks_the_claim() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BatonStore::open(&dir.path().join("baton.sqlite")).unwrap();
-        let thread = store
+        let id = host_id();
+        let path = dir.path().join("baton.sqlite");
+        let setup = BatonStore::open(&path).unwrap();
+        let host = BatonStore::open_hosted(&path, &id).unwrap();
+        let thread = setup
             .create_thread(NewThread {
                 title: "local work".into(),
                 cwd: "/work".into(),
@@ -417,23 +430,23 @@ mod tests {
                 current_model: None,
             })
             .unwrap();
-        store
+        setup
             .start_turn_record(&thread.id, 1, ProviderId::Codex, None)
             .unwrap();
         let actual_start = crate::process::process_start(std::process::id()).unwrap();
         let probe = FakeProbe::new()
             .live(std::process::id(), "host-start")
             .live(std::process::id(), &actual_start);
-        let refused = match acquire(&store, dir.path(), &host_id(), &probe).unwrap() {
+        let refused = match acquire(&host, dir.path(), &id, &probe).unwrap() {
             ClaimOutcome::Refused(refusal) => refusal,
             other => panic!("expected refusal, got {other:?}"),
         };
         assert_eq!(refused.code, "open_work");
-        store
+        setup
             .finish_turn_record(&thread.id, 1, crate::types::TurnPhase::Completed, None)
             .unwrap();
         assert!(matches!(
-            acquire(&store, dir.path(), &host_id(), &probe).unwrap(),
+            acquire(&host, dir.path(), &id, &probe).unwrap(),
             ClaimOutcome::Claimed(_)
         ));
     }
@@ -441,8 +454,9 @@ mod tests {
     #[test]
     fn a_claim_without_a_readable_start_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let store = BatonStore::open(&dir.path().join("baton.sqlite")).unwrap();
-        let refused = match acquire(&store, dir.path(), &host_id(), &FakeProbe::new()).unwrap() {
+        let id = host_id();
+        let store = BatonStore::open_hosted(&dir.path().join("baton.sqlite"), &id).unwrap();
+        let refused = match acquire(&store, dir.path(), &id, &FakeProbe::new()).unwrap() {
             ClaimOutcome::Refused(refusal) => refusal,
             other => panic!("expected refusal, got {other:?}"),
         };

@@ -6,7 +6,8 @@ use rusqlite::{
 };
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::ops::Deref;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::types::{PermissionMode, ProviderId, SessionMode, TurnPhase, TurnUsage};
@@ -87,6 +88,30 @@ pub enum HostClaimAttempt {
     Owned { pid: u32, process_start: String },
     OpenWork { pid: u32 },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NotTheHost {
+    pub owner_pid: Option<u32>,
+    pub host_id: Option<String>,
+}
+
+impl fmt::Display for NotTheHost {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.owner_pid, self.host_id.as_deref()) {
+            (Some(pid), Some(host_id)) => formatter.write_str(&format!(
+                "not_the_host: the store is claimed by pid {pid} as host {host_id}"
+            )),
+            (Some(pid), None) => {
+                formatter.write_str(&format!("not_the_host: the store is claimed by pid {pid}"))
+            }
+            (None, _) => {
+                formatter.write_str("not_the_host: this store no longer has a live host claim")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NotTheHost {}
 
 #[derive(Debug, Clone)]
 pub struct RetryableTurnRow {
@@ -323,10 +348,38 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn store_home(path: &Path) -> Option<PathBuf> {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+}
+
 pub const SCHEMA_VERSION: i64 = 2;
 
 pub struct BatonStore {
     db: Connection,
+    home: Option<PathBuf>,
+    host_id: Option<String>,
+}
+
+pub(crate) struct WriteGuard<'a> {
+    tx: Transaction<'a>,
+    _lock: Option<crate::claim::WriteLock>,
+}
+
+impl Deref for WriteGuard<'_> {
+    type Target = Connection;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tx
+    }
+}
+
+impl WriteGuard<'_> {
+    fn commit(self) -> Result<()> {
+        self.tx.commit()?;
+        Ok(())
+    }
 }
 
 const MIGRATIONS: &str = r#"
@@ -874,7 +927,23 @@ impl BatonStore {
         db.busy_timeout(std::time::Duration::from_secs(5))?;
         db.pragma_update(None, "journal_mode", "WAL")?;
         apply_schema(&db)?;
-        Ok(BatonStore { db })
+        Ok(BatonStore {
+            db,
+            home: store_home(path),
+            host_id: None,
+        })
+    }
+
+    /// Opens the writable store as a host generation. Every write must match a
+    /// live claim carrying this id. Claiming itself uses the untracked row path.
+    pub fn open_hosted(path: &Path, host_id: &str) -> Result<BatonStore> {
+        let mut store = Self::open(path)?;
+        store.host_id = Some(host_id.to_string());
+        Ok(store)
+    }
+
+    pub fn host_id(&self) -> Option<&str> {
+        self.host_id.as_deref()
     }
 
     /// Open an existing store without running schema migration or taking a
@@ -895,13 +964,67 @@ impl BatonStore {
             );
         }
         db.pragma_update(None, "query_only", true)?;
-        Ok(BatonStore { db })
+        Ok(BatonStore {
+            db,
+            home: store_home(path),
+            host_id: None,
+        })
     }
 
     pub fn memory() -> Result<BatonStore> {
         let db = Connection::open_in_memory()?;
         apply_schema(&db)?;
-        Ok(BatonStore { db })
+        Ok(BatonStore {
+            db,
+            home: None,
+            host_id: None,
+        })
+    }
+
+    fn write(&self) -> Result<WriteGuard<'_>> {
+        let lock = if let Some(home) = self.home.as_deref() {
+            match crate::claim::acquire_write_lock(home, crate::claim::LOCK_WAIT)? {
+                crate::claim::LockAttempt::Acquired(lock) => Some(lock),
+                crate::claim::LockAttempt::Busy => {
+                    anyhow::bail!("write_lock_busy: another Baton process is writing")
+                }
+                crate::claim::LockAttempt::Unsupported => None,
+            }
+        } else {
+            None
+        };
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        self.ensure_write_fence(&tx)?;
+        Ok(WriteGuard { tx, _lock: lock })
+    }
+
+    fn write_execute(&self, sql: &str, params: impl rusqlite::Params) -> Result<usize> {
+        let write = self.write()?;
+        let changed = write.execute(sql, params)?;
+        write.commit()?;
+        Ok(changed)
+    }
+
+    fn ensure_write_fence(&self, db: &Connection) -> Result<()> {
+        let claim = Self::get_host_claim_from(db)?;
+        let live = claim.and_then(|claim| {
+            crate::process::process_identity_alive(claim.pid, Some(&claim.process_start))
+                .then_some(claim)
+        });
+        match (self.host_id.as_deref(), live.as_ref()) {
+            (Some(expected), Some(claim)) if claim.host_id == expected => Ok(()),
+            (Some(_), claim) => Err(NotTheHost {
+                owner_pid: claim.map(|claim| claim.pid),
+                host_id: claim.map(|claim| claim.host_id.clone()),
+            }
+            .into()),
+            (None, Some(claim)) => Err(NotTheHost {
+                owner_pid: Some(claim.pid),
+                host_id: Some(claim.host_id.clone()),
+            }
+            .into()),
+            (None, None) => Ok(()),
+        }
     }
 
     pub fn create_thread(&self, input: NewThread) -> Result<ThreadRow> {
@@ -927,7 +1050,7 @@ impl BatonStore {
         session_mode: SessionMode,
     ) -> Result<ThreadRow> {
         let now = now_iso();
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO threads (id, title, cwd, current_provider, current_model, permission_mode, goal, goal_paused, session_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 'default', NULL, 0, ?, ?, ?)",
             params![id, input.title, input.cwd, input.current_provider.as_str(), input.current_model, session_mode.as_str(), now, now],
         )?;
@@ -1023,7 +1146,7 @@ impl BatonStore {
         }
         let id = Uuid::new_v4().to_string();
         let now = now_iso();
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write()?;
         tx.execute(
             "INSERT INTO threads (id, title, cwd, current_provider, current_model, reasoning_effort, permission_mode, goal, goal_paused, session_mode, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
@@ -1078,7 +1201,7 @@ impl BatonStore {
 
     /// Marks a forked thread as a side chat without changing the source.
     pub fn mark_side_chat(&self, thread_id: &str, source_thread_id: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "INSERT OR REPLACE INTO side_chats (thread_id, source_thread_id, created_at) VALUES (?, ?, ?)",
             params![thread_id, source_thread_id, now_iso()],
         )?;
@@ -1274,7 +1397,7 @@ impl BatonStore {
     }
 
     pub fn rename_thread(&self, id: &str, title: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET title = ?, updated_at = ? WHERE id = ?",
             params![title, now_iso(), id],
         )?;
@@ -1288,7 +1411,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_snoozed_at(&self, id: &str, snoozed_at: &str, until: &str) -> Result<()> {
-        let changed = self.db.execute(
+        let changed = self.write_execute(
             "UPDATE threads SET snoozed_at = ?, snoozed_until = ? WHERE id = ?",
             params![snoozed_at, until, id],
         )?;
@@ -1305,7 +1428,7 @@ impl BatonStore {
         provider: ProviderId,
         info: &crate::types::RateLimitInfo,
     ) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO provider_rate_limits (provider, info, updated_at) VALUES (?, ?, ?)
              ON CONFLICT(provider) DO UPDATE SET info = excluded.info, updated_at = excluded.updated_at",
             params![provider.as_str(), serde_json::to_string(info)?, now_iso()],
@@ -1338,7 +1461,7 @@ impl BatonStore {
     /// the write share one immediate transaction, so two processes cannot both
     /// see an idle thread and archive it mid-turn.
     pub fn archive_thread(&self, id: &str) -> Result<ArchiveOutcome> {
-        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let archived_at: Option<Option<String>> = transaction
             .query_row(
                 "SELECT archived_at FROM threads WHERE id = ?",
@@ -1371,7 +1494,7 @@ impl BatonStore {
     }
 
     pub fn unarchive_thread(&self, id: &str) -> Result<ArchiveOutcome> {
-        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let archived_at: Option<Option<String>> = transaction
             .query_row(
                 "SELECT archived_at FROM threads WHERE id = ?",
@@ -1395,7 +1518,7 @@ impl BatonStore {
     }
 
     pub fn clear_thread_snooze(&self, id: &str) -> Result<bool> {
-        let changed = self.db.execute(
+        let changed = self.write_execute(
             "UPDATE threads SET snoozed_at = NULL, snoozed_until = NULL WHERE id = ? AND (snoozed_at IS NOT NULL OR snoozed_until IS NOT NULL)",
             params![id],
         )?;
@@ -1403,7 +1526,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_pinned(&self, id: &str, pinned: bool) -> Result<()> {
-        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         if pinned {
             let key = self.next_pin_order_key()?;
             let changed = transaction.execute(
@@ -1431,7 +1554,7 @@ impl BatonStore {
             .into_iter()
             .map(|candidate| candidate.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let transaction = self.write()?;
         let thread = match self.get_thread(id)? {
             Some(thread) => thread,
             None => return Ok(PinMoveOutcome::NotFound),
@@ -1501,7 +1624,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_cwd(&self, id: &str, cwd: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET cwd = ?, updated_at = ? WHERE id = ?",
             params![cwd, now_iso(), id],
         )?;
@@ -1509,7 +1632,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_session_mode(&self, id: &str, mode: SessionMode) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET session_mode = ?, updated_at = ? WHERE id = ?",
             params![mode.as_str(), now_iso(), id],
         )?;
@@ -1517,7 +1640,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_title(&self, id: &str, title: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET title = ?, updated_at = ? WHERE id = ?",
             params![title, now_iso(), id],
         )?;
@@ -1525,7 +1648,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_provider(&self, id: &str, provider: ProviderId, model: Option<String>) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET current_provider = ?, current_model = ?, updated_at = ? WHERE id = ?",
             params![provider.as_str(), model, now_iso(), id],
         )?;
@@ -1533,7 +1656,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_model(&self, id: &str, model: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET current_model = ?, updated_at = ? WHERE id = ?",
             params![model, now_iso(), id],
         )?;
@@ -1541,7 +1664,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_effort(&self, id: &str, effort: Option<&str>) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET reasoning_effort = ?, updated_at = ? WHERE id = ?",
             params![effort, now_iso(), id],
         )?;
@@ -1549,7 +1672,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_permission_mode(&self, id: &str, mode: PermissionMode) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET permission_mode = ?, updated_at = ? WHERE id = ?",
             params![mode.as_str(), now_iso(), id],
         )?;
@@ -1557,7 +1680,7 @@ impl BatonStore {
     }
 
     pub fn set_thread_goal(&self, id: &str, goal: Option<&str>, paused: bool) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET goal = ?, goal_paused = ?, updated_at = ? WHERE id = ?",
             params![goal, if paused { 1 } else { 0 }, now_iso(), id],
         )?;
@@ -1578,11 +1701,11 @@ impl BatonStore {
         if latest.as_deref() == Some(text) {
             return Ok(());
         }
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO prompt_history (cwd, text, created_at) VALUES (?, ?, ?)",
             params![cwd, text, now_iso()],
         )?;
-        self.db.execute(
+        self.write_execute(
             "DELETE FROM prompt_history WHERE cwd = ? AND id NOT IN (
                  SELECT id FROM prompt_history WHERE cwd = ? ORDER BY id DESC LIMIT ?
              )",
@@ -1614,7 +1737,7 @@ impl BatonStore {
         if count >= MEMORY_SCOPE_LIMIT {
             anyhow::bail!("memory limit reached ({MEMORY_SCOPE_LIMIT}); remove one first");
         }
-        self.db.execute(
+        self.write_execute(
             "INSERT OR IGNORE INTO memories (scope, cwd, text, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?)",
             params![scope, cwd, text, now_iso(), now_iso()],
@@ -1655,7 +1778,7 @@ impl BatonStore {
     /// the table keeps only the most recent `RECENT_FILE_LIMIT` paths per project.
     pub fn record_recent_file(&self, project_path: &str, path: &str) -> Result<()> {
         let picked_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-        let transaction = self.db.unchecked_transaction()?;
+        let transaction = self.write()?;
         let seq: i64 = transaction.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM recent_files WHERE project_path = ?1",
             params![project_path],
@@ -1711,7 +1834,7 @@ impl BatonStore {
         let mut removed = 0;
         for project_path in project_paths {
             if !Path::new(&project_path).is_dir() {
-                removed += self.db.execute(
+                removed += self.write_execute(
                     "DELETE FROM recent_files WHERE project_path = ?",
                     params![project_path],
                 )?;
@@ -1743,7 +1866,7 @@ impl BatonStore {
 
     /// Removes a memory only when it is global or belongs to this project.
     pub fn remove_memory(&self, cwd: &str, id: i64) -> Result<bool> {
-        let changed = self.db.execute(
+        let changed = self.write_execute(
             "DELETE FROM memories WHERE id = ? AND (scope = 'global' OR cwd = ?)",
             params![id, cwd],
         )?;
@@ -1753,9 +1876,9 @@ impl BatonStore {
     /// Clears either the project memories for this cwd or every global memory.
     pub fn clear_memories(&self, cwd: &str, global: bool) -> Result<usize> {
         let changed = if global {
-            self.db.execute("DELETE FROM memories WHERE scope = 'global'", [])?
+            self.write_execute("DELETE FROM memories WHERE scope = 'global'", [])?
         } else {
-            self.db.execute(
+            self.write_execute(
                 "DELETE FROM memories WHERE scope = 'project' AND cwd = ?",
                 params![cwd],
             )?
@@ -1787,7 +1910,7 @@ impl BatonStore {
         body: &str,
         diff_fingerprint: &str,
     ) -> Result<i64> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO review_notes (thread_id, turn, path, line, added, body, diff_fingerprint, created_at, sent_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL)",
             params![thread_id, turn, path, line as i64, if added { 1 } else { 0 }, body, diff_fingerprint, now_iso()],
         )?;
@@ -1820,7 +1943,7 @@ impl BatonStore {
             return Ok(());
         }
         let sent_at = now_iso();
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write()?;
         for id in ids {
             tx.execute(
                 "UPDATE review_notes SET sent_at = ? WHERE thread_id = ? AND id = ? AND sent_at IS NULL",
@@ -1835,7 +1958,7 @@ impl BatonStore {
         if ids.is_empty() {
             return Ok(());
         }
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write()?;
         for id in ids {
             tx.execute(
                 "DELETE FROM review_notes WHERE thread_id = ? AND id = ?",
@@ -1847,7 +1970,7 @@ impl BatonStore {
     }
 
     fn touch_thread(&self, id: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE threads SET updated_at = ? WHERE id = ?",
             params![now_iso(), id],
         )?;
@@ -1863,7 +1986,7 @@ impl BatonStore {
         rollout_path: Option<String>,
     ) -> Result<()> {
         let provider = provider.into();
-        self.db.execute(
+        self.write_execute(
             r#"INSERT INTO provider_sessions (thread_id, provider, native_session_id, model, rollout_path, updated_at)
                VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT (thread_id, provider) DO UPDATE SET
@@ -1884,7 +2007,7 @@ impl BatonStore {
         turn: i64,
     ) -> Result<()> {
         let provider = provider.into();
-        self.db.execute(
+        self.write_execute(
             "UPDATE provider_sessions SET covered_turn = MAX(covered_turn, ?) WHERE thread_id = ? AND provider = ?",
             params![turn, thread_id, provider.as_str()],
         )?;
@@ -1920,7 +2043,7 @@ impl BatonStore {
 
     pub fn save_plan(&self, thread_id: &str, plan: &StoredPlan) -> Result<()> {
         let entries = serde_json::to_string(&plan.entries)?;
-        self.db.execute(
+        self.write_execute(
             r#"INSERT INTO plans (thread_id, provider, plan_id, turn_id, entries, explanation, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (thread_id, provider) DO UPDATE SET
@@ -1943,7 +2066,7 @@ impl BatonStore {
     }
 
     pub fn remove_plan(&self, thread_id: &str, provider: ProviderId) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "DELETE FROM plans WHERE thread_id = ? AND provider = ?",
             params![thread_id, provider.as_str()],
         )?;
@@ -1951,8 +2074,10 @@ impl BatonStore {
     }
 
     pub fn remove_plans_for_thread(&self, thread_id: &str) -> Result<()> {
-        self.db
-            .execute("DELETE FROM plans WHERE thread_id = ?", params![thread_id])?;
+        self.write_execute(
+            "DELETE FROM plans WHERE thread_id = ?",
+            params![thread_id],
+        )?;
         Ok(())
     }
 
@@ -2083,7 +2208,7 @@ impl BatonStore {
         let pid = std::process::id();
         let owner_pid = i64::from(pid);
         let owner_start = crate::process::process_start(pid);
-        self.db.execute(
+        self.write_execute(
             r#"INSERT INTO turns (thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start)
                VALUES (?, ?, ?, ?, 'running', NULL, NULL, ?, NULL, ?, ?)
                ON CONFLICT (thread_id, turn) DO UPDATE SET
@@ -2112,7 +2237,7 @@ impl BatonStore {
         text: &str,
         drain_queued: bool,
     ) -> Result<i64> {
-        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let tx = self.write()?;
         if let Some(work) = Self::thread_open_work_on(&tx, thread_id, drain_queued)? {
             return Err(SubmitRefused(work).into());
         }
@@ -2158,7 +2283,7 @@ impl BatonStore {
         phase: TurnPhase,
         error: Option<&str>,
     ) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE turns SET phase = ?, error = ?, ended_at = ? WHERE thread_id = ? AND turn = ?",
             params![phase.as_str(), error, now_iso(), thread_id, turn],
         )?;
@@ -2167,7 +2292,7 @@ impl BatonStore {
 
     /// Moves an open turn between queued and running without ending it.
     pub fn set_turn_phase(&self, thread_id: &str, turn: i64, phase: TurnPhase) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE turns SET phase = ?, error = NULL, ended_at = NULL WHERE thread_id = ? AND turn = ?",
             params![phase.as_str(), thread_id, turn],
         )?;
@@ -2175,7 +2300,7 @@ impl BatonStore {
     }
 
     pub fn set_turn_provider_id(&self, thread_id: &str, turn: i64, provider_turn_id: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE turns SET provider_turn_id = ? WHERE thread_id = ? AND turn = ?",
             params![provider_turn_id, thread_id, turn],
         )?;
@@ -2351,6 +2476,9 @@ impl BatonStore {
         process_start: &str,
         alive: &dyn Fn(u32, Option<&str>) -> bool,
     ) -> Result<HostClaimAttempt> {
+        if self.host_id.as_deref() != Some(host_id) {
+            anyhow::bail!("host store must be opened with open_hosted and the same host id");
+        }
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         if let Some(claim) = Self::get_host_claim_from(&tx)? {
             if alive(claim.pid, Some(&claim.process_start)) {
@@ -2425,10 +2553,12 @@ impl BatonStore {
     }
 
     pub fn release_host_claim(&self, host_id: &str) -> Result<bool> {
-        let changed = self.db.execute(
+        let write = self.write()?;
+        let changed = write.execute(
             "DELETE FROM host_claim WHERE singleton = 1 AND host_id = ?",
             params![host_id],
         )?;
+        write.commit()?;
         Ok(changed == 1)
     }
 
@@ -2467,7 +2597,7 @@ impl BatonStore {
             }) {
                 continue;
             }
-            let changed = self.db.execute(
+            let changed = self.write_execute(
                 "UPDATE turns SET phase = 'unverified', error = COALESCE(error, 'baton exited before the turn settled'), ended_at = ? WHERE thread_id = ? AND turn = ? AND phase IN ('queued', 'running', 'settling') AND owner_pid IS ? AND owner_start IS ?",
                 params![
                     now_iso(),
@@ -2498,7 +2628,7 @@ impl BatonStore {
         cwd: &str,
         owner_pid: u32,
     ) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             r#"INSERT INTO provider_processes (pid, provider, port, command, process_start, cwd, owner_pid, started_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(pid) DO UPDATE SET
@@ -2515,10 +2645,7 @@ impl BatonStore {
     }
 
     pub fn remove_provider_process(&self, pid: u32) -> Result<()> {
-        self.db.execute(
-            "DELETE FROM provider_processes WHERE pid = ?",
-            params![pid],
-        )?;
+        self.write_execute("DELETE FROM provider_processes WHERE pid = ?", params![pid])?;
         Ok(())
     }
 
@@ -2546,7 +2673,7 @@ impl BatonStore {
     }
 
     pub fn enqueue_message(&self, thread_id: &str, text: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO queued_messages (thread_id, text, created_at) VALUES (?, ?, ?)",
             params![thread_id, text, now_iso()],
         )?;
@@ -2565,7 +2692,7 @@ impl BatonStore {
 
     /// Removes and returns the oldest queued message for a thread.
     pub fn pop_queued_message(&self, thread_id: &str) -> Result<Option<String>> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write()?;
         let text: Option<String> = tx
             .query_row(
                 "SELECT text FROM queued_messages WHERE thread_id = ? ORDER BY id LIMIT 1",
@@ -2587,7 +2714,7 @@ impl BatonStore {
 
     /// Removes and returns the queued message at `index`, counted from zero.
     pub fn take_queued_message(&self, thread_id: &str, index: usize) -> Result<Option<String>> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write()?;
         let id: Option<i64> = tx
             .query_row(
                 "SELECT id FROM queued_messages WHERE thread_id = ? ORDER BY id LIMIT 1 OFFSET ?",
@@ -2610,7 +2737,7 @@ impl BatonStore {
 
     /// Rewrites the whole queue in one transaction, preserving the given order.
     pub fn replace_queued_messages(&self, thread_id: &str, messages: &[String]) -> Result<()> {
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write()?;
         tx.execute(
             "DELETE FROM queued_messages WHERE thread_id = ?",
             params![thread_id],
@@ -2626,7 +2753,7 @@ impl BatonStore {
     }
 
     pub fn clear_queued_messages(&self, thread_id: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "DELETE FROM queued_messages WHERE thread_id = ?",
             params![thread_id],
         )?;
@@ -2646,7 +2773,7 @@ impl BatonStore {
         started_at: &str,
         finished_at: Option<&str>,
     ) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO subagents (thread_id, turn, provider, call_id, name, detail, status, started_at, finished_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![thread_id, turn, provider, call_id, name, detail, status, started_at, finished_at],
         )?;
@@ -2685,7 +2812,7 @@ impl BatonStore {
         model: Option<&str>,
         text: &str,
     ) -> Result<i64> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO messages (thread_id, turn, role, provider, model, text, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
             params![thread_id, turn, role, provider, model, text, now_iso()],
         )?;
@@ -2796,7 +2923,7 @@ impl BatonStore {
     }
 
     pub fn add_checkpoint(&self, thread_id: &str, turn: i64, git_ref: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO checkpoints (thread_id, turn, git_ref, created_at) VALUES (?, ?, ?, ?) ON CONFLICT (thread_id, turn) DO UPDATE SET git_ref = excluded.git_ref",
             params![thread_id, turn, git_ref, now_iso()],
         )?;
@@ -2839,7 +2966,7 @@ impl BatonStore {
     }
 
     pub fn add_usage(&self, thread_id: &str, turn: i64, provider: ProviderId, model: Option<&str>, usage: &TurnUsage) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO usage (thread_id, turn, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 thread_id,
@@ -2897,7 +3024,7 @@ impl BatonStore {
         provider: ProviderId,
         turn: i64,
     ) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO native_rewinds (thread_id, provider, turn, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(thread_id) DO UPDATE SET provider = excluded.provider, turn = excluded.turn, created_at = excluded.created_at",
             params![thread_id, provider.as_str(), turn, now_iso()],
         )?;
@@ -2928,7 +3055,7 @@ impl BatonStore {
     }
 
     pub fn clear_native_rewind_pending(&self, thread_id: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "DELETE FROM native_rewinds WHERE thread_id = ?",
             params![thread_id],
         )?;
@@ -2966,7 +3093,7 @@ impl BatonStore {
                 );
             }
         }
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write()?;
         tx.execute(
             "DELETE FROM messages WHERE thread_id = ? AND turn >= ?",
             params![thread_id, from_turn],
@@ -3037,7 +3164,7 @@ impl BatonStore {
         owner_pid: Option<u32>,
         owner_start: Option<&str>,
     ) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO orchestration_runs (id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, owner_pid, owner_start) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
             params![
                 id,
@@ -3056,7 +3183,7 @@ impl BatonStore {
     }
 
     pub fn finish_orchestration_run(&self, id: &str, status: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE orchestration_runs SET status = ?, finished_at = ? WHERE id = ?",
             params![status, now_iso(), id],
         )?;
@@ -3067,7 +3194,7 @@ impl BatonStore {
     /// verdict while preserving every worker that already completed.
     pub fn abandon_orchestration_run(&self, run_id: &str, error: &str) -> Result<()> {
         let now = now_iso();
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write()?;
         tx.execute(
             "UPDATE orchestration_tasks SET status = 'failed', error = COALESCE(NULLIF(error, ''), ?), finished_at = COALESCE(finished_at, ?) WHERE run_id = ? AND status IN ('queued', 'running')",
             params![error, now, run_id],
@@ -3123,7 +3250,7 @@ impl BatonStore {
     }
 
     pub fn archive_orchestration_run(&self, id: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE orchestration_runs SET archived_at = COALESCE(archived_at, ?) WHERE id = ?",
             params![now_iso(), id],
         )?;
@@ -3152,7 +3279,7 @@ impl BatonStore {
         snapshot_tree: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "INSERT INTO orchestration_tasks (id, run_id, position, title, provider, model, prompt, worktree_path, branch, commit_sha, thread_id, status, text, error, created_at, finished_at, snapshot_base, snapshot_tree, reasoning_effort) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 id,
@@ -3180,7 +3307,7 @@ impl BatonStore {
     }
 
     pub fn mark_orchestration_task_merged(&self, id: &str, merged_at: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE orchestration_tasks SET merged_at = ? WHERE id = ?",
             params![merged_at, id],
         )?;
@@ -3188,7 +3315,7 @@ impl BatonStore {
     }
 
     pub fn mark_orchestration_task_pr(&self, id: &str, pr_url: &str) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE orchestration_tasks SET pr_url = ? WHERE id = ?",
             params![pr_url, id],
         )?;
@@ -3299,7 +3426,7 @@ impl BatonStore {
         text: Option<&str>,
         reviewed_at: &str,
     ) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE orchestration_tasks SET review_status = ?, review_text = ?, reviewed_at = ? WHERE run_id = ? AND id = ?",
             params![status, text, reviewed_at, run_id, id],
         )?;
@@ -3313,7 +3440,7 @@ impl BatonStore {
         text: Option<&str>,
         error: &str,
     ) -> Result<()> {
-        self.db.execute(
+        self.write_execute(
             "UPDATE orchestration_tasks SET status = ?, text = ?, error = ?, finished_at = ? WHERE id = ?",
             params![status, text, error, now_iso(), id],
         )?;
@@ -3329,12 +3456,12 @@ impl BatonStore {
     ) -> Result<()> {
         let finished_at = now_iso();
         if clear_markers {
-            self.db.execute(
+            self.write_execute(
                 "UPDATE orchestration_tasks SET status = 'completed', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ?, merged_at = NULL, pr_url = NULL, review_status = 'pending', review_text = NULL, reviewed_at = NULL WHERE id = ?",
                 params![text, commit_sha, finished_at, id],
             )?;
         } else {
-            self.db.execute(
+            self.write_execute(
                 "UPDATE orchestration_tasks SET status = 'completed', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ? WHERE id = ?",
                 params![text, commit_sha, finished_at, id],
             )?;
@@ -3351,12 +3478,12 @@ impl BatonStore {
     ) -> Result<()> {
         let finished_at = now_iso();
         if clear_markers {
-            self.db.execute(
+            self.write_execute(
                 "UPDATE orchestration_tasks SET status = 'needs_input', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ?, merged_at = NULL, pr_url = NULL, review_status = 'pending', review_text = NULL, reviewed_at = NULL WHERE id = ?",
                 params![text, commit_sha, finished_at, id],
             )?;
         } else {
-            self.db.execute(
+            self.write_execute(
                 "UPDATE orchestration_tasks SET status = 'needs_input', text = ?, error = NULL, commit_sha = COALESCE(?, commit_sha), finished_at = ? WHERE id = ?",
                 params![text, commit_sha, finished_at, id],
             )?;
@@ -3394,7 +3521,7 @@ impl BatonStore {
         } else {
             "partial"
         };
-        self.db.execute(
+        self.write_execute(
             "UPDATE orchestration_runs SET status = ?, finished_at = ? WHERE id = ?",
             params![status, if status == "running" { None } else { Some(now_iso()) }, run_id],
         )?;
@@ -3410,7 +3537,7 @@ impl BatonStore {
     ) -> Result<ThreadRow> {
         let now = now_iso();
         let thread = self.create_thread_with_id(input, Uuid::new_v4().to_string())?;
-        let tx = self.db.unchecked_transaction()?;
+        let tx = self.write()?;
         tx.execute(
             "INSERT INTO provider_sessions (thread_id, provider, native_session_id, model, rollout_path, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
             params![
@@ -3489,6 +3616,124 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn every_store_mutation_uses_the_write_seam() {
+        let source = include_str!("store.rs");
+        let direct_execute = ["self.db", ".execute"].concat();
+        let direct_tx = ["self.db", ".unchecked_transaction"].concat();
+        let raw_tx = ["Transaction::new_unchecked(&self", ".db"].concat();
+        assert!(
+            !source.contains(&direct_execute),
+            "a store write bypassed write_execute"
+        );
+        assert!(
+            !source.contains(&direct_tx),
+            "a store write bypassed write()"
+        );
+        assert_eq!(
+            source.matches(&raw_tx).count(),
+            2,
+            "only write() and claim_host_row may open the raw transaction"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_live_host_claim_fences_out_a_local_writer() {
+        use crate::claim::{acquire, ClaimOutcome, SystemProbe};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let host_id = uuid::Uuid::new_v4().to_string();
+        let host = BatonStore::open_hosted(&path, &host_id).unwrap();
+        let local = BatonStore::open(&path).unwrap();
+        assert!(matches!(
+            acquire(&host, dir.path(), &host_id, &SystemProbe).unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        let error = local
+            .create_thread(NewThread {
+                title: "local".into(),
+                cwd: "/local".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap_err();
+        assert!(error.downcast_ref::<NotTheHost>().is_some(), "{error}");
+        host.create_thread(NewThread {
+            title: "host".into(),
+            cwd: "/host".into(),
+            current_provider: ProviderId::Codex,
+            current_model: None,
+        })
+        .unwrap();
+        assert!(host.release_host_claim(&host_id).unwrap());
+        local
+            .create_thread(NewThread {
+                title: "local after release".into(),
+                cwd: "/local".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_host_store_needs_its_live_claim() {
+        use crate::claim::{acquire, ClaimOutcome, SystemProbe};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let host_id = uuid::Uuid::new_v4().to_string();
+        let host = BatonStore::open_hosted(&path, &host_id).unwrap();
+        let error = host
+            .create_thread(NewThread {
+                title: "before claim".into(),
+                cwd: "/host".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<NotTheHost>(),
+            Some(NotTheHost { owner_pid: None, .. })
+        ));
+        assert!(matches!(
+            acquire(&host, dir.path(), &host_id, &SystemProbe).unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        assert!(host.release_host_claim(&host_id).unwrap());
+        let error = host
+            .create_thread(NewThread {
+                title: "after release".into(),
+                cwd: "/host".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap_err();
+        assert!(error.downcast_ref::<NotTheHost>().is_some(), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_store_cannot_release_a_live_host_claim() {
+        use crate::claim::{acquire, ClaimOutcome, SystemProbe};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let host_id = uuid::Uuid::new_v4().to_string();
+        let host = BatonStore::open_hosted(&path, &host_id).unwrap();
+        let local = BatonStore::open(&path).unwrap();
+        assert!(matches!(
+            acquire(&host, dir.path(), &host_id, &SystemProbe).unwrap(),
+            ClaimOutcome::Claimed(_)
+        ));
+        let error = local.release_host_claim(&host_id).unwrap_err();
+        assert!(error.downcast_ref::<NotTheHost>().is_some(), "{error}");
+        assert!(host.get_host_claim().unwrap().is_some());
     }
 
     #[test]

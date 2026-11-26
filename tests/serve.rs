@@ -334,8 +334,15 @@ fn serve_shutdown_settles_work_from_stopped_owners() {
         .as_str()
         .expect("claim-info names the host")
         .to_string();
+    let host_pid = claim["result"]["pid"]
+        .as_u64()
+        .expect("claim-info names the host pid") as u32;
+    let host_start = claim["result"]["process_start"]
+        .as_str()
+        .expect("claim-info names the host start")
+        .to_string();
 
-    let thread_id = {
+    let (child_thread_id, host_thread_id) = {
         let store = BatonStore::open_hosted(&db, &host_id).unwrap();
         let thread = store
             .create_thread(NewThread {
@@ -384,15 +391,67 @@ fn serve_shutdown_settles_work_from_stopped_owners() {
                 None,
             )
             .unwrap();
-        thread.id
+        let host_thread = store
+            .create_thread(NewThread {
+                title: "host work".into(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&host_thread.id, ProviderId::Codex, None, "host work", false)
+            .unwrap();
+        store
+            .create_orchestration_run_owned(
+                "run-host",
+                "host goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+                Some(host_pid),
+                Some(&host_start),
+            )
+            .unwrap();
+        store
+            .add_orchestration_task(
+                "task-host",
+                "run-host",
+                1,
+                "host task",
+                ProviderId::Codex,
+                "model",
+                "prompt",
+                Some("/tmp/host-worktree"),
+                None,
+                None,
+                Some(&host_thread.id),
+                "queued",
+                None,
+                None,
+                "2026-11-26T00:00:00.000Z",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        (thread.id, host_thread.id)
     };
     {
-        // The turn belongs to the helper so startup recovery left it alone
-        // and shutdown has to settle it after the helper stops.
+        // The child turn belongs to the helper so startup recovery left it
+        // alone. The second turn belongs to the host, so D-5 cancels it.
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute(
-            "UPDATE turns SET owner_pid = ?1, owner_start = ?2",
-            rusqlite::params![owner_pid, owner_start],
+            "UPDATE turns SET owner_pid = ?1, owner_start = ?2 WHERE thread_id = ?3",
+            rusqlite::params![owner_pid, owner_start, child_thread_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE turns SET owner_pid = ?1, owner_start = ?2 WHERE thread_id = ?3",
+            rusqlite::params![host_pid, host_start, host_thread_id],
         )
         .unwrap();
     }
@@ -420,21 +479,40 @@ fn serve_shutdown_settles_work_from_stopped_owners() {
         output.contains("settled 1 unfinished turn(s) on shutdown"),
         "{output}"
     );
+    assert!(
+        output.contains("cancelled 1 host turn(s), 1 task(s), and 1 run(s)"),
+        "{output}"
+    );
+    assert!(output.contains("left 1 worktree(s) in place"), "{output}");
+    assert!(output.contains("/tmp/host-worktree"), "{output}");
 
     let store = BatonStore::open_read_only(&db).unwrap();
-    let turn = store.get_turn_record(&thread_id, 1).unwrap().unwrap();
-    assert_eq!(turn.phase, TurnPhase::Unverified);
+    let child_turn = store.get_turn_record(&child_thread_id, 1).unwrap().unwrap();
+    assert_eq!(child_turn.phase, TurnPhase::Unverified);
     assert!(
-        turn.error.as_deref().unwrap_or("").contains("exited"),
+        child_turn.error.as_deref().unwrap_or("").contains("exited"),
         "{:?}",
-        turn.error
+        child_turn.error
     );
-    let run = store
+    let host_turn = store.get_turn_record(&host_thread_id, 1).unwrap().unwrap();
+    assert_eq!(host_turn.phase, TurnPhase::Unverified);
+    assert_eq!(host_turn.error.as_deref(), Some("host shut down"));
+    let child_run = store
         .find_orchestration_runs("run-child")
         .unwrap()
         .into_iter()
         .next()
         .unwrap();
-    assert_eq!(run.status, "failed");
+    assert_eq!(child_run.status, "failed");
+    let host_run = store
+        .find_orchestration_runs("run-host")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(host_run.status, "cancelled");
+    let host_tasks = store.list_orchestration_tasks("run-host").unwrap();
+    assert_eq!(host_tasks[0].status, "cancelled");
+    assert_eq!(host_tasks[0].error.as_deref(), Some("host shut down"));
     assert!(store.get_host_claim().unwrap().is_none());
 }

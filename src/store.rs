@@ -110,6 +110,13 @@ pub struct RunSettlement {
     pub turns: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostWorkSettlement {
+    pub turns: usize,
+    pub tasks: usize,
+    pub runs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunVerdict {
     Completed,
@@ -3580,6 +3587,49 @@ impl BatonStore {
         Ok(RunSettlement { tasks, turns })
     }
 
+    /// D-5 shutdown for work this host owns. A deliberate host stop records
+    /// its turns as unverified with the host reason, cancels open tasks, and
+    /// lets the run verdict derive to cancelled. Work owned by another
+    /// process is untouched.
+    pub fn cancel_host_work(
+        &self,
+        owner_pid: u32,
+        owner_start: Option<&str>,
+        reason: &str,
+    ) -> Result<HostWorkSettlement> {
+        let now = now_iso();
+        let turns = self.write_execute(
+            "UPDATE turns SET phase = 'unverified', error = COALESCE(error, ?), ended_at = COALESCE(ended_at, ?) WHERE phase IN ('queued', 'running', 'settling') AND owner_pid = ? AND owner_start IS ?",
+            params![reason, now, owner_pid, owner_start],
+        )?;
+        let runs = {
+            let mut statement = self.db.prepare(
+                "SELECT id FROM orchestration_runs WHERE status = 'running' AND owner_pid = ? AND owner_start IS ? ORDER BY created_at",
+            )?;
+            let rows = statement
+                .query_map(params![owner_pid, owner_start], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            rows
+        };
+        let mut tasks = 0;
+        if !runs.is_empty() {
+            let tx = self.write()?;
+            for run_id in &runs {
+                tasks += tx.execute(
+                    "UPDATE orchestration_tasks SET status = 'cancelled', error = COALESCE(NULLIF(error, ''), ?), finished_at = COALESCE(finished_at, ?) WHERE run_id = ? AND status IN ('queued', 'running')",
+                    params![reason, now, run_id],
+                )?;
+            }
+            tx.commit()?;
+            for run_id in &runs {
+                self.abandon_orchestration_run(run_id, reason)?;
+            }
+        }
+        Ok(HostWorkSettlement { turns, tasks, runs })
+    }
+
     pub fn archive_orchestration_run(&self, id: &str) -> Result<()> {
         self.write_execute(
             "UPDATE orchestration_runs SET archived_at = COALESCE(archived_at, ?) WHERE id = ?",
@@ -4416,6 +4466,156 @@ mod tests {
             assert!(tasks[0].error.as_deref().unwrap_or("").contains(expected));
             assert_eq!(run_row(&store, run_id).status, expected);
         }
+    }
+
+    #[test]
+    fn cancel_host_work_settles_only_the_named_owner() {
+        let store = BatonStore::memory().unwrap();
+        let host_pid = 4_000_001;
+        let host_start = "host-start";
+        let other_pid = 4_000_002;
+        let host_thread = store
+            .create_thread(NewThread {
+                title: "host".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&host_thread.id, ProviderId::Codex, None, "host", false)
+            .unwrap();
+        let other_thread = store
+            .create_thread(NewThread {
+                title: "other".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&other_thread.id, ProviderId::Codex, None, "other", false)
+            .unwrap();
+        store
+            .write_execute(
+                "UPDATE turns SET owner_pid = ?, owner_start = ? WHERE thread_id = ?",
+                params![host_pid, host_start, host_thread.id],
+            )
+            .unwrap();
+        store
+            .write_execute(
+                "UPDATE turns SET owner_pid = ?, owner_start = NULL WHERE thread_id = ?",
+                params![other_pid, other_thread.id],
+            )
+            .unwrap();
+        store
+            .create_orchestration_run_owned(
+                "run-host",
+                "host goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+                Some(host_pid),
+                Some(host_start),
+            )
+            .unwrap();
+        store
+            .add_orchestration_task(
+                "task-host",
+                "run-host",
+                1,
+                "host task",
+                ProviderId::Codex,
+                "model",
+                "do host",
+                Some("/tmp/host-worktree"),
+                None,
+                None,
+                Some(&host_thread.id),
+                "queued",
+                None,
+                None,
+                "2026-11-26T00:00:00.000Z",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .create_orchestration_run_owned(
+                "run-other",
+                "other goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+                Some(other_pid),
+                None,
+            )
+            .unwrap();
+        store
+            .add_orchestration_task(
+                "task-other",
+                "run-other",
+                1,
+                "other task",
+                ProviderId::Codex,
+                "model",
+                "do other",
+                None,
+                None,
+                None,
+                None,
+                "queued",
+                None,
+                None,
+                "2026-11-26T00:00:00.000Z",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let settlement = store
+            .cancel_host_work(host_pid, Some(host_start), "host shut down")
+            .unwrap();
+        assert_eq!(
+            settlement,
+            HostWorkSettlement {
+                turns: 1,
+                tasks: 1,
+                runs: vec!["run-host".to_string()],
+            }
+        );
+        let host_turn = store.get_turn_record(&host_thread.id, 1).unwrap().unwrap();
+        assert_eq!(host_turn.phase, TurnPhase::Unverified);
+        assert_eq!(host_turn.error.as_deref(), Some("host shut down"));
+        let other_turn = store.get_turn_record(&other_thread.id, 1).unwrap().unwrap();
+        assert_eq!(
+            other_turn.phase,
+            TurnPhase::Running,
+            "another owner's turn is untouched"
+        );
+        let host_task = store.list_orchestration_tasks("run-host").unwrap();
+        assert_eq!(host_task[0].status, "cancelled");
+        assert_eq!(host_task[0].error.as_deref(), Some("host shut down"));
+        assert_eq!(
+            host_task[0].worktree_path.as_deref(),
+            Some("/tmp/host-worktree")
+        );
+        assert_eq!(run_row(&store, "run-host").status, "cancelled");
+        let other_task = store.list_orchestration_tasks("run-other").unwrap();
+        assert_eq!(other_task[0].status, "queued");
+        assert_eq!(
+            run_row(&store, "run-other").status,
+            "running",
+            "another owner's run is untouched"
+        );
     }
 
     #[test]

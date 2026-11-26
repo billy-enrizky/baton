@@ -327,9 +327,15 @@ def main() -> int:
         os.write(master, b"/skills\r")
         pump(master, 0.8, transcript)
         skills_picker = screen_text(transcript, args.width, args.height)
-        skills_required = ["skills (2)", "enter insert", "claude-demo (claude)"]
+        skills_required = [
+            "skills (2)",
+            "enter insert",
+            "i install",
+            "u update",
+            "claude-demo (claude · global)",
+        ]
         missing.extend(value for value in skills_required if value not in skills_picker)
-        if "codex-demo (codex) · Run the demo checks" not in skills_picker:
+        if "codex-demo (codex · global) · Run the demo checks" not in skills_picker:
             missing.append("codex skill row")
         (evidence / "skills-picker-screen.txt").write_text(skills_picker + "\n")
         os.write(master, b"\x1b[B")
@@ -412,10 +418,16 @@ def main() -> int:
         (evidence / "auth-arrow-selected-screen.txt").write_text(
             auth_arrow_selected + "\n"
         )
-        os.write(master, b"\x7f" * 24)
-        pump(master, 0.3, transcript)
         os.write(master, b"\x1b")
-        pump(master, 0.2, transcript)
+        if not wait_for_screen(
+            master,
+            "composer cleared",
+            3.0,
+            transcript,
+            args.width,
+            args.height,
+        ):
+            missing.append("arrow-selected auth completion did not clear from the composer")
 
         os.write(master, b"/auth\r")
         pump(master, 0.8, transcript)

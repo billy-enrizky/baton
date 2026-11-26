@@ -213,6 +213,15 @@ fn collect_skill_dirs(path: &Path, source: &str, depth: usize, skills: &mut Vec<
     if !path.is_dir() {
         return;
     }
+    if path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.starts_with(".baton-staging-") || name.starts_with(".baton-backup-")
+        })
+    {
+        return;
+    }
     if is_skill_dir(path) {
         if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
             skills.push(DiscoveredSkill {
@@ -266,6 +275,24 @@ pub fn scan_skills() -> Vec<DiscoveredSkill> {
         &crate::paths::claude_global_settings_dir().join("skills"),
         &crate::paths::codex_global_home().join("skills"),
     )
+}
+
+/// Global skills for one harness, without cross-harness deduplication. The
+/// update path needs the exact source directory for a project copy.
+pub fn scan_global_skills_for(harness: &str) -> Vec<DiscoveredSkill> {
+    match harness {
+        "claude" => scan_skill_root(
+            &crate::paths::claude_global_settings_dir().join("skills"),
+            "claude",
+        ),
+        "codex" => scan_skill_root(&crate::paths::codex_global_home().join("skills"), "codex"),
+        _ => Vec::new(),
+    }
+}
+
+pub fn is_project_skill(cwd: &Path, path: &Path) -> bool {
+    path.starts_with(cwd.join(".claude").join("skills"))
+        || path.starts_with(cwd.join(".codex").join("skills"))
 }
 
 /// Project skills shadow global skills with the same name. Both harness
@@ -481,6 +508,46 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "project");
         assert_eq!(skills[0].source, "codex");
+    }
+
+    #[test]
+    fn global_source_scan_keeps_the_exact_harness_copy() {
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        skill(claude.path(), "shared", "SKILL.md");
+        skill(codex.path(), "shared", "SKILL.md");
+        assert_eq!(scan_skill_root(claude.path(), "claude").len(), 1);
+        assert_eq!(scan_skill_root(codex.path(), "codex").len(), 1);
+    }
+
+    #[test]
+    fn project_skill_detection_uses_the_project_roots() {
+        let cwd = tempfile::tempdir().unwrap();
+        assert!(is_project_skill(
+            cwd.path(),
+            &cwd.path().join(".claude").join("skills").join("demo")
+        ));
+        assert!(is_project_skill(
+            cwd.path(),
+            &cwd.path().join(".codex").join("skills").join("demo")
+        ));
+        assert!(!is_project_skill(
+            cwd.path(),
+            &cwd.path().join("other").join("demo")
+        ));
+    }
+
+    #[test]
+    fn internal_install_directories_are_hidden() {
+        let root = tempfile::tempdir().unwrap();
+        skill(root.path(), "demo", "SKILL.md");
+        skill(root.path(), ".baton-staging-test", "SKILL.md");
+        skill(root.path(), ".baton-backup-test", "SKILL.md");
+        let names = scan_skill_root(root.path(), "claude")
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["demo"]);
     }
 
     #[test]

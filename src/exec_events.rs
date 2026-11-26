@@ -154,14 +154,7 @@ pub fn turn_event_json(thread_id: &str, event: &TurnEvent) -> Value {
             "plan_id": plan_id,
             "turn_id": turn_id,
             "explanation": explanation,
-            "entries": entries
-                .iter()
-                .map(|entry| json!({
-                    "content": entry.content,
-                    "status": entry.status,
-                    "priority": entry.priority,
-                }))
-                .collect::<Vec<_>>(),
+            "entries": entries,
         }),
         TurnEvent::PlanRemoved { provider, plan_id } => json!({
             "type": "plan_removed",
@@ -245,11 +238,7 @@ pub fn result_json(result: &ExecResult<'_>) -> Value {
             "plan_id": plan.plan_id,
             "turn_id": plan.turn_id,
             "explanation": plan.explanation,
-            "entries": plan.entries.iter().map(|entry| json!({
-                "content": entry.content,
-                "status": entry.status,
-                "priority": entry.priority,
-            })).collect::<Vec<_>>(),
+            "entries": plan.entries,
         })),
     })
 }
@@ -460,6 +449,8 @@ mod tests {
                     content: "step one".into(),
                     status: "in_progress".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: Some("check".into()),
             },
@@ -498,6 +489,8 @@ mod tests {
                 content: "step one".into(),
                 status: "completed".into(),
                 priority: Some("high".into()),
+                kind: crate::types::PlanKind::Items,
+                uri: None,
             }],
             explanation: Some("check".into()),
         };
@@ -532,6 +525,8 @@ mod tests {
                     content: "Inspect the parser".into(),
                     status: "in_progress".into(),
                     priority: Some("high".into()),
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: Some("One check".into()),
             },
@@ -544,6 +539,28 @@ mod tests {
         assert_eq!(value["entries"][0]["content"], "Inspect the parser");
         assert_eq!(value["entries"][0]["status"], "in_progress");
         assert_eq!(value["entries"][0]["priority"], "high");
+    }
+
+    #[test]
+    fn plan_document_entries_carry_kind_and_uri() {
+        let value = turn_event_json(
+            "thread-1",
+            &TurnEvent::PlanUpdated {
+                provider: crate::types::ProviderId::Antigravity,
+                plan_id: Some("plan-doc".into()),
+                turn_id: None,
+                entries: vec![
+                    PlanEntry::markdown("# Ship it"),
+                    PlanEntry::file("file:///workspace/PLAN.md"),
+                ],
+                explanation: None,
+            },
+        );
+        assert_eq!(value["entries"][0]["kind"], "markdown");
+        assert_eq!(value["entries"][0]["content"], "# Ship it");
+        assert_eq!(value["entries"][1]["kind"], "file");
+        assert_eq!(value["entries"][1]["uri"], "file:///workspace/PLAN.md");
+        assert!(value["entries"][0].get("uri").is_none());
     }
 
     #[test]

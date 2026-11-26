@@ -520,6 +520,96 @@ async fn acp_adapter_maps_plan_updates() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_adapter_preserves_markdown_file_and_unknown_plan_kinds() {
+    let updates = Arc::new(vec![
+        json!({
+            "sessionUpdate": "plan_update",
+            "plan": { "type": "markdown", "planId": "plan-markdown", "content": "# Ship it\n\n- run checks" }
+        }),
+        json!({
+            "sessionUpdate": "plan_update",
+            "plan": { "type": "file", "planId": "plan-file", "uri": "file:///workspace/PLAN.md" }
+        }),
+        json!({
+            "sessionUpdate": "plan_update",
+            "plan": { "type": "diagram", "planId": "plan-future", "nodes": [] }
+        }),
+        json!({
+            "sessionUpdate": "plan_update",
+            "plan": { "type": "markdown", "planId": "plan-missing-content" }
+        }),
+        json!({
+            "sessionUpdate": "plan_update",
+            "plan": { "type": "file", "planId": "plan-missing-uri" }
+        }),
+    ]);
+    let spawner_updates = updates.clone();
+    let spawner = Arc::new(
+        move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_acp_plan(
+                server_read,
+                server_write,
+                2,
+                (*spawner_updates).clone(),
+            ));
+            Ok(halves)
+        },
+    );
+    let mut adapter = AcpAdapter::new(ProviderId::Antigravity, spawner);
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        adapter.start_turn(
+            baton::adapters::TurnStartInput {
+                turn: 1,
+                thread_id: "bt".into(),
+                cwd: "/work".into(),
+                model: "gemini-3.7-flash".into(),
+                effort: None,
+                prompt: "plan".into(),
+                permission_mode: PermissionMode::Default,
+                auth_env: vec![],
+            },
+            None,
+            event_sender,
+        ),
+    )
+    .await
+    .expect("plan turn completes")
+    .expect("plan turn succeeds");
+
+    let events: Vec<baton::adapters::TurnEvent> = event_receiver.iter().collect();
+    let plans: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            baton::adapters::TurnEvent::PlanUpdated {
+                plan_id, entries, ..
+            } => Some((plan_id.as_deref(), entries)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(plans.len(), 3, "plan kinds: {events:?}");
+    assert!(!plans
+        .iter()
+        .any(|(id, _)| matches!(*id, Some("plan-missing-content") | Some("plan-missing-uri"))));
+    assert_eq!(plans[0].0, Some("plan-markdown"));
+    assert_eq!(plans[0].1[0].kind, baton::types::PlanKind::Markdown);
+    assert_eq!(plans[0].1[0].content, "# Ship it\n\n- run checks");
+    assert_eq!(plans[0].1[0].status, "pending");
+    assert_eq!(plans[1].0, Some("plan-file"));
+    assert_eq!(plans[1].1[0].kind, baton::types::PlanKind::File);
+    assert_eq!(
+        plans[1].1[0].uri.as_deref(),
+        Some("file:///workspace/PLAN.md")
+    );
+    assert_eq!(plans[2].0, Some("plan-future"));
+    assert_eq!(plans[2].1[0].kind, baton::types::PlanKind::Items);
+    assert_eq!(plans[2].1[0].content, "[unsupported ACP plan: diagram]");
+    adapter.dispose().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn acp_adapter_maps_the_legacy_plan_frame() {
     let updates = Arc::new(vec![json!({
         "sessionUpdate": "plan",

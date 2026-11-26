@@ -12355,7 +12355,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::UsagePicker { .. } => USAGE_CHOICES.len() + 4,
             Overlay::UsageReport { lines, .. } => lines.len().min(12) + 3,
             Overlay::PlanView { .. } => current_plan(state)
-                .map(|plan| plan.entries.len().min(12) + 4 + usize::from(plan.explanation.is_some()))
+                .map(|plan| plan_preview_rows(plan) + 4 + usize::from(plan.explanation.is_some()))
                 .unwrap_or(4),
             Overlay::ChangesView { .. } => area.height.saturating_sub(8).max(8) as usize,
             Overlay::RewindPicker { .. } => {
@@ -15492,6 +15492,18 @@ fn draw_changes_view(
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn plan_preview_rows(plan: &PlanSnapshot) -> usize {
+    use crate::types::PlanKind;
+    plan.entries
+        .iter()
+        .map(|entry| match entry.kind {
+            PlanKind::Markdown => entry.content.lines().count().max(1),
+            PlanKind::Items | PlanKind::File => 1,
+        })
+        .sum::<usize>()
+        .min(12)
+}
+
 fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scroll: usize) {
     let Some(plan) = current_plan(state) else {
         let block = Block::default()
@@ -15507,9 +15519,14 @@ fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scro
         );
         return;
     };
-    let total = plan.entries.len();
-    let done = plan
+    use crate::types::PlanKind;
+    let item_entries = plan
         .entries
+        .iter()
+        .filter(|entry| entry.kind == PlanKind::Items)
+        .collect::<Vec<_>>();
+    let total = item_entries.len();
+    let done = item_entries
         .iter()
         .filter(|entry| entry.status == "completed")
         .count();
@@ -15528,30 +15545,46 @@ fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scro
         }
     }
     for entry in &plan.entries {
-        let (marker, color) = match entry.status.as_str() {
-            "completed" => ("✓", COLORS.success),
-            "in_progress" => ("▸", COLORS.accent),
-            _ => ("·", COLORS.muted),
-        };
-        let mut safe = crate::sanitize::sanitize_terminal_text(&entry.content).into_owned();
-        if let Some(priority) = entry.priority.as_deref() {
-            safe.push_str(&format!(
-                " ({})",
-                crate::sanitize::sanitize_terminal_text(priority)
-            ));
-        }
-        let indent = " ".repeat(marker.chars().count() + 1);
-        let rows = wrap_plan_text(&safe, width.saturating_sub(indent.len()));
-        for (index, row) in rows.into_iter().enumerate() {
-            let prefix = if index == 0 {
-                format!("{marker} ")
-            } else {
-                indent.clone()
-            };
-            content.push(Line::styled(
-                format!("{prefix}{row}"),
-                Style::default().fg(color),
-            ));
+        match entry.kind {
+            PlanKind::Markdown => {
+                let safe = crate::sanitize::sanitize_terminal_text(&entry.content);
+                content.extend(crate::tui::markdown::render(&safe, width));
+            }
+            PlanKind::File => {
+                let uri = entry.uri.as_deref().unwrap_or("(missing file URI)");
+                let safe = crate::sanitize::sanitize_terminal_text(uri);
+                for row in wrap_plan_text(&format!("file plan: {safe}"), width) {
+                    content.push(Line::styled(row, Style::default().fg(COLORS.secondary)));
+                }
+            }
+            PlanKind::Items => {
+                let (marker, color) = match entry.status.as_str() {
+                    "completed" => ("✓", COLORS.success),
+                    "in_progress" => ("▸", COLORS.accent),
+                    _ => ("·", COLORS.muted),
+                };
+                let mut safe =
+                    crate::sanitize::sanitize_terminal_text(&entry.content).into_owned();
+                if let Some(priority) = entry.priority.as_deref() {
+                    safe.push_str(&format!(
+                        " ({})",
+                        crate::sanitize::sanitize_terminal_text(priority)
+                    ));
+                }
+                let indent = " ".repeat(marker.chars().count() + 1);
+                let rows = wrap_plan_text(&safe, width.saturating_sub(indent.len()));
+                for (index, row) in rows.into_iter().enumerate() {
+                    let prefix = if index == 0 {
+                        format!("{marker} ")
+                    } else {
+                        indent.clone()
+                    };
+                    content.push(Line::styled(
+                        format!("{prefix}{row}"),
+                        Style::default().fg(color),
+                    ));
+                }
+            }
         }
     }
     let visible = inner.height.saturating_sub(1) as usize;
@@ -15563,7 +15596,22 @@ fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scro
     } else {
         scroll.min(content.len() - visible)
     };
-    let mut header = format!("plan · {done}/{total} done");
+    let only_document = plan.entries.first().is_some_and(|entry| {
+        !matches!(entry.kind, PlanKind::Items)
+            && plan
+                .entries
+                .iter()
+                .all(|candidate| candidate.kind == entry.kind)
+    });
+    let mut header = if only_document {
+        match plan.entries.first().map(|entry| entry.kind) {
+            Some(PlanKind::Markdown) => "plan · markdown".to_string(),
+            Some(PlanKind::File) => "plan · file".to_string(),
+            _ => format!("plan · {done}/{total} done"),
+        }
+    } else {
+        format!("plan · {done}/{total} done")
+    };
     if let Some(turn_id) = plan.turn_id.as_deref() {
         header.push_str(&format!(" · turn {}", truncate_chars(turn_id, 12)));
     }
@@ -31923,16 +31971,22 @@ exit 1
                         content: "first".into(),
                         status: "completed".into(),
                         priority: None,
+                        kind: crate::types::PlanKind::Items,
+                        uri: None,
                     },
                     crate::types::PlanEntry {
                         content: "second".into(),
                         status: "in_progress".into(),
                         priority: Some("high\u{202e}".into()),
+                        kind: crate::types::PlanKind::Items,
+                        uri: None,
                     },
                     crate::types::PlanEntry {
                         content: "third".into(),
                         status: "pending".into(),
                         priority: None,
+                        kind: crate::types::PlanKind::Items,
+                        uri: None,
                     },
                 ],
                 explanation: Some("two steps".into()),
@@ -31959,6 +32013,50 @@ exit 1
             KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()),
         );
         assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn plan_view_renders_markdown_and_file_plans() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let provider = state.thread.current_provider;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: Some("plan-markdown".into()),
+                turn_id: None,
+                entries: vec![crate::types::PlanEntry::markdown(
+                    "# Ship it\n\n- run checks\u{1b}]0;title",
+                )],
+                explanation: None,
+            },
+        );
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("plan · markdown"), "{text}");
+        assert!(text.contains("Ship it"), "{text}");
+        assert!(text.contains("• run checks"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+
+        apply_turn_event(
+            &mut state,
+            TurnEvent::PlanUpdated {
+                provider,
+                plan_id: Some("plan-file".into()),
+                turn_id: None,
+                entries: vec![crate::types::PlanEntry::file("file:///workspace/PLAN.md")],
+                explanation: None,
+            },
+        );
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("plan · file"), "{text}");
+        assert!(
+            text.contains("file plan: file:///workspace/PLAN.md"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -31997,6 +32095,8 @@ exit 1
                     content: "private to thread a".into(),
                     status: "pending".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },
@@ -32032,6 +32132,8 @@ exit 1
                     content: "private to claude".into(),
                     status: "pending".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },
@@ -32069,6 +32171,8 @@ exit 1
                     content: "worker step".into(),
                     status: "pending".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },
@@ -32101,6 +32205,8 @@ exit 1
                     content: "first plan".into(),
                     status: "pending".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },
@@ -32147,6 +32253,8 @@ exit 1
                     content: "old plan".into(),
                     status: "pending".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },
@@ -32181,6 +32289,8 @@ exit 1
                     content: "old plan".into(),
                     status: "pending".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },
@@ -32216,6 +32326,8 @@ exit 1
                     content: "current plan".into(),
                     status: "in_progress".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },
@@ -32247,6 +32359,8 @@ exit 1
                         .into(),
                     status: "in_progress".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: Some(
                     "the explanation keeps its own verbatim wording and ends with tail-explanation".into(),
@@ -32285,6 +32399,8 @@ exit 1
                     content: "one step".into(),
                     status: "pending".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },
@@ -32304,6 +32420,8 @@ exit 1
                 content: "one step".into(),
                 status: "pending".into(),
                 priority: None,
+                kind: crate::types::PlanKind::Items,
+                uri: None,
             }],
             explanation: None,
         }
@@ -32380,6 +32498,8 @@ exit 1
                     content: "one step".into(),
                     status: "pending".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },
@@ -32417,6 +32537,8 @@ exit 1
                     content: "worker step".into(),
                     status: "in_progress".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: Some("check".into()),
             }),
@@ -32466,6 +32588,8 @@ exit 1
                         content: "other step".into(),
                         status: "completed".into(),
                         priority: None,
+                        kind: crate::types::PlanKind::Items,
+                        uri: None,
                     }],
                     explanation: None,
                 },
@@ -32621,6 +32745,8 @@ exit 1
                         content: format!("step {index}"),
                         status: "pending".into(),
                         priority: None,
+                        kind: crate::types::PlanKind::Items,
+                        uri: None,
                     })
                     .collect(),
                 explanation: None,
@@ -32660,6 +32786,8 @@ exit 1
                     content: "temporary".into(),
                     status: "pending".into(),
                     priority: None,
+                    kind: crate::types::PlanKind::Items,
+                    uri: None,
                 }],
                 explanation: None,
             },

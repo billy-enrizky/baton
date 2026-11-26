@@ -590,14 +590,14 @@ fn plan_entries(value: Option<&Value>) -> Vec<crate::types::PlanEntry> {
             entries
                 .iter()
                 .filter_map(|entry| {
-                    Some(crate::types::PlanEntry {
-                        content: entry.get("content")?.as_str()?.to_string(),
-                        status: crate::types::normalize_plan_status(entry.get("status")?.as_str()?),
-                        priority: entry
+                    Some(crate::types::PlanEntry::item(
+                        entry.get("content")?.as_str()?,
+                        crate::types::normalize_plan_status(entry.get("status")?.as_str()?),
+                        entry
                             .get("priority")
                             .and_then(Value::as_str)
                             .map(str::to_string),
-                    })
+                    ))
                 })
                 .collect()
         })
@@ -647,22 +647,40 @@ fn handle_session_update(
         }
         "plan_update" => {
             let plan = update.get("plan");
-            if plan
-                .and_then(|plan| plan.get("type"))
-                .and_then(Value::as_str)
-                == Some("items")
-            {
-                let _ = emit.send(TurnEvent::PlanUpdated {
-                    provider,
-                    plan_id: plan
-                        .and_then(|plan| plan.get("planId"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string),
-                    turn_id: None,
-                    entries: plan_entries(plan.and_then(|plan| plan.get("entries"))),
-                    explanation: None,
-                });
-            }
+            let Some(plan) = plan else {
+                return;
+            };
+            let entries = match plan.get("type").and_then(Value::as_str) {
+                Some("items") => plan_entries(plan.get("entries")),
+                Some("markdown") => {
+                    let Some(content) = plan.get("content").and_then(Value::as_str) else {
+                        return;
+                    };
+                    vec![crate::types::PlanEntry::markdown(content)]
+                }
+                Some("file") => {
+                    let Some(uri) = plan.get("uri").and_then(Value::as_str) else {
+                        return;
+                    };
+                    vec![crate::types::PlanEntry::file(uri)]
+                }
+                Some(other) => vec![crate::types::PlanEntry::item(
+                    format!("[unsupported ACP plan: {other}]"),
+                    "pending",
+                    None,
+                )],
+                None => return,
+            };
+            let _ = emit.send(TurnEvent::PlanUpdated {
+                provider,
+                plan_id: plan
+                    .get("planId")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                turn_id: None,
+                entries,
+                explanation: None,
+            });
         }
         "plan_removed" => {
             if let Some(plan_id) = update.get("planId").and_then(Value::as_str) {

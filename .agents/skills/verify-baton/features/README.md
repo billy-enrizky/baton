@@ -23,7 +23,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Recent thread hint | TUI | a new session points at existing threads in the folder |
 | Usage report | TUI | `/usage` picks this thread or all threads, then totals or a day/model/provider grouping, and shows a scrollable report |
 | Terminal capabilities | TUI | `NO_COLOR` or `TERM=dumb` renders without palette colors, and a non-interactive stdin or stdout exits with a message that names `baton exec` as the script path |
-| Plan review | TUI | `/plan` shows the harness-reported steps, explanation, status, and priority in a scrollable read-only overlay; an empty state names why there is no plan |
+| Plan review | TUI | `/plan` shows harness-reported item, markdown, and file plans with explanation, status, priority, and file URI in a scrollable read-only overlay; an empty state names why there is no plan |
 | Attention inbox | TUI | `/inbox` lists failed, unverified, interrupted, needs-input, and queued work and opens the selected thread |
 | Thread pins | TUI; CLI read | `/pin` toggles a durable pin, Ctrl+Up/Ctrl+Down or `/pin move` orders pinned threads, pinned rows sort first, and `baton threads --json` exposes `pinned` and `pin_order_key` |
 | File navigation | TUI; CLI | `/files [--ignored]` inserts a selected project path or `path:line` and warns when ignored files are included; Ctrl+O launches that target or a selected `/grep` match in `VISUAL` or `EDITOR`; `/grep` and `baton grep` search file contents with sorted previews; `baton files` ranks project paths with ripgrep or git; and `baton open` launches the editor with `-C`-directory containment |

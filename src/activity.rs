@@ -303,6 +303,7 @@ mod tests {
             ended_at: Some(format!("2026-01-01T00:01:0{turn}Z")),
             owner_pid: None,
             owner_start: None,
+            owner_grant_id: None,
         }
     }
 

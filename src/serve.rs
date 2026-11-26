@@ -30,8 +30,46 @@ pub fn finish_host(store: &BatonStore, host_id: &str, loop_result: Result<()>) -
         }
         Err(error) => eprintln!("baton: child shutdown failed: {error}"),
     }
-    // Children stop first so their turns and runs are settled by owner
-    // identity before the claim opens the store to another process.
+    // Children stop first so a provider cannot overwrite a settled turn.
+    // A deliberate host stop then cancels the work this host owns with the
+    // signed host reason, and reports the worktrees it leaves in place.
+    match store.get_host_claim() {
+        Ok(Some(claim)) if claim.host_id == host_id => {
+            match store.cancel_host_work(claim.pid, Some(&claim.process_start), "host shut down") {
+                Ok(settled) => {
+                    if settled.turns + settled.tasks + settled.runs.len() > 0 {
+                        eprintln!(
+                            "baton: cancelled {} host turn(s), {} task(s), and {} run(s)",
+                            settled.turns,
+                            settled.tasks,
+                            settled.runs.len()
+                        );
+                    }
+                    let mut worktrees = Vec::new();
+                    for run_id in &settled.runs {
+                        match store.list_orchestration_tasks(run_id) {
+                            Ok(tasks) => worktrees
+                                .extend(tasks.into_iter().filter_map(|task| task.worktree_path)),
+                            Err(error) => {
+                                eprintln!("baton: worktree report failed for {run_id}: {error}")
+                            }
+                        }
+                    }
+                    if !worktrees.is_empty() {
+                        eprintln!("baton: left {} worktree(s) in place", worktrees.len());
+                        for path in worktrees {
+                            eprintln!("baton: worktree {path}");
+                        }
+                    }
+                }
+                Err(error) => eprintln!("baton: host work cancellation failed: {error}"),
+            }
+        }
+        Ok(_) => {}
+        Err(error) => eprintln!("baton: host claim read failed: {error}"),
+    }
+    // Then settle work whose owner stopped while this host was running, so a
+    // client cannot open the store to a turn or run that only looks live.
     match store.reconcile_running_turns(None) {
         Ok(turns) => {
             if !turns.is_empty() {
@@ -369,11 +407,68 @@ mod tests {
             finish_host(&store, &host_id, Err(anyhow::anyhow!("stdout closed"))).unwrap_err();
         assert_eq!(error.to_string(), "stdout closed");
         let turn = store.get_turn_record(&thread_id, 1).unwrap().unwrap();
-        assert_eq!(
-            turn.phase,
-            crate::types::TurnPhase::Running,
-            "a live owner's turn stays open"
-        );
+        assert_eq!(turn.phase, crate::types::TurnPhase::Unverified);
+        assert_eq!(turn.error.as_deref(), Some("host shut down"));
+        assert!(store.get_host_claim().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_host_cancels_its_own_work_before_release() {
+        let (_dir, store) = claimed_store();
+        let claim = store.get_host_claim().unwrap().unwrap();
+        let thread_id = store.list_threads(None).unwrap().remove(0).id;
+        store
+            .create_orchestration_run_owned(
+                "run-host",
+                "host goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+                Some(claim.pid),
+                Some(&claim.process_start),
+            )
+            .unwrap();
+        store
+            .add_orchestration_task(
+                "task-host",
+                "run-host",
+                1,
+                "host task",
+                ProviderId::Codex,
+                "model",
+                "do host",
+                Some("/tmp/host-worktree"),
+                None,
+                None,
+                Some(&thread_id),
+                "queued",
+                None,
+                None,
+                "2026-11-26T00:00:00.000Z",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        finish_host(&store, &claim.host_id, Ok(())).unwrap();
+        let turn = store.get_turn_record(&thread_id, 1).unwrap().unwrap();
+        assert_eq!(turn.phase, crate::types::TurnPhase::Unverified);
+        assert_eq!(turn.error.as_deref(), Some("host shut down"));
+        let tasks = store.list_orchestration_tasks("run-host").unwrap();
+        assert_eq!(tasks[0].status, "cancelled");
+        assert_eq!(tasks[0].error.as_deref(), Some("host shut down"));
+        let run = store
+            .find_orchestration_runs("run-host")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(run.status, "cancelled");
         assert!(store.get_host_claim().unwrap().is_none());
     }
 }

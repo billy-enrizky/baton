@@ -168,6 +168,11 @@ pub fn turn_event_json(thread_id: &str, event: &TurnEvent) -> Value {
             "provider": provider.as_str(),
             "plan_id": plan_id,
         }),
+        TurnEvent::RateLimits { provider, info } => json!({
+            "type": "rate_limits",
+            "provider": provider.as_str(),
+            "rate_limits": info,
+        }),
         TurnEvent::Usage { usage } => json!({
             "type": "usage",
             "usage": usage,
@@ -252,7 +257,10 @@ pub fn result_json(result: &ExecResult<'_>) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ApprovalChoice, PlanEntry, QuestionPrompt, TurnUsage};
+    use crate::types::{
+        ApprovalChoice, PlanEntry, ProviderId, QuestionPrompt, RateLimitInfo, RateLimitWindow,
+        TurnUsage,
+    };
 
     fn completed(final_text: &str) -> TurnEvent {
         TurnEvent::TurnCompleted {
@@ -261,6 +269,30 @@ mod tests {
             native_session_id: None,
             rollout_path: None,
         }
+    }
+
+    #[test]
+    fn rate_limit_events_carry_the_snapshot() {
+        let event = TurnEvent::RateLimits {
+            provider: ProviderId::Codex,
+            info: RateLimitInfo {
+                plan_type: Some("plus".into()),
+                primary: Some(RateLimitWindow {
+                    used_percent: 12,
+                    window_duration_mins: Some(300),
+                    resets_at: Some(1_767_000_000),
+                }),
+                secondary: None,
+                credits_balance: Some("12.50".into()),
+                credits_unlimited: false,
+                reported_at: "2026-11-26T03:00:00Z".into(),
+            },
+        };
+        let value = turn_event_json("thread-1", &event);
+        assert_eq!(value["type"], "rate_limits");
+        assert_eq!(value["provider"], "codex");
+        assert_eq!(value["rate_limits"]["plan_type"], "plus");
+        assert_eq!(value["rate_limits"]["primary"]["used_percent"], 12);
     }
 
     #[test]

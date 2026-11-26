@@ -459,6 +459,15 @@ impl CodexAdapter {
         turn_usage: &mut Option<TurnUsage>,
         final_text: &mut String,
     ) {
+        if method == "account/rateLimits/updated" {
+            if let Some(info) = rate_limit_info(params.get("rateLimits")) {
+                let _ = emit.send(TurnEvent::RateLimits {
+                    provider: ProviderId::Codex,
+                    info,
+                });
+            }
+            return;
+        }
         let thread_id = params.get("threadId").and_then(Value::as_str).unwrap_or("");
         if method == "thread/tokenUsage/updated" {
             // v2 nests per-turn usage under `last` and cumulative thread usage
@@ -1060,6 +1069,87 @@ impl BatonAdapter for CodexAdapter {
     }
 }
 
+fn rate_limit_window(value: Option<&Value>) -> Option<crate::types::RateLimitWindow> {
+    let value = value?;
+    let used = value.get("usedPercent")?;
+    // The protocol sends an integer, but older servers can send a fraction.
+    let used_percent = used
+        .as_i64()
+        .or_else(|| used.as_f64().map(|value| value.round() as i64))?;
+    Some(crate::types::RateLimitWindow {
+        used_percent,
+        window_duration_mins: value.get("windowDurationMins").and_then(Value::as_i64),
+        resets_at: value.get("resetsAt").and_then(Value::as_i64),
+    })
+}
+
+fn rate_limit_info(value: Option<&Value>) -> Option<crate::types::RateLimitInfo> {
+    let value = value?;
+    let credits = value.get("credits");
+    let info = crate::types::RateLimitInfo {
+        plan_type: value
+            .get("planType")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        primary: rate_limit_window(value.get("primary")),
+        secondary: rate_limit_window(value.get("secondary")),
+        credits_balance: credits
+            .and_then(|credits| credits.get("balance"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        credits_unlimited: credits
+            .and_then(|credits| credits.get("unlimited"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        reported_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    };
+    (info.primary.is_some()
+        || info.secondary.is_some()
+        || info.credits_balance.is_some()
+        || info.plan_type.is_some())
+    .then_some(info)
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_notification_parses_windows_and_credits() {
+        let value = serde_json::json!({
+            "planType": "plus",
+            "primary": {"usedPercent": 12, "windowDurationMins": 300, "resetsAt": 1_767_000_000},
+            "secondary": {"usedPercent": 48, "windowDurationMins": 10_080, "resetsAt": null},
+            "credits": {"hasCredits": true, "unlimited": false, "balance": "12.50"}
+        });
+        let info = rate_limit_info(Some(&value)).expect("parsed");
+        assert_eq!(info.plan_type.as_deref(), Some("plus"));
+        let primary = info.primary.expect("primary");
+        assert_eq!(primary.used_percent, 12);
+        assert_eq!(primary.window_duration_mins, Some(300));
+        assert_eq!(primary.resets_at, Some(1_767_000_000));
+        let secondary = info.secondary.expect("secondary");
+        assert_eq!(secondary.used_percent, 48);
+        assert_eq!(secondary.resets_at, None);
+        assert_eq!(info.credits_balance.as_deref(), Some("12.50"));
+        assert!(!info.credits_unlimited);
+    }
+
+    #[test]
+    fn a_fractional_used_percent_is_rounded() {
+        let value = serde_json::json!({"primary": {"usedPercent": 12.6}});
+        let info = rate_limit_info(Some(&value)).expect("parsed");
+        assert_eq!(info.primary.expect("primary").used_percent, 13);
+    }
+
+    #[test]
+    fn empty_rate_limit_payloads_are_ignored() {
+        assert!(rate_limit_info(None).is_none());
+        assert!(rate_limit_info(Some(&serde_json::json!({}))).is_none());
+        let unknown = serde_json::json!({"primary": {"windowDurationMins": 300}});
+        assert!(rate_limit_info(Some(&unknown)).is_none());
+    }
+}
 
 #[cfg(test)]
 mod tests {

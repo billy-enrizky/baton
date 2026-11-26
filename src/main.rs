@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, claim, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, status, store, tasks, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, claim, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, serve, status, store, tasks, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -7,7 +7,6 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::io::AsyncReadExt;
 
 use adapters::{AcpAdapter, BatonAdapter, ClaudeAdapter};
 use config::{describe_auth, load_config_file, resolve_config, save_config_file};
@@ -2957,7 +2956,11 @@ fn run_serve(home: &Path, stdio: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(wait_for_host_stop(stdio))?;
+    if stdio {
+        runtime.block_on(serve::stdio_loop(&store))?;
+    } else {
+        runtime.block_on(wait_for_host_stop())?;
+    }
     if !store.release_host_claim(&host_id)? {
         anyhow::bail!("host claim disappeared before shutdown");
     }
@@ -2965,14 +2968,7 @@ fn run_serve(home: &Path, stdio: bool) -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_host_stop(stdio: bool) -> Result<()> {
-    let stdin_wait = async move {
-        if stdio {
-            wait_for_stdin_eof().await;
-        } else {
-            std::future::pending::<()>().await;
-        }
-    };
+async fn wait_for_host_stop() -> Result<()> {
     #[cfg(unix)]
     {
         let mut sigterm =
@@ -2980,28 +2976,13 @@ async fn wait_for_host_stop(stdio: bool) -> Result<()> {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
             _ = sigterm.recv() => {}
-            _ = stdin_wait => {}
         }
     }
     #[cfg(not(unix))]
     {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = stdin_wait => {}
-        }
+        tokio::signal::ctrl_c().await?;
     }
     Ok(())
-}
-
-async fn wait_for_stdin_eof() {
-    let mut stdin = tokio::io::stdin();
-    let mut buffer = [0u8; 4096];
-    loop {
-        match stdin.read(&mut buffer).await {
-            Ok(0) | Err(_) => break,
-            Ok(_) => {}
-        }
-    }
 }
 
 fn build_all_adapters(

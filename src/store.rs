@@ -2398,6 +2398,22 @@ impl BatonStore {
         Ok(())
     }
 
+    pub fn count_open_turns(&self, thread_id: Option<&str>) -> Result<usize> {
+        let count: i64 = match thread_id {
+            Some(thread_id) => self.db.query_row(
+                "SELECT COUNT(*) FROM turns WHERE thread_id = ? AND phase IN ('queued', 'running', 'settling')",
+                params![thread_id],
+                |row| row.get(0),
+            )?,
+            None => self.db.query_row(
+                "SELECT COUNT(*) FROM turns WHERE phase IN ('queued', 'running', 'settling')",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+        Ok(count.max(0) as usize)
+    }
+
     pub fn get_turn_record(&self, thread_id: &str, turn: i64) -> Result<Option<TurnRow>> {
         self.db
             .query_row(

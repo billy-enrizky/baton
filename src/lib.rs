@@ -31,6 +31,7 @@ pub mod sanitize;
 pub mod shell;
 pub mod side_chat;
 pub mod scanner;
+pub mod serve;
 pub mod skill_dispatch;
 pub mod skills;
 pub mod snooze;

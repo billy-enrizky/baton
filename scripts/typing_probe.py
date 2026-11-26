@@ -8,9 +8,12 @@ start, the quiet window starts later.
 
 Each probe types 80 samples by cycling the sample text; three whole-probe
 repetitions are compared by their minimum p50 and p95. The larger sample keeps
-the p95 stable enough for a 10 percent gate on a shared host. Metrics recorded
-below `--resolution-ms` are reported but not enforced, because a sub-2 ms p95
-moves by more than the 10 percent band between identical runs on a shared host.
+the p95 stable enough for a 10 percent gate on a shared host. The slash mode
+also times a plain character repaint before each slash and gates the
+slash-to-control ratio of first responses, so host load that slows both key
+paths cancels. Metrics recorded below `--resolution-ms` are reported but not
+enforced, because a sub-2 ms p95 moves by more than the 10 percent band between
+identical runs on a shared host.
 """
 
 import argparse
@@ -57,6 +60,23 @@ def drain(fd: int, quiet_ms: float, timeout_s: float) -> float:
             break
         last = now
     return time.perf_counter() - start
+
+
+def wait_for_first_output(fd: int, timeout_s: float) -> tuple[bool, bytes]:
+    """Reads until the first chunk arrives or the deadline passes."""
+    deadline = time.perf_counter() + timeout_s
+    while time.perf_counter() < deadline:
+        ready, _, _ = select.select([fd], [], [], 0.05)
+        if not ready:
+            continue
+        try:
+            chunk = os.read(fd, 65536)
+        except OSError:
+            return False, b""
+        if not chunk:
+            return False, b""
+        return True, chunk
+    return False, b""
 
 
 def wait_for_text(fd: int, needle: bytes, timeout_s: float) -> bool:
@@ -107,6 +127,8 @@ def measure(binary: Path, args: argparse.Namespace) -> dict | None:
 
     set_size(master, args.width, args.height)
     samples = []
+    controls = []
+    firsts = []
     try:
         deadline = time.time() + args.timeout
         seen = b""
@@ -124,14 +146,33 @@ def measure(binary: Path, args: argparse.Namespace) -> dict | None:
 
         if args.slash:
             for _ in range(args.runs):
+                # Same composer repaint without the suggestion list. The ratio
+                # of the first response to this control cancels host load.
+                os.write(master, b"x")
+                start = time.perf_counter()
+                ok, _chunk = wait_for_first_output(master, args.timeout)
+                if not ok:
+                    print("composer repaint did not start", file=sys.stderr)
+                    return None
+                controls.append((time.perf_counter() - start) * 1000.0)
+                drain(master, QUIET_MS, 1.0)
+                os.write(master, b"\x7f")
+                drain(master, QUIET_MS, 1.0)
                 start = time.perf_counter()
                 os.write(master, b"/")
-                hit = wait_for_text(master, args.suggestion.encode(), args.timeout)
-                elapsed = (time.perf_counter() - start) * 1000.0
-                if not hit:
-                    print("suggestion list did not render", file=sys.stderr)
+                ok, chunk = wait_for_first_output(master, args.timeout)
+                if not ok:
+                    print("suggestion list did not start", file=sys.stderr)
                     return None
-                samples.append(elapsed)
+                firsts.append((time.perf_counter() - start) * 1000.0)
+                if args.suggestion.encode() not in chunk:
+                    hit = wait_for_text(
+                        master, args.suggestion.encode(), args.timeout
+                    )
+                    if not hit:
+                        print("suggestion list did not render", file=sys.stderr)
+                        return None
+                samples.append((time.perf_counter() - start) * 1000.0)
                 os.write(master, b"\x1b")
                 drain(master, QUIET_MS, 1.0)
         else:
@@ -166,6 +207,19 @@ def measure(binary: Path, args: argparse.Namespace) -> dict | None:
         "max_ms": ordered[-1],
         "exit_code": exit_code,
     }
+    if controls:
+        ratios = sorted(
+            first / control
+            for first, control in zip(firsts, controls)
+            if control > 0
+        )
+        control_ordered = sorted(controls)
+        result["control_p50_ms"] = statistics.median(controls)
+        result["control_p95_ms"] = control_ordered[
+            max(0, int(len(control_ordered) * 0.95) - 1)
+        ]
+        result["ratio_p50"] = statistics.median(ratios)
+        result["ratio_p95"] = ratios[max(0, int(len(ratios) * 0.95) - 1)]
     return result
 
 def main() -> int:
@@ -239,6 +293,15 @@ def main() -> int:
         "max_ms": max(r["max_ms"] for r in results),
         "exit_code": max(r["exit_code"] for r in results),
     }
+    if "ratio_p50" in results[0]:
+        result["control_p50_ms"] = statistics.median(
+            r["control_p50_ms"] for r in results
+        )
+        result["control_p95_ms"] = statistics.median(
+            r["control_p95_ms"] for r in results
+        )
+        result["ratio_p50_min"] = min(r["ratio_p50"] for r in results)
+        result["ratio_p95_min"] = min(r["ratio_p95"] for r in results)
     label = "slash" if args.slash else "typing"
     print(json.dumps(result, indent=2) if args.json else
           f"{label}: {result['runs']} runs x {result['samples']} samples, "
@@ -263,6 +326,36 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
+        if "ratio_p50_min" in baseline:
+            print(
+                f"slash p50 {result['p50_min_ms']:.2f} ms on a "
+                f"{result['control_p50_ms']:.2f} ms control; "
+                f"p95 {result['p95_min_ms']:.2f} ms on a "
+                f"{result['control_p95_ms']:.2f} ms control",
+                file=sys.stderr,
+            )
+            failures = []
+            for key, absolute in (
+                ("ratio_p50_min", "p50_min_ms"),
+                ("ratio_p95_min", "p95_min_ms"),
+            ):
+                if baseline[absolute] < args.resolution_ms:
+                    print(
+                        f"{key} recorded on a {baseline[absolute]:.2f} ms "
+                        f"baseline below the {args.resolution_ms:.2f} ms "
+                        "resolution floor; not enforced",
+                        file=sys.stderr,
+                    )
+                    continue
+                limit = baseline[key] * (1.0 + args.tolerance)
+                if result[key] > limit:
+                    failures.append(
+                        f"{key} {result[key]:.2f} > {limit:.2f} "
+                        f"({baseline[key]:.2f} baseline)"
+                    )
+            for failure in failures:
+                print(f"regression: {failure}", file=sys.stderr)
+            return 1 if failures else 0
         failures = []
         for key in ("p50_min_ms", "p95_min_ms"):
             if baseline[key] < args.resolution_ms:

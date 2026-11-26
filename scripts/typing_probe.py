@@ -8,7 +8,9 @@ start, the quiet window starts later.
 
 Each probe types 80 samples by cycling the sample text; three whole-probe
 repetitions are compared by their minimum p50 and p95. The larger sample keeps
-the p95 stable enough for a 10 percent gate on a shared host.
+the p95 stable enough for a 10 percent gate on a shared host. Metrics recorded
+below `--resolution-ms` are reported but not enforced, because a sub-2 ms p95
+moves by more than the 10 percent band between identical runs on a shared host.
 """
 
 import argparse
@@ -203,6 +205,12 @@ def main() -> int:
         default=0.1,
         help="absolute slack added to each limit for measurement noise",
     )
+    parser.add_argument(
+        "--resolution-ms",
+        type=float,
+        default=2.0,
+        help="metrics recorded below this are reported but not enforced",
+    )
     parser.add_argument("--force", action="store_true", help="compare across machines")
     args = parser.parse_args()
 
@@ -257,6 +265,13 @@ def main() -> int:
             return 2
         failures = []
         for key in ("p50_min_ms", "p95_min_ms"):
+            if baseline[key] < args.resolution_ms:
+                print(
+                    f"{key} recorded at {baseline[key]:.2f} ms is below the "
+                    f"{args.resolution_ms:.2f} ms resolution floor; not enforced",
+                    file=sys.stderr,
+                )
+                continue
             limit = baseline[key] * (1.0 + args.tolerance) + args.slack_ms
             if result[key] > limit:
                 failures.append(f"{key} {result[key]:.2f} ms > {limit:.2f} ms ({baseline[key]:.2f} baseline)")

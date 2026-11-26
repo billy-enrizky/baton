@@ -1,29 +1,30 @@
 {
   "machine": "Darwin-arm64",
   "binary": "target/release/baton",
-  "runs": 15,
-  "process_start_ms": 17.45512500019686,
-  "process_start_min_ms": 16.65499999990061,
-  "process_start_p95_ms": 18.389583000043785,
+  "runs": 9,
+  "repeats": 3,
+  "process_start_ms": 15.516708001086954,
+  "process_start_min_ms": 14.819999996689148,
+  "process_start_p95_ms": 15.914625000732485,
   "control_command": "/usr/bin/true",
-  "control_start_ms": 12.976250000065193,
-  "control_start_min_ms": 12.211374999878899,
-  "spawn_overhead_ratio": 1.3451594258826058,
-  "spawn_overhead_min_ratio": 1.363892272579114,
+  "control_start_ms": 10.932166995189618,
+  "control_start_min_ms": 10.502833996724803,
+  "spawn_overhead_ratio": 1.4193625113771706,
+  "spawn_overhead_min_ratio": 1.4110477230536642,
   "startup_ms": {
-    "config": 0.002,
-    "store": 0.33775,
-    "reap": 0.008,
-    "hydrate": 0.015917,
-    "total": 0.372458,
-    "process": 1.695417
+    "config": 0.0020829999999999998,
+    "store": 0.41066600000000003,
+    "reap": 0.008583,
+    "hydrate": 0.016334,
+    "total": 0.441583,
+    "process": 1.922833
   },
   "startup_min_ms": {
-    "config": 0.001708,
-    "store": 0.3155,
-    "reap": 0.007542,
-    "hydrate": 0.014584,
-    "total": 0.345458,
-    "process": 1.568
+    "config": 0.0015,
+    "store": 0.337333,
+    "reap": 0.007125,
+    "hydrate": 0.013125000000000001,
+    "total": 0.361167,
+    "process": 1.6802080000000001
   }
 }

@@ -362,6 +362,8 @@ impl McpServer {
                             "port": row.port,
                             "cwd": row.cwd,
                             "owner_pid": row.owner_pid,
+                            "owner_start": row.owner_start,
+                            "host_id": row.host_id,
                             "owner_running": state.owner_running,
                             "process_alive": state.alive,
                             "command_matches": state.command_matches,
@@ -975,6 +977,8 @@ mod tests {
                 None,
                 "/work",
                 u32::MAX,
+                None,
+                None,
             )
             .unwrap();
         let processes = tool_json(&server, "baton_processes", json!({}));

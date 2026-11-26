@@ -364,6 +364,8 @@ pub struct ProviderProcessRow {
     pub process_start: Option<String>,
     pub cwd: String,
     pub owner_pid: u32,
+    pub owner_start: Option<String>,
+    pub host_id: Option<String>,
     pub started_at: String,
 }
 
@@ -394,7 +396,7 @@ fn store_home(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 pub struct BatonStore {
     db: Connection,
@@ -572,6 +574,8 @@ CREATE TABLE IF NOT EXISTS provider_processes (
   process_start TEXT,
   cwd TEXT NOT NULL,
   owner_pid INTEGER NOT NULL,
+  owner_start TEXT,
+  host_id TEXT,
   started_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS orchestration_runs (
@@ -669,6 +673,8 @@ fn apply_schema(db: &Connection) -> Result<()> {
     ensure_column(db, "orchestration_runs", "archived_at", "TEXT")?;
     ensure_column(db, "orchestration_runs", "owner_pid", "INTEGER")?;
     ensure_column(db, "orchestration_runs", "owner_start", "TEXT")?;
+    ensure_column(db, "provider_processes", "owner_start", "TEXT")?;
+    ensure_column(db, "provider_processes", "host_id", "TEXT")?;
     db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -2796,10 +2802,12 @@ impl BatonStore {
         process_start: Option<&str>,
         cwd: &str,
         owner_pid: u32,
+        owner_start: Option<&str>,
+        host_id: Option<&str>,
     ) -> Result<()> {
         self.write_execute(
-            r#"INSERT INTO provider_processes (pid, provider, port, command, process_start, cwd, owner_pid, started_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            r#"INSERT INTO provider_processes (pid, provider, port, command, process_start, cwd, owner_pid, owner_start, host_id, started_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT(pid) DO UPDATE SET
                  provider = excluded.provider,
                  port = excluded.port,
@@ -2807,8 +2815,21 @@ impl BatonStore {
                  process_start = excluded.process_start,
                  cwd = excluded.cwd,
                  owner_pid = excluded.owner_pid,
+                 owner_start = excluded.owner_start,
+                 host_id = excluded.host_id,
                  started_at = excluded.started_at"#,
-            params![pid, provider.as_str(), port, command, process_start, cwd, owner_pid, now_iso()],
+            params![
+                pid,
+                provider.as_str(),
+                port,
+                command,
+                process_start,
+                cwd,
+                owner_pid,
+                owner_start,
+                host_id,
+                now_iso()
+            ],
         )?;
         Ok(())
     }
@@ -2820,7 +2841,7 @@ impl BatonStore {
 
     pub fn list_provider_processes(&self) -> Result<Vec<ProviderProcessRow>> {
         let mut statement = self.db.prepare(
-            "SELECT pid, provider, port, command, process_start, cwd, owner_pid, started_at
+            "SELECT pid, provider, port, command, process_start, cwd, owner_pid, owner_start, host_id, started_at
              FROM provider_processes ORDER BY started_at, pid",
         )?;
         let rows = statement
@@ -2834,7 +2855,9 @@ impl BatonStore {
                     process_start: row.get(4)?,
                     cwd: row.get(5)?,
                     owner_pid: row.get::<_, i64>(6)?.max(0) as u32,
-                    started_at: row.get(7)?,
+                    owner_start: row.get(7)?,
+                    host_id: row.get(8)?,
+                    started_at: row.get(9)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3780,6 +3803,51 @@ mod tests {
 
         let store = BatonStore::open(&path).unwrap();
         assert!(store.get_host_claim().unwrap().is_none());
+        let db = Connection::open(&path).unwrap();
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_version_two_store_gains_provider_host_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            "CREATE TABLE provider_processes (
+               pid INTEGER PRIMARY KEY,
+               provider TEXT NOT NULL,
+               port INTEGER,
+               command TEXT NOT NULL,
+               process_start TEXT,
+               cwd TEXT NOT NULL,
+               owner_pid INTEGER NOT NULL,
+               started_at TEXT NOT NULL
+             );
+             PRAGMA user_version = 2;",
+        )
+        .unwrap();
+        drop(db);
+
+        let store = BatonStore::open(&path).unwrap();
+        store
+            .record_provider_process(
+                42,
+                ProviderId::Codex,
+                None,
+                "codex app-server",
+                Some("start"),
+                "/work",
+                7,
+                Some("owner-start"),
+                Some("host-one"),
+            )
+            .unwrap();
+        let row = store.list_provider_processes().unwrap().remove(0);
+        assert_eq!(row.owner_start.as_deref(), Some("owner-start"));
+        assert_eq!(row.host_id.as_deref(), Some("host-one"));
         let db = Connection::open(&path).unwrap();
         let version: i64 = db
             .query_row("PRAGMA user_version", [], |row| row.get(0))

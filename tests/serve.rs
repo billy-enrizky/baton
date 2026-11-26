@@ -8,6 +8,17 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+struct ChildGuard(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
 #[test]
 fn serve_claims_once_and_releases_on_sigterm() {
     let home = tempfile::tempdir().unwrap();
@@ -177,4 +188,82 @@ fn serve_stdio_protocol_round_trips_and_releases_on_eof() {
     assert!(status.success(), "{status:?}");
     let store = baton::store::BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
     assert!(store.get_host_claim().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_shutdown_stops_owned_provider_children() {
+    let home = tempfile::tempdir().unwrap();
+    let mut host = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["serve", "--stdio"])
+        .env("BATON_HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdin = host.stdin.take().unwrap();
+    let stderr = host.stderr.take().unwrap();
+    let mut stderr_reader = BufReader::new(stderr);
+    let mut ready = String::new();
+    stderr_reader.read_line(&mut ready).unwrap();
+    assert!(ready.contains("host ready"), "{ready}");
+    let tokens = ready.split_whitespace().collect::<Vec<_>>();
+    let installation = tokens
+        .iter()
+        .position(|token| *token == "installation")
+        .expect("installation token");
+    let host_id = tokens[installation - 1];
+    let host_pid = host.id();
+    let owner_start = baton::process::process_start(host_pid);
+
+    let mut provider = ChildGuard(
+        Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn provider"),
+    );
+    let provider_pid = provider.0.id();
+    let command = baton::process::command_line(provider_pid).unwrap();
+    let start = baton::process::process_start(provider_pid).unwrap();
+    let db = rusqlite::Connection::open(home.path().join("baton.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO provider_processes (pid, provider, port, command, process_start, cwd, owner_pid, owner_start, host_id, started_at) VALUES (?, 'codex', NULL, ?, ?, ?, ?, ?, ?, ?)",
+        rusqlite::params![
+            provider_pid,
+            command,
+            start,
+            "/tmp/project",
+            host_pid,
+            owner_start,
+            host_id,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = host.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "serve did not stop after EOF");
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert!(status.success(), "{status:?}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if provider.0.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "host shutdown did not stop its provider child"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let store = baton::store::BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+    assert!(store.list_provider_processes().unwrap().is_empty());
 }

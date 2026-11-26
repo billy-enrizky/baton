@@ -81,6 +81,9 @@ impl ProcessRecorder {
         let store = store
             .lock()
             .map_err(|_| anyhow::anyhow!("baton store lock poisoned"))?;
+        let owner_pid = std::process::id();
+        let owner_start = crate::process::process_start(owner_pid);
+        let host_id = store.host_id().map(str::to_string);
         store.record_provider_process(
             pid,
             provider,
@@ -88,7 +91,9 @@ impl ProcessRecorder {
             command,
             process_start,
             &self.cwd,
-            std::process::id(),
+            owner_pid,
+            owner_start.as_deref(),
+            host_id.as_deref(),
         )
     }
 
@@ -102,13 +107,23 @@ impl ProcessRecorder {
     }
 }
 
+#[cfg(unix)]
+fn owner_running(row: &ProviderProcessRow) -> bool {
+    process_identity_alive(row.owner_pid, row.owner_start.as_deref())
+}
+
+#[cfg(not(unix))]
+fn owner_running(row: &ProviderProcessRow) -> bool {
+    pid_alive(row.owner_pid)
+}
+
 pub fn probe(row: &ProviderProcessRow) -> ProcessState {
     let alive = pid_alive(row.pid);
     let command = command_line(row.pid);
     let process_start = process_start(row.pid);
     ProcessState {
         alive,
-        owner_running: pid_alive(row.owner_pid),
+        owner_running: owner_running(row),
         command_matches: command.as_deref() == Some(row.command.as_str()),
         start_matches: row
             .process_start
@@ -125,13 +140,23 @@ pub fn probe(row: &ProviderProcessRow) -> ProcessState {
 /// kept and reported instead of killed. A reused PID or a different process is
 /// left alone.
 #[cfg(unix)]
-pub fn reap_orphans(store: &BatonStore) -> Result<ReapReport> {
+fn reap_rows(
+    store: &BatonStore,
+    rows: Vec<ProviderProcessRow>,
+    skip_live_owners: bool,
+) -> Result<ReapReport> {
     let mut report = ReapReport::default();
     let current_pid = std::process::id();
-    for row in store.list_provider_processes()? {
-        if row.owner_pid == current_pid || pid_alive(row.owner_pid) {
-            report.live_owners += 1;
-            continue;
+    for row in rows {
+        if skip_live_owners {
+            let owner_alive = match row.owner_start.as_deref() {
+                Some(start) => process_identity_alive(row.owner_pid, Some(start)),
+                None => row.owner_pid == current_pid || pid_alive(row.owner_pid),
+            };
+            if owner_alive {
+                report.live_owners += 1;
+                continue;
+            }
         }
         if !pid_alive(row.pid) {
             store.remove_provider_process(row.pid)?;
@@ -177,8 +202,31 @@ pub fn reap_orphans(store: &BatonStore) -> Result<ReapReport> {
     Ok(report)
 }
 
+#[cfg(unix)]
+pub fn reap_orphans(store: &BatonStore) -> Result<ReapReport> {
+    reap_rows(store, store.list_provider_processes()?, true)
+}
+
+/// Stops every recorded provider child that belongs to one host generation.
+/// Each child still has to pass the recorded command and start-time identity
+/// check before any signal is sent.
+#[cfg(unix)]
+pub fn terminate_host_children(store: &BatonStore, host_id: &str) -> Result<ReapReport> {
+    let rows = store
+        .list_provider_processes()?
+        .into_iter()
+        .filter(|row| row.host_id.as_deref() == Some(host_id))
+        .collect();
+    reap_rows(store, rows, false)
+}
+
 #[cfg(not(unix))]
 pub fn reap_orphans(_store: &BatonStore) -> Result<ReapReport> {
+    Ok(ReapReport::default())
+}
+
+#[cfg(not(unix))]
+pub fn terminate_host_children(_store: &BatonStore, _host_id: &str) -> Result<ReapReport> {
     Ok(ReapReport::default())
 }
 
@@ -500,6 +548,8 @@ mod tests {
                 Some(&start),
                 "/tmp/project",
                 u32::MAX,
+                None,
+                None,
             )
             .unwrap();
 
@@ -510,6 +560,74 @@ mod tests {
         assert!(report.errors.is_empty());
         assert!(store.list_provider_processes().unwrap().is_empty());
         child.0.wait().expect("reaped child must exit");
+    }
+
+    #[test]
+    fn reaps_a_child_whose_owner_start_was_reused() {
+        let store = BatonStore::memory().unwrap();
+        let (mut child, pid, command, start) = sleeper();
+        store
+            .record_provider_process(
+                pid,
+                ProviderId::OpenCode,
+                None,
+                &command,
+                Some(&start),
+                "/tmp/project",
+                std::process::id(),
+                Some("an older process generation"),
+                None,
+            )
+            .unwrap();
+
+        let report = reap_orphans(&store).unwrap();
+
+        assert_eq!(report.reaped.len(), 1);
+        assert!(store.list_provider_processes().unwrap().is_empty());
+        child.0.wait().expect("reaped child must exit");
+    }
+
+    #[test]
+    fn terminate_host_children_stops_only_the_named_generation() {
+        let store = BatonStore::memory().unwrap();
+        let (mut old_child, old_pid, old_command, old_start) = sleeper();
+        let (mut new_child, new_pid, new_command, new_start) = sleeper();
+        store
+            .record_provider_process(
+                old_pid,
+                ProviderId::Codex,
+                None,
+                &old_command,
+                Some(&old_start),
+                "/tmp/project",
+                u32::MAX,
+                None,
+                Some("host-old"),
+            )
+            .unwrap();
+        store
+            .record_provider_process(
+                new_pid,
+                ProviderId::Codex,
+                None,
+                &new_command,
+                Some(&new_start),
+                "/tmp/project",
+                u32::MAX,
+                None,
+                Some("host-new"),
+            )
+            .unwrap();
+
+        let report = terminate_host_children(&store, "host-old").unwrap();
+
+        assert_eq!(report.reaped.len(), 1);
+        assert_eq!(report.reaped[0].pid, old_pid);
+        old_child.0.wait().expect("old child must exit");
+        assert!(new_child.0.try_wait().unwrap().is_none());
+        let rows = store.list_provider_processes().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].host_id.as_deref(), Some("host-new"));
     }
 
     #[test]
@@ -525,6 +643,8 @@ mod tests {
                 Some(&start),
                 "/tmp/project",
                 std::process::id(),
+                process_start(std::process::id()).as_deref(),
+                None,
             )
             .unwrap();
 
@@ -549,6 +669,8 @@ mod tests {
                 Some(&start),
                 "/tmp/project",
                 u32::MAX,
+                None,
+                None,
             )
             .unwrap();
 
@@ -571,6 +693,8 @@ mod tests {
             process_start: None,
             cwd: "/tmp/project".to_string(),
             owner_pid: u32::MAX,
+            owner_start: None,
+            host_id: None,
             started_at: String::new(),
         };
 
@@ -595,6 +719,8 @@ mod tests {
                 None,
                 "/tmp/project",
                 u32::MAX,
+                None,
+                None,
             )
             .unwrap();
 
@@ -627,6 +753,8 @@ mod tests {
                 Some("not the real start time"),
                 "/tmp/project",
                 u32::MAX,
+                None,
+                None,
             )
             .unwrap();
 
@@ -702,7 +830,17 @@ mod tests {
         let pid = child.id();
         child.wait().unwrap();
         store
-            .record_provider_process(pid, ProviderId::OpenCode, None, "true", None, "/tmp", u32::MAX)
+            .record_provider_process(
+                pid,
+                ProviderId::OpenCode,
+                None,
+                "true",
+                None,
+                "/tmp",
+                u32::MAX,
+                None,
+                None,
+            )
             .unwrap();
 
         let report = reap_orphans(&store).unwrap();

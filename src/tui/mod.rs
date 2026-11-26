@@ -867,6 +867,7 @@ struct ShellEvent {
 const FILES_PICKER_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_SUGGESTIONS: usize = 8;
+const FILE_REF_DIRECTORY_SUGGESTIONS: usize = 4;
 const GREP_PICKER_LIMIT: usize = 200;
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -3214,16 +3215,33 @@ fn file_reference_suggestions(state: &TuiState) -> Vec<CommandSuggestion> {
     if state.file_ref.entries.is_empty() {
         return Vec::new();
     }
-    crate::files::ranked_indices(&state.file_ref.entries, &query)
-        .into_iter()
-        .take(FILE_REF_SUGGESTIONS)
-        .filter_map(|index| state.file_ref.entries.get(index))
-        .map(|path| CommandSuggestion {
-            insert: path.clone(),
-            description: "project file".to_string(),
-            replace: Some((start, end)),
-        })
-        .collect()
+    let mut suggestions: Vec<CommandSuggestion> = Vec::new();
+    if !query.trim().is_empty() {
+        for directory in crate::files::directory_candidates(
+            &state.file_ref.entries,
+            &query,
+            FILE_REF_DIRECTORY_SUGGESTIONS,
+        ) {
+            suggestions.push(CommandSuggestion {
+                insert: directory,
+                description: "project directory".to_string(),
+                replace: Some((start, end)),
+            });
+        }
+    }
+    let remaining = FILE_REF_SUGGESTIONS.saturating_sub(suggestions.len());
+    suggestions.extend(
+        crate::files::ranked_indices(&state.file_ref.entries, &query)
+            .into_iter()
+            .take(remaining)
+            .filter_map(|index| state.file_ref.entries.get(index))
+            .map(|path| CommandSuggestion {
+                insert: path.clone(),
+                description: "project file".to_string(),
+                replace: Some((start, end)),
+            }),
+    );
+    suggestions
 }
 
 fn ensure_file_reference_index(state: &mut TuiState) {
@@ -3290,11 +3308,18 @@ fn apply_file_ref_event(state: &mut TuiState, event: FileRefEvent) {
 }
 
 fn apply_suggestion(state: &mut TuiState, suggestion: &CommandSuggestion) {
+    // A directory ends with `/`; keep the cursor inside the mention so the next
+    // keystroke narrows the files inside it instead of starting a new word.
+    let separator = if suggestion.insert.ends_with('/') {
+        ""
+    } else {
+        " "
+    };
     match suggestion.replace {
         Some((start, end)) => {
-            state.replace_input_range(start, end, &format!("@{} ", suggestion.insert))
+            state.replace_input_range(start, end, &format!("@{}{separator}", suggestion.insert))
         }
-        None => state.set_input(format!("{} ", suggestion.insert)),
+        None => state.set_input(format!("{}{separator}", suggestion.insert)),
     }
     state.suggestion_index = 0;
 }
@@ -28443,6 +28468,72 @@ exit 1
         );
         assert_eq!(state.input, "explain @src/parser/mod.rs ");
         assert_eq!(state.input_cursor, state.input.chars().count());
+    }
+
+    #[test]
+    fn file_reference_offers_directories_before_files() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.file_ref.root = Some(state.thread.cwd.clone());
+        state.file_ref.entries = vec![
+            "README.md".to_string(),
+            "src/main.rs".to_string(),
+            "src/tui/mod.rs".to_string(),
+        ];
+        state.input = "@src".to_string();
+        state.input_cursor = state.input.chars().count();
+
+        let suggestions = suggestions_for(&state);
+        assert_eq!(suggestions[0].insert, "src/");
+        assert_eq!(suggestions[0].description, "project directory");
+        assert!(suggestions
+            .iter()
+            .any(|suggestion| suggestion.insert == "src/tui/"));
+        assert!(suggestions
+            .iter()
+            .any(|suggestion| suggestion.insert == "src/main.rs"));
+
+        state.suggestion_index = suggestions
+            .iter()
+            .position(|suggestion| suggestion.insert == "src/")
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Tab),
+        );
+        assert_eq!(state.input, "@src/");
+        assert_eq!(state.input_cursor, state.input.chars().count());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        for character in ['m', 'a'] {
+            handle_key(
+                &mut state,
+                &store,
+                &engine_command_sender,
+                key(KeyCode::Char(character)),
+            );
+        }
+        let suggestions = suggestions_for(&state);
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.insert == "src/main.rs"),
+            "{suggestions:?}"
+        );
+        state.suggestion_index = suggestions
+            .iter()
+            .position(|suggestion| suggestion.insert == "src/main.rs")
+            .unwrap();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Tab),
+        );
+        assert_eq!(state.input, "@src/main.rs ");
     }
 
     #[test]

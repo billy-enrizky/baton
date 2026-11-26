@@ -591,6 +591,52 @@ pub fn ranked_indices_with_recent(
     sorted_indices(entries, &query, &tokens, &recent)
 }
 
+/// Directory mentions derived from the file index. Each parent directory is
+/// returned once, with a trailing slash, and only when it matches the query.
+pub fn directory_candidates(entries: &[String], query: &str, limit: usize) -> Vec<String> {
+    let query = query.trim().to_lowercase();
+    let match_query = query.trim_end_matches('/');
+    if match_query.is_empty() {
+        return Vec::new();
+    }
+    let mut directories = std::collections::BTreeSet::new();
+    for entry in entries {
+        let mut path = entry.as_str();
+        while let Some((parent, _)) = path.rsplit_once('/') {
+            if parent.is_empty() {
+                break;
+            }
+            directories.insert(format!("{parent}/"));
+            path = parent;
+        }
+    }
+    let mut matches = directories
+        .into_iter()
+        .filter_map(|directory| {
+            let trimmed = directory.trim_end_matches('/').to_lowercase();
+            let name = trimmed.rsplit('/').next().unwrap_or(&trimmed);
+            let score = if name == match_query {
+                0
+            } else if name.starts_with(match_query) {
+                1
+            } else if trimmed.starts_with(match_query) {
+                2
+            } else if trimmed.contains(match_query) {
+                3
+            } else {
+                return None;
+            };
+            Some((score, directory.chars().count(), directory))
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches
+        .into_iter()
+        .take(limit)
+        .map(|(_, _, directory)| directory)
+        .collect()
+}
+
 #[cfg(test)]
 fn rank_candidates(candidates: Vec<String>, query: Option<&str>) -> Vec<String> {
     rank_candidates_with_recent(candidates, query, &std::collections::HashMap::new())
@@ -676,6 +722,30 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_candidates_list_unique_parents_with_trailing_slashes() {
+        let entries = vec![
+            "src/lib.rs".to_string(),
+            "src/tui/mod.rs".to_string(),
+            "src/tui/viewport.rs".to_string(),
+            "README.md".to_string(),
+        ];
+        assert_eq!(
+            directory_candidates(&entries, "src", 4),
+            vec!["src/".to_string(), "src/tui/".to_string(),]
+        );
+        assert_eq!(
+            directory_candidates(&entries, "tui", 4),
+            vec!["src/tui/".to_string()]
+        );
+        assert!(directory_candidates(&entries, "", 4).is_empty());
+        assert!(directory_candidates(&entries, "missing", 4).is_empty());
+        assert_eq!(
+            directory_candidates(&entries, "src/", 4),
+            vec!["src/".to_string(), "src/tui/".to_string(),]
+        );
+    }
 
     #[test]
     fn ranking_filters_tokens_and_prefers_file_names() {

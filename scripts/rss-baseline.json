@@ -1,7 +1,8 @@
 {
   "machine": "Darwin-arm64",
   "binary": "target/debug/baton",
-  "idle_mb": 18.375,
-  "load_peak_mb": 18.65625,
+  "idle_mb": 20.171875,
+  "load_peak_mb": 20.421875,
+  "provider_peak_mb": 22.125,
   "exit_code": 0
 }

@@ -23,6 +23,69 @@ from pathlib import Path
 
 SAMPLE_INTERVAL_S = 0.05
 
+FAKE_CODEX = '''#!/usr/bin/env python3
+import json
+import sys
+import time
+
+if "app-server" not in sys.argv:
+    print("codex 0.0.0")
+    sys.exit(0)
+
+
+def send(value):
+    sys.stdout.write(json.dumps(value) + "\\n")
+    sys.stdout.flush()
+
+
+for line in sys.stdin:
+    try:
+        frame = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    method = frame.get("method")
+    request_id = frame.get("id")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "thread/start":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"thread": {"id": "native-rss", "path": None}}})
+    elif method == "thread/resume":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "model/list":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"data": [], "nextCursor": None}})
+    elif method == "turn/start":
+        send({"jsonrpc": "2.0", "id": request_id, "result": {"turn": {"id": "turn-rss", "status": "inProgress"}}})
+        for index in range(30):
+            send({
+                "jsonrpc": "2.0",
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "native-rss",
+                    "turnId": "turn-rss",
+                    "itemId": "msg-rss",
+                    "delta": "chunk %d " % index,
+                },
+            })
+            time.sleep(0.05)
+        send({
+            "jsonrpc": "2.0",
+            "method": "turn/completed",
+            "params": {
+                "threadId": "native-rss",
+                "turn": {
+                    "id": "turn-rss",
+                    "status": "completed",
+                    "items": [
+                        {"type": "agentMessage", "id": "msg-rss", "text": "stream done"}
+                    ],
+                },
+            },
+        })
+    elif request_id is not None:
+        send({"jsonrpc": "2.0", "id": request_id, "result": {}})
+'''
+
+
 
 def set_size(fd: int, width: int, height: int) -> None:
     fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", height, width, 0, 0))
@@ -82,17 +145,28 @@ def main() -> int:
 
     home = tempfile.mkdtemp(prefix="baton-rss-home-")
     workdir = tempfile.mkdtemp(prefix="baton-rss-cwd-")
+    harness_dir = Path(workdir) / "bin"
+    harness_dir.mkdir()
+    fake_codex = harness_dir / "codex"
+    fake_codex.write_text(FAKE_CODEX)
+    fake_codex.chmod(0o755)
+    Path(home, "config.json").write_text(
+        json.dumps({"defaultProvider": "codex", "defaultMode": "single"}) + "\n"
+    )
     pid, master = pty.fork()
     if pid == 0:
         os.chdir(workdir)
         env = os.environ.copy()
         env["BATON_HOME"] = home
+        env["PATH"] = f"{harness_dir}:{env.get('PATH', '')}"
         env["TERM"] = "xterm-256color"
         os.execvpe(str(binary), [str(binary)], env)
 
     set_size(master, args.width, args.height)
     idle_samples: list[int] = []
     load_samples: list[int] = []
+    provider_samples: list[int] = []
+    transcript = bytearray()
 
     def pump(seconds: float) -> None:
         deadline = time.perf_counter() + seconds
@@ -100,7 +174,7 @@ def main() -> int:
             ready, _, _ = select.select([master], [], [], SAMPLE_INTERVAL_S)
             if ready:
                 try:
-                    os.read(master, 65536)
+                    transcript.extend(os.read(master, 65536))
                 except OSError:
                     return
 
@@ -134,6 +208,18 @@ def main() -> int:
                     load_samples.append(value)
                 pump(0.05)
 
+        # A provider turn through a fake Codex app server. The fake streams
+        # deltas for about 1.5 seconds so the parent can sample during the turn.
+        os.write(master, b"memory test\r")
+        for _ in range(40):
+            value = rss_kb(pid)
+            if value is not None:
+                provider_samples.append(value)
+            pump(SAMPLE_INTERVAL_S)
+        if b"chunk 0" not in transcript:
+            print("the provider turn did not stream", file=sys.stderr)
+            return 1
+
         # Two control-c presses exit; the third write can hit EIO once the tty
         # closes, which is an exit, not a failure.
         for _ in range(3):
@@ -157,12 +243,17 @@ def main() -> int:
         "binary": str(args.binary),
         "idle_mb": max(idle_samples) / 1024.0,
         "load_peak_mb": max(load_samples or idle_samples) / 1024.0,
+        "provider_peak_mb": max(provider_samples or idle_samples) / 1024.0,
         "exit_code": exit_code,
     }
     print(
         json.dumps(result, indent=2)
         if args.json
-        else f"rss: idle {result['idle_mb']:.1f} MB, load peak {result['load_peak_mb']:.1f} MB"
+        else (
+            f"rss: idle {result['idle_mb']:.1f} MB, load peak "
+            f"{result['load_peak_mb']:.1f} MB, provider peak "
+            f"{result['provider_peak_mb']:.1f} MB"
+        )
     )
     if exit_code != 0:
         return 1
@@ -178,7 +269,7 @@ def main() -> int:
             )
             return 2
         failures = []
-        for key in ("idle_mb", "load_peak_mb"):
+        for key in ("idle_mb", "load_peak_mb", "provider_peak_mb"):
             limit = baseline[key] * (1.0 + args.tolerance)
             if result[key] > limit:
                 failures.append(f"{key} {result[key]:.1f} MB > {limit:.1f} MB ({baseline[key]:.1f} baseline)")

@@ -4,6 +4,10 @@ use baton::types::{PermissionMode, ProviderId, SessionMode, TurnPhase, TurnUsage
 use baton::usage::{cache_hit_rate, format_token_count, format_usage_line, sum_usage};
 use baton::scanner::{parse_claude_transcript, parse_codex_transcript};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 
 fn message(role: &str, text: &str) -> HandoffMessage {
@@ -2362,4 +2366,111 @@ fn tui_refuses_a_non_interactive_terminal() {
         stderr.contains("interactive terminal"),
         "stderr did not name the terminal requirement: {stderr}"
     );
+}
+
+#[test]
+fn status_json_reports_an_empty_state_with_a_closed_stdin() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["-C", cwd.path().to_str().unwrap(), "status", "--json"])
+        .env("BATON_HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("status should exit");
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("status --json must print JSON");
+    assert!(value["thread_id"].is_null(), "{value}");
+    assert_eq!(value["turn_count"], 0, "{value}");
+    assert_eq!(value["next_action"], "start a thread with baton", "{value}");
+}
+
+#[test]
+fn status_text_reports_an_empty_state() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["-C", cwd.path().to_str().unwrap(), "status"])
+        .env("BATON_HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("status should exit");
+    assert!(output.status.success(), "{:?}", output.status);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no thread in this directory yet"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn exec_usage_errors_exit_two() {
+    let home = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .arg("exec")
+        .env("BATON_HOME", home.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .expect("exec should exit");
+    assert_eq!(output.status.code(), Some(2), "{:?}", output.status);
+}
+
+#[cfg(unix)]
+#[test]
+fn exec_sigint_terminates_the_process_by_signal() {
+    let home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    let bin = cwd.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let harness = bin.join("codex");
+    std::fs::write(
+        &harness,
+        "#!/bin/sh\necho started > harness-started\nsleep 30\n",
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["-C", cwd.path().to_str().unwrap(), "exec", "interrupt me"])
+        .env("BATON_HOME", home.path())
+        .env("PATH", path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("exec should start");
+    // The fake harness writes its marker from the provider process, so the
+    // signal lands after Baton has started a turn.
+    let marker = cwd.path().join("harness-started");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !marker.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    assert!(
+        marker.exists(),
+        "the fake harness did not start before the interrupt"
+    );
+    let pid = child.id() as i32;
+    let _ = unsafe { libc::kill(-pid, libc::SIGINT) };
+    let status = child.wait().expect("exec should exit");
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
 }

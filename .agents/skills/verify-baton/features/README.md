@@ -16,7 +16,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Worker questions list | TUI | `/questions` lists open worker questions and opens the worker thread to answer |
 | Roles | TUI and CLI | `/roles` shows the four resolved role rows and detail; `baton roles --json` also returns effort, prompt source/path, and parsed hook declarations |
 | Skills | TUI | `/skills` lists Claude and Codex skills, scrolls past eight rows, and Enter inserts the source-specific invocation into the composer |
-| Status next action | CLI | `baton status` and `--json` answer what to do now |
+| Status next action | CLI | `baton status` and `--json` answer what to do now; a directory with no threads exits 0 with a null-thread JSON shape and `start a thread with baton` |
 | Model catalog | TUI | `/model` merges the live list, the last recorded full list, and the known catalog; a short or failed probe keeps the older models |
 | Provider readiness | CLI and TUI | doctor summarizes ready/missing; pickers mark missing harnesses |
 | Default provider | CLI and TUI | new work starts on an installed harness, with an explicit override |

@@ -122,7 +122,8 @@ fn main_result(started: Instant) -> Result<()> {
             }
             let prompt = prompt.join(" ");
             if prompt.is_empty() {
-                anyhow::bail!("usage: baton exec <prompt>");
+                eprintln!("usage: baton exec <prompt>");
+                std::process::exit(2);
             }
             let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
             let resolved = resolve_config(&home, &cwd);
@@ -2480,11 +2481,17 @@ fn main_result(started: Instant) -> Result<()> {
             let store = BatonStore::open(&paths::baton_db_path())?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
                 Some(thread_id) => resolve_thread(&store, thread_id)?,
-                None => store
-                    .list_threads_for_path(&cwd)?
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("no threads in this directory yet"))?,
+                None => match store.list_threads_for_path(&cwd)?.into_iter().next() {
+                    Some(thread) => thread,
+                    None => {
+                        if json {
+                            println!("{}", serde_json::to_string_pretty(&status::empty_json())?);
+                        } else {
+                            println!("no thread in this directory yet. Run baton to start one.");
+                        }
+                        return Ok(());
+                    }
+                },
             };
             let resolved = resolve_config(&home, Path::new(&thread.cwd));
             let model = thread

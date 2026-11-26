@@ -102,6 +102,7 @@ A harness is the coding agent CLI you already use, such as Codex, Claude Code, C
   - 12.2 [Turns and execution](#122-turns-and-execution)
   - 12.3 [Orchestration](#123-orchestration)
   - 12.4 [Data and maintenance](#124-data-and-maintenance)
+  - 12.5 [Exit codes](#125-exit-codes)
 - 13\. [Configuration and storage](#13-configuration-and-storage)
   - 13.1 [Files](#131-files)
   - 13.2 [BATON_HOME](#132-baton_home)
@@ -644,6 +645,8 @@ baton doctor [--json]
 baton ps [--json]
 ```
 
+In a directory with no threads, `baton status` still exits 0. The text form says `no thread in this directory yet. Run baton to start one.`, and `--json` keeps the usual shape with `thread_id: null`, `turn_count: 0`, and `next_action: "start a thread with baton"`.
+
 `baton usage` prints one row per thread. `--by day` sums newest days first; `--by model` and `--by provider` sum alphabetically. `--json` emits schema version 1 with a `threads` array, or a `groups` array with `by` when grouping.
 
 ### 12.2 Turns and execution
@@ -691,6 +694,17 @@ baton bench startup [--json] [--repeat N]
 baton completions <shell>
 baton update
 ```
+
+### 12.5 Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | The command finished. A query that finds no threads or no work still succeeds. |
+| `1` | A runtime failure: a provider error, a missing repository, an unreadable store, or a failed turn. |
+| `2` | A usage error: an unknown flag, a missing command argument, or a missing `exec` prompt. |
+| `130` | Interrupted. A cancelled orchestration exits 130; a process killed by Ctrl+C/SIGINT reports signal 2, which shells show as 130. |
+
+Machine output stays on stdout and progress stays on stderr, so a pipeline can parse `--json` without filtering log lines. The TUI itself does not use exit codes for turns; Ctrl+C interrupts a turn and a second idle Ctrl+C exits.
 
 ## 13. Configuration and storage
 

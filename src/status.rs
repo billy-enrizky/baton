@@ -82,6 +82,31 @@ pub fn to_json(status: &ThreadStatus) -> serde_json::Value {
     })
 }
 
+/// The same shape as `to_json`, with null thread fields, for a directory with
+/// no threads. Agents can parse it without a special empty response.
+pub fn empty_json() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "thread_id": null,
+        "title": null,
+        "provider": null,
+        "model": null,
+        "reasoning_effort": null,
+        "permission_mode": null,
+        "session_mode": null,
+        "goal": null,
+        "goal_paused": false,
+        "latest_turn": null,
+        "turn_count": 0,
+        "queue": [],
+        "queue_count": 0,
+        "usage": null,
+        "next_action": "start a thread with baton",
+        "open_turn": false,
+        "stale_hint": null,
+    })
+}
+
 /// One plain-language answer to "what do I do now?" for humans and agents.
 pub fn next_action(status: &ThreadStatus) -> &'static str {
     match status.latest_turn.as_ref().map(|turn| turn.phase) {
@@ -215,6 +240,18 @@ mod tests {
         assert_eq!(value["next_action"], "read the error, then send another message");
         assert_eq!(value["open_turn"], false);
         assert_eq!(value["stale_hint"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn empty_json_keeps_the_status_shape() {
+        let value = empty_json();
+        assert_eq!(value["schema_version"], SCHEMA_VERSION);
+        assert!(value["thread_id"].is_null());
+        assert!(value["latest_turn"].is_null());
+        assert_eq!(value["turn_count"], 0);
+        assert_eq!(value["queue_count"], 0);
+        assert_eq!(value["next_action"], "start a thread with baton");
+        assert_eq!(value["open_turn"], false);
     }
 
     #[test]

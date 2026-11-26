@@ -48,7 +48,22 @@ baton host takeover --pid <pid>    # replace a live host after confirmation
 
 A directory with no threads is not an error. `baton status` exits 0 and reports `thread_id: null` with `next_action: "start a thread with baton"`.
 
-`baton serve` claims the local store for one host process, runs provider and turn recovery, and holds the claim until SIGINT, SIGTERM, or, with `--stdio`, stdin EOF. It does not accept commands yet. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and takeover hint. The TUI opens read-only with the same notice.
+`baton serve` claims the local store for one host process, runs provider and turn recovery, and holds the claim until SIGINT, SIGTERM, or, with `--stdio`, stdin EOF. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and takeover hint. The TUI opens read-only with the same notice.
+
+`--stdio` accepts one newline-delimited JSON request per line. The response echoes `id`, and stdout carries protocol lines only:
+
+```json
+{"v":1,"kind":"request","id":7,"command":"status","args":{"thread":null}}
+{"v":1,"kind":"response","id":7,"ok":true,"result":{"scope":"host","threads":2,"running_turns":0}}
+```
+
+| Command | Result |
+| --- | --- |
+| `ping` | `{"pong":true}` |
+| `claim-info` | The live claim row, or `null`. |
+| `status` | `{"scope":"host" or "thread","threads":n,"running_turns":n}` |
+
+A malformed line or unsupported version answers with `id: null` and code `malformed_line` or `bad_version`, and the host continues. An unknown command answers `not_implemented`. EOF stops the host and releases the claim.
 
 `baton host takeover --pid <pid>` prints the live claim's pid and process start and asks for a `y` or `yes` answer. Confirmation replaces the claim, fences the old host out, settles all open turns and running orchestration, and releases the store for a new host. A wrong pid, changed claim, dead owner, held write lock, or declined prompt leaves the claim untouched. The old host process is not signalled.
 

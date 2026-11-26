@@ -599,7 +599,16 @@ Install and update copy the whole skill directory through a staging directory. S
 }
 ```
 
-`baton serve` claims the local store for one host process, runs provider and turn recovery, and holds the claim until SIGINT, SIGTERM, or, with `--stdio`, stdin EOF. It does not accept commands yet. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and the `baton host takeover --pid <pid>` hint. The TUI opens read-only, shows the same ownership line, and refuses to send a prompt or change the store.
+`baton serve` claims the local store for one host process, runs provider and turn recovery, and holds the claim until SIGINT, SIGTERM, or, with `--stdio`, stdin EOF. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and the `baton host takeover --pid <pid>` hint. The TUI opens read-only, shows the same ownership line, and refuses to send a prompt or change the store.
+
+With `--stdio`, the host accepts one newline-delimited JSON request per line. Responses carry the same `id`, and stdout carries no diagnostics:
+
+```json
+{"v":1,"kind":"request","id":7,"command":"status","args":{"thread":null}}
+{"v":1,"kind":"response","id":7,"ok":true,"result":{"scope":"host","threads":2,"running_turns":0}}
+```
+
+`ping` returns `{"pong":true}`, `claim-info` returns the live claim row or `null`, and `status` returns host-wide counts or counts for one `thread` id. A malformed line or unsupported version answers `malformed_line` or `bad_version` with `id: null` and keeps the host alive. An unknown command answers `not_implemented`. Closing stdin stops the host and releases the claim.
 
 `baton host takeover --pid <pid>` reads the live claim, prints its pid and process start, and asks for `y` or `yes`. Confirmation replaces the claim, fences the old host out, settles every open turn and running orchestration, releases the takeover claim, and leaves the store ready for a new `baton serve`. A wrong pid, a changed claim, a dead owner, a held write lock, or a declined prompt leaves the claim in place. The command does not signal the old host process.
 

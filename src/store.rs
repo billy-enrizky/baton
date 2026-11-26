@@ -69,6 +69,7 @@ pub struct TurnRow {
     pub ended_at: Option<String>,
     pub owner_pid: Option<u32>,
     pub owner_start: Option<String>,
+    pub owner_grant_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -434,7 +435,7 @@ fn store_home(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 pub struct BatonStore {
     db: Connection,
@@ -491,6 +492,7 @@ CREATE TABLE IF NOT EXISTS turns (
   ended_at TEXT,
   owner_pid INTEGER,
   owner_start TEXT,
+  owner_grant_id TEXT,
   PRIMARY KEY (thread_id, turn)
 );
 CREATE TABLE IF NOT EXISTS provider_sessions (
@@ -696,6 +698,7 @@ fn apply_schema(db: &Connection) -> Result<()> {
         "INTEGER NOT NULL DEFAULT 0",
     )?;
     ensure_column(db, "provider_processes", "process_start", "TEXT")?;
+    ensure_column(db, "turns", "owner_grant_id", "TEXT")?;
     ensure_column(db, "recent_files", "seq", "INTEGER NOT NULL DEFAULT 0")?;
     ensure_column(db, "orchestration_tasks", "commit_sha", "TEXT")?;
     ensure_column(db, "orchestration_tasks", "merged_at", "TEXT")?;
@@ -2329,6 +2332,7 @@ impl BatonStore {
             ended_at: row.get(8)?,
             owner_pid: row.get::<_, Option<i64>>(9)?.map(|pid| pid as u32),
             owner_start: row.get(10)?,
+            owner_grant_id: row.get(11)?,
         })
     }
 
@@ -2461,7 +2465,7 @@ impl BatonStore {
     pub fn get_turn_record(&self, thread_id: &str, turn: i64) -> Result<Option<TurnRow>> {
         self.db
             .query_row(
-                "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start FROM turns WHERE thread_id = ? AND turn = ?",
+                "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start, owner_grant_id FROM turns WHERE thread_id = ? AND turn = ?",
                 params![thread_id, turn],
                 Self::map_turn,
             )
@@ -2471,7 +2475,7 @@ impl BatonStore {
 
     pub fn list_turn_records(&self, thread_id: &str) -> Result<Vec<TurnRow>> {
         let mut statement = self.db.prepare(
-            "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start FROM turns WHERE thread_id = ? ORDER BY turn",
+            "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start, owner_grant_id FROM turns WHERE thread_id = ? ORDER BY turn",
         )?;
         let rows = statement
             .query_map(params![thread_id], Self::map_turn)?
@@ -2783,7 +2787,7 @@ impl BatonStore {
         let rows = match cwd {
             Some(cwd) => {
                 let mut statement = self.db.prepare(
-                    "SELECT tu.thread_id, tu.turn, tu.provider, tu.model, tu.phase, tu.error, tu.provider_turn_id, tu.started_at, tu.ended_at, tu.owner_pid, tu.owner_start
+                    "SELECT tu.thread_id, tu.turn, tu.provider, tu.model, tu.phase, tu.error, tu.provider_turn_id, tu.started_at, tu.ended_at, tu.owner_pid, tu.owner_start, tu.owner_grant_id
                      FROM turns tu JOIN threads t ON t.id = tu.thread_id
                      WHERE t.cwd = ? AND tu.phase IN ('queued', 'running', 'settling') ORDER BY tu.started_at",
                 )?;
@@ -2794,7 +2798,7 @@ impl BatonStore {
             }
             None => {
                 let mut statement = self.db.prepare(
-                    "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start
+                    "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start, owner_grant_id
                      FROM turns WHERE phase IN ('queued', 'running', 'settling') ORDER BY started_at",
                 )?;
                 let rows = statement
@@ -4454,6 +4458,77 @@ mod tests {
             .unwrap();
         assert_eq!(settlement.tasks, 1);
         assert_eq!(run_row(&store, "run-live").status, "cancelled");
+    }
+
+    #[test]
+    fn a_version_three_store_gains_the_turn_grant_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", 3).unwrap();
+        db.execute_batch(
+            "CREATE TABLE turns (
+               thread_id TEXT NOT NULL,
+               turn INTEGER NOT NULL,
+               provider TEXT NOT NULL,
+               model TEXT,
+               phase TEXT NOT NULL,
+               error TEXT,
+               provider_turn_id TEXT,
+               started_at TEXT NOT NULL,
+               ended_at TEXT,
+               owner_pid INTEGER,
+               owner_start TEXT,
+               PRIMARY KEY (thread_id, turn)
+             );",
+        )
+        .unwrap();
+        drop(db);
+
+        let store = BatonStore::open(&path).unwrap();
+        drop(store);
+        let db = Connection::open(&path).unwrap();
+        let columns: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('turns') WHERE name = 'owner_grant_id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(columns, 1, "the migration adds the grant column");
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn turn_rows_read_the_grant_owner() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "grant".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&thread.id, ProviderId::Codex, None, "work", false)
+            .unwrap();
+        let turn = store.get_turn_record(&thread.id, 1).unwrap().unwrap();
+        assert_eq!(turn.owner_grant_id, None, "local work has no grant");
+
+        store
+            .write_execute(
+                "UPDATE turns SET owner_grant_id = ? WHERE thread_id = ? AND turn = 1",
+                params!["grant-1", thread.id],
+            )
+            .unwrap();
+        let turn = store.get_turn_record(&thread.id, 1).unwrap().unwrap();
+        assert_eq!(turn.owner_grant_id.as_deref(), Some("grant-1"));
+        let listed = store.list_turn_records(&thread.id).unwrap();
+        assert_eq!(listed[0].owner_grant_id.as_deref(), Some("grant-1"));
     }
 
     #[test]

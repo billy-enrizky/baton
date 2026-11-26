@@ -29,6 +29,16 @@ A turn becomes `unverified` when the harness process ends without a clean comple
 
 `/status` names the phase and the adapter state. `/retry` starts a new turn from a failed or unverified turn on the same harness. It refuses a thread with open work or a different harness.
 
+## A run stays running after its process stops
+
+A run becomes `running` when it starts. If the orchestrator process is killed, the run can stay in that state with tasks that will never finish.
+
+```sh
+baton runs settle <run-id> --status failed
+```
+
+`baton orchestrate --list` lists runs with their status, and `baton orchestrate --run <run-id>` shows that run's tasks. `completed` is refused while a task or turn is open; use `partial`, `failed`, or `cancelled` for a run that stopped early. Add `--force` when you know the recorded owner process is gone but its pid is still visible.
+
 ## A restore is refused
 
 `/rewind` and `baton restore` refuse some targets on purpose.

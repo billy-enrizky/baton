@@ -1,0 +1,81 @@
+---
+title: "Quickstart"
+description: "From a fresh install to a first turn in under five minutes."
+icon: "rocket"
+---
+
+This page takes you from an installed binary to a first answer. You need git and one harness CLI.
+
+<Steps>
+  <Step title="Install a harness and sign in">
+    Install a harness such as Codex or Claude Code, then sign in with its own CLI or with `/login` inside Baton.
+
+    ```sh
+    baton doctor
+    ```
+
+    `baton doctor` prints one row per harness with the auth source it found. Fix anything it marks as missing before you continue.
+  </Step>
+  <Step title="Open a repository">
+    ```sh
+    cd ~/code/my-project
+    baton
+    ```
+
+    Baton draws the transcript, the composer, and a status bar that names the harness, model, permission mode, and billing source.
+  </Step>
+  <Step title="Send a prompt">
+    Type in plain language and press Enter.
+
+    ```text
+    Add a retry to the upload client and test it.
+    ```
+
+    New threads start in orchestrate mode, so a planner splits the goal first and the run report shows the tasks as workers start. If you want one harness to answer directly, run `/orchestrate off` before your prompt.
+  </Step>
+  <Step title="Read the result">
+    The transcript shows the assistant text, one row per tool call, and a tinted diff when files change. A long diff collapses to twelve rows. Press Ctrl+T to expand it.
+  </Step>
+  <Step title="Review and ship">
+    ```text
+    /review
+    ```
+
+    Select a changed line, press `n` to write a note, then `s` to send the notes. When the change looks right, `/git commit` and `/git push` finish the loop. See [Ship from the terminal](/guides/ship-from-the-terminal).
+  </Step>
+</Steps>
+
+## Watch a session
+
+<Frame>
+  <video
+    src="https://baton.openbrowser.me/media/commands.mp4"
+    poster="https://baton.openbrowser.me/media/commands-poster.png"
+    controls
+    muted
+    playsinline
+  />
+</Frame>
+
+The recording is a real Baton window driven by a scripted harness. It shows the git, harness, and help pickers opening from the composer.
+
+## Find your way around
+
+| Key or command | What it opens |
+|---|---|
+| `/help` | The common paths |
+| `/help all` | Every command with its description |
+| Ctrl+K | A palette that filters actions, threads, and recent files |
+| `/status` | The current thread, phase, goal, queue, and adapter state |
+| `/inbox` | Every thread that needs attention across projects |
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Your first session" icon="terminal" href="/start/first-session">
+    Single mode, orchestrate mode, and how to reopen a thread.
+  </Card>
+  <Card title="Harnesses and auth" icon="key" href="/guides/harnesses-and-auth">
+    Which harnesses Baton drives and how each one authenticates.
+  </Card>
+</CardGroup>

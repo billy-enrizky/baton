@@ -1,0 +1,45 @@
+---
+title: "Data and privacy"
+description: "Where Baton keeps state, what leaves the machine, and what it never collects."
+icon: "shield"
+---
+
+## What Baton sends
+
+Baton sends prompts and the context a turn needs to the harness you chose. That harness then sends the request to its own provider under the subscription or API key you configured.
+
+Baton has no hosted service, no Baton account, and no telemetry. It does not proxy your prompts through a server run by the Baton project.
+
+## What Baton stores
+
+State lives in `~/.baton`, or in `BATON_HOME` when that variable is set.
+
+| Location | Contents |
+|---|---|
+| `baton.sqlite` | Threads, messages, turns, usage, review notes, queues, and process records |
+| `config.json` | Provider overrides and settings, written with owner-only permissions on Unix |
+| `roles.json` and `roles/` | Role models, hooks, and prompts |
+| `worktrees/` | Orchestration and thread worktrees |
+| `model-cache/` | The last model list reported by each harness |
+
+Checkpoints are hidden git refs under `refs/baton/checkpoints/` in each project. They are not files in `~/.baton`.
+
+Deleting the Baton directory removes threads and configuration. It does not remove checkpoint refs from your repositories.
+
+## What a handoff contains
+
+When you switch to a harness that has no native session for the thread, Baton builds a handoff from prior messages and the working tree. Before the handoff leaves the thread, a preview shows the exact payload. You can send it, skip the handoff, or cancel.
+
+## Keys
+
+Baton reads a key from `~/.baton/config.json`, the harness's own settings, or the environment, in that order. In API mode it passes the key to the harness process. `baton secret check` names the winning source and never prints the key.
+
+Baton does not write keys into the transcript. A harness message or a command output that echoes a key is shown as the harness sent it, so check the preview before you share a transcript.
+
+## MCP
+
+`baton mcp` serves the local store over stdio to the process that starts it. It does not open a network port. The server is read-only except for clearing the queue and creating a fork.
+
+## Output sanitization
+
+Baton replaces terminal control characters, bidi controls, and invisible formatting characters in harness and command output before it draws them. Diff paths and line text get the same treatment. Machine JSON is left exactly as the provider sent it.

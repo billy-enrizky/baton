@@ -1,0 +1,92 @@
+---
+title: "Install Baton"
+description: "Install on macOS, Linux, or Windows, then check the harness and the terminal."
+icon: "download"
+---
+
+Baton ships as one binary. Pick the install path for your system, then run one check to confirm the harness and the terminal are ready.
+
+<Note>
+Baton needs git and at least one harness CLI. Neither ships with Baton.
+</Note>
+
+## macOS and Linux
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/billy-enrizky/baton/main/install.sh | sh
+```
+
+The installer picks the release for your OS and architecture and checks its SHA-256. If no release archive fits, it builds from source when Cargo and git are installed.
+
+## Windows
+
+```powershell
+irm https://raw.githubusercontent.com/billy-enrizky/baton/main/install.ps1 | iex
+```
+
+The installer adds `%LOCALAPPDATA%\Baton\bin` to your user `PATH`.
+
+## Homebrew
+
+```sh
+brew install billy-enrizky/baton/baton
+```
+
+Upgrade with `brew upgrade billy-enrizky/baton/baton`. The formula lives in the `billy-enrizky/baton` tap.
+
+## From source
+
+```sh
+git clone https://github.com/billy-enrizky/baton
+cd baton
+cargo install --path . --locked
+```
+
+## Check the install
+
+<Steps>
+  <Step title="Check the version">
+    ```sh
+    baton --version
+    ```
+  </Step>
+  <Step title="Check the environment">
+    ```sh
+    baton doctor
+    ```
+    `baton doctor` lists each harness it found, the auth source for each one, and anything missing. Add `--json` for machine output.
+  </Step>
+  <Step title="Install or sign in to a harness">
+    Install a harness CLI, or run `/login` inside Baton to sign in. See [Harnesses and auth](/guides/harnesses-and-auth).
+  </Step>
+</Steps>
+
+## Upgrade
+
+```sh
+baton update
+```
+
+A Homebrew install upgrades with `brew`. A source install upgrades with `cargo install --path . --locked`.
+
+## Uninstall
+
+```sh
+rm ~/.local/bin/baton                    # install script
+brew uninstall billy-enrizky/baton/baton # Homebrew
+cargo uninstall baton                    # source
+```
+
+On Windows, remove `%LOCALAPPDATA%\Baton\bin\baton.exe` and remove that directory from your user `PATH` if the installer added it.
+
+Baton keeps threads, configuration, and its database in `~/.baton`, or in `BATON_HOME` when that variable is set. Delete that directory only when you also want to delete the data. Checkpoints are hidden git refs under `refs/baton/checkpoints/` in each project, so they stay until you delete those refs.
+
+## Requirements
+
+| Tool | Why Baton needs it |
+|---|---|
+| A harness CLI on `PATH` | Performs the turns |
+| Git | Worktrees, diffs, checkpoints, and commits |
+| `gh` | Pull request checks, creation, review, merge, and `/task` |
+| `rg` | Faster `/files` and `/grep`; without it Baton uses `git ls-files` and `git grep` |
+| `VISUAL` or `EDITOR` | Opening files from a picker |

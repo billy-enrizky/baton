@@ -1,0 +1,93 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Baton",
+  "description": "Run coding agents from one terminal.",
+  "colors": {
+    "primary": "#B45309",
+    "light": "#FEF3C7",
+    "dark": "#92400E"
+  },
+  "appearance": {
+    "default": "light",
+    "strict": true
+  },
+  "fonts": {
+    "family": "Geist"
+  },
+  "navbar": {
+    "links": [
+      {
+        "href": "https://github.com/billy-enrizky/baton",
+        "label": "GitHub"
+      },
+      {
+        "href": "/start/install",
+        "label": "Install"
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/billy-enrizky/baton"
+    }
+  },
+  "icons": {
+    "library": "fontawesome"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Docs",
+        "groups": [
+          {
+            "group": "Start here",
+            "pages": [
+              "index",
+              "start/install",
+              "start/quickstart",
+              "start/first-session"
+            ]
+          },
+          {
+            "group": "Concepts",
+            "pages": [
+              "concepts/harness",
+              "concepts/threads-and-turns",
+              "concepts/modes",
+              "concepts/roles-and-orchestration",
+              "concepts/worktrees-and-checkpoints"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/harnesses-and-auth",
+              "guides/context-and-memory",
+              "guides/review-a-change",
+              "guides/ship-from-the-terminal",
+              "guides/recover-work"
+            ]
+          },
+          {
+            "group": "Reference",
+            "pages": [
+              "reference/slash-commands",
+              "reference/cli",
+              "reference/configuration",
+              "reference/keyboard",
+              "reference/exit-codes"
+            ]
+          },
+          {
+            "group": "Help",
+            "pages": [
+              "help/troubleshooting",
+              "help/data-and-privacy"
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,69 @@
+---
+title: "Review a change"
+description: "Read the diff, attach notes to lines, and send the notes back to the agent."
+icon: "magnifying-glass"
+---
+
+A turn that changes files stores a diff and a checkpoint. `/review` opens that diff as a list of rows you can annotate.
+
+## Open the review
+
+```text
+/review
+```
+
+`/review` shows the latest turn. `/review <turn>` opens a specific turn, and `/diff` shows a checkpoint against the working tree.
+
+Added and removed lines are selectable. Context rows are not, because a note on unchanged text has no line to attach to.
+
+## Write a note
+
+| Key | Action |
+|---|---|
+| Up and Down | Move between rows |
+| `n` | Start a note on the selected changed line |
+| Enter | Save the note |
+| `d` | Delete the note on the selected line |
+| `[` and `]` | Move between files |
+| `/` | Search row text and paths |
+| `s` | Send every note |
+| Esc | Close without sending |
+
+Notes are stored unsent, with the turn, path, line, side, and a fingerprint of the diff. If the file changes before you send, the note no longer matches and Baton does not attach it silently.
+
+## Send the notes
+
+Press `s`. During a running turn the notes go as a steer. Otherwise they become the next prompt. The agent receives the note text with the file and line for each one.
+
+## Read a long diff
+
+A diff longer than twelve rows collapses in the transcript.
+
+```text
+… 109 more lines · ctrl+t expand
+```
+
+Press Ctrl+T to expand every long diff inline. The footer changes to `ctrl+t collapse`, and a second Ctrl+T collapses it again. A multi-file diff keeps every file's path and change counts in the collapsed preview, so you can see what changed before you expand anything.
+
+Long diff rows wrap at the terminal width.
+
+![A long diff collapsing, then expanding with Ctrl+T](https://baton.openbrowser.me/media/review.gif)
+
+## Review a pull request
+
+```text
+/git review
+```
+
+The picker offers Approve, Request changes, and Comment. Approve confirms and runs `gh pr review --approve` only when your local HEAD still matches the pull request head. Request changes and Comment put `/git review <action> ` in the composer so you can write the body.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Ship from the terminal" icon="code-branch" href="/guides/ship-from-the-terminal">
+    Commit, push, and open or merge a pull request.
+  </Card>
+  <Card title="Recover work" icon="rotate-left" href="/guides/recover-work">
+    Rewind, retry, and restore.
+  </Card>
+</CardGroup>

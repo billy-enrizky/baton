@@ -1,0 +1,126 @@
+---
+title: "Configuration"
+description: "Files, keys, roles, and the permission modes Baton passes to a harness."
+icon: "gear"
+---
+
+Baton reads configuration from `~/.baton`, from each harness's own settings, and from `baton.json` in a repository. Set `BATON_HOME` to move the Baton directory.
+
+## Files
+
+| Path | Contents |
+|---|---|
+| `~/.baton/baton.sqlite` | Threads, provider sessions, messages, turns, queues, review notes, checkpoints, usage, subagents, and process records |
+| `~/.baton/config.json` | Provider overrides, default mode, and settings |
+| `~/.baton/roles.json` and `~/.baton/roles/<role>.md` | Role models, hooks, and prompts |
+| `~/.baton/worktrees/` | Orchestration and thread worktrees |
+| `~/.baton/model-cache/` | The last full model list for each harness |
+| `baton.json` in a repository root | Shared worktree directories |
+
+`config.json` is written with owner-only permissions on Unix. `/auth` and `/settings` refuse a malformed file instead of replacing it, so a hand-edit error never deletes your keys.
+
+## config.json
+
+```json
+{
+  "defaultProvider": "claude",
+  "defaultMode": "single",
+  "notifications": { "bell": false },
+  "defaultModels": { "claude": "claude-sonnet-5-5" },
+  "codex": { "apiKeyEnv": "OPENAI_API_KEY" },
+  "antigravity": {
+    "mode": "api",
+    "apiKeyEnv": "MY_GATEWAY_KEY",
+    "apiBaseUrl": "https://your-gateway.example.com"
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `defaultProvider` | The harness a new thread starts on |
+| `defaultMode` | `orchestrate` or `single` |
+| `notifications.bell` | Ring on turn end, an approval, and a provider question |
+| `defaultModels` | Model per harness |
+| `<provider>.mode` | `subscription` or `api` |
+| `<provider>.apiKeyEnv` | A variable name for a gateway key |
+| `<provider>.apiBaseUrl` | Endpoint for Grok or Antigravity |
+
+Unknown provider and notification fields survive a write.
+
+## Key lookup
+
+A key resolves in this order:
+
+1. `~/.baton/config.json`.
+2. The harness's own settings.
+3. The environment variable.
+
+`baton secret check` names the winning source for every harness without printing the key.
+
+## Permission modes
+
+| Mode | What it allows |
+|---|---|
+| `default` | The harness asks before sensitive actions |
+| `acceptEdits` | File edits are accepted; shell commands still ask |
+| `bypassPermissions` | No permission checks; use only in trusted work |
+| `plan` | Read-only; the harness proposes a plan |
+
+Baton passes these modes to Claude and Codex. Cursor, Grok, OpenCode, and Antigravity keep their own permission flow.
+
+## Roles
+
+```json
+{
+  "schema_version": 1,
+  "review": true,
+  "roles": {
+    "orchestrator": { "provider": "claude", "model": "claude-opus-5-5" },
+    "planner": { "provider": "claude", "model": "claude-opus-5-5" },
+    "implementor": { "provider": "codex", "model": "gpt-6.2-sol" },
+    "reviewer": { "provider": "codex", "model": "gpt-6.2-astra" }
+  }
+}
+```
+
+A role can also set `effort` and a prompt path. Prompts live in `~/.baton/roles/<role>.md`. Set `"review": false` to skip the reviewer turn. `/roles` shows the resolved rows with their source.
+
+## Hooks
+
+Roles declare six hooks in `roles.json`. Each hook runs with a timeout.
+
+| Hook | Runs |
+|---|---|
+| `before_plan`, `after_plan` | Around the planner turn |
+| `before_implement`, `after_implement` | Around each worker |
+| `before_review`, `after_review` | Around each reviewer turn |
+
+A failing plan hook aborts the run. A failing implement hook fails the task before the commit. A failing review hook marks the review failed.
+
+## Shared worktree directories
+
+```json
+{
+  "worktree": {
+    "sharedDirectories": ["node_modules", "target"]
+  }
+}
+```
+
+Each listed directory that exists and is gitignored becomes a symlink in a new worktree. Use it for build output and caches only.
+
+## Terminal behavior
+
+Baton uses RGB colors only when `COLORTERM` is `truecolor` or `24bit`, or when `TERM` contains `direct`. A term that advertises `256color` without `direct` gets the nearest xterm-256 color, and every other term gets a 16-color palette picked by role. Set `NO_COLOR` to any non-empty value, or run with `TERM=dumb`, to draw without palette colors.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Harnesses and auth" icon="key" href="/guides/harnesses-and-auth">
+    Choose a harness and find the key it will use.
+  </Card>
+  <Card title="Data and privacy" icon="shield" href="/help/data-and-privacy">
+    What Baton stores and what leaves the machine.
+  </Card>
+</CardGroup>

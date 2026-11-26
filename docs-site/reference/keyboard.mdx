@@ -1,0 +1,82 @@
+---
+title: "Keyboard"
+description: "Send, steer, interrupt, select, and scroll without leaving the composer."
+icon: "keyboard"
+---
+
+## Send and newline
+
+| Key | Action |
+|---|---|
+| Enter | Send the prompt, or run the complete command |
+| Shift+Enter | Add a newline |
+| Alt+Enter | Add a newline on terminals that cannot report Shift+Enter |
+
+A pasted multi-line prompt stays in the composer.
+
+## Interrupt and exit
+
+| Key | Action |
+|---|---|
+| Ctrl+C | Interrupt a running turn, or cancel an orchestration with its worker processes |
+| Ctrl+C twice while idle | Exit Baton |
+| Esc | Close a picker or preview |
+
+## Steer and queue
+
+While a turn runs, a new message is sent as a steer on Codex, Claude, and OpenCode 2 or newer. Other harnesses queue it durably. A bare `/queue` opens the queue: Enter sends, `e` edits, `d` deletes, `c` twice clears, and Ctrl+Up and Ctrl+Down reorder.
+
+## Pickers
+
+| Key | Action |
+|---|---|
+| Up, Down, `j`, `k` | Move the selection |
+| PageUp, PageDown | Move a page |
+| Home, End | Jump to the first or last row |
+| Enter | Confirm |
+| Esc | Cancel |
+
+Approval requests also accept `y` for allow once, `a` for allow for the session, and `n` to deny.
+
+## Transcript
+
+| Key | Action |
+|---|---|
+| Ctrl+T | Expand or collapse every long diff |
+| Drag | Select text across wrapped rows |
+| Ctrl+K | Open the command palette |
+
+The transcript follows the bottom while a turn streams. Scroll up to stop following, and press End to return to the bottom.
+
+## Diff review
+
+| Key | Action |
+|---|---|
+| Up, Down | Move between rows |
+| `n` | Write a note on the selected changed line |
+| `d` | Delete the note on the selected line |
+| `[`, `]` | Move between files |
+| `/` | Search row text and paths |
+| `s` | Send the notes |
+| Esc | Close |
+
+## Queue
+
+| Key | Action |
+|---|---|
+| Enter | Send the selected message |
+| `e` | Edit it in the composer |
+| `d` | Delete it |
+| `c` twice | Clear the queue |
+| Ctrl+Up, Ctrl+Down | Reorder |
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Slash commands" icon="command" href="/reference/slash-commands">
+    Every command with the picker it opens.
+  </Card>
+  <Card title="Review a change" icon="magnifying-glass" href="/guides/review-a-change">
+    Read the diff and send line notes.
+  </Card>
+</CardGroup>

@@ -1,0 +1,90 @@
+---
+title: "Recover work"
+description: "Rewind, retry, restore a checkpoint, and keep the inbox clear."
+icon: "rotate-left"
+---
+
+A turn can fail, a harness can crash, or you can want an earlier state back. Baton keeps enough state to recover without starting over.
+
+## Retry a failed turn
+
+```text
+/retry
+```
+
+The picker lists failed and unverified turns with a short preview of the prompt and error. Choosing one starts a new turn on the same harness with the same prompt.
+
+Retry refuses a thread with an open turn, a queued message, an orchestration owner, or a different harness. It rechecks those conditions after the picker opens, so a change in between cannot slip through.
+
+## Rewind
+
+```text
+/rewind
+```
+
+The picker lists earlier messages. Choosing one moves the conversation back to that point and restores the files when the checkout is safe to restore.
+
+A file restore refuses the repository's main checkout, where another thread can share the same files, and it refuses a checkout with open work from another thread. The conversation rewind still completes, so you can continue without restoring files. `/rewind --native` uses a Codex or OpenCode native rollback when the harness supports one.
+
+From a shell, run `baton rewind -t <id> --turn N`.
+
+## Inspect and restore a checkpoint
+
+| Command | What it does |
+|---|---|
+| `/checkpoints` | List the checkpoints for this thread |
+| `/diff` | Show a checkpoint against the working tree |
+| `/review` | Read the latest turn diff with line notes |
+
+```sh
+baton restore <thread-id> <turn> [--force]
+```
+
+`--force` allows a restore over a dirty linked worktree. It does not allow a restore that would overwrite work another thread is using.
+
+## Keep the inbox useful
+
+```text
+/inbox
+```
+
+The inbox merges threads from every project that need a person: a failed turn, an unverified turn, an interrupted turn, a worker waiting for an answer, a completed worker that has not shipped, or a queued message.
+
+`/snooze` hides the current thread until a wake time.
+
+```text
+/snooze 1h
+/snooze tomorrow
+/snooze off
+```
+
+A snoozed thread leaves the inbox and returns when a failure or worker state happens after the snooze was set, or when the wake time passes. `/threads` marks a snoozed thread with its wake time.
+
+## Handle queued follow-ups
+
+```text
+/queue
+```
+
+The queue lists messages that were sent during a turn on a harness that cannot steer. Enter sends a row, `e` edits it, `d` deletes it, and `c` pressed twice clears the queue. Ctrl+Up and Ctrl+Down reorder the list.
+
+## Find out what happened
+
+| Command | What it shows |
+|---|---|
+| `/status` | The current thread, phase, goal, queue, and adapter state |
+| `/turns` | Every turn with its durable phase |
+| `/activity` | Every turn with tool calls, diff, and usage |
+| `/commands` | Every command this thread ran |
+| `/agents` | Subagent calls and their status |
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Worktrees and checkpoints" icon="code-branch" href="/concepts/worktrees-and-checkpoints">
+    Where the files live and which restores are allowed.
+  </Card>
+  <Card title="Troubleshooting" icon="wrench" href="/help/troubleshooting">
+    Common failures and what to do next.
+  </Card>
+</CardGroup>

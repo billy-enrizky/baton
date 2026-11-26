@@ -119,6 +119,11 @@ pub enum Commands {
         #[arg(long)]
         stdio: bool,
     },
+    /// Inspect or change host ownership of the local store
+    Host {
+        #[command(subcommand)]
+        command: HostCommand,
+    },
     /// Serve the local thread store over MCP stdio for coding agents
     Mcp,
     /// Inspect every turn's tool calls, diff, and usage
@@ -426,6 +431,16 @@ pub fn login_command(provider: ProviderId) -> Option<Vec<&'static str>> {
         ProviderId::OpenCode => Some(vec!["opencode", "auth", "login"]),
         ProviderId::Antigravity => None,
     }
+}
+
+#[derive(Subcommand, Clone)]
+pub enum HostCommand {
+    /// Replace a live host claim after a terminal confirmation
+    Takeover {
+        /// Pid named by the current host claim
+        #[arg(long)]
+        pid: u32,
+    },
 }
 
 #[derive(Subcommand, Clone)]

@@ -165,7 +165,7 @@ Known events are `before_plan`, `after_plan`, `before_implement`, `after_impleme
 
 ## MCP, skills, and memory
 
-- `/mcp` lists, adds, removes, or syncs MCP servers. `baton mcp` exposes Baton state over stdio. `baton serve` claims the store, runs recovery, and idles until SIGINT, SIGTERM, or stdin EOF; it does not accept commands yet. While that claim is live, CLI and MCP clients exit 4 with the owner and takeover hint, and the TUI opens read-only with the same line.
+- `/mcp` lists, adds, removes, or syncs MCP servers. `baton mcp` exposes Baton state over stdio. `baton serve` claims the store, runs recovery, and idles until SIGINT, SIGTERM, or stdin EOF; it does not accept commands yet. While that claim is live, CLI and MCP clients exit 4 with the owner and takeover hint, and the TUI opens read-only with the same line. `baton host takeover --pid <pid>` asks for confirmation, replaces the claim, settles open work, and releases the store for a new host.
 - `/skills` lists skills from the Claude and Codex skill directories. Enter inserts `$name`; a Claude thread rewrites the final payload to `/name`.
 - `/memory` lists Claude user, project, local, and rule files, Codex user and project instructions, and the auto-memory index and topics. Enter opens or creates a file in `VISUAL` or `EDITOR`. Auto-memory edits the user `autoMemoryEnabled` setting. The governed-memory CLI is `baton memories`; the `$memories` prompt token still expands governed notes.
 

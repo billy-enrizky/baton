@@ -2,7 +2,7 @@ use baton::claim::{acquire, ClaimOutcome, SystemProbe};
 use baton::store::BatonStore;
 
 #[cfg(unix)]
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::process::{Child, ChildStdin, Command, Stdio};
 #[cfg(unix)]
@@ -121,6 +121,25 @@ fn hosted_child(home: &std::path::Path, bin: &std::path::Path, host_id: Option<&
 }
 
 #[cfg(unix)]
+fn run_with_stdin(home: &std::path::Path, args: &[&str], input: &str) -> std::process::Output {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(args)
+        .env("BATON_HOME", home)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start command");
+    child
+        .stdin
+        .take()
+        .expect("command stdin")
+        .write_all(input.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[cfg(unix)]
 fn wait_for_file(path: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(10);
     while !path.exists() {
@@ -200,6 +219,66 @@ fn a_plain_client_exits_four_and_names_the_owner() {
             "{stderr}"
         );
     }
+    drop(host);
+}
+
+#[cfg(unix)]
+#[test]
+fn host_takeover_replaces_the_live_claim_and_allows_a_new_host() {
+    let home = tempfile::tempdir().unwrap();
+    let (host, _host_id) = start_host(home.path());
+    let pid = host.child.id().to_string();
+    let output = run_with_stdin(home.path(), &["host", "takeover", "--pid", &pid], "y\n");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("took over from pid {pid}")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("settled 0 turn(s)"), "{stdout}");
+    let store = BatonStore::open_read_only(&home.path().join("baton.sqlite")).unwrap();
+    assert!(store.get_host_claim().unwrap().is_none());
+
+    let threads = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .arg("threads")
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(threads.status.success(), "{threads:?}");
+
+    let (replacement, _host_id) = start_host(home.path());
+    drop(replacement);
+    drop(host);
+}
+
+#[cfg(unix)]
+#[test]
+fn host_takeover_requires_confirmation_and_the_exact_pid() {
+    let home = tempfile::tempdir().unwrap();
+    let (host, host_id) = start_host(home.path());
+    let pid = host.child.id();
+    let wrong = pid.saturating_add(1).to_string();
+    let refused = run_with_stdin(home.path(), &["host", "takeover", "--pid", &wrong], "y\n");
+    assert!(!refused.status.success(), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains(&format!("belongs to pid {pid}")),
+        "{stderr}"
+    );
+
+    let cancelled = run_with_stdin(
+        home.path(),
+        &["host", "takeover", "--pid", &pid.to_string()],
+        "n\n",
+    );
+    assert!(!cancelled.status.success(), "{cancelled:?}");
+    let stderr = String::from_utf8_lossy(&cancelled.stderr);
+    assert!(stderr.contains("takeover cancelled"), "{stderr}");
+
+    let store = BatonStore::open_read_only(&home.path().join("baton.sqlite")).unwrap();
+    let claim = store.get_host_claim().unwrap().expect("claim survives");
+    assert_eq!(claim.pid, pid);
+    assert_eq!(claim.host_id, host_id);
     drop(host);
 }
 

@@ -601,6 +601,8 @@ Install and update copy the whole skill directory through a staging directory. S
 
 `baton serve` claims the local store for one host process, runs provider and turn recovery, and holds the claim until SIGINT, SIGTERM, or, with `--stdio`, stdin EOF. It does not accept commands yet. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and the `baton host takeover --pid <pid>` hint. The TUI opens read-only, shows the same ownership line, and refuses to send a prompt or change the store.
 
+`baton host takeover --pid <pid>` reads the live claim, prints its pid and process start, and asks for `y` or `yes`. Confirmation replaces the claim, fences the old host out, settles every open turn and running orchestration, releases the takeover claim, and leaves the store ready for a new `baton serve`. A wrong pid, a changed claim, a dead owner, a held write lock, or a declined prompt leaves the claim in place. The command does not signal the old host process.
+
 ### 11.2 Tools
 
 The server exposes 15 tools: `baton_doctor`, `baton_status`, `baton_threads`, `baton_turns`, `baton_agents`, `baton_messages`, `baton_queue`, `baton_search`, `baton_latest_diff`, `baton_processes`, `baton_orchestration_runs`, `baton_orchestration_report`, `baton_activity`, `baton_memories`, and `baton_fork`.
@@ -653,6 +655,7 @@ baton search <query> [--all] [--json]
 baton doctor [--json]
 baton ps [--json]
 baton serve [--stdio]              # claim the store and idle until stopped
+baton host takeover --pid <pid>    # replace a live host after confirmation
 ```
 
 In a directory with no threads, `baton status` still exits 0. The text form says `no thread in this directory yet. Run baton to start one.`, and `--json` keeps the usual shape with `thread_id: null`, `turn_count: 0`, and `next_action: "start a thread with baton"`.

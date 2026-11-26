@@ -59,6 +59,14 @@ pub enum ClaimOutcome {
     Refused(ClaimRefusal),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeoverOutcome {
+    Taken(HostClaimRow),
+    NoClaim,
+    Changed { pid: u32, process_start: String },
+    NotLive { pid: u32 },
+}
+
 pub fn acquire(
     store: &BatonStore,
     home: &Path,
@@ -138,6 +146,53 @@ pub fn open_tui_store(path: &Path) -> Result<(BatonStore, Option<String>)> {
             let store = BatonStore::open_read_only(path)?;
             Ok((store, Some(refusal.to_string())))
         }
+    }
+}
+
+/// Replaces a live claim after the caller names and confirms its exact owner.
+/// The takeover store must already carry the new host id, and that claim stays
+/// live until the caller settles old work and releases it.
+pub fn takeover(
+    store: &BatonStore,
+    home: &Path,
+    expected_pid: u32,
+    new_host_id: &str,
+    probe: &dyn ProcessProbe,
+) -> Result<TakeoverOutcome> {
+    uuid::Uuid::parse_str(new_host_id).context("host id must be a UUID")?;
+    if store.host_id() != Some(new_host_id) {
+        anyhow::bail!("host store must be opened with open_hosted and the new host id");
+    }
+    let _lock = match acquire_write_lock(home, LOCK_WAIT)? {
+        LockAttempt::Acquired(lock) => lock,
+        LockAttempt::Busy => {
+            anyhow::bail!("the Baton write lock is held by another process; retry takeover")
+        }
+        LockAttempt::Unsupported => {
+            anyhow::bail!("host takeover needs Unix file locking in this build")
+        }
+    };
+    let pid = std::process::id();
+    let Some(process_start) = probe.start(pid) else {
+        anyhow::bail!("cannot verify this process start time; host takeover is Unix-only")
+    };
+    let current = store.get_host_claim()?;
+    let Some(current) = current else {
+        return Ok(TakeoverOutcome::NoClaim);
+    };
+    match store.takeover_host_row(
+        new_host_id,
+        expected_pid,
+        &current.process_start,
+        pid,
+        &process_start,
+    )? {
+        crate::store::TakeoverAttempt::Taken(claim) => Ok(TakeoverOutcome::Taken(claim)),
+        crate::store::TakeoverAttempt::NoClaim => Ok(TakeoverOutcome::NoClaim),
+        crate::store::TakeoverAttempt::Changed { pid, process_start } => {
+            Ok(TakeoverOutcome::Changed { pid, process_start })
+        }
+        crate::store::TakeoverAttempt::NotLive { pid } => Ok(TakeoverOutcome::NotLive { pid }),
     }
 }
 
@@ -339,6 +394,75 @@ mod tests {
 
     fn host_id() -> String {
         uuid::Uuid::new_v4().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn takeover_replaces_only_the_named_live_claim() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("baton.sqlite");
+        let old_id = host_id();
+        let new_id = host_id();
+        let host = BatonStore::open_hosted(&path, &old_id).unwrap();
+        let claim = match acquire(&host, dir.path(), &old_id, &SystemProbe).unwrap() {
+            ClaimOutcome::Claimed(claim) => claim,
+            other => panic!("expected claim, got {other:?}"),
+        };
+        let takeover_store = BatonStore::open_hosted(&path, &new_id).unwrap();
+
+        let changed = takeover(
+            &takeover_store,
+            dir.path(),
+            claim.pid + 1,
+            &new_id,
+            &SystemProbe,
+        )
+        .unwrap();
+        assert!(matches!(changed, TakeoverOutcome::Changed { .. }));
+        assert_eq!(host.get_host_claim().unwrap().as_ref(), Some(&claim));
+
+        let taken = takeover(
+            &takeover_store,
+            dir.path(),
+            claim.pid,
+            &new_id,
+            &SystemProbe,
+        )
+        .unwrap();
+        assert!(matches!(taken, TakeoverOutcome::Taken(_)));
+        let current = host.get_host_claim().unwrap().expect("replacement claim");
+        assert_eq!(current.host_id, new_id);
+        assert!(host
+            .create_thread(NewThread {
+                title: "old host".into(),
+                cwd: "/old".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap_err()
+            .downcast_ref::<crate::store::NotTheHost>()
+            .is_some());
+        takeover_store
+            .create_thread(NewThread {
+                title: "new host".into(),
+                cwd: "/new".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        assert!(takeover_store.release_host_claim(&new_id).unwrap());
+        assert!(host.get_host_claim().unwrap().is_none());
+        assert!(matches!(
+            takeover(
+                &takeover_store,
+                dir.path(),
+                claim.pid,
+                &new_id,
+                &SystemProbe
+            )
+            .unwrap(),
+            TakeoverOutcome::NoClaim
+        ));
     }
 
     #[cfg(unix)]

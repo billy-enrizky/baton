@@ -1161,7 +1161,7 @@ pub fn run_tui(
         review: None,
         plans: std::collections::HashMap::new(),
         plan_scroll_max: std::cell::Cell::new(0),
-        rate_limits: std::collections::HashMap::new(),
+        rate_limits: store.lock().unwrap().load_rate_limits().unwrap_or_default(),
         changes_scroll_max: std::cell::Cell::new(0),
         changes_offsets: std::cell::RefCell::new(Vec::new()),
         activity: None,
@@ -3070,6 +3070,9 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
             }
         }
         TurnEvent::RateLimits { provider, info } => {
+            if let Ok(guard) = state.store.lock() {
+                let _ = guard.save_rate_limits(provider, &info);
+            }
             state.rate_limits.insert(provider, info);
         }
         TurnEvent::ProviderTurnId { .. }
@@ -17588,7 +17591,7 @@ mod tests {
             review: None,
             plans: std::collections::HashMap::new(),
             plan_scroll_max: std::cell::Cell::new(0),
-            rate_limits: std::collections::HashMap::new(),
+            rate_limits: store.lock().unwrap().load_rate_limits().unwrap_or_default(),
             changes_scroll_max: std::cell::Cell::new(0),
             changes_offsets: std::cell::RefCell::new(Vec::new()),
             activity: None,
@@ -24203,6 +24206,33 @@ mod tests {
         for provider in PROVIDERS {
             assert!(text.contains(provider.as_str()), "{text}");
         }
+    }
+
+    #[test]
+    fn a_rate_limit_event_persists_for_the_next_session() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        assert!(state.rate_limits.is_empty());
+        apply_turn_event(
+            &mut state,
+            TurnEvent::RateLimits {
+                provider: ProviderId::Codex,
+                info: codex_rate_limits(),
+            },
+        );
+        let stored = store.lock().unwrap().load_rate_limits().unwrap();
+        assert!(stored.contains_key(&ProviderId::Codex));
+
+        let mut reopened = test_state(home.path(), &store, Vec::new());
+        assert!(
+            reopened.rate_limits.contains_key(&ProviderId::Codex),
+            "a new TUI session hydrates the stored snapshot"
+        );
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut reopened, &store, &engine_command_sender, "/limits");
+        let text = buffer_lines(&render_state(&reopened, 100, 40)).join("\n");
+        assert!(text.contains("primary · 5h window · 12% used"), "{text}");
     }
 
     #[test]

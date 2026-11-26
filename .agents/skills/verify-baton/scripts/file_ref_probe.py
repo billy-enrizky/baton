@@ -91,6 +91,37 @@ def main() -> int:
         for _ in range(len("explain @src/main.rs ")):
             os.write(master, b"\x7f")
         pump(master, 0.4, transcript)
+
+        os.write(master, b"@src")
+        pump(master, 1.4, transcript)
+        directories = screen_text(transcript, args.width, args.height)
+        (evidence / "directory-mentions.txt").write_text(directories + "\n")
+        for value in ["src/", "project directory"]:
+            if value not in directories:
+                missing.append(f"directory mentions: {value}")
+        os.write(master, b"\t")
+        pump(master, 0.6, transcript)
+        directory_inserted = screen_text(transcript, args.width, args.height)
+        (evidence / "directory-inserted.txt").write_text(directory_inserted + "\n")
+        if "@src/" not in directory_inserted:
+            missing.append("directory insertion adds the trailing slash")
+        os.write(master, b"ma")
+        pump(master, 1.2, transcript)
+        narrowed = screen_text(transcript, args.width, args.height)
+        (evidence / "directory-narrowed.txt").write_text(narrowed + "\n")
+        if "src/main.rs" not in narrowed:
+            missing.append("typing after a directory narrows inside it")
+        os.write(master, b"\t")
+        pump(master, 0.6, transcript)
+        narrowed_inserted = screen_text(transcript, args.width, args.height)
+        if "@src/main.rs " not in narrowed_inserted:
+            missing.append("the narrowed file completes after a directory mention")
+        os.write(master, b"\x1b")
+        pump(master, 0.2, transcript)
+        for _ in range(len("@src/main.rs ")):
+            os.write(master, b"\x7f")
+        pump(master, 0.4, transcript)
+
         os.write(master, b"mail a@b")
         pump(master, 0.8, transcript)
         address = screen_text(transcript, args.width, args.height)

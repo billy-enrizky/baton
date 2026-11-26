@@ -330,7 +330,7 @@ The top of the screen shows the Baton version, working directory, session mode, 
 
 ### 6.2 Composer
 
-The composer is where prompts, slash commands, and file mentions are typed. `@` followed by part of a project path offers ranked files. Tab or Enter replaces only the mention. Ordinary text and addresses such as `a@b` never start a file search. Start a line with `!` to run a shell command in the thread working directory. Baton captures stdout and stderr, sanitizes and caps the output, and shows it with the exit code. The command is not sent to the harness, and it is not an interactive terminal: one command runs at a time with a 60-second limit.
+The composer is where prompts, slash commands, and file mentions are typed. `@` followed by part of a project path offers matching directories with a trailing slash, then ranked files. Tab or Enter replaces only the mention. Ordinary text and addresses such as `a@b` never start a file search. Start a line with `!` to run a shell command in the thread working directory. Baton captures stdout and stderr, sanitizes and caps the output, and shows it with the exit code. The command is not sent to the harness, and it is not an interactive terminal: one command runs at a time with a 60-second limit.
 
 ### 6.3 Pickers and previews
 

@@ -258,6 +258,7 @@ fn main_result(started: Instant) -> Result<()> {
                 skip_handoff: false,
                 expected_provider: None,
                 retry: false,
+                drain_queued: false,
             });
 
             let mut stream = exec_events::TurnStreamState::default();

@@ -7,7 +7,7 @@ use crate::adapters::{BatonAdapter, ModelListInput, SteerHandle, SteerOutcome, S
 use crate::checkpoints::capture_checkpoint;
 use crate::config::{provider_auth_env, resolve_config};
 use crate::handoff::{derive_title, git_status_summary, HandoffMessage};
-use crate::store::{BatonStore, NewThread, ThreadRow};
+use crate::store::{BatonStore, NewThread, SubmitRefused, ThreadRow};
 use crate::types::{PermissionMode, ProviderId, RateLimitInfo, TurnPhase, TurnUsage};
 
 pub type SharedStore = Arc<Mutex<BatonStore>>;
@@ -22,6 +22,7 @@ pub enum EngineCommand {
         skip_handoff: bool,
         expected_provider: Option<ProviderId>,
         retry: bool,
+        drain_queued: bool,
     },
     Steer {
         thread_id: String,
@@ -90,23 +91,13 @@ struct TurnLedger {
 }
 
 impl TurnLedger {
-    fn start(
-        store: &SharedStore,
-        thread_id: &str,
-        turn: i64,
-        provider: ProviderId,
-        model: &str,
-    ) -> Result<TurnLedger> {
-        store
-            .lock()
-            .unwrap()
-            .start_turn_record(thread_id, turn, provider, Some(model))?;
-        Ok(TurnLedger {
+    fn submitted(store: &SharedStore, thread_id: &str, turn: i64) -> TurnLedger {
+        TurnLedger {
             store: store.clone(),
             thread_id: thread_id.to_string(),
             turn,
             settled: false,
-        })
+        }
     }
 
     fn settle(&mut self, phase: TurnPhase, error: Option<&str>) {
@@ -189,6 +180,11 @@ impl TurnRunGuard {
         });
     }
 
+    fn abandon(&mut self) {
+        self.release_claim();
+        self.finished = true;
+    }
+
     fn release_claim(&self) {
         self.turn_cancellations
             .lock()
@@ -210,20 +206,17 @@ impl Drop for TurnRunGuard {
             return;
         }
         self.release_claim();
-        let (phase, error) = self
+        let record = self
             .store
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get_turn_record(&self.thread_id, self.expected_turn)
             .ok()
-            .flatten()
-            .map(|record| (record.phase, record.error))
-            .unwrap_or_else(|| {
-                (
-                    TurnPhase::Unverified,
-                    Some("turn task ended without a terminal state".to_string()),
-                )
-            });
+            .flatten();
+        let Some(record) = record.filter(record_is_owned_here) else {
+            return;
+        };
+        let (phase, error) = (record.phase, record.error);
         let ok = matches!(phase, TurnPhase::Completed);
         let _ = self.engine_event_sender.send(EngineEvent::TurnFinished {
             thread_id: self.thread_id.clone(),
@@ -232,6 +225,11 @@ impl Drop for TurnRunGuard {
             phase,
         });
     }
+}
+
+fn record_is_owned_here(record: &crate::store::TurnRow) -> bool {
+    let pid = std::process::id();
+    record.owner_pid == Some(pid) && record.owner_start == crate::process::process_start(pid)
 }
 
 const QUIT_DISPOSE_TIMEOUT: Duration = Duration::from_secs(1);
@@ -726,6 +724,7 @@ pub async fn run_engine(
                 skip_handoff,
                 expected_provider,
                 retry,
+                drain_queued,
             } => {
                 if let Some(expected_provider) = expected_provider {
                     let current = store
@@ -797,6 +796,8 @@ pub async fn run_engine(
                     permission_mode,
                     skip_handoff,
                     expected_provider,
+                    retry,
+                    drain_queued,
                     engine_event_sender.clone(),
                     turn_event_sender.clone(),
                     active_threads.clone(),
@@ -820,6 +821,8 @@ async fn run_turn(
     permission_mode: PermissionMode,
     skip_handoff: bool,
     expected_provider: Option<ProviderId>,
+    retry: bool,
+    drain_queued: bool,
     engine_event_sender: std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: ThreadTurnEventSender,
     active_threads: Arc<Mutex<HashSet<String>>>,
@@ -849,10 +852,23 @@ async fn run_turn(
         permission_mode,
         skip_handoff,
         expected_provider,
+        drain_queued,
         &engine_event_sender,
         &turn_event_sender,
     )
     .await;
+    if let Err(error) = &result {
+        if let Some(refused) = error.downcast_ref::<SubmitRefused>() {
+            guard.abandon();
+            let _ = engine_event_sender.send(EngineEvent::TurnRejected {
+                thread_id,
+                text,
+                reason: refused.to_string(),
+                retry,
+            });
+            return;
+        }
+    }
     let record = if expected_turn > 0 {
         store
             .lock()
@@ -862,13 +878,14 @@ async fn run_turn(
     } else {
         None
     };
-    let phase = record
-        .as_ref()
-        .map(|record| record.phase)
-        .unwrap_or(TurnPhase::Unverified);
+    let Some(record) = record.filter(record_is_owned_here) else {
+        guard.abandon();
+        return;
+    };
+    let phase = record.phase;
     let error = record
-        .as_ref()
-        .and_then(|record| record.error.clone())
+        .error
+        .clone()
         .or_else(|| result.as_ref().err().map(ToString::to_string));
     guard.finish(phase, error);
 }
@@ -1011,6 +1028,7 @@ async fn execute_turn(
     permission_mode: PermissionMode,
     skip_handoff: bool,
     expected_provider: Option<ProviderId>,
+    drain_queued: bool,
     engine_event_sender: &std::sync::mpsc::Sender<EngineEvent>,
     turn_event_sender: &ThreadTurnEventSender,
 ) -> Result<()> {
@@ -1055,13 +1073,12 @@ async fn execute_turn(
         }
         let provider = current.current_provider;
         let prior = store.list_messages(thread_id)?;
-        let turn = store.next_turn_number(thread_id)?;
-        store.add_message(thread_id, turn, "user", Some(provider.as_str()), Some(&model), text)?;
         let session = store.get_provider_session(thread_id, provider)?;
+        let turn = store.submit_turn(thread_id, provider, Some(&model), text, drain_queued)?;
         (prior, turn, session)
     };
 
-    let mut turn_ledger = TurnLedger::start(store, thread_id, turn, provider, &model)?;
+    let mut turn_ledger = TurnLedger::submitted(store, thread_id, turn);
 
     let _ = engine_event_sender.send(EngineEvent::UserEcho {
         thread_id: thread_id.to_string(),
@@ -1675,6 +1692,7 @@ mod tests {
             PermissionMode::Default,
             false,
             None,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -1775,6 +1793,7 @@ mod tests {
             PermissionMode::Default,
             false,
             None,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -1850,6 +1869,7 @@ mod tests {
             PermissionMode::Default,
             false,
             None,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -1925,6 +1945,7 @@ mod tests {
             PermissionMode::Default,
             false,
             None,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -2009,6 +2030,7 @@ mod tests {
             PermissionMode::Default,
             true,
             None,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -2081,6 +2103,7 @@ mod tests {
             PermissionMode::Default,
             false,
             None,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -2153,6 +2176,7 @@ mod tests {
             PermissionMode::Default,
             false,
             None,
+            false,
             &engine_sender,
             &turn_sender,
         )
@@ -2352,6 +2376,7 @@ mod tests {
                 skip_handoff: false,
                 expected_provider: None,
                 retry: false,
+                drain_queued: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started).await, thread.id);
@@ -2413,6 +2438,7 @@ mod tests {
                 skip_handoff: false,
                 expected_provider: None,
                 retry: false,
+                drain_queued: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started).await, thread.id);
@@ -2505,6 +2531,7 @@ mod tests {
                 skip_handoff: false,
                 expected_provider: None,
                 retry: false,
+                drain_queued: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, claude_thread.id);
@@ -2577,6 +2604,7 @@ mod tests {
                 skip_handoff: false,
                 expected_provider: None,
                 retry: false,
+                drain_queued: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, first.id);
@@ -2589,6 +2617,7 @@ mod tests {
                 skip_handoff: false,
                 expected_provider: None,
                 retry: false,
+                drain_queued: false,
             })
             .unwrap();
         wait_engine_event(&event_receiver, |event| {
@@ -2712,6 +2741,7 @@ mod tests {
                 skip_handoff: false,
                 expected_provider: None,
                 retry: false,
+                drain_queued: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, first.id);
@@ -2723,6 +2753,7 @@ mod tests {
                 skip_handoff: false,
                 expected_provider: None,
                 retry: false,
+                drain_queued: false,
             })
             .unwrap();
         wait_engine_event(&event_receiver, |event| {
@@ -2773,7 +2804,12 @@ mod tests {
                 current_model: Some("m".into()),
             })
             .unwrap();
-        let ledger = TurnLedger::start(&store, &thread.id, 1, ProviderId::Codex, "m").unwrap();
+        store
+            .lock()
+            .unwrap()
+            .start_turn_record(&thread.id, 1, ProviderId::Codex, Some("m"))
+            .unwrap();
+        let ledger = TurnLedger::submitted(&store, &thread.id, 1);
         drop(ledger);
         assert_eq!(
             store
@@ -2824,6 +2860,7 @@ mod tests {
                 skip_handoff: false,
                 expected_provider: None,
                 retry: false,
+                drain_queued: false,
             })
             .unwrap();
         assert_eq!(next_started(&mut started_receiver).await, thread.id);
@@ -2934,6 +2971,7 @@ mod tests {
                     skip_handoff: false,
                     expected_provider: None,
                     retry: false,
+                    drain_queued: false,
                 })
                 .unwrap();
         }
@@ -3141,6 +3179,7 @@ mod tests {
                     skip_handoff: false,
                     expected_provider: None,
                     retry: false,
+                    drain_queued: false,
                 })
                 .unwrap();
         }
@@ -3204,6 +3243,7 @@ mod tests {
                 skip_handoff: true,
                 expected_provider: Some(ProviderId::Claude),
                 retry: true,
+                drain_queued: false,
             })
             .unwrap();
 
@@ -3299,6 +3339,7 @@ mod tests {
                     skip_handoff: false,
                     expected_provider: None,
                     retry: false,
+                    drain_queued: false,
                 })
                 .unwrap();
             let event = wait_engine_event(&event_receiver, |event| {
@@ -3317,6 +3358,158 @@ mod tests {
         assert!(
             !event_receiver.try_iter().any(|event| matches!(event, EngineEvent::TurnRejected { .. })),
             "the second submit must be accepted after the first panic"
+        );
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+    }
+
+    #[tokio::test]
+    async fn a_refused_submit_reports_the_open_turn_without_finishing_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "owned".into(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .start_turn_record(&thread.id, 1, ProviderId::Codex, Some("m"))
+            .unwrap();
+        let adapters: Vec<SharedAdapter> =
+            vec![Arc::new(tokio::sync::Mutex::new(Box::new(ScriptAdapter {
+                mode: AdapterMode::Complete,
+            })
+                as Box<dyn BatonAdapter>))];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store.clone(),
+            home.path().to_path_buf(),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        command_sender
+            .send(EngineCommand::Submit {
+                thread_id: thread.id.clone(),
+                text: "second".into(),
+                permission_mode: PermissionMode::Default,
+                skip_handoff: false,
+                expected_provider: None,
+                retry: false,
+                drain_queued: false,
+            })
+            .unwrap();
+        let event = wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnRejected { .. })
+        })
+        .await;
+        match event {
+            EngineEvent::TurnRejected { reason, .. } => {
+                assert!(reason.contains("already running"), "{reason}");
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            !event_receiver
+                .try_iter()
+                .any(|event| matches!(event, EngineEvent::TurnFinished { .. })),
+            "a refused submit must not settle another turn"
+        );
+        let record = store
+            .lock()
+            .unwrap()
+            .get_turn_record(&thread.id, 1)
+            .unwrap()
+            .expect("the original turn still exists");
+        assert_eq!(record.phase, TurnPhase::Running);
+        command_sender.send(EngineCommand::Quit).unwrap();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;
+    }
+
+    #[tokio::test]
+    async fn a_queued_drain_submit_is_admitted_with_remaining_queue_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "drain".into(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: Some("m".into()),
+            })
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&thread.id, "queued one")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&thread.id, "queued two")
+            .unwrap();
+        let adapters: Vec<SharedAdapter> =
+            vec![Arc::new(tokio::sync::Mutex::new(Box::new(ScriptAdapter {
+                mode: AdapterMode::Complete,
+            })
+                as Box<dyn BatonAdapter>))];
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (event_sender, event_receiver) = std::sync::mpsc::channel();
+        let (turn_sender, _turn_receiver) = std::sync::mpsc::channel();
+        let engine = tokio::spawn(run_engine(
+            store.clone(),
+            home.path().to_path_buf(),
+            adapters,
+            Vec::new(),
+            Vec::new(),
+            command_receiver,
+            event_sender,
+            turn_sender,
+        ));
+        command_sender
+            .send(EngineCommand::Submit {
+                thread_id: thread.id.clone(),
+                text: "queued one".into(),
+                permission_mode: PermissionMode::Default,
+                skip_handoff: false,
+                expected_provider: None,
+                retry: false,
+                drain_queued: true,
+            })
+            .unwrap();
+        wait_engine_event(&event_receiver, |event| {
+            matches!(event, EngineEvent::TurnFinished { thread_id, phase, .. }
+                if thread_id == &thread.id && *phase == TurnPhase::Completed)
+        })
+        .await;
+        let messages = store.lock().unwrap().list_messages(&thread.id).unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].text, "queued one");
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[1].text, "done");
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&thread.id)
+                .unwrap()
+                .len(),
+            2
         );
         command_sender.send(EngineCommand::Quit).unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), engine).await;

@@ -5,6 +5,7 @@ use rusqlite::{
     TransactionBehavior,
 };
 use std::collections::HashMap;
+use std::fmt;
 use std::path::Path;
 use uuid::Uuid;
 
@@ -65,6 +66,8 @@ pub struct TurnRow {
     pub provider_turn_id: Option<String>,
     pub started_at: String,
     pub ended_at: Option<String>,
+    pub owner_pid: Option<u32>,
+    pub owner_start: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +89,24 @@ pub enum ThreadOpenWork {
     NativeRewind,
     Orchestration,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmitRefused(pub ThreadOpenWork);
+
+impl fmt::Display for SubmitRefused {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.0 {
+            ThreadOpenWork::Turn => "a turn is already running for this thread",
+            ThreadOpenWork::Queue => {
+                "the thread has queued messages; send or clear them before starting a turn"
+            }
+            ThreadOpenWork::NativeRewind => "a provider-native rewind is still pending",
+            ThreadOpenWork::Orchestration => "an orchestration is still running for this thread",
+        })
+    }
+}
+
+impl std::error::Error for SubmitRefused {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredPlan {
@@ -317,6 +338,8 @@ CREATE TABLE IF NOT EXISTS turns (
   provider_turn_id TEXT,
   started_at TEXT NOT NULL,
   ended_at TEXT,
+  owner_pid INTEGER,
+  owner_start TEXT,
   PRIMARY KEY (thread_id, turn)
 );
 CREATE TABLE IF NOT EXISTS provider_sessions (
@@ -2016,6 +2039,8 @@ impl BatonStore {
             provider_turn_id: row.get(6)?,
             started_at: row.get(7)?,
             ended_at: row.get(8)?,
+            owner_pid: row.get::<_, Option<i64>>(9)?.map(|pid| pid as u32),
+            owner_start: row.get(10)?,
         })
     }
 
@@ -2027,9 +2052,12 @@ impl BatonStore {
         provider: ProviderId,
         model: Option<&str>,
     ) -> Result<()> {
+        let pid = std::process::id();
+        let owner_pid = i64::from(pid);
+        let owner_start = crate::process::process_start(pid);
         self.db.execute(
-            r#"INSERT INTO turns (thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at)
-               VALUES (?, ?, ?, ?, 'running', NULL, NULL, ?, NULL)
+            r#"INSERT INTO turns (thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start)
+               VALUES (?, ?, ?, ?, 'running', NULL, NULL, ?, NULL, ?, ?)
                ON CONFLICT (thread_id, turn) DO UPDATE SET
                  provider = excluded.provider,
                  model = excluded.model,
@@ -2037,10 +2065,62 @@ impl BatonStore {
                  error = NULL,
                  provider_turn_id = NULL,
                  started_at = excluded.started_at,
-                 ended_at = NULL"#,
-            params![thread_id, turn, provider.as_str(), model, now_iso()],
+                 ended_at = NULL,
+                 owner_pid = excluded.owner_pid,
+                 owner_start = excluded.owner_start"#,
+            params![thread_id, turn, provider.as_str(), model, now_iso(), owner_pid, owner_start],
         )?;
         Ok(())
+    }
+
+    /// Inserts the user message and the running turn row in one immediate
+    /// transaction, after proving no other work owns the thread. A queue drain
+    /// skips only the queue guard because the caller already popped one row.
+    pub fn submit_turn(
+        &self,
+        thread_id: &str,
+        provider: ProviderId,
+        model: Option<&str>,
+        text: &str,
+        drain_queued: bool,
+    ) -> Result<i64> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if let Some(work) = Self::thread_open_work_on(&tx, thread_id, drain_queued)? {
+            return Err(SubmitRefused(work).into());
+        }
+        let turn: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(turn), 0) + 1 FROM messages WHERE thread_id = ?",
+            params![thread_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "INSERT INTO messages (thread_id, turn, role, provider, model, text, created_at) VALUES (?, ?, 'user', ?, ?, ?, ?)",
+            params![thread_id, turn, provider.as_str(), model, text, now_iso()],
+        )?;
+        let pid = std::process::id();
+        let owner_pid = i64::from(pid);
+        let owner_start = crate::process::process_start(pid);
+        tx.execute(
+            r#"INSERT INTO turns (thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start)
+               VALUES (?, ?, ?, ?, 'running', NULL, NULL, ?, NULL, ?, ?)
+               ON CONFLICT (thread_id, turn) DO UPDATE SET
+                 provider = excluded.provider,
+                 model = excluded.model,
+                 phase = 'running',
+                 error = NULL,
+                 provider_turn_id = NULL,
+                 started_at = excluded.started_at,
+                 ended_at = NULL,
+                 owner_pid = excluded.owner_pid,
+                 owner_start = excluded.owner_start"#,
+            params![thread_id, turn, provider.as_str(), model, now_iso(), owner_pid, owner_start],
+        )?;
+        tx.execute(
+            "UPDATE threads SET updated_at = ? WHERE id = ?",
+            params![now_iso(), thread_id],
+        )?;
+        tx.commit()?;
+        Ok(turn)
     }
 
     pub fn finish_turn_record(
@@ -2077,7 +2157,7 @@ impl BatonStore {
     pub fn get_turn_record(&self, thread_id: &str, turn: i64) -> Result<Option<TurnRow>> {
         self.db
             .query_row(
-                "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at FROM turns WHERE thread_id = ? AND turn = ?",
+                "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start FROM turns WHERE thread_id = ? AND turn = ?",
                 params![thread_id, turn],
                 Self::map_turn,
             )
@@ -2087,7 +2167,7 @@ impl BatonStore {
 
     pub fn list_turn_records(&self, thread_id: &str) -> Result<Vec<TurnRow>> {
         let mut statement = self.db.prepare(
-            "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at FROM turns WHERE thread_id = ? ORDER BY turn",
+            "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start FROM turns WHERE thread_id = ? ORDER BY turn",
         )?;
         let rows = statement
             .query_map(params![thread_id], Self::map_turn)?
@@ -2162,7 +2242,15 @@ impl BatonStore {
     /// This is not a distributed lease; startup and retry reconciliation own
     /// the decision that an orchestration owner is gone.
     pub fn thread_open_work(&self, thread_id: &str) -> Result<Option<ThreadOpenWork>> {
-        let (turn, queue, native_rewind, orchestration): (bool, bool, bool, bool) = self.db.query_row(
+        Self::thread_open_work_on(&self.db, thread_id, false)
+    }
+
+    fn thread_open_work_on(
+        db: &Connection,
+        thread_id: &str,
+        allow_queued: bool,
+    ) -> Result<Option<ThreadOpenWork>> {
+        let (turn, queue, native_rewind, orchestration): (bool, bool, bool, bool) = db.query_row(
             "SELECT EXISTS(SELECT 1 FROM turns WHERE thread_id = ?1 AND phase IN ('queued', 'running', 'settling')),
                     EXISTS(SELECT 1 FROM queued_messages WHERE thread_id = ?1),
                     EXISTS(SELECT 1 FROM native_rewinds WHERE thread_id = ?1),
@@ -2174,7 +2262,7 @@ impl BatonStore {
         )?;
         Ok(if turn {
             Some(ThreadOpenWork::Turn)
-        } else if queue {
+        } else if queue && !allow_queued {
             Some(ThreadOpenWork::Queue)
         } else if native_rewind {
             Some(ThreadOpenWork::NativeRewind)
@@ -2209,7 +2297,7 @@ impl BatonStore {
         let rows = match cwd {
             Some(cwd) => {
                 let mut statement = self.db.prepare(
-                    "SELECT tu.thread_id, tu.turn, tu.provider, tu.model, tu.phase, tu.error, tu.provider_turn_id, tu.started_at, tu.ended_at
+                    "SELECT tu.thread_id, tu.turn, tu.provider, tu.model, tu.phase, tu.error, tu.provider_turn_id, tu.started_at, tu.ended_at, tu.owner_pid, tu.owner_start
                      FROM turns tu JOIN threads t ON t.id = tu.thread_id
                      WHERE t.cwd = ? AND tu.phase IN ('queued', 'running', 'settling') ORDER BY tu.started_at",
                 )?;
@@ -2220,7 +2308,7 @@ impl BatonStore {
             }
             None => {
                 let mut statement = self.db.prepare(
-                    "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at
+                    "SELECT thread_id, turn, provider, model, phase, error, provider_turn_id, started_at, ended_at, owner_pid, owner_start
                      FROM turns WHERE phase IN ('queued', 'running', 'settling') ORDER BY started_at",
                 )?;
                 let rows = statement
@@ -3809,6 +3897,156 @@ mod tests {
             )
             .unwrap();
         assert_eq!(store.thread_open_work(&thread.id).unwrap(), None);
+    }
+
+    #[test]
+    fn submit_turn_writes_the_message_and_owner_in_one_transaction() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "submit".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+
+        let turn = store
+            .submit_turn(&thread.id, ProviderId::Codex, Some("gpt"), "hello", false)
+            .unwrap();
+        assert_eq!(turn, 1);
+
+        let messages = store.list_messages(&thread.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "hello");
+        let turn = store
+            .get_turn_record(&thread.id, 1)
+            .unwrap()
+            .expect("turn exists");
+        assert_eq!(turn.phase, TurnPhase::Running);
+        assert_eq!(turn.owner_pid, Some(std::process::id()));
+        assert_eq!(
+            turn.owner_start,
+            crate::process::process_start(std::process::id())
+        );
+    }
+
+    #[test]
+    fn submit_turn_rolls_back_when_the_turn_write_fails() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "atomic".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER refuse_turn BEFORE INSERT ON turns BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            )
+            .unwrap();
+
+        let error = store
+            .submit_turn(&thread.id, ProviderId::Codex, None, "hello", false)
+            .unwrap_err();
+        assert!(error.to_string().contains("refused"), "{error}");
+        assert!(store.list_messages(&thread.id).unwrap().is_empty());
+        assert!(store.get_turn_record(&thread.id, 1).unwrap().is_none());
+        assert_eq!(store.thread_open_work(&thread.id).unwrap(), None);
+    }
+
+    #[test]
+    fn submit_turn_refuses_an_open_turn_without_adding_a_message() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "owner".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&thread.id, ProviderId::Codex, None, "first", false)
+            .unwrap();
+
+        let error = store
+            .submit_turn(&thread.id, ProviderId::Codex, None, "second", false)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SubmitRefused>(),
+            Some(&SubmitRefused(ThreadOpenWork::Turn))
+        );
+        let messages = store.list_messages(&thread.id).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "first");
+    }
+
+    #[test]
+    fn submit_turn_can_drain_one_queued_message_but_not_skip_the_queue_guard() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "queue".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&thread.id, ProviderId::Codex, None, "first", false)
+            .unwrap();
+        store
+            .finish_turn_record(&thread.id, 1, TurnPhase::Completed, None)
+            .unwrap();
+        store.enqueue_message(&thread.id, "queued one").unwrap();
+        store.enqueue_message(&thread.id, "queued two").unwrap();
+
+        let error = store
+            .submit_turn(&thread.id, ProviderId::Codex, None, "second", false)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SubmitRefused>(),
+            Some(&SubmitRefused(ThreadOpenWork::Queue))
+        );
+        assert_eq!(store.list_messages(&thread.id).unwrap().len(), 1);
+
+        assert_eq!(
+            store
+                .submit_turn(&thread.id, ProviderId::Codex, None, "second", true)
+                .unwrap(),
+            2
+        );
+        assert_eq!(store.list_messages(&thread.id).unwrap().len(), 2);
+        assert_eq!(store.list_queued_messages(&thread.id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn submit_turn_refuses_a_pending_native_rewind() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "rewind".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .set_native_rewind_pending(&thread.id, ProviderId::Codex, 1)
+            .unwrap();
+
+        let error = store
+            .submit_turn(&thread.id, ProviderId::Codex, None, "hello", false)
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<SubmitRefused>(),
+            Some(&SubmitRefused(ThreadOpenWork::NativeRewind))
+        );
+        assert!(store.list_messages(&thread.id).unwrap().is_empty());
     }
 
     #[test]

@@ -944,6 +944,15 @@ struct HandoffPrompt {
     payload: String,
     unseen: usize,
     provider: ProviderId,
+    drain_queued: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct SubmitOptions {
+    skip_handoff: bool,
+    expected_provider: Option<ProviderId>,
+    retry: bool,
+    drain_queued: bool,
 }
 
 struct PendingEditorOpen {
@@ -7667,9 +7676,10 @@ fn handle_key(
                     store,
                     engine_command_sender,
                     pending.prompt.clone(),
-                    false,
-                    None,
-                    false,
+                    SubmitOptions {
+                        drain_queued: pending.drain_queued,
+                        ..Default::default()
+                    },
                 );
             }
             KeyCode::Char('n') | KeyCode::Char('N') => {
@@ -7680,9 +7690,11 @@ fn handle_key(
                     store,
                     engine_command_sender,
                     pending.prompt.clone(),
-                    true,
-                    None,
-                    false,
+                    SubmitOptions {
+                        skip_handoff: true,
+                        drain_queued: pending.drain_queued,
+                        ..Default::default()
+                    },
                 );
             }
             KeyCode::Esc => {
@@ -8297,6 +8309,24 @@ fn dispatch_message(
     text: String,
     allow_commands: bool,
 ) {
+    dispatch_message_with_drain(
+        state,
+        store,
+        engine_command_sender,
+        text,
+        allow_commands,
+        false,
+    );
+}
+
+fn dispatch_message_with_drain(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    text: String,
+    allow_commands: bool,
+    drain_queued: bool,
+) {
     if let Some(command) = text.strip_prefix('!') {
         run_shell_command(state, command.trim().to_string());
         return;
@@ -8327,14 +8357,14 @@ fn dispatch_message(
             return;
         }
         if orchestrate::is_conversational_greeting(&text) {
-            submit(state, store, engine_command_sender, text);
+            submit_with_drain(state, store, engine_command_sender, text, drain_queued);
             return;
         }
         if crate::worktree::repo_root(std::path::Path::new(&state.thread.cwd)).is_err() {
             state.notice = Some(
                 "orchestrate needs a git repository; this prompt runs on a single harness".into(),
             );
-            submit(state, store, engine_command_sender, text);
+            submit_with_drain(state, store, engine_command_sender, text, drain_queued);
             return;
         }
         remember_prompt(state, store, &text);
@@ -8356,7 +8386,7 @@ fn dispatch_message(
         });
         state.notice = Some("steering the current turn...".into());
     } else {
-        submit(state, store, engine_command_sender, text);
+        submit_with_drain(state, store, engine_command_sender, text, drain_queued);
     }
 }
 
@@ -9006,7 +9036,7 @@ fn handle_composer_key(
                     .unwrap()
                     .list_queued_messages(&state.thread.id)
                     .unwrap_or_default();
-                dispatch_message(state, store, engine_command_sender, next, false);
+                dispatch_message_with_drain(state, store, engine_command_sender, next, false, true);
                 return;
             }
             state.set_input(String::new());
@@ -9203,6 +9233,16 @@ fn submit(
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     text: String,
 ) {
+    submit_with_drain(state, store, engine_command_sender, text, false);
+}
+
+fn submit_with_drain(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    text: String,
+    drain_queued: bool,
+) {
     let text = if let Some(goal) = &state.goal {
         if state.goal_paused {
             text
@@ -9212,7 +9252,8 @@ fn submit(
     } else {
         text
     };
-    if let Some(pending) = handoff_preview(state, store, &text) {
+    if let Some(mut pending) = handoff_preview(state, store, &text) {
+        pending.drain_queued = drain_queued;
         state.overlay = Overlay::HandoffPreview {
             pending: Box::new(pending),
         };
@@ -9224,9 +9265,10 @@ fn submit(
         store,
         engine_command_sender,
         text,
-        false,
-        None,
-        false,
+        SubmitOptions {
+            drain_queued,
+            ..Default::default()
+        },
     );
 }
 
@@ -9299,6 +9341,7 @@ fn handoff_preview(
         payload,
         unseen: unseen.len(),
         provider: state.thread.current_provider,
+        drain_queued: false,
     })
 }
 
@@ -9307,9 +9350,7 @@ fn dispatch_submit(
     store: &Arc<Mutex<BatonStore>>,
     engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
     text: String,
-    skip_handoff: bool,
-    expected_provider: Option<ProviderId>,
-    retry: bool,
+    options: SubmitOptions,
 ) {
     remember_prompt(state, store, &text);
     let result = {
@@ -9328,9 +9369,10 @@ fn dispatch_submit(
         thread_id,
         text,
         permission_mode,
-        skip_handoff,
-        expected_provider,
-        retry,
+        skip_handoff: options.skip_handoff,
+        expected_provider: options.expected_provider,
+        retry: options.retry,
+        drain_queued: options.drain_queued,
     });
 }
 
@@ -9509,9 +9551,12 @@ fn retry_turn(
         store,
         engine_command_sender,
         prompt,
-        true,
-        Some(choice.current_provider_id),
-        true,
+        SubmitOptions {
+            skip_handoff: true,
+            expected_provider: Some(choice.current_provider_id),
+            retry: true,
+            ..Default::default()
+        },
     );
 }
 
@@ -9811,6 +9856,7 @@ fn handle_command(
                     skip_handoff: false,
                     expected_provider: None,
                     retry: false,
+                    drain_queued: false,
                 });
             }
             state.multi = Some(MultiView {
@@ -18524,6 +18570,7 @@ mod tests {
                 skip_handoff,
                 expected_provider,
                 retry,
+                ..
             } => {
                 assert_eq!(submitted_thread, thread_id);
                 assert_eq!(text, "unverified prompt");
@@ -18624,6 +18671,7 @@ mod tests {
                 skip_handoff,
                 expected_provider,
                 retry,
+                ..
             } => {
                 assert_eq!(submitted_thread, thread_id);
                 assert_eq!(text, "failed prompt");
@@ -23867,6 +23915,7 @@ mod tests {
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
         enqueue_message(&mut state, &store, "queued prompt".into());
+        enqueue_message(&mut state, &store, "next prompt".into());
         let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
             &mut state,
@@ -23880,16 +23929,23 @@ mod tests {
             },
         );
         match receiver.try_recv().expect("queued message is submitted") {
-            EngineCommand::Submit { text, .. } => assert_eq!(text, "queued prompt"),
+            EngineCommand::Submit {
+                text, drain_queued, ..
+            } => {
+                assert_eq!(text, "queued prompt");
+                assert!(drain_queued, "the queue drain must bypass its own row");
+            }
             _ => panic!("expected a submit command"),
         }
-        assert!(state.queued_messages.is_empty());
-        assert!(store
-            .lock()
-            .unwrap()
-            .list_queued_messages(&state.thread.id)
-            .unwrap()
-            .is_empty());
+        assert_eq!(state.queued_messages, vec!["next prompt".to_string()]);
+        assert_eq!(
+            store
+                .lock()
+                .unwrap()
+                .list_queued_messages(&state.thread.id)
+                .unwrap(),
+            vec!["next prompt".to_string()]
+        );
     }
 
     #[test]
@@ -32301,9 +32357,7 @@ exit 1
             &store,
             &engine_command_sender,
             "new work".into(),
-            false,
-            None,
-            false,
+            SubmitOptions::default(),
         );
         assert!(current_plan(&state).is_none());
     }
@@ -32468,9 +32522,7 @@ exit 1
             &store,
             &engine_command_sender,
             "new work".into(),
-            false,
-            None,
-            false,
+            SubmitOptions::default(),
         );
         assert!(current_plan(&state).is_none());
         assert!(store

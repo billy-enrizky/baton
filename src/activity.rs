@@ -301,6 +301,8 @@ mod tests {
             provider_turn_id: None,
             started_at: format!("2026-01-01T00:00:0{turn}Z"),
             ended_at: Some(format!("2026-01-01T00:01:0{turn}Z")),
+            owner_pid: None,
+            owner_start: None,
         }
     }
 

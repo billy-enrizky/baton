@@ -455,7 +455,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | Command | What it does |
 |---|---|
 | `/memory` | Open instruction files, rules, and auto-memory topics |
-| `/skills` | Pick a Claude or Codex skill and insert its invocation |
+| `/skills` | Pick a Claude or Codex skill, insert its invocation, or install or update it in this project |
 | `/mcp` | List, add, remove, or sync MCP servers |
 | `/init` | Create a starter `CLAUDE.md` project memory file |
 | `/export` | Export the conversation |
@@ -574,7 +574,9 @@ baton orchestrate --archive <run-id>
 
 ### 10.2 Skills
 
-`/skills` lists skills discovered in the project's `.claude/skills` and `.codex/skills` directories first, then the global Claude and Codex skill directories; a project skill with the same name shadows the global one. Rows show a description from the skill's frontmatter when one is present. Enter inserts `$name` into the composer and reports the source. A Claude thread rewrites the final payload to `/name`; the stored transcript keeps `$name`.
+`/skills` lists skills discovered in the project's `.claude/skills` and `.codex/skills` directories first, then the global Claude and Codex skill directories; a project skill with the same name shadows the global one. Rows show the harness, whether the copy is project or global, and a description from the skill's frontmatter when one is present. Enter inserts `$name` into the composer, `i` copies a global skill into this project, and `u` replaces the project copy from its global source. A Claude thread rewrites the final payload to `/name`; the stored transcript keeps `$name`.
+
+Install and update copy the whole skill directory through a staging directory. Symlinks and non-regular files are refused, the copy is capped at 2,048 files and 32 MiB, an existing project skill is never overwritten by install, and an update restores the old copy if the swap fails. Update replaces the project directory, so a file removed from the global skill is also removed from the project copy.
 
 ### 10.3 Governed memories
 

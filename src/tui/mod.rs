@@ -243,7 +243,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "configure global preferences and inspect harness settings",
     ),
     ("/mcp", "manage MCP servers and sync across harnesses"),
-    ("/skills", "list skills across harnesses"),
+    ("/skills", "insert, install, or update a skill"),
     ("/copy", "copy the latest assistant reply to the clipboard"),
     ("/clear", "clear panels and notices"),
     ("/quit", "exit baton"),
@@ -518,6 +518,8 @@ struct SkillChoice {
     name: String,
     source: String,
     description: Option<String>,
+    path: std::path::PathBuf,
+    project: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3740,7 +3742,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/init", _) => Some("init (no arguments)"),
         ("/export", _) => Some("export (no arguments)"),
         ("/settings", _) => Some("settings (no arguments)"),
-        ("/skills", _) => Some("skills (no arguments)"),
+        ("/skills", _) => Some("skills (enter insert · i install · u update)"),
         ("/clear", _) => Some("clear (no arguments)"),
         ("/quit", _) => Some("quit (no arguments)"),
         ("/exit", _) => Some("exit (no arguments)"),
@@ -5309,7 +5311,7 @@ fn open_command_palette(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
         ("Billing mode", "subscription or API per harness", "/auth"),
         ("Sign in", "run a harness login", "/login"),
         ("Memory", "open instruction and rule files", "/memory"),
-        ("Skills", "insert a harness skill", "/skills"),
+        ("Skills", "insert, install, or update a skill", "/skills"),
         ("Settings", "global mode and bell", "/settings"),
         ("MCP servers", "list, add, remove, sync", "/mcp"),
         ("Review", "diff the latest turn", "/review"),
@@ -6362,6 +6364,36 @@ fn handle_key(
                     .map(|skill| insert_skill(state, &skill.name, &skill.source))
                     .unwrap_or(false);
                 if !inserted {
+                    state.overlay = Overlay::SkillsPicker { selected, skills };
+                }
+            }
+            KeyCode::Char('i') | KeyCode::Char('I') => {
+                let installed = skills
+                    .get(selected)
+                    .map(|skill| {
+                        install_selected_skill(
+                            state,
+                            skill,
+                            crate::skills::SkillInstallMode::Install,
+                        )
+                    })
+                    .unwrap_or(false);
+                if !installed {
+                    state.overlay = Overlay::SkillsPicker { selected, skills };
+                }
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                let updated = skills
+                    .get(selected)
+                    .map(|skill| {
+                        install_selected_skill(
+                            state,
+                            skill,
+                            crate::skills::SkillInstallMode::Update,
+                        )
+                    })
+                    .unwrap_or(false);
+                if !updated {
                     state.overlay = Overlay::SkillsPicker { selected, skills };
                 }
             }
@@ -10269,15 +10301,17 @@ fn handle_command(
             }
         }
         "/skills" => {
-            let skills: Vec<SkillChoice> =
-                sync::scan_skills_in(std::path::Path::new(&state.thread.cwd))
-                    .into_iter()
-                    .map(|skill| SkillChoice {
-                        name: skill.name,
-                        source: skill.source,
-                        description: skill.description,
-                    })
-                    .collect();
+            let cwd = std::path::PathBuf::from(&state.thread.cwd);
+            let skills: Vec<SkillChoice> = sync::scan_skills_in(&cwd)
+                .into_iter()
+                .map(|skill| SkillChoice {
+                    name: skill.name,
+                    source: skill.source,
+                    description: skill.description,
+                    path: skill.path.clone(),
+                    project: sync::is_project_skill(&cwd, &skill.path),
+                })
+                .collect();
             if skills.is_empty() {
                 state.notice = Some(
                     "no skills found in the configured Claude or Codex skill directories".into(),
@@ -13238,19 +13272,7 @@ fn draw_copy_picker(
 }
 
 fn is_insertable_skill_name(name: &str) -> bool {
-    let mut characters = name.chars();
-    let Some(first) = characters.next() else {
-        return false;
-    };
-    if !first.is_ascii_alphanumeric() {
-        return false;
-    }
-    let mut has_letter = first.is_ascii_alphabetic();
-    let valid = characters.all(|character| {
-        has_letter |= character.is_ascii_alphabetic();
-        character.is_ascii_alphanumeric() || matches!(character, ':' | '_' | '-')
-    });
-    valid && has_letter
+    crate::skills::is_safe_skill_name(name)
 }
 
 fn skill_label(value: &str, max_chars: usize) -> String {
@@ -13305,6 +13327,78 @@ fn insert_skill(state: &mut TuiState, name: &str, source: &str) -> bool {
     true
 }
 
+fn install_selected_skill(
+    state: &mut TuiState,
+    skill: &SkillChoice,
+    mode: crate::skills::SkillInstallMode,
+) -> bool {
+    use crate::skills::{SkillInstallMode, SkillInstallOutcome};
+
+    let cwd = std::path::PathBuf::from(&state.thread.cwd);
+    if mode == SkillInstallMode::Install && skill.project {
+        state.notice = Some(format!("${} is already a project skill", skill.name));
+        return false;
+    }
+    let source = if mode == SkillInstallMode::Update && skill.project {
+        match sync::scan_global_skills_for(&skill.source)
+            .into_iter()
+            .find(|candidate| candidate.name == skill.name)
+        {
+            Some(candidate) => candidate.path,
+            None => {
+                state.notice = Some(format!(
+                    "no global {} copy of ${} to update from",
+                    skill.source, skill.name
+                ));
+                return false;
+            }
+        }
+    } else {
+        skill.path.clone()
+    };
+    match crate::skills::install_skill(&cwd, &source, &skill.source, mode) {
+        Ok(SkillInstallOutcome::Installed {
+            destination,
+            updated,
+        }) => {
+            state.overlay = Overlay::None;
+            let relative = destination
+                .strip_prefix(&cwd)
+                .unwrap_or(&destination)
+                .display()
+                .to_string();
+            state.notice = Some(if updated {
+                format!("updated ${} in {relative}", skill.name)
+            } else {
+                format!("installed ${} into {relative}", skill.name)
+            });
+            true
+        }
+        Ok(SkillInstallOutcome::AlreadyInstalled(_)) => {
+            state.notice = Some(format!(
+                "${} is already installed in this project; press u to update",
+                skill.name
+            ));
+            false
+        }
+        Ok(SkillInstallOutcome::NotInstalled(_)) => {
+            state.notice = Some(format!(
+                "${} is not installed in this project; press i to install",
+                skill.name
+            ));
+            false
+        }
+        Ok(SkillInstallOutcome::SourceInProject) => {
+            state.notice = Some(format!("${} is already a project skill", skill.name));
+            false
+        }
+        Err(error) => {
+            state.notice = Some(format!("cannot install ${}: {error}", skill.name));
+            false
+        }
+    }
+}
+
 fn draw_skills_picker(
     frame: &mut ratatui::Frame,
     area: Rect,
@@ -13327,12 +13421,12 @@ fn draw_skills_picker(
     };
     let mut lines: Vec<Line> = vec![Line::styled(
         format!(
-            "skills ({}){position} · ↑↓ select · enter insert · esc close",
+            "skills ({}){position} · ↑↓ · enter insert · i install · u update · esc",
             skills.len()
         ),
         Style::default().fg(COLORS.muted),
     )];
-    let description_budget = (area.width as usize).saturating_sub(34).clamp(8, 80);
+    let description_budget = (area.width as usize).saturating_sub(46).clamp(8, 80);
     for (index, skill) in skills.iter().enumerate().skip(start).take(visible) {
         let style = if index == selected {
             Style::default()
@@ -13344,6 +13438,7 @@ fn draw_skills_picker(
         let cursor = if index == selected { "❯" } else { " " };
         let name = skill_label(&skill.name, 32);
         let source = skill_label(&skill.source, 16);
+        let location = if skill.project { "project" } else { "global" };
         let description = skill
             .description
             .as_deref()
@@ -13352,7 +13447,7 @@ fn draw_skills_picker(
             .map(|description| format!(" · {description}"))
             .unwrap_or_default();
         lines.push(Line::styled(
-            format!("{cursor} {name} ({source}){description}"),
+            format!("{cursor} {name} ({source} · {location}){description}"),
             style,
         ));
     }
@@ -17467,6 +17562,8 @@ mod tests {
             name: name.into(),
             source: source.into(),
             description: None,
+            path: std::path::PathBuf::from("/skill"),
+            project: false,
         }
     }
     use crate::types::QuestionOption;
@@ -22335,33 +22432,163 @@ mod tests {
                     name: "review".into(),
                     source: "codex".into(),
                     description: Some("Review the current diff".into()),
+                    path: std::path::PathBuf::from("/skill"),
+                    project: false,
                 },
                 SkillChoice {
                     name: "spoof".into(),
                     source: "claude".into(),
                     description: Some("safe\u{1b}]0;title".into()),
+                    path: std::path::PathBuf::from("/skill"),
+                    project: false,
                 },
                 SkillChoice {
                     name: "long".into(),
                     source: "codex".into(),
                     description: Some("x".repeat(200)),
+                    path: std::path::PathBuf::from("/skill"),
+                    project: false,
                 },
             ],
         };
         let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
         assert!(
-            text.contains("review (codex) · Review the current diff"),
+            text.contains("review (codex · global) · Review the current diff"),
             "{text}"
         );
         assert!(!text.contains('\u{1b}'), "{text}");
         assert!(text.contains("safe\u{fffd}]0;title"), "{text}");
         assert_eq!(
             text.lines()
-                .filter(|line| line.contains("long (codex)"))
+                .filter(|line| line.contains("long (codex · global)"))
                 .count(),
             1
         );
         assert!(text.contains('…'), "{text}");
+    }
+
+    #[test]
+    fn skills_picker_installs_and_updates_a_project_copy() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        state.thread.session_mode = SessionMode::Single;
+        let source = home.path().join("global").join("demo");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "version one\n").unwrap();
+        let choice = SkillChoice {
+            name: "demo".into(),
+            source: "codex".into(),
+            description: None,
+            path: source.clone(),
+            project: false,
+        };
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![choice.clone()],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        let destination = home.path().join(".codex").join("skills").join("demo");
+        assert_eq!(
+            std::fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            "version one\n"
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("installed $demo into .codex/skills/demo"));
+
+        std::fs::write(source.join("SKILL.md"), "version two\n").unwrap();
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![choice],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(
+            std::fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            "version two\n"
+        );
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("updated $demo in .codex/skills/demo"));
+    }
+
+    #[test]
+    fn skills_picker_explains_a_refused_install_or_update() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.current_provider = ProviderId::Codex;
+        state.thread.session_mode = SessionMode::Single;
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let project = home.path().join(".codex").join("skills").join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("SKILL.md"), "project\n").unwrap();
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![SkillChoice {
+                name: "demo".into(),
+                source: "codex".into(),
+                description: None,
+                path: project,
+                project: true,
+            }],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::SkillsPicker { .. }));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("already a project skill"));
+
+        let source = home.path().join("global").join("other");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("SKILL.md"), "global\n").unwrap();
+        state.overlay = Overlay::SkillsPicker {
+            selected: 0,
+            skills: vec![SkillChoice {
+                name: "other".into(),
+                source: "codex".into(),
+                description: None,
+                path: source,
+                project: false,
+            }],
+        };
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        );
+        assert!(matches!(state.overlay, Overlay::SkillsPicker { .. }));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("not installed in this project; press i to install"));
     }
 
     #[test]
@@ -22376,15 +22603,19 @@ mod tests {
                     name: format!("skill-{index}"),
                     source: "codex".into(),
                     description: None,
+                    path: std::path::PathBuf::from("/skill"),
+                    project: false,
                 })
                 .collect(),
         };
         let text = buffer_lines(&render_state(&state, 100, 30)).join("\n");
         assert!(text.contains("skills (10) · 10/10"), "{text}");
-        assert!(text.contains("❯ skill-9 (codex)"), "{text}");
+        assert!(text.contains("❯ skill-9 (codex · global)"), "{text}");
         assert_eq!(text.lines().filter(|line| line.contains('❯')).count(), 1);
-        assert!(!text.contains("skill-0 (codex)"), "{text}");
+        assert!(!text.contains("skill-0 (codex · global)"), "{text}");
         assert!(text.contains("enter insert"), "{text}");
+        assert!(text.contains("i install"), "{text}");
+        assert!(text.contains("u update"), "{text}");
 
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         handle_key(
@@ -22411,11 +22642,13 @@ mod tests {
                     name: format!("skill-{index}"),
                     source: "codex".into(),
                     description: None,
+                    path: std::path::PathBuf::from("/skill"),
+                    project: false,
                 })
                 .collect(),
         };
         let text = buffer_lines(&render_state(&state, 80, 16)).join("\n");
-        assert!(text.contains("skill-9 (codex)"), "{text}");
+        assert!(text.contains("skill-9 (codex · global)"), "{text}");
         assert_eq!(text.lines().filter(|line| line.contains('❯')).count(), 1);
     }
 

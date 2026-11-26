@@ -1,7 +1,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use rusqlite::{
-    params, params_from_iter, Connection, OptionalExtension, Transaction, TransactionBehavior,
+    params, params_from_iter, Connection, OpenFlags, OptionalExtension, Transaction,
+    TransactionBehavior,
 };
 use std::collections::HashMap;
 use std::path::Path;
@@ -283,6 +284,8 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+pub const SCHEMA_VERSION: i64 = 1;
+
 pub struct BatonStore {
     db: Connection,
 }
@@ -522,6 +525,7 @@ fn apply_schema(db: &Connection) -> Result<()> {
     ensure_column(db, "orchestration_runs", "archived_at", "TEXT")?;
     ensure_column(db, "orchestration_runs", "owner_pid", "INTEGER")?;
     ensure_column(db, "orchestration_runs", "owner_start", "TEXT")?;
+    db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
 
@@ -817,7 +821,29 @@ impl BatonStore {
         // project windows). Wait for another writer instead of failing the
         // command immediately with SQLITE_BUSY.
         db.busy_timeout(std::time::Duration::from_secs(5))?;
+        db.pragma_update(None, "journal_mode", "WAL")?;
         apply_schema(&db)?;
+        Ok(BatonStore { db })
+    }
+
+    /// Open an existing store without running schema migration or taking a
+    /// writer path. This is the read-only client entry point for a host-owned
+    /// store. A pre-versioned or future schema is refused rather than guessed.
+    pub fn open_read_only(path: &Path) -> Result<BatonStore> {
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let version: i64 = db.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < SCHEMA_VERSION {
+            anyhow::bail!(
+                "schema_too_old: store schema {version}, binary expects {SCHEMA_VERSION}"
+            );
+        }
+        if version > SCHEMA_VERSION {
+            anyhow::bail!(
+                "schema_too_new: store schema {version}, binary expects {SCHEMA_VERSION}"
+            );
+        }
+        db.pragma_update(None, "query_only", true)?;
         Ok(BatonStore { db })
     }
 
@@ -3182,6 +3208,89 @@ pub struct ImportedMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_sets_wal_and_schema_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        {
+            let store = BatonStore::open(&path).unwrap();
+            thread_for_archive(&store, "wal");
+        }
+        let db = Connection::open(&path).unwrap();
+        let journal: String = db
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal.to_ascii_lowercase(), "wal");
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn read_only_open_reads_without_running_ddl_or_allowing_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        {
+            let store = BatonStore::open(&path).unwrap();
+            thread_for_archive(&store, "read-only");
+        }
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch("DROP TABLE plans").unwrap();
+        drop(db);
+
+        let store = BatonStore::open_read_only(&path).unwrap();
+        assert_eq!(store.list_threads(None).unwrap().len(), 1);
+        let error = store
+            .create_thread(NewThread {
+                title: "write".into(),
+                cwd: "/tmp/read-only".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap_err();
+        assert!(
+            error.to_string().to_ascii_lowercase().contains("readonly")
+                || error.to_string().to_ascii_lowercase().contains("read-only"),
+            "{error}"
+        );
+        drop(store);
+        let db = Connection::open(&path).unwrap();
+        let plans: i64 = db
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'plans'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(plans, 0, "read-only open must not run schema DDL");
+    }
+
+    #[test]
+    fn read_only_open_refuses_an_unversioned_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        drop(Connection::open(&path).unwrap());
+        let error = BatonStore::open_read_only(&path)
+            .err()
+            .expect("schema refusal");
+        assert!(error.to_string().contains("schema_too_old"), "{error}");
+    }
+
+    #[test]
+    fn read_only_open_refuses_a_future_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(db);
+        let error = BatonStore::open_read_only(&path)
+            .err()
+            .expect("schema refusal");
+        assert!(error.to_string().contains("schema_too_new"), "{error}");
+    }
 
     fn stored_plan(provider: ProviderId, content: &str) -> StoredPlan {
         StoredPlan {

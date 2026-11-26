@@ -73,6 +73,10 @@ pub struct Cli {
 
     #[arg(long, global = true)]
     pub dry_run: bool,
+
+    /// Internal: act as a trusted child of the process that owns the live host claim
+    #[arg(long, global = true, hide = true, value_name = "UUID")]
+    pub host_id: Option<String>,
 }
 
 #[derive(Subcommand, Clone)]

@@ -859,6 +859,12 @@ fn coordinator_command(
     command
 }
 
+fn apply_host_identity(command: &mut Command, host_id: Option<&str>) {
+    if let Some(host_id) = host_id {
+        command.arg("--host-id").arg(host_id);
+    }
+}
+
 fn run_coordinator(
     prompt: &str,
     cwd: &Path,
@@ -1261,6 +1267,7 @@ fn run_worker(
     repo_root: Option<&Path>,
     repo_snapshot: Option<&worktree::RepoSnapshot>,
     worker_bin: Option<&Path>,
+    host_id: Option<&str>,
     implementor_prompt: &str,
     progress: Option<&ProgressFn<'_>>,
     cancel: Option<&AtomicBool>,
@@ -1275,6 +1282,7 @@ fn run_worker(
         repo_root,
         repo_snapshot,
         worker_bin,
+        host_id,
         implementor_prompt,
         progress,
         cancel,
@@ -1309,6 +1317,7 @@ fn run_worker_inner(
     repo_root: Option<&Path>,
     repo_snapshot: Option<&worktree::RepoSnapshot>,
     worker_bin: Option<&Path>,
+    host_id: Option<&str>,
     implementor_prompt: &str,
     progress: Option<&ProgressFn<'_>>,
     cancel: Option<&AtomicBool>,
@@ -1505,6 +1514,7 @@ fn run_worker_inner(
         },
     );
     let mut command = Command::new(binary);
+    apply_host_identity(&mut command, host_id);
     command
         .arg("-C")
         .arg(&worker_cwd)
@@ -1747,12 +1757,14 @@ fn reviewer_prompt(reviewer: &RoleSpec, task: &WorkerResult, diff: &str) -> Stri
 /// One reviewer turn over a completed worker's commit. The reviewer runs in the
 /// worker worktree with a role marker, so a harness or fixture can tell the two
 /// turns apart.
+#[allow(clippy::too_many_arguments)]
 fn review_task(
     task: &WorkerResult,
     home: &Path,
     repo_root: &Path,
     reviewer: &RoleSpec,
     binary: &Path,
+    host_id: Option<&str>,
     permission_mode: PermissionMode,
     cancel: Option<&AtomicBool>,
 ) -> ReviewOutcome {
@@ -1789,6 +1801,7 @@ fn review_task(
         }
     };
     let mut command = Command::new(binary);
+    apply_host_identity(&mut command, host_id);
     command
         .arg("-C")
         .arg(&cwd)
@@ -1917,6 +1930,7 @@ fn review_run_with_bin(
         .map(Path::to_path_buf)
         .or_else(|| std::env::current_exe().ok())
         .unwrap_or_else(|| PathBuf::from("baton"));
+    let host_id = store.host_id();
     let mut reviewed = 0usize;
     for (offset, task) in report.tasks.iter().enumerate() {
         let index = offset + 1;
@@ -1932,6 +1946,7 @@ fn review_run_with_bin(
             &repo_root,
             reviewer,
             &binary,
+            host_id,
             permission_mode,
             None,
         );
@@ -2948,6 +2963,7 @@ fn run_with_worker_bin_and_progress(
     if is_cancelled(cancel) {
         anyhow::bail!(CANCELLED_ERROR);
     }
+    let host_id = store.host_id().map(str::to_string);
     let registry = crate::roles::load(home)?;
     let implementor = registry.get(RoleId::Implementor);
     let implementor_prompt = implementor.prompt.clone();
@@ -3014,6 +3030,7 @@ fn run_with_worker_bin_and_progress(
                 let cwd = cwd.to_path_buf();
                 let repo_root = repo_root.clone();
                 let worker_bin = worker_bin.map(Path::to_path_buf);
+                let host_id = host_id.clone();
                 let implementor_prompt = implementor_prompt.clone();
                 let worker_snapshot = repo_snapshot.as_ref();
                 let gate = &gate;
@@ -3036,6 +3053,7 @@ fn run_with_worker_bin_and_progress(
                             Some(repo_root.as_path()),
                             worker_snapshot,
                             worker_bin.as_deref(),
+                            host_id.as_deref(),
                             &implementor_prompt,
                             progress,
                             cancel,
@@ -3155,6 +3173,7 @@ fn run_with_worker_bin_and_progress(
                     &repo_root,
                     reviewer,
                     &reviewer_bin,
+                    host_id.as_deref(),
                     permission_mode,
                     None,
                 )
@@ -3956,6 +3975,7 @@ esac"#;
             Some(repo.path()),
             None,
             Some(&worker),
+            None,
             "implementor",
             None,
             None,
@@ -3993,6 +4013,7 @@ esac"#;
             Some(repo.path()),
             None,
             Some(&worker),
+            None,
             "implementor",
             None,
             None,
@@ -4279,6 +4300,40 @@ esac"#;
         assert_eq!(
             with_implementor.tasks[0].model.as_deref(),
             Some("gpt-6.2-sol")
+        );
+    }
+
+    #[test]
+    fn child_exec_args_carry_the_host_id_without_exporting_it() {
+        let host_id = uuid::Uuid::new_v4().to_string();
+        let mut command = Command::new("baton");
+        apply_host_identity(&mut command, Some(&host_id));
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--host-id" && pair[1] == host_id));
+        assert!(
+            !command.get_envs().any(|(key, _)| key == "BATON_HOST_ID"),
+            "host authority must travel in argv, not the environment"
+        );
+    }
+
+    #[test]
+    fn coordinator_command_carries_no_host_identity() {
+        let command = coordinator_command(
+            Path::new("baton"),
+            Path::new("/repo"),
+            ProviderId::Codex,
+            "planner-model",
+            None,
+            PermissionMode::Default,
+        );
+        assert!(
+            !command.get_args().any(|arg| arg == "--host-id"),
+            "the planner runs against a temporary home and must not inherit host authority"
         );
     }
 

@@ -48,12 +48,16 @@ fn main_result(started: Instant) -> Result<()> {
     };
     let command = cli.command.clone().unwrap_or(cli::Commands::Chat);
     let cli_prompt = cli.prompt.clone();
+    if cli.host_id.is_some() && !matches!(&command, cli::Commands::Exec { .. }) {
+        anyhow::bail!("--host-id is reserved for internal child processes");
+    }
 
     let serving = matches!(&command, cli::Commands::Serve { .. });
-    if !serving {
+    let hosted_child = cli.host_id.is_some();
+    if !serving && !hosted_child {
         reap_startup_processes();
     }
-    if !matches!(&command, cli::Commands::Chat | cli::Commands::Serve { .. }) {
+    if !hosted_child && !matches!(&command, cli::Commands::Chat | cli::Commands::Serve { .. }) {
         reconcile_startup_orchestrations();
     }
 
@@ -129,7 +133,7 @@ fn main_result(started: Instant) -> Result<()> {
                 eprintln!("usage: baton exec <prompt>");
                 std::process::exit(2);
             }
-            let store = Arc::new(Mutex::new(BatonStore::open(&paths::baton_db_path())?));
+            let store = Arc::new(Mutex::new(open_store(cli.host_id.as_deref())?));
             let resolved = resolve_config(&home, &cwd);
             let requested_provider = cli.provider.as_deref().and_then(ProviderId::parse);
             if let Some(provider) = requested_provider {
@@ -399,7 +403,7 @@ fn main_result(started: Instant) -> Result<()> {
                             && outcome.error.is_none()
                             && outcome.question.is_none() =>
                     {
-                        match BatonStore::open(&paths::baton_db_path()).and_then(|review_store| {
+                        match open_store(cli.host_id.as_deref()).and_then(|review_store| {
                             orchestrate::auto_review_followup(
                                 &review_store,
                                 &home,
@@ -2769,6 +2773,14 @@ fn run_bench(home: &Path, started: Instant, target: &str, json: bool, repeat: u3
         );
     }
     Ok(())
+}
+
+fn open_store(host_id: Option<&str>) -> Result<BatonStore> {
+    let path = paths::baton_db_path();
+    match host_id {
+        Some(host_id) => BatonStore::open_hosted(&path, host_id),
+        None => BatonStore::open(&path),
+    }
 }
 
 fn reconcile_startup_orchestrations() {

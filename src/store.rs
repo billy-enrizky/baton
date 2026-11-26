@@ -4149,6 +4149,60 @@ mod tests {
     }
 
     #[test]
+    fn reconcile_running_turns_without_a_project_covers_every_project() {
+        let store = BatonStore::memory().unwrap();
+        let mut ids = Vec::new();
+        for (title, cwd) in [("one", "/one"), ("two", "/two")] {
+            let thread = store
+                .create_thread(NewThread {
+                    title: title.into(),
+                    cwd: cwd.into(),
+                    current_provider: ProviderId::Codex,
+                    current_model: None,
+                })
+                .unwrap();
+            store
+                .start_turn_record(&thread.id, 1, ProviderId::Codex, None)
+                .unwrap();
+            store
+                .db
+                .execute(
+                    "UPDATE turns SET owner_pid = 0, owner_start = NULL WHERE thread_id = ?",
+                    params![thread.id],
+                )
+                .unwrap();
+            ids.push(thread.id);
+        }
+        let live = store
+            .create_thread(NewThread {
+                title: "live".into(),
+                cwd: "/live".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .start_turn_record(&live.id, 1, ProviderId::Codex, None)
+            .unwrap();
+
+        assert_eq!(store.reconcile_running_turns(None).unwrap().len(), 2);
+        for id in ids {
+            assert_eq!(
+                store.get_turn_record(&id, 1).unwrap().expect("turn").phase,
+                TurnPhase::Unverified
+            );
+        }
+        assert_eq!(
+            store
+                .get_turn_record(&live.id, 1)
+                .unwrap()
+                .expect("turn")
+                .phase,
+            TurnPhase::Running
+        );
+    }
+
+    #[test]
     fn subagents_round_trip_in_order() {
         let store = BatonStore::memory().unwrap();
         let thread = store.draft_thread(NewThread {

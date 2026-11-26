@@ -1124,7 +1124,7 @@ pub fn run_tui(
     let reconciled = store
         .lock()
         .unwrap()
-        .reconcile_running_turns(Some(thread.cwd.as_str()))
+        .reconcile_running_turns(None)
         .unwrap_or_default();
     let recovered_runs =
         orchestrate::reconcile_abandoned_runs(&store.lock().unwrap()).unwrap_or_default();
@@ -1274,13 +1274,9 @@ pub fn run_tui(
         ));
     }
     if !reconciled.is_empty() {
-        let turns = reconciled
-            .iter()
-            .map(|row| row.turn.to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
         startup_notes.push(format!(
-            "previous turn(s) {turns} did not finish and were marked unverified"
+            "{} unfinished turn(s) were marked unverified at startup",
+            reconciled.len()
         ));
     }
     if !startup_notes.is_empty() {

@@ -122,6 +122,9 @@ pub enum Commands {
         /// Emit a JSON array
         #[arg(long)]
         json: bool,
+        /// Include archived threads
+        #[arg(long)]
+        all: bool,
     },
     /// List threads that need attention across all projects
     Inbox {

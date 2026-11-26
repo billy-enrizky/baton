@@ -271,6 +271,7 @@ mod tests {
             pin_order_key: None,
             snoozed_at: None,
             snoozed_until: None,
+            archived_at: None,
             created_at: String::new(),
             updated_at: String::new(),
         }

@@ -753,6 +753,85 @@ fn threads_json_reports_pinned() {
 }
 
 #[test]
+fn threads_json_hides_archived_until_all() {
+    let home = tempfile::tempdir().unwrap();
+    let work = tempfile::tempdir().unwrap();
+    let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+    let older = store
+        .create_thread(NewThread {
+            title: "older".to_string(),
+            cwd: work.path().to_string_lossy().to_string(),
+            current_provider: ProviderId::Claude,
+            current_model: None,
+        })
+        .unwrap();
+    let shelved = store
+        .create_thread(NewThread {
+            title: "shelved".to_string(),
+            cwd: work.path().to_string_lossy().to_string(),
+            current_provider: ProviderId::Claude,
+            current_model: None,
+        })
+        .unwrap();
+    store.archive_thread(&shelved.id).unwrap();
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["-C", work.path().to_str().unwrap(), "threads", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0]["thread_id"], older.id);
+    assert!(rows[0]["archived_at"].is_null());
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "-C",
+            work.path().to_str().unwrap(),
+            "threads",
+            "--json",
+            "--all",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let rows: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(rows.as_array().unwrap().len(), 2);
+    assert!(rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|row| row["thread_id"] == shelved.id && row["archived_at"].is_string()));
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["-C", work.path().to_str().unwrap(), "status", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        status["thread_id"], older.id,
+        "an archived thread is not the default status"
+    );
+}
+
+#[test]
 fn agents_json_reports_subagent_rows_for_a_thread() {
     let home = tempfile::tempdir().unwrap();
     let work = tempfile::tempdir().unwrap();

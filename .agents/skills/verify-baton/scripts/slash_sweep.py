@@ -17,6 +17,9 @@ from tui_probe import Screen, binary_identity, pump, read_available, set_size, w
 
 COMMANDS = [
     ("/help", ["Type what you want to do"]),
+    ("/archive", ["send a message before archiving this thread"]),
+    ("/unarchive", ["send a message before unarchiving this thread"]),
+    ("/snooze", ["send a message before snoozing this thread"]),
     # The unit test `help_all_lists_every_command` proves every registered
     # command is in the help text; this screen checks that a recently added
     # command reaches the rendered surface, which clips on a short terminal.
@@ -49,7 +52,6 @@ COMMANDS = [
     ("/memory", ["Memory ·", "Auto-memory"]),
     ("/threads", ["threads ·", "New thread"]),
     ("/pin", ["pin ·", "New thread"]),
-    ("/snooze", ["send a message before snoozing this thread"]),
     ("/inbox", ["inbox empty"]),
     ("/questions", ["no open worker questions"]),
     ("/open", ["threads ·"]),

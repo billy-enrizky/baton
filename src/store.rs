@@ -26,8 +26,22 @@ pub struct ThreadRow {
     /// Set together: when the snooze was requested and when it ends.
     pub snoozed_at: Option<String>,
     pub snoozed_until: Option<String>,
+    /// Hidden from the default thread list and the inbox while set.
+    pub archived_at: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// Why an archive or unarchive did or did not change a thread. A running turn
+/// is the claim that keeps a thread from being hidden mid-flight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArchiveOutcome {
+    Archived,
+    Unarchived,
+    AlreadyArchived,
+    NotArchived,
+    RunningTurn,
+    NotFound,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -539,6 +553,7 @@ fn ensure_thread_columns(db: &Connection) -> Result<()> {
     ensure_column(db, "threads", "pin_order_key", "TEXT")?;
     ensure_column(db, "threads", "snoozed_at", "TEXT")?;
     ensure_column(db, "threads", "snoozed_until", "TEXT")?;
+    ensure_column(db, "threads", "archived_at", "TEXT")?;
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS threads_pin_order_idx ON threads(pin_order_key DESC) WHERE pin_order_key IS NOT NULL;
          CREATE INDEX IF NOT EXISTS threads_pin_backfill_idx ON threads(updated_at) WHERE pinned = 1 AND (pin_order_key IS NULL OR pin_order_key = '');",
@@ -723,6 +738,7 @@ fn map_thread(row: &rusqlite::Row) -> rusqlite::Result<ThreadRow> {
         pin_order_key: row.get(13)?,
         snoozed_at: row.get(14)?,
         snoozed_until: row.get(15)?,
+        archived_at: row.get(16)?,
         created_at: row.get(5)?,
         updated_at: row.get(6)?,
     })
@@ -777,11 +793,11 @@ fn map_orchestration_task(row: &rusqlite::Row) -> rusqlite::Result<Orchestration
     })
 }
 
-const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode, reasoning_effort, pinned, pin_order_key, snoozed_at, snoozed_until";
+const THREAD_COLUMNS: &str = "id, title, cwd, current_provider, current_model, created_at, updated_at, permission_mode, goal, goal_paused, session_mode, reasoning_effort, pinned, pin_order_key, snoozed_at, snoozed_until, archived_at";
 
 /// The same list with table aliases, for queries that join another table.
 /// Keep the order identical to `THREAD_COLUMNS`: `map_thread` reads positions.
-const THREAD_COLUMNS_ALIASED: &str = "t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode, t.reasoning_effort, t.pinned, t.pin_order_key, t.snoozed_at, t.snoozed_until";
+const THREAD_COLUMNS_ALIASED: &str = "t.id, t.title, t.cwd, t.current_provider, t.current_model, t.created_at, t.updated_at, t.permission_mode, t.goal, t.goal_paused, t.session_mode, t.reasoning_effort, t.pinned, t.pin_order_key, t.snoozed_at, t.snoozed_until, t.archived_at";
 
 /// Per-project prompt history cap, Claude Code style.
 pub const PROMPT_HISTORY_LIMIT: i64 = 100;
@@ -848,6 +864,7 @@ impl BatonStore {
             pin_order_key: None,
             snoozed_at: None,
             snoozed_until: None,
+            archived_at: None,
             created_at: now.clone(),
             updated_at: now,
         })
@@ -1032,6 +1049,7 @@ impl BatonStore {
             pin_order_key: None,
             snoozed_at: None,
             snoozed_until: None,
+            archived_at: None,
             created_at: now.clone(),
             updated_at: now,
         }
@@ -1050,13 +1068,26 @@ impl BatonStore {
         self.list_threads_for_path_ordered(cwd, true)
     }
 
+    pub fn list_threads_for_path_display_all(&self, cwd: &Path) -> Result<Vec<ThreadRow>> {
+        self.list_threads_for_path_matching(cwd, true, true)
+    }
+
     fn list_threads_for_path_ordered(
         &self,
         cwd: &Path,
         pinned_first: bool,
     ) -> Result<Vec<ThreadRow>> {
+        self.list_threads_for_path_matching(cwd, pinned_first, false)
+    }
+
+    fn list_threads_for_path_matching(
+        &self,
+        cwd: &Path,
+        pinned_first: bool,
+        include_archived: bool,
+    ) -> Result<Vec<ThreadRow>> {
         let canonical = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let rows = self.list_threads_ordered(None, pinned_first)?;
+        let rows = self.list_threads_matching(None, pinned_first, include_archived)?;
         Ok(rows
             .into_iter()
             .filter(|thread| {
@@ -1076,6 +1107,15 @@ impl BatonStore {
 
     pub fn list_threads_display(&self, cwd: Option<&str>) -> Result<Vec<ThreadRow>> {
         self.list_threads_ordered(cwd, true)
+    }
+
+    /// Includes archived threads. The default lists hide them.
+    pub fn list_threads_all(&self, cwd: Option<&str>) -> Result<Vec<ThreadRow>> {
+        self.list_threads_matching(cwd, false, true)
+    }
+
+    pub fn list_threads_display_all(&self, cwd: Option<&str>) -> Result<Vec<ThreadRow>> {
+        self.list_threads_matching(cwd, true, true)
     }
 
     pub fn latest_turn_phases(&self, thread_ids: &[String]) -> Result<HashMap<String, TurnPhase>> {
@@ -1106,17 +1146,31 @@ impl BatonStore {
         cwd: Option<&str>,
         pinned_first: bool,
     ) -> Result<Vec<ThreadRow>> {
+        self.list_threads_matching(cwd, pinned_first, false)
+    }
+
+    fn list_threads_matching(
+        &self,
+        cwd: Option<&str>,
+        pinned_first: bool,
+        include_archived: bool,
+    ) -> Result<Vec<ThreadRow>> {
         let order = if pinned_first {
             "pinned DESC, pin_order_key DESC, updated_at DESC, rowid DESC"
         } else {
             "updated_at DESC, rowid DESC"
         };
+        let archived = if include_archived {
+            ""
+        } else {
+            " AND archived_at IS NULL"
+        };
         let mut statement = match cwd {
             Some(_cwd) => self.db.prepare(&format!(
-                "SELECT {THREAD_COLUMNS} FROM threads WHERE cwd = ? ORDER BY {order}"
+                "SELECT {THREAD_COLUMNS} FROM threads WHERE cwd = ?{archived} ORDER BY {order}"
             ))?,
             None => self.db.prepare(&format!(
-                "SELECT {THREAD_COLUMNS} FROM threads ORDER BY {order}"
+                "SELECT {THREAD_COLUMNS} FROM threads WHERE 1 = 1{archived} ORDER BY {order}"
             ))?,
         };
         let rows = match cwd {
@@ -1160,6 +1214,67 @@ impl BatonStore {
             anyhow::bail!("thread {id} not found");
         }
         Ok(())
+    }
+
+    /// Hides a thread from the default lists and the inbox. A thread with a
+    /// running turn is refused: that turn is the operation claim. The check and
+    /// the write share one immediate transaction, so two processes cannot both
+    /// see an idle thread and archive it mid-turn.
+    pub fn archive_thread(&self, id: &str) -> Result<ArchiveOutcome> {
+        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let archived_at: Option<Option<String>> = transaction
+            .query_row(
+                "SELECT archived_at FROM threads WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let outcome = match archived_at {
+            None => ArchiveOutcome::NotFound,
+            Some(Some(_)) => ArchiveOutcome::AlreadyArchived,
+            Some(None) => {
+                let running: i64 = transaction.query_row(
+                    "SELECT COUNT(*) FROM turns WHERE thread_id = ? AND phase NOT IN ('completed', 'failed', 'interrupted', 'unverified')",
+                    params![id],
+                    |row| row.get(0),
+                )?;
+                if running > 0 {
+                    ArchiveOutcome::RunningTurn
+                } else {
+                    transaction.execute(
+                        "UPDATE threads SET archived_at = ?, snoozed_at = NULL, snoozed_until = NULL WHERE id = ?",
+                        params![now_iso(), id],
+                    )?;
+                    ArchiveOutcome::Archived
+                }
+            }
+        };
+        transaction.commit()?;
+        Ok(outcome)
+    }
+
+    pub fn unarchive_thread(&self, id: &str) -> Result<ArchiveOutcome> {
+        let transaction = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let archived_at: Option<Option<String>> = transaction
+            .query_row(
+                "SELECT archived_at FROM threads WHERE id = ?",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let outcome = match archived_at {
+            None => ArchiveOutcome::NotFound,
+            Some(None) => ArchiveOutcome::NotArchived,
+            Some(Some(_)) => {
+                transaction.execute(
+                    "UPDATE threads SET archived_at = NULL WHERE id = ?",
+                    params![id],
+                )?;
+                ArchiveOutcome::Unarchived
+            }
+        };
+        transaction.commit()?;
+        Ok(outcome)
     }
 
     pub fn clear_thread_snooze(&self, id: &str) -> Result<bool> {
@@ -1800,6 +1915,7 @@ impl BatonStore {
                         pin_order_key: row.get(13)?,
                         snoozed_at: row.get(14)?,
                         snoozed_until: row.get(15)?,
+                        archived_at: row.get(16)?,
                         created_at: row.get(5)?,
                         updated_at: row.get(6)?,
                     })
@@ -3039,6 +3155,98 @@ mod tests {
             }],
             explanation: Some("two steps".into()),
         }
+    }
+
+    fn thread_for_archive(store: &BatonStore, title: &str) -> ThreadRow {
+        store
+            .create_thread(NewThread {
+                title: title.to_string(),
+                cwd: "/tmp/archive-test".to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn archive_hides_a_thread_and_unarchive_restores_it() {
+        let store = BatonStore::memory().unwrap();
+        let thread = thread_for_archive(&store, "later");
+        assert_eq!(
+            store.archive_thread(&thread.id).unwrap(),
+            ArchiveOutcome::Archived
+        );
+        assert!(
+            store.list_threads(None).unwrap().is_empty(),
+            "the default list hides archived threads"
+        );
+        assert_eq!(store.list_threads_all(None).unwrap().len(), 1);
+        assert!(store.list_threads_display_all(None).unwrap()[0]
+            .archived_at
+            .is_some());
+        assert_eq!(
+            store.unarchive_thread(&thread.id).unwrap(),
+            ArchiveOutcome::Unarchived
+        );
+        assert_eq!(store.list_threads(None).unwrap().len(), 1);
+        assert_eq!(
+            store.unarchive_thread(&thread.id).unwrap(),
+            ArchiveOutcome::NotArchived
+        );
+    }
+
+    #[test]
+    fn archive_refuses_a_running_turn_and_clears_a_snooze() {
+        let store = BatonStore::memory().unwrap();
+        let thread = thread_for_archive(&store, "busy");
+        let until = "2099-01-01T00:00:00Z";
+        store.set_thread_snoozed(&thread.id, until).unwrap();
+        store
+            .start_turn_record(&thread.id, 1, ProviderId::Codex, None)
+            .unwrap();
+        assert_eq!(
+            store.archive_thread(&thread.id).unwrap(),
+            ArchiveOutcome::RunningTurn
+        );
+        assert_eq!(store.list_threads(None).unwrap().len(), 1);
+        store
+            .finish_turn_record(&thread.id, 1, crate::types::TurnPhase::Completed, None)
+            .unwrap();
+        assert_eq!(
+            store.archive_thread(&thread.id).unwrap(),
+            ArchiveOutcome::Archived
+        );
+        let archived = store.list_threads_all(None).unwrap().remove(0);
+        assert!(archived.archived_at.is_some());
+        assert!(
+            archived.snoozed_until.is_none(),
+            "archive supersedes snooze"
+        );
+        assert_eq!(
+            store.archive_thread(&thread.id).unwrap(),
+            ArchiveOutcome::AlreadyArchived
+        );
+        assert_eq!(
+            store.archive_thread("missing").unwrap(),
+            ArchiveOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn archive_survives_a_store_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let thread_id = {
+            let store = BatonStore::open(&path).unwrap();
+            let thread = thread_for_archive(&store, "persisted");
+            store.archive_thread(&thread.id).unwrap();
+            thread.id
+        };
+        let store = BatonStore::open(&path).unwrap();
+        assert!(store.list_threads(None).unwrap().is_empty());
+        let archived = store.list_threads_all(None).unwrap().remove(0);
+        assert_eq!(archived.id, thread_id);
+        assert!(archived.archived_at.is_some());
     }
 
     #[test]

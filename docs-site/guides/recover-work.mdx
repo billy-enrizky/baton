@@ -60,6 +60,16 @@ The inbox merges threads from every project that need a person: a failed turn, a
 
 A snoozed thread leaves the inbox and returns when a failure or worker state happens after the snooze was set, or when the wake time passes. `/threads` marks a snoozed thread with its wake time.
 
+To put a thread away for longer, run `/archive`. It leaves the default thread list and the inbox.
+
+```text
+/archive
+/threads all
+/unarchive <id>
+```
+
+Archiving the thread you have open starts a new thread. A turn that is still running blocks the archive, so work cannot be hidden mid-flight.
+
 ## Handle queued follow-ups
 
 ```text

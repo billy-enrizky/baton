@@ -20,6 +20,7 @@ COMMANDS = [
     ("/archive", ["send a message before archiving this thread"]),
     ("/unarchive", ["send a message before unarchiving this thread"]),
     ("/snooze", ["send a message before snoozing this thread"]),
+    ("/changes", ["no diff recorded yet"]),
     # The unit test `help_all_lists_every_command` proves every registered
     # command is in the help text; this screen checks that a recently added
     # command reaches the rendered surface, which clips on a short terminal.

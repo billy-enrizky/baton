@@ -418,6 +418,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 |---|---|
 | `/checkpoints` | List checkpoints for this thread |
 | `/review` | Review the latest turn diff, search it with `/`, and keep line notes |
+| `/changes` | Every diff in this thread in one scrollable view; `/changes <turn>` filters one turn |
 | `/plan` | Show the plan the current harness reported, with status and priority |
 | `/diff` | Diff a checkpoint against the working tree |
 | `/rewind` | Restore a turn and optionally the code; `--native` uses a Codex or OpenCode native rollback |

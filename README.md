@@ -344,7 +344,7 @@ Most commands open a picker instead of requiring memorized syntax. Pickers show 
 
 ### 6.4 Transcript
 
-The transcript streams Markdown with tables, aligned columns, tinted diffs, and one row per tool call. Running tools show a status; completed and failed tools keep their result.
+The transcript streams Markdown with tables, aligned columns, tinted diffs, and one row per tool call. Running tools show a status; completed and failed tools keep their result. A diff longer than twelve rows collapses to a preview with `… N more lines · ctrl+t expand`; Ctrl+T expands every long diff inline and changes the hint to `ctrl+t collapse`. Long diff rows wrap at the terminal width.
 
 ### 6.5 Keyboard
 

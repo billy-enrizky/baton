@@ -264,7 +264,7 @@ Common
   /retry                      retry a failed or unverified turn
   /quit                       exit
 
-/help all  every command · shift+enter newline · up/down history";
+/help all  every command · shift+enter newline · up/down history · ctrl+t expand/collapse long diffs";
 
 #[derive(Debug, Clone)]
 struct RunChoice {
@@ -868,6 +868,8 @@ const FILES_PICKER_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_LIMIT: usize = crate::files::MAX_FILES;
 const FILE_REF_SUGGESTIONS: usize = 8;
 const FILE_REF_DIRECTORY_SUGGESTIONS: usize = 4;
+/// Inline diff rows before Ctrl+T expands the rest.
+const DIFF_PREVIEW_ROWS: usize = 12;
 const GREP_PICKER_LIMIT: usize = 200;
 
 const PROVIDERS: [ProviderId; 6] = [
@@ -884,6 +886,8 @@ pub struct TuiState {
     bell_enabled: bool,
     /// Palette colors are stripped; selections use reverse video instead.
     monochrome: bool,
+    /// Ctrl+T expands long diff cells in the transcript.
+    expand_diffs: bool,
     bell: crate::notify::BellLimiter,
     store: Arc<Mutex<BatonStore>>,
     prompt_history: Vec<String>,
@@ -1032,6 +1036,7 @@ pub fn run_tui(
     let mut state = TuiState {
         bell_enabled,
         monochrome: capability::monochrome_requested(),
+        expand_diffs: false,
         bell: crate::notify::BellLimiter::new(),
         store: store.clone(),
         prompt_history,
@@ -5069,6 +5074,22 @@ fn handle_key(
         && matches!(state.overlay, Overlay::None)
     {
         open_command_palette(state, store);
+        return;
+    }
+
+    if key.code == KeyCode::Char('t')
+        && key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(state.overlay, Overlay::None)
+        && state.review.is_none()
+        && state.activity.is_none()
+        && state.orchestration_report.is_none()
+    {
+        state.expand_diffs = !state.expand_diffs;
+        state.notice = Some(if state.expand_diffs {
+            "long diffs expanded".into()
+        } else {
+            "long diffs collapsed".into()
+        });
         return;
     }
 
@@ -15161,7 +15182,25 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
                 .diff_cache
                 .borrow_mut()
                 .render(&message.text, width.saturating_sub(2));
-            all_lines.extend(rendered.iter().cloned());
+            let clipped = rendered.len() > DIFF_PREVIEW_ROWS;
+            if state.expand_diffs || !clipped {
+                all_lines.extend(rendered.iter().cloned());
+                if state.expand_diffs && clipped {
+                    all_lines.push(Line::styled(
+                        "ctrl+t collapse",
+                        Style::default().fg(COLORS.muted),
+                    ));
+                }
+            } else {
+                all_lines.extend(rendered.iter().take(DIFF_PREVIEW_ROWS).cloned());
+                all_lines.push(Line::styled(
+                    format!(
+                        "… {} more lines · ctrl+t expand",
+                        rendered.len() - DIFF_PREVIEW_ROWS
+                    ),
+                    Style::default().fg(COLORS.muted),
+                ));
+            }
             all_lines.push(Line::from(vec![Span::raw(" ")]));
             continue;
         }
@@ -16746,6 +16785,7 @@ mod tests {
         TuiState {
             bell_enabled: crate::config::notifications(home).bell,
             monochrome: false,
+            expand_diffs: false,
             bell: crate::notify::BellLimiter::new(),
             store: store.clone(),
             prompt_history: Vec::new(),
@@ -21737,6 +21777,64 @@ mod tests {
             text: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,3 @@\n context\n-old line\n+new line\n+another line\n".to_string(),
             created_at: String::new(),
         }
+    }
+
+    #[test]
+    fn a_short_diff_has_no_expand_hint() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.history = vec![review_diff_message(&state.thread.id)];
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("new line"), "{text}");
+        assert!(!text.contains("ctrl+t expand"), "{text}");
+    }
+
+    #[test]
+    fn ctrl_t_expands_a_long_diff() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let added = (0..16)
+            .map(|index| format!("+line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.history = vec![MessageRow {
+            id: 91,
+            thread_id: state.thread.id.clone(),
+            turn: 1,
+            role: "diff".to_string(),
+            provider: None,
+            model: None,
+            text: format!(
+                "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1,16 @@\n{added}\n"
+            ),
+            created_at: String::new(),
+        }];
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("ctrl+t expand"), "{text}");
+        assert!(!text.contains("line-15"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("line-15"), "{text}");
+        assert!(text.contains("ctrl+t collapse"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+        );
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("ctrl+t expand"), "{text}");
+        assert!(!text.contains("line-15"), "{text}");
     }
 
     #[test]

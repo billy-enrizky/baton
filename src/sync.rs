@@ -217,7 +217,9 @@ fn collect_skill_dirs(path: &Path, source: &str, depth: usize, skills: &mut Vec<
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| {
-            name.starts_with(".baton-staging-") || name.starts_with(".baton-backup-")
+            name.starts_with(".baton-staging-")
+                || name.starts_with(".baton-backup-")
+                || name.starts_with(".baton-trash-")
         })
     {
         return;
@@ -543,6 +545,7 @@ mod tests {
         skill(root.path(), "demo", "SKILL.md");
         skill(root.path(), ".baton-staging-test", "SKILL.md");
         skill(root.path(), ".baton-backup-test", "SKILL.md");
+        skill(root.path(), ".baton-trash-test", "SKILL.md");
         let names = scan_skill_root(root.path(), "claude")
             .into_iter()
             .map(|skill| skill.name)

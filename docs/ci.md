@@ -80,9 +80,9 @@ Measured from the cited runs. The older Rust samples were based on `be31fc5` and
 | Warm meta PR feedback, descriptive | 59 seconds, n=1 | Run 45005544007 |
 | Warm Test job | 33 to 52 seconds; n=16 | Runs 45035044248, 45055995298, 45004705055, 45009466461, 45021604178, 45060299027, 45011836996, 45010710576, 45037001045, 45046974039, 45051808580, 45064707055, 45069517940, 45075059836, 45075683884, and 45080151770 |
 | Main push at `7f22ab5` | Whole run 66 seconds; Test job 51 seconds. Job steps: 17 seconds of checkout and cache restore, 30 seconds of Test, 4 seconds of tail. The run starts the Test job 5 seconds in because it waits only on `changes`, so the remaining lead-in is runner startup | Run 45580109649 |
-| `cargo test --lib` | 1.67 to 3.70 seconds at the cited runs; 846 library tests in the current suite | Timing runs 45009466461 and 45011836996; current count from the 2026-11-26 plan-kind run |
-| Integration tests | 0.40 to 0.75 seconds at the cited runs; 129 tests across nine binaries in the current suite | Timing runs 45009466461 and 45011836996; current count from the 2026-11-26 plan-kind run |
-| Executed test count (`ci/test-inventory.sh`) | 975 macOS after the plan-kind slice | Current source inventory; Linux runs the same suite plus the two platform-specific tests named below |
+| `cargo test --lib` | 1.67 to 3.70 seconds at the cited runs; 850 library tests in the current suite | Timing runs 45009466461 and 45011836996; current count from the 2026-11-26 WAL/read-only run |
+| Integration tests | 0.40 to 0.75 seconds at the cited runs; 129 tests across nine binaries in the current suite | Timing runs 45009466461 and 45011836996; current count from the 2026-11-26 WAL/read-only run |
+| Executed test count (`ci/test-inventory.sh`) | 979 macOS after the WAL/read-only slice | Current source inventory; Linux runs the same suite plus the two platform-specific tests named below |
 | `ci/test-inventory-floor.txt` | 776 | Lower-bound floor; it does not shrink when the current count grows |
 | `ci/fmt-baseline.txt` | 547 | Current debt ceiling |
 | `ci/clippy-baseline.txt` | 61 | Current debt ceiling |

@@ -89,10 +89,14 @@ The overlay never edits the plan and never sends a provider message. Accept is o
 
 ## How to get to it (user POV)
 
-Run a turn on a harness that reports plans, then type `/plan`. A Codex app server sends `turn/plan/updated`; an ACP v2 agent sends `sessionUpdate: "plan_update"` with an item, markdown, or file plan, and a v1 peer can send `sessionUpdate: "plan"`. In a clean isolated instance, `/plan` reports the empty state. The populated Codex path is driven through a fake app server in a real PTY:
+Run a turn on a harness that reports plans, then type `/plan`. A Codex app server sends `turn/plan/updated`; an ACP v2 agent sends `sessionUpdate: "plan_update"` with an item, markdown, or file plan, and a v1 peer can send `sessionUpdate: "plan"`. In a clean isolated instance, `/plan` reports the empty state. The populated Codex item path is driven through a fake app server in a real PTY. The ACP probe starts a fake `agy` ACP server, runs one markdown plan turn and one file plan turn, opens `/plan` after each, and checks the rendered markdown and file URI:
 
 ```sh
 .agents/skills/verify-baton/scripts/plan_probe.py \
+  --binary target/debug/baton \
+  --evidence-dir local_docs/verification/evidence
+
+uv run --no-project python .agents/skills/verify-baton/scripts/acp_plan_probe.py \
   --binary target/debug/baton \
   --evidence-dir local_docs/verification/evidence
 ```
@@ -140,7 +144,8 @@ Run a turn on a harness that reports plans, then type `/plan`. A Codex app serve
 - `plan_events_keep_the_entries_and_explanation`
 - `plan_statuses_use_one_vocabulary`
 - `plan_removal_keeps_the_plan_id`
-- `.agents/skills/verify-baton/scripts/plan_probe.py` proves the populated overlay in a PTY, including `/mode plan`, the `enter accept` and `esc revise` hints, the Esc revision draft, and the Enter acceptance notice.
+- `.agents/skills/verify-baton/scripts/plan_probe.py` proves the populated item overlay in a PTY, including `/mode plan`, the `enter accept` and `esc revise` hints, the Esc revision draft, and the Enter acceptance notice.
+- `.agents/skills/verify-baton/scripts/acp_plan_probe.py` proves markdown and file plans through a fake ACP agent and the real TUI overlay.
 - `.agents/skills/verify-baton/scripts/slash_sweep.py` runs `/plan` and requires the empty-state notice.
 
 ## Gotchas
@@ -149,4 +154,4 @@ Run a turn on a harness that reports plans, then type `/plan`. A Codex app serve
 - ACP markdown and file plans are rendered, but a file plan is shown as a URI; the overlay does not open the file. Only a `plan_removed` with the snapshot's own `planId` clears it.
 - A plan is cleared when the thread submits new work, runs `/multi` or orchestration, and when it rewinds. A retained plan names its reporting turn when the harness supplied one, and it survives a restart through the `plans` table.
 - Orchestration workers run outside the TUI process, so their plan is forwarded only after the worker settles; a plan reported mid-run is not live.
-- The populated path is PTY-tested against a fake Codex server. No live provider plan event has been recorded yet.
+- The item path is PTY-tested against a fake Codex server. The markdown and file path is PTY-tested against a fake ACP server. No live provider document plan event has been recorded yet.

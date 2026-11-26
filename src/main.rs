@@ -3,7 +3,7 @@ use baton::{activity, adapters, checkpoints, claim, cli, config, doctor, exec_ev
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
 use std::collections::HashMap;
-use std::io::{IsTerminal, Write};
+use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -704,6 +704,7 @@ fn main_result(started: Instant) -> Result<()> {
             requested_effort,
         ),
         cli::Commands::Serve { stdio } => run_serve(&home, stdio),
+        cli::Commands::Host { command } => run_host(&home, command),
         cli::Commands::Mcp => {
             let store = open_store(None)?;
             mcp::run_stdio(mcp::McpServer::new(store, home.clone(), cwd.clone()))
@@ -2786,6 +2787,83 @@ fn run_bench(home: &Path, started: Instant, target: &str, json: bool, repeat: u3
 
 fn open_store(host_id: Option<&str>) -> Result<BatonStore> {
     BatonStore::open_client(&paths::baton_db_path(), host_id)
+}
+
+fn run_host(home: &Path, command: cli::HostCommand) -> Result<()> {
+    match command {
+        cli::HostCommand::Takeover { pid } => takeover_host(home, pid),
+    }
+}
+
+fn takeover_host(home: &Path, pid: u32) -> Result<()> {
+    let path = paths::baton_db_path();
+    if !path.exists() {
+        anyhow::bail!(
+            "no Baton store at {}; start baton serve first",
+            path.display()
+        );
+    }
+    let read_only = BatonStore::open_read_only(&path)?;
+    let Some(claim) = read_only.get_host_claim()? else {
+        anyhow::bail!("no host claim; start baton serve first");
+    };
+    if claim.pid != pid {
+        anyhow::bail!(
+            "the live claim belongs to pid {} started {}",
+            claim.pid,
+            claim.process_start
+        );
+    }
+    if !process::process_identity_alive(claim.pid, Some(&claim.process_start)) {
+        anyhow::bail!(
+            "host pid {} is not live; start baton serve to replace the stale claim",
+            claim.pid
+        );
+    }
+    eprint!(
+        "baton: take over the store from pid {} started {}? [y/N] ",
+        claim.pid, claim.process_start
+    );
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().lock().read_line(&mut answer)?;
+    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+        anyhow::bail!("takeover cancelled");
+    }
+
+    let host_id = uuid::Uuid::new_v4().to_string();
+    let store = BatonStore::open_hosted(&path, &host_id)?;
+    let taken = match claim::takeover(&store, home, pid, &host_id, &claim::SystemProbe)? {
+        claim::TakeoverOutcome::Taken(claim) => claim,
+        claim::TakeoverOutcome::NoClaim => {
+            anyhow::bail!("the host claim disappeared; no takeover was needed")
+        }
+        claim::TakeoverOutcome::Changed { pid, process_start } => {
+            anyhow::bail!(
+                "the host claim changed to pid {pid} started {process_start}; retry with that pid"
+            )
+        }
+        claim::TakeoverOutcome::NotLive { pid } => {
+            anyhow::bail!("host pid {pid} is no longer live; no takeover was needed")
+        }
+    };
+    let settlement =
+        store.settle_open_work_after_takeover(&format!("host pid {} was taken over", taken.pid));
+    let released = store.release_host_claim(&host_id);
+    let settlement = settlement?;
+    if !released? {
+        anyhow::bail!("takeover claim disappeared before release");
+    }
+    println!(
+        "baton: took over from pid {} started {}",
+        claim.pid, claim.process_start
+    );
+    println!(
+        "baton: settled {} turn(s) and {} orchestration run(s)",
+        settlement.turns, settlement.runs
+    );
+    println!("baton: the old host is fenced out; start baton serve for a new host");
+    Ok(())
 }
 
 fn reconcile_startup_orchestrations() {

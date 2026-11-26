@@ -90,6 +90,20 @@ pub enum HostClaimAttempt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TakeoverAttempt {
+    Taken(HostClaimRow),
+    NoClaim,
+    Changed { pid: u32, process_start: String },
+    NotLive { pid: u32 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TakeoverSettlement {
+    pub turns: usize,
+    pub runs: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotTheHost {
     pub owner_pid: Option<u32>,
     pub host_id: Option<String>,
@@ -2629,6 +2643,68 @@ impl BatonStore {
         }))
     }
 
+    /// Replaces a live claim only when the caller names its exact pid and
+    /// process start, and that process is still live. The takeover store must
+    /// already carry the new host id. The row keeps its installation id.
+    pub(crate) fn takeover_host_row(
+        &self,
+        new_host_id: &str,
+        expected_pid: u32,
+        expected_start: &str,
+        pid: u32,
+        process_start: &str,
+    ) -> Result<TakeoverAttempt> {
+        if self.host_id.as_deref() != Some(new_host_id) {
+            anyhow::bail!("host store must be opened with open_hosted and the new host id");
+        }
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let Some(claim) = Self::get_host_claim_from(&tx)? else {
+            return Ok(TakeoverAttempt::NoClaim);
+        };
+        if claim.pid != expected_pid || claim.process_start != expected_start {
+            return Ok(TakeoverAttempt::Changed {
+                pid: claim.pid,
+                process_start: claim.process_start,
+            });
+        }
+        if !crate::process::process_identity_alive(claim.pid, Some(&claim.process_start)) {
+            return Ok(TakeoverAttempt::NotLive { pid: claim.pid });
+        }
+        let now = now_iso();
+        tx.execute(
+            "UPDATE host_claim SET host_id = ?, pid = ?, process_start = ?, claimed_at = ?, heartbeat_at = ? WHERE singleton = 1",
+            params![new_host_id, i64::from(pid), process_start, now, now],
+        )?;
+        tx.commit()?;
+        Ok(TakeoverAttempt::Taken(HostClaimRow {
+            host_id: new_host_id.to_string(),
+            kind: claim.kind,
+            installation_id: claim.installation_id,
+            pid,
+            process_start: process_start.to_string(),
+            claimed_at: now.clone(),
+            heartbeat_at: now,
+        }))
+    }
+
+    /// Ends every open turn and running orchestration after a takeover claim
+    /// is installed. Task rows keep their completed or failed verdicts; only
+    /// queued and running work is converted.
+    pub fn settle_open_work_after_takeover(&self, error: &str) -> Result<TakeoverSettlement> {
+        let runs = self.list_running_orchestration_runs()?;
+        let turns = self.write_execute(
+            "UPDATE turns SET phase = 'unverified', error = COALESCE(error, ?), ended_at = COALESCE(ended_at, ?) WHERE phase IN ('queued', 'running', 'settling')",
+            params![error, now_iso()],
+        )?;
+        for run in &runs {
+            self.abandon_orchestration_run(&run.id, error)?;
+        }
+        Ok(TakeoverSettlement {
+            turns,
+            runs: runs.len(),
+        })
+    }
+
     pub fn release_host_claim(&self, host_id: &str) -> Result<bool> {
         let write = self.write()?;
         let changed = write.execute(
@@ -3711,8 +3787,8 @@ mod tests {
         );
         assert_eq!(
             source.matches(&raw_tx).count(),
-            2,
-            "only write() and claim_host_row may open the raw transaction"
+            3,
+            "only write(), claim_host_row, and takeover_host_row may open the raw transaction"
         );
     }
 
@@ -3873,6 +3949,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table, 1, "the writable client restores the schema");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn takeover_settlement_ends_open_turns_and_running_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let store = BatonStore::open(&path).unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "taken over".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(
+                &thread.id,
+                ProviderId::Codex,
+                Some("model"),
+                "open work",
+                false,
+            )
+            .unwrap();
+        let owner_pid = std::process::id();
+        let owner_start = crate::process::process_start(owner_pid);
+        store
+            .create_orchestration_run_owned(
+                "run",
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+                Some(owner_pid),
+                owner_start.as_deref(),
+            )
+            .unwrap();
+
+        let settlement = store
+            .settle_open_work_after_takeover("host pid 42 was taken over")
+            .unwrap();
+        assert_eq!(settlement.turns, 1);
+        assert_eq!(settlement.runs, 1);
+        let turn = store.get_turn_record(&thread.id, 1).unwrap().unwrap();
+        assert_eq!(turn.phase, TurnPhase::Unverified);
+        assert!(turn.error.as_deref().unwrap_or("").contains("taken over"));
+        let run = store
+            .list_orchestration_runs(1)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("run");
+        assert_ne!(run.status, "running");
+        assert!(run.finished_at.is_some());
     }
 
     #[test]

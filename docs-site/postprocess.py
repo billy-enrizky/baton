@@ -18,12 +18,16 @@ FAVICON = re.compile(
 BROWSERCONFIG = re.compile(
     r'<meta data-mint-head name="msapplication-config"[^>]*>'
 )
+BROWSERCONFIG_ESCAPED = re.compile(
+    r'\\u003cmeta data-mint-head name=\\"msapplication-config\\".*?\\">'
+)
 
 
 def replace_origin(text: str, site_url: str) -> str:
     text = text.replace("https://local.", site_url)
     text = text.replace('"subdomain":"localhost"', f'"subdomain":"{urlparse(site_url).hostname}"')
-    return BROWSERCONFIG.sub("", text)
+    text = BROWSERCONFIG.sub("", text)
+    return BROWSERCONFIG_ESCAPED.sub("", text)
 
 
 def write_sitemap(docs_root: Path, urls: list[str]) -> None:
@@ -67,7 +71,11 @@ def main() -> int:
 
         relative = page.parent.relative_to(docs_root).as_posix()
         label = "docs" if relative == "." else f"docs/{relative}"
-        if "https://local." in text or '"subdomain":"localhost"' in text:
+        if (
+            "https://local." in text
+            or '"subdomain":"localhost"' in text
+            or "mintlify.s3.us-west-1.amazonaws.com/local/" in text
+        ):
             errors.append(f"{label}: local origin remains")
         canonical = CANONICAL.search(text)
         if canonical is None:
@@ -105,7 +113,14 @@ def main() -> int:
         path.relative_to(docs_root).as_posix()
         for path in docs_root.rglob("*")
         if path.is_file() and path.suffix in {".html", ".json", ".txt", ".xml"}
-        and ("https://local." in path.read_text(encoding="utf-8", errors="replace"))
+        and any(
+            marker in path.read_text(encoding="utf-8", errors="replace")
+            for marker in (
+                "https://local.",
+                '"subdomain":"localhost"',
+                "mintlify.s3.us-west-1.amazonaws.com/local/",
+            )
+        )
     )
     errors.extend(f"{path}: local origin remains" for path in remaining)
 

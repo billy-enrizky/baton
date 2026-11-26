@@ -1,0 +1,16 @@
+---
+title: "Exit codes"
+description: "What each exit code means, and which stream carries machine output."
+icon: "arrow-right-from-bracket"
+---
+
+| Code | Meaning |
+|---|---|
+| `0` | The command finished. A query that finds no threads or no work still succeeds. |
+| `1` | A runtime failure: a provider error, a missing repository, an unreadable store, or a failed turn. |
+| `2` | A usage error: an unknown flag, a missing argument, or a missing `exec` prompt. |
+| `130` | Interrupted. A cancelled orchestration exits 130. A process killed by SIGINT reports signal 2, which shells show as 130. |
+
+Machine output stays on stdout and progress stays on stderr, so a pipeline can parse `--json` without filtering log lines.
+
+The TUI does not use exit codes for turns. Ctrl+C interrupts a turn, and a second idle Ctrl+C exits.

@@ -1,0 +1,68 @@
+---
+title: "Troubleshooting"
+description: "Fix the common failures: no harness, no key, a stale turn, a refused restart."
+icon: "wrench"
+---
+
+## Baton finds no harness
+
+Run `baton doctor`. It lists each harness binary it found on `PATH` and the auth source for each one.
+
+If a harness is missing, install its CLI and run `baton doctor` again. For a harness installed in a nonstandard location, add its directory to `PATH` before you start Baton.
+
+## A harness reports a missing key
+
+```sh
+baton secret check
+```
+
+The command names the winning source for each harness. Set the key in the environment, in `~/.baton/config.json`, or in the harness's own settings. See [Harnesses and auth](/guides/harnesses-and-auth).
+
+## A turn is stuck or marked unverified
+
+A turn becomes `unverified` when the harness process ends without a clean completion, for example after a crash.
+
+```text
+/status
+/retry
+```
+
+`/status` names the phase and the adapter state. `/retry` starts a new turn from a failed or unverified turn on the same harness. It refuses a thread with open work or a different harness.
+
+## A restore is refused
+
+`/rewind` and `baton restore` refuse some targets on purpose.
+
+- The repository's main checkout is shared by other threads, so a restore there needs `--force` on the command line.
+- A checkout with open work from another thread is refused.
+- The conversation rewind still completes when the file restore is refused, so you can continue.
+
+## Approvals or questions came from a worker
+
+A worker can ask with `BATON_QUESTION:`. The run becomes `needs_input`.
+
+```text
+/questions
+```
+
+The picker opens the worker thread so you can answer. Integration and shipping are refused until the worker is unblocked.
+
+## A commit or push is refused
+
+Baton refuses a commit when another thread has open work in the same repository, when a merge, rebase, cherry-pick, or bisect is in progress, or when the branch, HEAD, or file set changed since the preview.
+
+A push is refused when the upstream is behind, when HEAD moved, or when the update is not fast-forward. Baton never forces.
+
+## The terminal looks wrong
+
+- Run with `NO_COLOR=1` to draw without palette colors.
+- Run with `TERM=dumb` for the same result when `NO_COLOR` is not an option.
+- A 16-color terminal gets a smaller palette with the accent, success, error, and warning colors kept distinct.
+
+## Baton says the terminal is not interactive
+
+The TUI needs an interactive stdin and stdout. In a script, a pipe, or a CI job, use `baton exec` instead.
+
+## Reset the local state
+
+Baton stores state in `~/.baton`, or in `BATON_HOME` when that variable is set. Set `BATON_HOME` to a fresh directory to start from clean state without deleting the old one. Checkpoints are git refs in each repository and are not affected.

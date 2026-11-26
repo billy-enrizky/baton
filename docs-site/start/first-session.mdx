@@ -1,0 +1,68 @@
+---
+title: "Your first session"
+description: "Start a fresh thread, choose a mode, and reopen work later."
+icon: "play"
+---
+
+A session starts when you run `baton` in a project directory. Baton opens a new thread for that directory. The thread is saved with your first prompt and survives restarts.
+
+## Start a fresh thread
+
+```sh
+cd ~/code/my-project
+baton
+```
+
+The status bar shows the session mode. `orchestrate` is the default. To send each prompt to one harness, switch modes first.
+
+```text
+/orchestrate off
+```
+
+## Ask for a plan before work starts
+
+```text
+/orchestrate --plan-only add rate limiting to the API
+```
+
+The planner returns a plan with tasks and the harness chosen for each task. Enter starts the run and Esc returns the goal to the composer.
+
+## Open an existing thread
+
+```sh
+baton threads
+baton -t <thread-id>
+```
+
+`baton threads` shows each thread's short id, title, harness, model, mode, phase, turn count, and queue count. Add `--json` for the same data as JSON. Inside Baton, `/threads` opens a picker for the current directory.
+
+## Choose the harness for this thread
+
+```text
+/switch
+```
+
+The picker lists installed harnesses, then the models that harness reports. `/model` changes only the model. `/effort` changes the reasoning effort on Codex and Claude.
+
+## What the status bar tells you
+
+The top of the screen shows the version, the working directory, the session mode, the current harness and model, the reasoning effort when set, the permission mode, and the billing source. A queue, goal, or stale-turn warning appears there when it applies.
+
+## Send a prompt while a turn runs
+
+A new message during a turn becomes a steer on Codex, Claude, and OpenCode 2 or newer. Other harnesses queue the message durably. `/queue` opens the queue: Enter sends a row, `e` edits it, `d` deletes it, and `c` pressed twice clears the queue.
+
+## Exit
+
+Press Ctrl+C twice while idle, or run `/quit`. A single Ctrl+C during a turn interrupts that turn and leaves Baton open.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Threads and turns" icon="comments" href="/concepts/threads-and-turns">
+    What Baton stores for each thread and each turn.
+  </Card>
+  <Card title="Slash commands" icon="command" href="/reference/slash-commands">
+    Every command with the picker it opens.
+  </Card>
+</CardGroup>

@@ -1,0 +1,88 @@
+---
+title: "Ship from the terminal"
+description: "Commit, push, open and merge a pull request, and watch its checks."
+icon: "code-branch"
+---
+
+`/git` covers the delivery loop. Every remote action previews the exact plan first and rereads the live state before it runs.
+
+## Inspect the repository
+
+```text
+/git status
+```
+
+The view shows the repository root, the branch, the upstream, ahead and behind counts, any operation in progress, conflicts, and every changed path with its staged or unstaged code.
+
+## Commit
+
+```text
+/git commit
+```
+
+The confirmation lists every path that will be staged and the message. `/git commit --staged` commits only what is already staged. `/git commit -- <message>` supplies the message without the confirmation.
+
+Commit refuses to run when another thread has open work in the same repository, when a merge, cherry-pick, revert, rebase, bisect, or sequencer is in progress, or when the branch, HEAD, path set, or tree changed since the preview.
+
+## Push
+
+```text
+/git push
+```
+
+Baton asks for a remote, shows the branch and the ahead count, and pushes with `--no-follow-tags`. It never forces, never sets the branch upstream, and refuses a behind upstream or a moved HEAD.
+
+## Watch the checks
+
+```text
+/git checks
+```
+
+The view lists every check on the current pull request with its bucket, state, and description. A pending check is reported as pending, not as a failure.
+
+## Open a pull request
+
+```text
+/git pr [title]
+```
+
+The preview names the repository, base branch, head branch, title, body, and HEAD. Baton rereads both remote branches and runs `gh pr create` only when they still match. The body lists commits newest first and drops the oldest subjects when it reaches the size limit.
+
+## Merge a pull request
+
+```text
+/git merge
+```
+
+The picker offers Squash and merge, Create a merge commit, Rebase and merge, and Cancel. The confirmation names the method and HEAD. The merge rereads the pull request and refuses a changed number, a closed or conflicting pull request, or a moved head.
+
+## Ship orchestration work
+
+An orchestration run has two delivery paths.
+
+```sh
+baton orchestrate --integrate <run-id>
+baton orchestrate --open-prs <run-id>
+```
+
+Integration merges approved worker branches in plan order into a clean source checkout. It refuses a dirty checkout, a worker waiting for input, an unapproved commit, or a conflict.
+
+Shipping pushes each approved branch and opens one pull request against the source branch. It is idempotent: merged tasks and recorded pull requests are skipped, and an existing pull request for the same branch is linked.
+
+## Safety rules
+
+- No force-push.
+- A push never sets or changes the branch upstream.
+- No pull request without a preview.
+- A reviewer verdict is required before a worker commit can merge.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Review a change" icon="magnifying-glass" href="/guides/review-a-change">
+    Read the diff and send line notes.
+  </Card>
+  <Card title="Roles and orchestration" icon="users" href="/concepts/roles-and-orchestration">
+    How the reviewer gate fits the run.
+  </Card>
+</CardGroup>

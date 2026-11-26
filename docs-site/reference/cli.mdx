@@ -1,0 +1,130 @@
+---
+title: "CLI"
+description: "Commands, global flags, JSON output, and MCP."
+icon: "terminal"
+---
+
+Every interactive action has a command-line form for scripts and pipelines. Machine output stays on stdout and progress stays on stderr, so `--json` output can go straight into `jq`.
+
+## Global flags
+
+Global flags apply before or after a subcommand.
+
+```sh
+baton -C <dir>                    # working directory
+baton -t <thread-id>              # target a thread
+baton -p <provider> -m <model>    # harness and model overrides
+baton --effort <level>            # reasoning effort where supported
+baton --mode <single|orchestrate> # session mode for new work
+baton --plan                      # read-only plan permission mode
+baton --full-auto | --yolo        # accept edits, or bypass permissions
+baton --limit <n>                 # list or output limit
+baton --dry-run                   # inspect without running a turn
+```
+
+`--plan` is the read-only permission mode. `--plan-file` feeds a plan to orchestration. `/plan` shows the plan a harness reported.
+
+## Sessions and inspection
+
+```sh
+baton                              # fresh session
+baton new [title]                  # start a thread
+baton -t <id>                      # open a thread
+baton login <provider>             # sign in to a harness
+baton default <provider>           # set the default harness
+baton threads [--json]
+baton inbox [--json]
+baton status [-t id] [--json]
+baton activity [-t id] [--json]
+baton turns [-t id] [--json]
+baton agents -t <thread-id> [--json]
+baton usage [--by day|model|provider] [--json]
+baton search <query> [--all] [--json]
+baton doctor [--json]
+baton ps [--json]
+```
+
+A directory with no threads is not an error. `baton status` exits 0 and reports `thread_id: null` with `next_action: "start a thread with baton"`.
+
+## Turns and execution
+
+```sh
+baton exec -p <provider> [--effort level] [--json | --stream-json] "prompt"
+baton exec -t <worker-thread> [--json] [--no-review] "answer"
+baton spawn [-p provider] [--json] "task"
+baton resume [-t id] [--fork] [--print] [--force]
+baton fork [-t id] [--turn n] [--native] [--json] [title]
+baton rewind [-t id] --turn N [--native] [--json]
+```
+
+`baton exec` runs one prompt and prints the result. `--stream-json` emits one JSON object per line, ending with a `type: "result"` row.
+
+## Orchestration
+
+```sh
+baton orchestrate [--max-tasks N] [--plan-file path] [--plan-only] "goal"
+baton orchestrate --list [--all] [--json]
+baton orchestrate --run <run-id> [--json]
+baton orchestrate --review <run-id> [--task N] [--json]
+baton orchestrate --integrate <run-id> [--task N] [--json]
+baton orchestrate --open-prs <run-id> [--task N] [--json]
+baton orchestrate --archive <run-id> [--json]
+baton worktrees [--json] [--run <id>]
+baton worktrees --clean [--force] [--run <id>]
+```
+
+`--max-tasks` accepts 1 to 16. `--integrate` merges approved worker branches. `--open-prs` pushes each approved branch and opens one pull request.
+
+## Files, memory, and data
+
+```sh
+baton files [query...] [--ignored] [--json]
+baton open <path[:line]> [--print]
+baton grep <query> [--case-sensitive] [--word] [--regex] [--json]
+baton memories [add|remove|clear] [-C path] [--json]
+baton checkpoints <thread-id>
+baton queue [-t id] [--clear] [--json]
+baton auth [provider] [subscription|api]
+baton secret check [--json]
+baton roles [--json]
+baton diff <id> [turn]
+baton restore <id> <turn> [--force]
+baton import [--dry-run]
+baton bench startup [--json] [--repeat N]
+baton completions <shell>
+baton update
+```
+
+## MCP
+
+`baton mcp` serves the local store over MCP stdio.
+
+```json
+{
+  "mcpServers": {
+    "baton": {
+      "command": "baton",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+The server exposes 15 tools: `baton_doctor`, `baton_status`, `baton_threads`, `baton_turns`, `baton_agents`, `baton_messages`, `baton_queue`, `baton_search`, `baton_latest_diff`, `baton_processes`, `baton_orchestration_runs`, `baton_orchestration_report`, `baton_activity`, `baton_memories`, and `baton_fork`.
+
+It is read-only except for `baton_queue` clear and `baton_fork`, which creates a new thread and leaves the source unchanged. The server reads the same database and honors `BATON_HOME`.
+
+## Exit codes
+
+Every command uses the same codes. See [Exit codes](/reference/exit-codes).
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Slash commands" icon="command" href="/reference/slash-commands">
+    The same actions inside the terminal.
+  </Card>
+  <Card title="Configuration" icon="gear" href="/reference/configuration">
+    Files, keys, roles, and permission modes.
+  </Card>
+</CardGroup>

@@ -1,0 +1,63 @@
+---
+title: "Worktrees and checkpoints"
+description: "Where each worker keeps its files, and how Baton restores an earlier state."
+icon: "code-branch"
+---
+
+Two git features keep parallel work and recovery separate from your main checkout: worktrees and checkpoint refs.
+
+## Worker worktrees
+
+An orchestration worker runs in its own checkout.
+
+```text
+$BATON_HOME/worktrees/<short-run>/<task-slug>
+```
+
+The branch is `baton/<short-run>/<task-slug>`. Two workers can edit the same file without colliding, and a reviewer can read a clean diff against the source branch. A worker that changes files commits as `baton worker: <title>`.
+
+## Thread worktrees
+
+`/worktree` starts a thread in a new worktree instead of the current checkout.
+
+- If the source checkout is clean, Baton creates the worktree and opens the thread there.
+- If the source checkout has uncommitted changes, Baton asks first. Enter snapshots tracked and untracked files that are not ignored into the new worktree. `s` runs one harness in the live checkout instead. Esc cancels.
+
+`/task <number>` creates a worktree for a GitHub issue. Without a number it loads open issues, and it prints a clear notice when it cannot read them.
+
+## Share large directories
+
+Build output and dependency caches do not need a copy per worktree. Add `baton.json` to the repository root.
+
+```json
+{
+  "worktree": {
+    "sharedDirectories": ["node_modules", "target"]
+  }
+}
+```
+
+Each listed directory that exists and is gitignored becomes a symlink in the new worktree. Edits inside a shared directory affect the primary checkout, so share only regenerable files.
+
+## Checkpoints
+
+A checkpoint is a hidden git ref that captures the working tree at a turn boundary.
+
+- `/checkpoints` lists the points for the thread.
+- `/diff` shows a checkpoint against the working tree.
+- `/review` reads the latest turn diff and attaches notes to changed lines.
+- `/rewind` moves the conversation back and restores the files when the checkout is safe to restore.
+- `baton restore <thread> <turn>` does the same from a shell, and `--force` allows a dirty linked worktree.
+
+Restore has guards. It refuses the repository's main checkout unless you pass `--force`, and it refuses to overwrite a worktree that another thread is using. It never deletes a checkpoint, so a failed restore leaves the conversation and files as they were.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Recover work" icon="rotate-left" href="/guides/recover-work">
+    Rewind, retry, and restore with the guards that keep them safe.
+  </Card>
+  <Card title="Ship from the terminal" icon="code-branch" href="/guides/ship-from-the-terminal">
+    Commit, push, and open a pull request.
+  </Card>
+</CardGroup>

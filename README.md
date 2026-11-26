@@ -4,6 +4,8 @@ Baton is a terminal workspace for developers who use command-line coding agents 
 
 A harness is the coding agent CLI you already use, such as Codex, Claude Code, Cursor, Grok, OpenCode, or Antigravity. Baton drives the harness and keeps the thread, tools, and git history around it. It does not replace the harness or its subscription.
 
+Site: https://baton.openbrowser.me · Docs: https://baton.openbrowser.me/docs
+
 ## What it can do
 
 - Keep one conversation while switching harness or model.

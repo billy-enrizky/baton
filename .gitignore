@@ -10,3 +10,14 @@ local_docs/
 # CI formal verification run artifacts
 ci/formal/**/.tlc/
 ci/formal/**/.tools/
+
+# wrangler files
+.wrangler
+.dev.vars*
+!.dev.vars.example
+.env*
+!.env.example
+
+# generated docs export
+site/docs/
+docs-site/docs-export.zip

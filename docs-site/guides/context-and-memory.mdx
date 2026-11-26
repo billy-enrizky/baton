@@ -1,0 +1,64 @@
+---
+title: "Context and memory"
+description: "Point a prompt at files, search the project, and keep instructions in memory files."
+icon: "brain"
+---
+
+A prompt is easier to answer when the agent can find the file you mean. Baton gives you file mentions, project search, persistent instruction files, and a way to measure and shrink the conversation.
+
+## Mention a file
+
+Type `@` and part of a path in the composer.
+
+- Directories appear first, with a trailing slash. Accepting one inserts `@dir/` and leaves the cursor inside the mention, so the next characters narrow the files in that directory.
+- Files appear ranked by how well the path matches. Tab or Enter replaces only the mention token.
+- Ordinary text and addresses such as `a@b` never start a file search.
+
+## Browse and search
+
+| Command | What it does |
+|---|---|
+| `/files` | Pick a project file, insert its path or `path:line`, or open it in your editor |
+| `/grep` | Search project contents, insert `path:line`, or open the match |
+| `/find` | Search the conversation |
+
+`/files` and `/grep` use `rg` when it is installed and fall back to `git ls-files` and `git grep` inside a repository. Ctrl+O opens the selected file in `VISUAL` or `EDITOR`.
+
+## Memory files
+
+```text
+/memory
+```
+
+The memory picker lists user instructions, project instructions, imported files, rule files, and the auto-memory folder. Enter opens the selected file in your editor. The page shows where each file lives, so you can see whether an instruction is global or checked in with the project.
+
+`/init` creates a project memory file with a summary of the repository.
+
+## Measure and shrink the conversation
+
+| Command | What it does |
+|---|---|
+| `/context` | Show context usage for this thread |
+| `/compact` | Compact the conversation to free context |
+| `/turns` | List durable turn phases |
+| `/activity` | Every turn, tool call, diff, and usage |
+
+`/compact` refuses when there is not enough conversation to compact.
+
+## Skills and MCP
+
+- `/skills` lists the skill files Baton found across harnesses, with their descriptions.
+- `/mcp` lists MCP servers, adds one, and syncs the list to every harness.
+
+An MCP server that Baton registers is available to the next harness you switch to, so you do not configure the same server twice.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Review a change" icon="magnifying-glass" href="/guides/review-a-change">
+    Read the diff and send line notes back to the agent.
+  </Card>
+  <Card title="Slash commands" icon="command" href="/reference/slash-commands">
+    Every command with the picker it opens.
+  </Card>
+</CardGroup>

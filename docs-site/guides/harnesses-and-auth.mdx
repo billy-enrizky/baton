@@ -1,0 +1,97 @@
+---
+title: "Harnesses and auth"
+description: "Switch harnesses, choose a billing mode, and find out which key Baton will use."
+icon: "key"
+---
+
+Baton runs the harness you already installed. This guide covers the harness picker, the two billing modes, and the key lookup order.
+
+## Switch the harness for a thread
+
+```text
+/switch
+```
+
+The picker lists installed harnesses, then the models that harness reports. Choosing a harness does not reset the conversation. The new harness receives a handoff built from the turns it has not seen.
+
+To change only the model, run `/model`. To change the reasoning effort on Codex or Claude, run `/effort`; `/effort default` clears the override.
+
+## Choose a billing mode
+
+```text
+/auth
+```
+
+The picker lists a subscription row and an API row for every harness. The API row names the key variable and shows `key` or `missing`, so you can see what Baton will read before you switch.
+
+| Harness | Key variable |
+|---|---|
+| Claude Code | `ANTHROPIC_API_KEY` |
+| Codex | `OPENAI_API_KEY` |
+| Cursor | `CURSOR_API_KEY` |
+| Grok | `XAI_API_KEY` |
+| OpenCode | `OPENCODE_API_KEY` |
+| Antigravity | `GEMINI_API_KEY` |
+
+A missing key keeps the picker open with the exact variable name. `/auth` stays readable while a turn runs, and a mode change waits until the turn or orchestration ends.
+
+From a shell, run `baton auth <provider> api`.
+
+## Sign in
+
+```text
+/login
+```
+
+Baton starts the harness's own sign-in flow, or prints the steps when the harness has no CLI login. From a shell, run `baton login <provider>`.
+
+## Find the key Baton will use
+
+```sh
+baton secret check
+```
+
+The command names the winning source for every harness and does not print the key. `--json` emits one row per provider.
+
+The lookup order is:
+
+1. `~/.baton/config.json`.
+2. The harness's own settings.
+3. The environment variable.
+
+## Use a gateway or a non-default endpoint
+
+Set `apiKeyEnv` to give Baton a provider-neutral variable name. The harness still receives its native variable. Set `apiBaseUrl` for Grok or Antigravity.
+
+```json
+{
+  "antigravity": {
+    "mode": "api",
+    "apiKeyEnv": "MY_GATEWAY_KEY",
+    "apiBaseUrl": "https://your-gateway.example.com"
+  },
+  "defaultModels": { "antigravity": "gemini-3.7-flash" }
+}
+```
+
+Antigravity runs `agy acp` and appends `/v1beta`, so its base URL is the endpoint root. Do not add `/v1`. Grok uses the OpenAI-compatible `/v1` base. Cursor rejects a custom endpoint; use `cursor-agent login`. OpenCode keeps its own provider settings in `opencode.json`.
+
+## Check what is installed
+
+```sh
+baton doctor
+baton doctor --json
+```
+
+`baton doctor` lists each harness, its binary, and its auth source. It also reports the checks Baton needs for its own features, such as git and `gh`.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Context and memory" icon="brain" href="/guides/context-and-memory">
+    File mentions, search, memory files, and compaction.
+  </Card>
+  <Card title="Configuration" icon="gear" href="/reference/configuration">
+    Every key in `~/.baton/config.json`.
+  </Card>
+</CardGroup>

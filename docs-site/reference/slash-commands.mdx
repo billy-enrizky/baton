@@ -1,0 +1,103 @@
+---
+title: "Slash commands"
+description: "Every command, grouped by the job it does."
+icon: "command"
+---
+
+Type `/` to see the commands. Typing a command and a space always answers: it lists valid choices, shows the argument syntax, or says the command takes no arguments. Partial text filters the choices. Tab completes a choice, and Enter runs a complete command. If you move through the choices with Up or Down, Enter completes the highlighted one instead.
+
+## Session and model
+
+| Command | What it does |
+|---|---|
+| `/help` | Show the common paths; `/help all` opens the full list |
+| `/switch` | Pick a harness, then a model, for this thread |
+| `/model` | Pick a model for the current harness |
+| `/effort` | Pick a reasoning effort on Codex or Claude; `/effort default` clears it |
+| `/mode` | Pick `default`, `acceptEdits`, `bypassPermissions`, or `plan` where the harness supports it |
+| `/auth` | Pick a billing mode; `/auth codex` scopes it to one harness |
+| `/login` | Sign in to a harness, or run `/login codex` |
+| `/orchestrate` | Switch modes, start a plan-only goal, or open recent runs |
+| `/goal` | Set, pause, resume, or clear the thread goal |
+| `/settings` | Change the default session mode and the terminal bell, and inspect harness settings |
+| `/roles` | Inspect the four roles, models, and prompt sources |
+
+## Navigation and project
+
+| Command | What it does |
+|---|---|
+| `/threads`, `/open`, `/pin` | List, open, or pin a thread |
+| `/snooze` | Hide this thread from `/inbox`: `/snooze [1h, 4h, tomorrow, week, off]` |
+| `/inbox` | List every thread that needs attention |
+| `/new`, `/fork` | Start a thread, or branch this conversation |
+| `/worktree`, `/task` | Start in a git worktree, or from a GitHub issue |
+| `/btw` | Open a side chat; the source thread is unchanged |
+| `/merge-back` | Append the side chat's new messages to its source |
+| `/files`, `/grep`, `/find` | Find a file, search the project, or search the conversation |
+| `/activity`, `/commands`, `/agents` | Inspect turns, tool calls, and subagent calls |
+| `/usage`, `/context`, `/status`, `/turns` | Inspect usage, context, status, and turn history |
+| `/memory` | Open instruction files and project memory |
+
+## Review and recovery
+
+| Command | What it does |
+|---|---|
+| `/checkpoints` | List checkpoints for this thread |
+| `/review` | Review the latest turn diff and keep line notes |
+| `/plan` | Show the plan the current harness reported |
+| `/diff` | Diff a checkpoint against the working tree |
+| `/rewind` | Restore a turn and optionally the code; `--native` uses a native rollback |
+| `/retry` | Retry a failed or unverified turn on the same harness |
+| `/queue` | Inspect, send, edit, delete, reorder, or clear queued follow-ups |
+| `/compact` | Compact the conversation |
+
+## Orchestration
+
+| Command | What it does |
+|---|---|
+| `/orchestrate on`, `/orchestrate off` | Switch between orchestrate and single mode |
+| `/orchestrate --plan-only <goal>` | Preview the plan before workers start |
+| `/multi` | Fan one prompt across harnesses, or use isolated worktrees |
+| `/questions` | List open worker questions and open the worker thread |
+| `/runs` | List, reopen, or include archived runs |
+| `/agents` | Inspect subagent calls, live and persisted |
+
+## Git
+
+| Command | What it does |
+|---|---|
+| `/git` | Open the git picker |
+| `/git status` | Show the branch, upstream, changes, and operation state |
+| `/git commit [--staged] [message]` | Commit the repository or the staged index |
+| `/git push` | Pick a remote and push without force |
+| `/git checks` | List the current pull request's checks |
+| `/git pr [title]` | Preview and open a pull request |
+| `/git review [approve, request-changes, comment] [body]` | Review a pull request |
+| `/git merge [squash, merge, rebase]` | Merge a pull request |
+
+## Memory, skills, and session
+
+| Command | What it does |
+|---|---|
+| `/skills` | Pick a skill and insert its invocation |
+| `/mcp` | List, add, remove, or sync MCP servers |
+| `/init` | Create a starter `CLAUDE.md` for the project |
+| `/export` | Export the conversation |
+| `/copy` | Choose an assistant reply to copy; `/copy 1` copies the latest |
+| `/clear`, `/quit`, `/exit` | Clear the panels, or leave the session |
+
+## Shell and palette
+
+- Start a line with `!` to run one shell command in the thread directory. Baton captures stdout and stderr, sanitizes the output, caps it, and shows the exit code. The command is not sent to the harness, and it has a 60-second limit.
+- Ctrl+K opens the command palette. It filters actions, threads, and recent files. Enter runs the selected item.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="CLI" icon="terminal" href="/reference/cli">
+    The same work from scripts and pipelines.
+  </Card>
+  <Card title="Keyboard" icon="keyboard" href="/reference/keyboard">
+    Send, steer, interrupt, select, and scroll.
+  </Card>
+</CardGroup>

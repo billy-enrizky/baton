@@ -1,0 +1,52 @@
+---
+title: "What is Baton?"
+description: "A terminal workspace for command-line coding agents."
+icon: "terminal"
+---
+
+Baton is a terminal workspace for developers who use command-line coding agents and want one conversation that can switch between them, split work across them, and keep going when one hits a wall.
+
+A harness is the coding agent CLI you already use, such as Codex, Claude Code, Cursor, Grok, OpenCode, or Antigravity. Baton drives the harness and keeps the thread, tools, and git history around it. It does not replace the harness or its subscription.
+
+## What it does
+
+- Keeps one conversation while you switch harness or model, and sends a returning harness only the turns it has not seen.
+- Splits a goal into independent tasks, runs each task on a harness in its own git worktree, and runs a reviewer over each commit before merge.
+- Reviews a diff with line-anchored notes and sends those notes back to the agent as a steer or a new prompt.
+- Commits, pushes, opens pull requests, reads checks, reviews, and merges from the terminal.
+- Rewinds a turn, restores a checkpoint, retries failed work, and reports usage and cost.
+- Reads project files, searches contents, and inserts `@` file mentions into a prompt.
+- Exposes threads, turns, usage, and orchestration state as JSON and over MCP.
+
+## When to use Baton
+
+Reach for Baton when you already run coding agents in a terminal and one of these is true.
+
+- You want to start a task on one harness and finish it on another without retyping context.
+- You want three agents on three parts of one goal, each in its own worktree, with a review gate before merge.
+- You want the diff, the notes, the commit, and the pull request in the same window as the conversation.
+- You want your threads and usage to survive restarts and stay readable by other tools.
+
+## What Baton is not
+
+- It is not a model. It runs harnesses you already installed, on your own subscription or API key.
+- It is not a hosted service. There is no Baton account and no telemetry.
+- It is not a git replacement. Worktrees and commits are ordinary git, and you can run `git` in the same directory.
+- It is not a GUI. Everything happens in one terminal window.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Install Baton" icon="download" href="/start/install">
+    One command for macOS, Linux, or Windows, or build from source.
+  </Card>
+  <Card title="Quickstart" icon="rocket" href="/start/quickstart">
+    Install a harness, run `baton doctor`, and send a first prompt.
+  </Card>
+  <Card title="Threads and turns" icon="comments" href="/concepts/threads-and-turns">
+    How Baton stores a conversation, a turn, and a checkpoint.
+  </Card>
+  <Card title="Slash commands" icon="command" href="/reference/slash-commands">
+    Every command, with the picker it opens.
+  </Card>
+</CardGroup>

@@ -1,0 +1,69 @@
+---
+title: "Modes"
+description: "Single mode sends a prompt to one harness. Orchestrate mode splits a goal across several."
+icon: "split"
+---
+
+The session mode belongs to the thread. It decides what Baton does with the next prompt: hand it to one harness, or ask a planner to split it first.
+
+## Single mode
+
+```text
+/orchestrate off
+```
+
+Each prompt goes to the current harness. The reply, tool calls, and diff appear in the same thread. Use single mode for a focused edit, an explanation, or a conversation you want to steer directly.
+
+## Orchestrate mode
+
+```text
+/orchestrate on
+```
+
+New threads start in this mode. A prompt becomes a goal. The planner turns the goal into tasks, each task names a harness and model, and Baton runs each task in its own worktree. A reviewer reads the implementation diff and returns `APPROVE` or `REQUEST_CHANGES` before a task can merge.
+
+A run records the plan, the workers, their commits, the review verdicts, and a final status.
+
+| Status | Meaning |
+|---|---|
+| `completed` | Every task finished and passed review |
+| `partial` | Some tasks finished; at least one failed or was skipped |
+| `failed` | The run could not finish |
+| `cancelled` | You stopped the run |
+| `needs_input` | A worker is waiting for your answer |
+| `needs_review` | A commit is waiting for a verdict |
+
+## Plan before work
+
+```text
+/orchestrate --plan-only add rate limiting to the API
+```
+
+Baton prints the resolved plan without creating a run or starting a worker. Enter starts it and Esc returns the goal to the composer. From a shell, use `baton orchestrate --plan-only "<goal>"`.
+
+## Inspect a run
+
+```text
+/runs
+```
+
+The picker lists recent runs. Enter opens the report: each task, its harness, its worktree, its commit, and its review state. You can open a worker thread, review a commit, integrate the branches, or open one pull request per worker.
+
+## Choose the max task count
+
+```sh
+baton orchestrate --max-tasks 3 "Audit billing, add tests, update docs"
+```
+
+The limit is 1 to 16. The planner gets the limit and the installed harness list, so it cannot assign work to a harness that is not installed.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Roles and orchestration" icon="users" href="/concepts/roles-and-orchestration">
+    The four roles, their defaults, and the flow of one run.
+  </Card>
+  <Card title="Review a change" icon="magnifying-glass" href="/guides/review-a-change">
+    Read the diff, write line notes, and send them back.
+  </Card>
+</CardGroup>

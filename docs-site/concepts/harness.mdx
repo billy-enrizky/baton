@@ -1,0 +1,54 @@
+---
+title: "Harnesses"
+description: "The coding agent CLIs Baton drives, and what Baton adds around them."
+icon: "plug"
+---
+
+A harness is the coding agent CLI that performs a turn. Baton does not bundle a model and does not proxy your prompts through a Baton service. It starts the harness, sends the prompt, reads the events, and keeps the conversation around it.
+
+## Supported harnesses
+
+| Harness | CLI Baton starts | Notes |
+|---|---|---|
+| Claude Code | `claude` | Supports permission modes and reasoning effort |
+| Codex | `codex` | Supports permission modes, reasoning effort, and native session forks |
+| Cursor | `cursor-agent` | Keeps its own permission flow |
+| Grok | `grok` | Keeps its own permission flow; accepts a custom endpoint |
+| OpenCode | `opencode` | Keeps its own permission flow; version 2 or newer can accept a steer during a turn |
+| Antigravity | `agy` | Speaks ACP; accepts a custom endpoint |
+
+`baton doctor` lists the harnesses it finds on `PATH` and the auth source for each one. To switch inside a thread, run `/switch`.
+
+## What Baton adds
+
+- One thread that can change harness without losing the conversation. A returning harness receives only the turns it has not seen.
+- A durable record of each turn, its tool calls, its diff, and its usage.
+- Permission modes for the harnesses that accept them.
+- A model picker built from the harness's own model list, cached in `~/.baton/model-cache/`.
+- An approval and question overlay, so a request from the harness appears as rows you can answer with the arrow keys.
+
+## What Baton does not add
+
+- It does not change the harness's own system prompt or tool set.
+- It does not send prompts to any other service.
+- It does not hide the harness's own costs. Usage is reported from what the harness sends back.
+
+## Auth
+
+Each harness authenticates in one of two ways.
+
+- **Subscription:** the harness uses its own login, and Baton only starts it.
+- **API key:** Baton passes a key from `~/.baton/config.json` or the environment to the harness process.
+
+`/auth` shows and changes the billing mode for a harness. `/login` starts the harness's own sign-in flow. See [Harnesses and auth](/guides/harnesses-and-auth) for the key lookup order.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Threads and turns" icon="comments" href="/concepts/threads-and-turns">
+    What Baton records for each conversation and turn.
+  </Card>
+  <Card title="Modes" icon="split" href="/concepts/modes">
+    Single mode and orchestrate mode.
+  </Card>
+</CardGroup>

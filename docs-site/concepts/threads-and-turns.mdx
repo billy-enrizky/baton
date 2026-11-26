@@ -1,0 +1,61 @@
+---
+title: "Threads and turns"
+description: "How Baton stores a conversation, a turn, and the checkpoint behind a diff."
+icon: "comments"
+---
+
+A thread is a durable conversation. A turn is one prompt and everything the harness did in response. Baton stores both in `~/.baton/baton.sqlite` and keeps the working tree in git.
+
+## Thread
+
+A thread has an id, a title, a working directory, a harness, a model, a session mode, and a transcript. It survives a restart. A thread belongs to one directory, and `/threads` lists the threads for the current directory.
+
+Two thread variants change how Baton treats the conversation.
+
+- A side chat is a fork marked as belonging to its source thread. `/btw` opens one and leaves the source untouched; `/merge-back` copies the new messages back as one redacted context message.
+- A worker thread belongs to one orchestration task. Its plan and result are stored on that thread.
+
+## Turn
+
+A turn records the provider, the model, a phase, and an error when one occurs.
+
+| Phase | Meaning |
+|---|---|
+| `running` | The harness is working |
+| `completed` | The harness finished |
+| `failed` | The harness returned an error |
+| `unverified` | The process ended without a clean completion, for example after a crash |
+| `interrupted` | You stopped the turn |
+
+Every turn can record tool calls, a diff, usage, subagent activity, and a checkpoint. `/turns` lists the phases, and `/activity` shows the calls, diffs, and usage for every turn.
+
+## Checkpoint
+
+A checkpoint is a hidden git ref that captures the working tree at a turn boundary. It powers `/rewind`, `/review`, and `/diff`. A turn that changes nothing does not write one.
+
+Checkpoints are refs under `refs/baton/checkpoints/` in your repository, not files in `~/.baton`. They stay until you delete the refs.
+
+## Native session and handoff
+
+Each harness keeps its own native session for a Baton thread. Later turns send only the new message, which keeps the harness prompt cache warm.
+
+When you switch to a harness that has no native session for this thread, Baton builds a handoff from the prior messages and the working tree. The handoff has a 24,000-character budget. A preview shows the exact payload before it leaves the thread, and you can send it, skip the handoff, or cancel.
+
+`/fork --native` forks the harness's own session when the harness supports it. Codex and OpenCode support this.
+
+## Rewind and retry
+
+- `/rewind` moves the conversation back to an earlier message and restores the files when the checkout is safe to restore.
+- `/retry` starts a new turn on the same harness from a failed or unverified turn. It refuses a thread with open work or a different harness.
+- `/checkpoints` and `/diff` inspect the stored points without changing the conversation.
+
+## Next
+
+<CardGroup cols={2}>
+  <Card title="Recover work" icon="rotate-left" href="/guides/recover-work">
+    Rewind, retry, and restore with the guards that keep them safe.
+  </Card>
+  <Card title="Worktrees and checkpoints" icon="code-branch" href="/concepts/worktrees-and-checkpoints">
+    Where each thread and worker keeps its files.
+  </Card>
+</CardGroup>

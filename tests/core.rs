@@ -1311,7 +1311,9 @@ fn rewind_can_keep_a_provider_session_for_native_rollback() {
 
 #[test]
 fn store_turn_records_and_reconcile() {
-    let store = BatonStore::memory().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("state.sqlite");
+    let store = BatonStore::open(&path).unwrap();
     let thread = store
         .create_thread(NewThread {
             title: "t".into(),
@@ -1327,6 +1329,13 @@ fn store_turn_records_and_reconcile() {
     let running = store.get_turn_record(&thread.id, 2).unwrap().unwrap();
     assert_eq!(running.phase, TurnPhase::Running);
     assert!(running.ended_at.is_none());
+
+    let db = rusqlite::Connection::open(&path).unwrap();
+    db.execute(
+        "UPDATE turns SET owner_pid = 0, owner_start = NULL WHERE thread_id = ? AND turn = 2",
+        rusqlite::params![thread.id],
+    )
+    .unwrap();
 
     let reconciled = store.reconcile_running_turns(Some("/tmp/project")).unwrap();
     assert_eq!(reconciled.len(), 1);

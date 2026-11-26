@@ -11,6 +11,52 @@ use crate::store::{BatonStore, HostClaimRow};
 
 pub const PROTOCOL_VERSION: u64 = 1;
 
+/// Stops this host generation's provider children, settles work whose owner
+/// stopped, and releases the claim. The server loop result is returned after
+/// cleanup, so a loop error cannot leave the store claimed by an exiting
+/// process.
+pub fn finish_host(store: &BatonStore, host_id: &str, loop_result: Result<()>) -> Result<()> {
+    match crate::process::terminate_host_children(store, host_id) {
+        Ok(report) => {
+            if !report.reaped.is_empty() {
+                eprintln!(
+                    "baton: stopped {} provider child(ren) for this host",
+                    report.reaped.len()
+                );
+            }
+            for error in &report.errors {
+                eprintln!("baton: child shutdown: {error}");
+            }
+        }
+        Err(error) => eprintln!("baton: child shutdown failed: {error}"),
+    }
+    // Children stop first so their turns and runs are settled by owner
+    // identity before the claim opens the store to another process.
+    match store.reconcile_running_turns(None) {
+        Ok(turns) => {
+            if !turns.is_empty() {
+                eprintln!(
+                    "baton: settled {} unfinished turn(s) on shutdown",
+                    turns.len()
+                );
+            }
+        }
+        Err(error) => eprintln!("baton: turn shutdown settlement failed: {error}"),
+    }
+    match crate::orchestrate::reconcile_abandoned_runs(store) {
+        Ok(runs) => {
+            if !runs.is_empty() {
+                eprintln!("baton: settled {} abandoned run(s) on shutdown", runs.len());
+            }
+        }
+        Err(error) => eprintln!("baton: run shutdown settlement failed: {error}"),
+    }
+    if !store.release_host_claim(host_id)? {
+        anyhow::bail!("host claim disappeared before shutdown");
+    }
+    loop_result
+}
+
 fn response(id: Value, result: Value) -> Value {
     json!({
         "v": PROTOCOL_VERSION,
@@ -291,5 +337,43 @@ mod tests {
         .unwrap();
         assert_eq!(unknown["id"], 11);
         assert_eq!(unknown["error"]["code"], "not_implemented");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_host_settles_dead_owner_work_before_release() {
+        let (dir, store) = claimed_store();
+        let host_id = store.get_host_claim().unwrap().unwrap().host_id;
+        let thread_id = store.list_threads(None).unwrap().remove(0).id;
+        {
+            let db = rusqlite::Connection::open(dir.path().join("baton.sqlite")).unwrap();
+            db.execute(
+                "UPDATE turns SET owner_pid = ?1, owner_start = NULL",
+                rusqlite::params![u32::MAX],
+            )
+            .unwrap();
+        }
+        finish_host(&store, &host_id, Ok(())).unwrap();
+        let turn = store.get_turn_record(&thread_id, 1).unwrap().unwrap();
+        assert_eq!(turn.phase, crate::types::TurnPhase::Unverified);
+        assert!(store.get_host_claim().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn finish_host_releases_the_claim_when_the_loop_failed() {
+        let (_dir, store) = claimed_store();
+        let host_id = store.get_host_claim().unwrap().unwrap().host_id;
+        let thread_id = store.list_threads(None).unwrap().remove(0).id;
+        let error =
+            finish_host(&store, &host_id, Err(anyhow::anyhow!("stdout closed"))).unwrap_err();
+        assert_eq!(error.to_string(), "stdout closed");
+        let turn = store.get_turn_record(&thread_id, 1).unwrap().unwrap();
+        assert_eq!(
+            turn.phase,
+            crate::types::TurnPhase::Running,
+            "a live owner's turn stays open"
+        );
+        assert!(store.get_host_claim().unwrap().is_none());
     }
 }

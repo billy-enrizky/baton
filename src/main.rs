@@ -3033,6 +3033,27 @@ fn run_serve(home: &Path, stdio: bool) -> Result<()> {
         }
         Err(error) => eprintln!("baton: child shutdown failed: {error}"),
     }
+    // Children stop first so their turns and runs are settled by owner
+    // identity before the claim opens the store to another process.
+    match store.reconcile_running_turns(None) {
+        Ok(turns) => {
+            if !turns.is_empty() {
+                eprintln!(
+                    "baton: settled {} unfinished turn(s) on shutdown",
+                    turns.len()
+                );
+            }
+        }
+        Err(error) => eprintln!("baton: turn shutdown settlement failed: {error}"),
+    }
+    match orchestrate::reconcile_abandoned_runs(&store) {
+        Ok(runs) => {
+            if !runs.is_empty() {
+                eprintln!("baton: settled {} abandoned run(s) on shutdown", runs.len());
+            }
+        }
+        Err(error) => eprintln!("baton: run shutdown settlement failed: {error}"),
+    }
     if !store.release_host_claim(&host_id)? {
         anyhow::bail!("host claim disappeared before shutdown");
     }

@@ -267,3 +267,174 @@ fn serve_shutdown_stops_owned_provider_children() {
     let store = baton::store::BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
     assert!(store.list_provider_processes().unwrap().is_empty());
 }
+
+#[cfg(unix)]
+#[test]
+fn serve_shutdown_settles_work_from_stopped_owners() {
+    use baton::store::{BatonStore, NewThread};
+    use baton::types::{ProviderId, TurnPhase};
+
+    let home = tempfile::tempdir().unwrap();
+    let db = home.path().join("baton.sqlite");
+    let mut owner = ChildGuard(Command::new("sleep").arg("60").spawn().unwrap());
+    let owner_pid = owner.0.id();
+    let owner_start = baton::process::process_start(owner_pid);
+
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_baton"))
+            .args(["serve", "--stdio"])
+            .env("BATON_HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut output = String::new();
+    let mut ready = false;
+    while Instant::now() < deadline {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                output.push_str(&line);
+                output.push('\n');
+                if line.contains("host ready") {
+                    ready = true;
+                    break;
+                }
+            }
+            Err(_) if child.0.try_wait().unwrap().is_some() => break,
+            Err(_) => {}
+        }
+    }
+    assert!(ready, "serve did not report readiness: {output}");
+
+    // A trusted child writes through the host generation it received on the
+    // command line, so the fixture takes the same host id from claim-info.
+    writeln!(
+        stdin,
+        r#"{{"v":1,"kind":"request","id":1,"command":"claim-info"}}"#
+    )
+    .unwrap();
+    let mut responses = BufReader::new(stdout).lines();
+    let claim: serde_json::Value =
+        serde_json::from_str(&responses.next().unwrap().unwrap()).unwrap();
+    let host_id = claim["result"]["host_id"]
+        .as_str()
+        .expect("claim-info names the host")
+        .to_string();
+
+    let thread_id = {
+        let store = BatonStore::open_hosted(&db, &host_id).unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "child work".into(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&thread.id, ProviderId::Codex, None, "child work", false)
+            .unwrap();
+        store
+            .create_orchestration_run_owned(
+                "run-child",
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+                Some(owner_pid),
+                owner_start.as_deref(),
+            )
+            .unwrap();
+        store
+            .add_orchestration_task(
+                "task-1",
+                "run-child",
+                1,
+                "task",
+                ProviderId::Codex,
+                "model",
+                "prompt",
+                None,
+                None,
+                None,
+                None,
+                "queued",
+                None,
+                None,
+                "2026-11-26T00:00:00.000Z",
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        thread.id
+    };
+    {
+        // The turn belongs to the helper so startup recovery left it alone
+        // and shutdown has to settle it after the helper stops.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute(
+            "UPDATE turns SET owner_pid = ?1, owner_start = ?2",
+            rusqlite::params![owner_pid, owner_start],
+        )
+        .unwrap();
+    }
+
+    owner.0.kill().unwrap();
+    owner.0.wait().unwrap();
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.0.kill();
+            panic!("serve did not stop after stdin EOF");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}");
+    while let Ok(line) = receiver.recv_timeout(Duration::from_millis(100)) {
+        output.push_str(&line);
+        output.push('\n');
+    }
+    assert!(
+        output.contains("settled 1 unfinished turn(s) on shutdown"),
+        "{output}"
+    );
+
+    let store = BatonStore::open_read_only(&db).unwrap();
+    let turn = store.get_turn_record(&thread_id, 1).unwrap().unwrap();
+    assert_eq!(turn.phase, TurnPhase::Unverified);
+    assert!(
+        turn.error.as_deref().unwrap_or("").contains("exited"),
+        "{:?}",
+        turn.error
+    );
+    let run = store
+        .find_orchestration_runs("run-child")
+        .unwrap()
+        .into_iter()
+        .next()
+        .unwrap();
+    assert_eq!(run.status, "failed");
+    assert!(store.get_host_claim().unwrap().is_none());
+}

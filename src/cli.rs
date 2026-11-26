@@ -109,6 +109,12 @@ pub enum Commands {
     Update,
     /// Open the interactive workspace (default)
     Chat,
+    /// Claim the local store as the host and idle until stopped
+    Serve {
+        /// Exit when stdin reaches EOF
+        #[arg(long)]
+        stdio: bool,
+    },
     /// Serve the local thread store over MCP stdio for coding agents
     Mcp,
     /// Inspect every turn's tool calls, diff, and usage

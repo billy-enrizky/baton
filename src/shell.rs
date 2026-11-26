@@ -72,7 +72,9 @@ pub fn run_with_shell(
     }
     let output_text = crate::sanitize::sanitize_terminal_text(&text).into_owned();
     Ok(ShellResult {
-        command: command.to_string(),
+        // The command is echoed in the notice and the overlay header, so it
+        // gets the same treatment as the output.
+        command: crate::sanitize::sanitize_terminal_text(command).into_owned(),
         output: output_text,
         exit_code: output.status.code(),
         truncated,
@@ -98,6 +100,22 @@ mod tests {
         assert!(result.output.contains("err"), "{}", result.output);
         assert_eq!(result.exit_code, Some(3));
         assert!(!result.truncated);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_and_output_are_sanitized_for_echo() {
+        let cwd = std::env::temp_dir();
+        let result = run_with_shell(
+            Path::new("/bin/sh"),
+            &cwd,
+            "printf 'out' # \u{202e}",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(!result.command.contains('\u{202e}'), "{}", result.command);
+        assert!(result.command.contains("printf 'out'"));
+        assert!(!result.output.contains('\u{202e}'), "{}", result.output);
     }
 
     #[cfg(unix)]

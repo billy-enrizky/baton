@@ -52,8 +52,31 @@ const COLORS: ColorConstants = ColorConstants {
     error: Color::Rgb(252, 165, 165),
     warning: Color::Rgb(251, 191, 36),
     selection_bg: Color::Rgb(62, 80, 120),
+    diff_add_bg: Color::Rgb(33, 58, 43),
+    diff_del_bg: Color::Rgb(74, 34, 29),
 };
 
+/// One 16-color stand-in per role. Nearest-RGB alone collapses the accent,
+/// success, and error roles into the same gray, which erases their meaning on
+/// a basic terminal. Diff tints become `Reset` because the basic palette has
+/// no dark green or red; the sign and the text color carry the distinction.
+const BASIC_FALLBACKS: [(Color, Color); 13] = [
+    (COLORS.accent, Color::LightYellow),
+    (COLORS.secondary, Color::LightMagenta),
+    (COLORS.text, Color::White),
+    (COLORS.muted, Color::Gray),
+    (COLORS.border, Color::DarkGray),
+    (COLORS.user_bg, Color::Black),
+    (COLORS.code_bg, Color::Black),
+    (COLORS.success, Color::LightGreen),
+    (COLORS.error, Color::LightRed),
+    (COLORS.warning, Color::Yellow),
+    (COLORS.selection_bg, Color::Blue),
+    (COLORS.diff_add_bg, Color::Reset),
+    (COLORS.diff_del_bg, Color::Reset),
+];
+
+#[derive(Debug, Clone, Copy)]
 struct ColorConstants {
     accent: Color,
     secondary: Color,
@@ -66,6 +89,30 @@ struct ColorConstants {
     error: Color,
     warning: Color,
     selection_bg: Color,
+    diff_add_bg: Color,
+    diff_del_bg: Color,
+}
+
+impl ColorConstants {
+    /// Every role color, so a test can prove the fallback table covers them all.
+    #[cfg(test)]
+    fn roles(&self) -> [Color; 13] {
+        [
+            self.accent,
+            self.secondary,
+            self.text,
+            self.muted,
+            self.border,
+            self.user_bg,
+            self.code_bg,
+            self.success,
+            self.error,
+            self.warning,
+            self.selection_bg,
+            self.diff_add_bg,
+            self.diff_del_bg,
+        ]
+    }
 }
 
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1035,7 +1082,7 @@ pub fn run_tui(
         .map(|source| source.title);
     let mut state = TuiState {
         bell_enabled,
-        monochrome: capability::monochrome_requested(),
+        monochrome: capability::color_mode_requested() == capability::ColorMode::Monochrome,
         expand_diffs: false,
         bell: crate::notify::BellLimiter::new(),
         store: store.clone(),
@@ -1202,9 +1249,10 @@ pub fn run_tui(
             crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
         )
     );
-    let backend = capability::MonochromeBackend::new(
+    let backend = capability::ColorBackend::new(
         ratatui::backend::CrosstermBackend::new(stdout),
-        capability::monochrome_requested(),
+        capability::color_mode_requested(),
+        &BASIC_FALLBACKS,
     );
     let mut terminal = Terminal::new(backend)?;
 
@@ -1337,7 +1385,7 @@ pub fn run_tui(
 }
 
 fn suspend_tui<W: std::io::Write>(
-    terminal: &mut Terminal<capability::MonochromeBackend<CrosstermBackend<W>>>,
+    terminal: &mut Terminal<capability::ColorBackend<CrosstermBackend<W>>>,
 ) -> Result<()> {
     terminal::disable_raw_mode()?;
     let _ = execute!(
@@ -1356,7 +1404,7 @@ fn suspend_tui<W: std::io::Write>(
 }
 
 fn resume_tui<W: std::io::Write>(
-    terminal: &mut Terminal<capability::MonochromeBackend<CrosstermBackend<W>>>,
+    terminal: &mut Terminal<capability::ColorBackend<CrosstermBackend<W>>>,
 ) -> Result<()> {
     terminal::enable_raw_mode()?;
     execute!(
@@ -16705,6 +16753,67 @@ mod tests {
     }
 
     #[test]
+    fn basic_fallbacks_cover_every_palette_role() {
+        let roles = COLORS.roles();
+        let mut seen = std::collections::BTreeSet::new();
+        for role in roles {
+            assert!(
+                seen.insert(format!("{role:?}")),
+                "two palette roles share {role:?}, so one fallback would hide the other"
+            );
+        }
+        assert_eq!(BASIC_FALLBACKS.len(), roles.len());
+        for role in roles {
+            assert!(
+                BASIC_FALLBACKS.iter().any(|(rich, _)| *rich == role),
+                "no 16-color fallback for {role:?}"
+            );
+        }
+        for (_, basic) in BASIC_FALLBACKS {
+            assert!(
+                matches!(
+                    basic,
+                    Color::Black
+                        | Color::Red
+                        | Color::Green
+                        | Color::Yellow
+                        | Color::Blue
+                        | Color::Magenta
+                        | Color::Cyan
+                        | Color::Gray
+                        | Color::DarkGray
+                        | Color::LightRed
+                        | Color::LightGreen
+                        | Color::LightYellow
+                        | Color::LightBlue
+                        | Color::LightMagenta
+                        | Color::LightCyan
+                        | Color::White
+                        | Color::Reset
+                ),
+                "a fallback must be a named basic color, got {basic:?}"
+            );
+        }
+        let anchored: Vec<Color> = BASIC_FALLBACKS
+            .iter()
+            .filter(|(rich, _)| {
+                [COLORS.accent, COLORS.success, COLORS.error, COLORS.warning].contains(rich)
+            })
+            .map(|(_, basic)| *basic)
+            .collect();
+        assert_eq!(
+            anchored,
+            vec![
+                Color::LightYellow,
+                Color::LightGreen,
+                Color::LightRed,
+                Color::Yellow
+            ],
+            "accent, success, error, and warning must stay distinguishable without color depth"
+        );
+    }
+
+    #[test]
     fn wrap_text_rows_counts_display_width_not_characters() {
         assert_eq!(wrap_text_rows("abcdef", 3), vec!["abc", "def"]);
         assert_eq!(wrap_text_rows("abcd", 3), vec!["abc", "d"]);
@@ -20661,12 +20770,12 @@ mod tests {
         );
         assert_eq!(
             buffer.get(0, added_row as u16).bg,
-            ratatui::style::Color::Rgb(33, 58, 43),
+            COLORS.diff_add_bg,
             "added rows carry the tinted background"
         );
         assert_eq!(
             buffer.get(0, removed_row as u16).bg,
-            ratatui::style::Color::Rgb(74, 34, 29),
+            COLORS.diff_del_bg,
             "removed rows carry the tinted background"
         );
     }

@@ -16,13 +16,18 @@ A long diff in the transcript does not push the conversation off screen without 
 cargo test --locked --lib ctrl_t_expands_a_long_diff
 cargo test --locked --lib a_short_diff_has_no_expand_hint
 cargo test --locked --lib hunk_separator_and_wrapping
+uv run --no-project python scripts/diff_expand_probe.py \
+  --binary target/debug/baton \
+  --evidence-dir local_docs/verification/evidence
 ```
 
-`ctrl_t_expands_a_long_diff` seeds a diff message with sixteen added lines, asserts the collapsed hint and that the last line is absent, presses Ctrl+T, asserts the last line and the collapse hint, then presses it again and asserts the collapsed state. `a_short_diff_has_no_expand_hint` proves a small diff is never collapsed. `hunk_separator_and_wrapping` proves the renderer wraps long rows and keeps the hunk separator. There is no PTY proof for this slice because the probe would need to seed a diff message directly in the store; the seed would test the fixture more than the key path.
+`ctrl_t_expands_a_long_diff` seeds a diff message with sixteen added lines, asserts the collapsed hint and that the last line is absent, presses Ctrl+T, asserts the last line and the collapse hint, then presses it again and asserts the collapsed state. `a_short_diff_has_no_expand_hint` proves a small diff is never collapsed. `hunk_separator_and_wrapping` proves the renderer wraps long rows and keeps the hunk separator.
+
+`scripts/diff_expand_probe.py` proves the same path in the real TUI. It creates a throwaway git repository with a sixty-line tracked file, starts Baton with a fake Codex app-server whose turn rewrites that file, and waits for the turn to settle so the runtime stores a real diff message. It then asserts the collapsed footer `… N more lines · ctrl+t expand`, that the last diff row is absent, that Ctrl+T swaps the footer to `ctrl+t collapse` and reveals the last row, and that a second Ctrl+T hides it again. The evidence keeps the collapsed, expanded, and recollapsed screens plus the raw transcript.
 
 ## Gotchas
 
-- Expansion is a single transcript-wide toggle, not a per-diff switch. Codex opens a separate transcript view; Baton keeps the conversation in place.
+- Expansion is a single transcript-wide toggle, not a per-diff switch. Baton keeps the conversation in place, with the viewport pinned to the bottom, instead of opening a separate transcript view.
 - The preview keeps the first twelve rendered rows, which are the summary header and the earliest hunks. It is not a per-file preview.
 - Diff text passes through the sanitizer before rendering; the footer is static text.
 - The hint is rendered as a line of text, not a clickable widget. The terminal surface has no buttons.

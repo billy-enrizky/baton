@@ -70,6 +70,24 @@ pub struct TurnRow {
     pub owner_start: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostClaimRow {
+    pub host_id: String,
+    pub kind: String,
+    pub installation_id: String,
+    pub pid: u32,
+    pub process_start: String,
+    pub claimed_at: String,
+    pub heartbeat_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostClaimAttempt {
+    Claimed(HostClaimRow),
+    Owned { pid: u32, process_start: String },
+    OpenWork { pid: u32 },
+}
+
 #[derive(Debug, Clone)]
 pub struct RetryableTurnRow {
     pub turn: i64,
@@ -305,7 +323,7 @@ fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 pub struct BatonStore {
     db: Connection,
@@ -516,6 +534,16 @@ CREATE TABLE IF NOT EXISTS provider_rate_limits (
   provider TEXT PRIMARY KEY,
   info TEXT NOT NULL,
   updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS host_claim (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  host_id TEXT NOT NULL,
+  kind TEXT NOT NULL CHECK (kind IN ('serve')),
+  installation_id TEXT NOT NULL,
+  pid INTEGER NOT NULL,
+  process_start TEXT NOT NULL,
+  claimed_at TEXT NOT NULL,
+  heartbeat_at TEXT NOT NULL
 );
 "#;
 
@@ -2291,6 +2319,119 @@ impl BatonStore {
         Ok(None)
     }
 
+    pub fn get_host_claim(&self) -> Result<Option<HostClaimRow>> {
+        Self::get_host_claim_from(&self.db)
+    }
+
+    fn get_host_claim_from(db: &Connection) -> Result<Option<HostClaimRow>> {
+        db.query_row(
+            "SELECT host_id, kind, installation_id, pid, process_start, claimed_at, heartbeat_at FROM host_claim WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(HostClaimRow {
+                    host_id: row.get(0)?,
+                    kind: row.get(1)?,
+                    installation_id: row.get(2)?,
+                    pid: row.get::<_, i64>(3)?.max(0) as u32,
+                    process_start: row.get(4)?,
+                    claimed_at: row.get(5)?,
+                    heartbeat_at: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    pub(crate) fn claim_host_row(
+        &self,
+        host_id: &str,
+        installation_id: &str,
+        pid: u32,
+        process_start: &str,
+        alive: &dyn Fn(u32, Option<&str>) -> bool,
+    ) -> Result<HostClaimAttempt> {
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        if let Some(claim) = Self::get_host_claim_from(&tx)? {
+            if alive(claim.pid, Some(&claim.process_start)) {
+                return Ok(HostClaimAttempt::Owned {
+                    pid: claim.pid,
+                    process_start: claim.process_start,
+                });
+            }
+        }
+        let turn_owners = {
+            let mut statement = tx.prepare(
+                "SELECT owner_pid, owner_start FROM turns WHERE phase IN ('queued', 'running', 'settling') AND owner_pid IS NOT NULL",
+            )?;
+            let owners = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?.max(0) as u32,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            owners
+        };
+        for (owner_pid, owner_start) in turn_owners {
+            if alive(owner_pid, owner_start.as_deref()) {
+                return Ok(HostClaimAttempt::OpenWork { pid: owner_pid });
+            }
+        }
+        let run_owners = {
+            let mut statement = tx.prepare(
+                "SELECT owner_pid, owner_start FROM orchestration_runs WHERE status = 'running' AND owner_pid IS NOT NULL",
+            )?;
+            let owners = statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?.max(0) as u32,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            owners
+        };
+        for (owner_pid, owner_start) in run_owners {
+            if alive(owner_pid, owner_start.as_deref()) {
+                return Ok(HostClaimAttempt::OpenWork { pid: owner_pid });
+            }
+        }
+        let now = now_iso();
+        tx.execute(
+            r#"INSERT INTO host_claim (singleton, host_id, kind, installation_id, pid, process_start, claimed_at, heartbeat_at)
+               VALUES (1, ?, 'serve', ?, ?, ?, ?, ?)
+               ON CONFLICT(singleton) DO UPDATE SET
+                 host_id = excluded.host_id,
+                 kind = excluded.kind,
+                 installation_id = excluded.installation_id,
+                 pid = excluded.pid,
+                 process_start = excluded.process_start,
+                 claimed_at = excluded.claimed_at,
+                 heartbeat_at = excluded.heartbeat_at"#,
+            params![host_id, installation_id, i64::from(pid), process_start, now, now],
+        )?;
+        tx.commit()?;
+        Ok(HostClaimAttempt::Claimed(HostClaimRow {
+            host_id: host_id.to_string(),
+            kind: "serve".to_string(),
+            installation_id: installation_id.to_string(),
+            pid,
+            process_start: process_start.to_string(),
+            claimed_at: now.clone(),
+            heartbeat_at: now,
+        }))
+    }
+
+    pub fn release_host_claim(&self, host_id: &str) -> Result<bool> {
+        let changed = self.db.execute(
+            "DELETE FROM host_claim WHERE singleton = 1 AND host_id = ?",
+            params![host_id],
+        )?;
+        Ok(changed == 1)
+    }
+
     /// A process that starts after a crash must not show a running turn as
     /// live. Mark unfinished turns in this project as unverified, but leave a
     /// turn alone while its recorded owner is still alive with the same start
@@ -3327,6 +3468,23 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal.to_ascii_lowercase(), "wal");
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_version_one_store_gains_the_host_claim_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", 1).unwrap();
+        drop(db);
+
+        let store = BatonStore::open(&path).unwrap();
+        assert!(store.get_host_claim().unwrap().is_none());
+        let db = Connection::open(&path).unwrap();
         let version: i64 = db
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();

@@ -103,6 +103,35 @@ pub struct TakeoverSettlement {
     pub runs: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunSettlement {
+    pub tasks: usize,
+    pub turns: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunVerdict {
+    Completed,
+    Partial,
+    Failed,
+    Cancelled,
+    NeedsReview,
+    NeedsInput,
+}
+
+impl RunVerdict {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunVerdict::Completed => "completed",
+            RunVerdict::Partial => "partial",
+            RunVerdict::Failed => "failed",
+            RunVerdict::Cancelled => "cancelled",
+            RunVerdict::NeedsReview => "needs_review",
+            RunVerdict::NeedsInput => "needs_input",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NotTheHost {
     pub owner_pid: Option<u32>,
@@ -3441,6 +3470,103 @@ impl BatonStore {
         Ok(())
     }
 
+    /// Terminalizes one running orchestration from the operator surface. A
+    /// completed verdict is accepted only when every task completed and no
+    /// turn is still open.
+    pub fn settle_orchestration_run(
+        &self,
+        run_id: &str,
+        verdict: RunVerdict,
+        force: bool,
+    ) -> Result<RunSettlement> {
+        let short = &run_id[..8.min(run_id.len())];
+        let now = now_iso();
+        let tx = self.write()?;
+        let (current, owner_pid, owner_start): (String, Option<u32>, Option<String>) = tx
+            .query_row(
+                "SELECT status, owner_pid, owner_start FROM orchestration_runs WHERE id = ?",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("no orchestration run matches {run_id}"))?;
+        if current != "running" {
+            anyhow::bail!("run {short} is already {current}");
+        }
+        if !force {
+            if let Some(pid) = owner_pid {
+                if crate::process::process_identity_alive(pid, owner_start.as_deref()) {
+                    anyhow::bail!(
+                        "run {short} is still owned by live process {pid}; stop it or pass --force"
+                    );
+                }
+            }
+        }
+        let (total_tasks, completed_tasks, open_tasks, open_turns): (i64, i64, i64, i64) = tx
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ?1),
+                   (SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ?1 AND status = 'completed'),
+                   (SELECT COUNT(*) FROM orchestration_tasks WHERE run_id = ?1 AND status IN ('queued', 'running')),
+                   (SELECT COUNT(*) FROM turns WHERE thread_id IN (SELECT thread_id FROM orchestration_tasks WHERE run_id = ?1 AND thread_id IS NOT NULL) AND phase IN ('queued', 'running', 'settling'))",
+                params![run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+        let task_status = match verdict {
+            RunVerdict::Completed => {
+                if total_tasks == 0 {
+                    anyhow::bail!("cannot settle run {short} as completed because it has no tasks");
+                }
+                if open_tasks > 0 {
+                    anyhow::bail!(
+                        "cannot settle run {short} as completed with {open_tasks} open task(s)"
+                    );
+                }
+                if completed_tasks != total_tasks {
+                    anyhow::bail!(
+                        "cannot settle run {short} as completed: {completed_tasks} of {total_tasks} task(s) completed"
+                    );
+                }
+                if open_turns > 0 {
+                    anyhow::bail!(
+                        "cannot settle run {short} as completed with {open_turns} open turn(s)"
+                    );
+                }
+                None
+            }
+            RunVerdict::Cancelled => Some("cancelled"),
+            RunVerdict::Partial
+            | RunVerdict::Failed
+            | RunVerdict::NeedsReview
+            | RunVerdict::NeedsInput => Some("failed"),
+        };
+        let error = format!("settled by operator as {}", verdict.as_str());
+        let tasks = match task_status {
+            Some(task_status) => tx.execute(
+                "UPDATE orchestration_tasks SET status = ?, error = COALESCE(NULLIF(error, ''), ?), finished_at = COALESCE(finished_at, ?) WHERE run_id = ? AND status IN ('queued', 'running')",
+                params![task_status, error, now, run_id],
+            )?,
+            None => 0,
+        };
+        let turns = if task_status.is_some() {
+            tx.execute(
+                "UPDATE turns SET phase = 'unverified', error = COALESCE(error, ?), ended_at = COALESCE(ended_at, ?) WHERE thread_id IN (SELECT thread_id FROM orchestration_tasks WHERE run_id = ? AND thread_id IS NOT NULL) AND phase IN ('queued', 'running', 'settling')",
+                params![error, now, run_id],
+            )?
+        } else {
+            0
+        };
+        let closed = tx.execute(
+            "UPDATE orchestration_runs SET status = ?, finished_at = ? WHERE id = ? AND status = 'running'",
+            params![verdict.as_str(), now, run_id],
+        )?;
+        if closed != 1 {
+            anyhow::bail!("run {short} changed while it was being settled; retry");
+        }
+        tx.commit()?;
+        Ok(RunSettlement { tasks, turns })
+    }
+
     pub fn archive_orchestration_run(&self, id: &str) -> Result<()> {
         self.write_execute(
             "UPDATE orchestration_runs SET archived_at = COALESCE(archived_at, ?) WHERE id = ?",
@@ -4090,6 +4216,235 @@ mod tests {
             .expect("run");
         assert_ne!(run.status, "running");
         assert!(run.finished_at.is_some());
+    }
+
+    fn add_run(store: &BatonStore, id: &str, owner: Option<u32>) {
+        let owner_start = owner.and_then(crate::process::process_start);
+        store
+            .create_orchestration_run_owned(
+                id,
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+                owner,
+                owner_start.as_deref(),
+            )
+            .unwrap();
+    }
+
+    fn add_run_task(
+        store: &BatonStore,
+        run_id: &str,
+        id: &str,
+        status: &str,
+        thread_id: Option<&str>,
+    ) {
+        let now = now_iso();
+        store
+            .add_orchestration_task(
+                id,
+                run_id,
+                1,
+                id,
+                ProviderId::Codex,
+                "model",
+                "prompt",
+                None,
+                None,
+                None,
+                thread_id,
+                status,
+                None,
+                None,
+                &now,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+    }
+
+    fn run_row(store: &BatonStore, id: &str) -> OrchestrationRunRow {
+        store
+            .find_orchestration_runs(id)
+            .unwrap()
+            .into_iter()
+            .find(|run| run.id == id)
+            .unwrap()
+    }
+
+    #[test]
+    fn settle_completed_refuses_open_or_unfinished_work() {
+        let store = BatonStore::memory().unwrap();
+        add_run(&store, "run-a", None);
+        add_run_task(&store, "run-a", "t1", "completed", None);
+        add_run_task(&store, "run-a", "t2", "failed", None);
+        let error = store
+            .settle_orchestration_run("run-a", RunVerdict::Completed, false)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("1 of 2 task(s) completed"),
+            "{error}"
+        );
+        assert_eq!(run_row(&store, "run-a").status, "running");
+
+        store
+            .update_orchestration_task_success("t2", None, None, false)
+            .unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "worker".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&thread.id, ProviderId::Codex, Some("model"), "open", false)
+            .unwrap();
+        add_run_task(&store, "run-a", "t3", "running", Some(&thread.id));
+        let error = store
+            .settle_orchestration_run("run-a", RunVerdict::Completed, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("open task(s)"), "{error}");
+        store
+            .update_orchestration_task_success("t3", None, None, false)
+            .unwrap();
+        let error = store
+            .settle_orchestration_run("run-a", RunVerdict::Completed, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("open turn(s)"), "{error}");
+        assert_eq!(run_row(&store, "run-a").status, "running");
+
+        store
+            .finish_turn_record(&thread.id, 1, TurnPhase::Completed, None)
+            .unwrap();
+        let settlement = store
+            .settle_orchestration_run("run-a", RunVerdict::Completed, false)
+            .unwrap();
+        assert_eq!(settlement, RunSettlement { tasks: 0, turns: 0 });
+        let run = run_row(&store, "run-a");
+        assert_eq!(run.status, "completed");
+        assert!(run.finished_at.is_some());
+        let turn = store.get_turn_record(&thread.id, 1).unwrap().unwrap();
+        assert_eq!(turn.phase, TurnPhase::Completed);
+    }
+
+    #[test]
+    fn settle_completed_refuses_a_run_without_tasks() {
+        let store = BatonStore::memory().unwrap();
+        add_run(&store, "run-empty", None);
+        let error = store
+            .settle_orchestration_run("run-empty", RunVerdict::Completed, false)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("because it has no tasks"),
+            "{error}"
+        );
+        assert_eq!(run_row(&store, "run-empty").status, "running");
+    }
+
+    #[test]
+    fn settle_cancelled_closes_tasks_and_turns_together() {
+        let store = BatonStore::memory().unwrap();
+        add_run(&store, "run-b", None);
+        let thread = store
+            .create_thread(NewThread {
+                title: "worker".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&thread.id, ProviderId::Codex, Some("model"), "open", false)
+            .unwrap();
+        add_run_task(&store, "run-b", "queued", "queued", None);
+        add_run_task(&store, "run-b", "running", "running", Some(&thread.id));
+        let settlement = store
+            .settle_orchestration_run("run-b", RunVerdict::Cancelled, false)
+            .unwrap();
+        assert_eq!(settlement, RunSettlement { tasks: 2, turns: 1 });
+        let tasks = store.list_orchestration_tasks("run-b").unwrap();
+        assert!(tasks.iter().all(|task| task.status == "cancelled"));
+        assert!(tasks.iter().all(|task| task.finished_at.is_some()));
+        assert!(tasks
+            .iter()
+            .all(|task| task.error.as_deref().unwrap_or("").contains("cancelled")));
+        let turn = store.get_turn_record(&thread.id, 1).unwrap().unwrap();
+        assert_eq!(turn.phase, TurnPhase::Unverified);
+        assert!(turn.error.as_deref().unwrap_or("").contains("cancelled"));
+        let run = run_row(&store, "run-b");
+        assert_eq!(run.status, "cancelled");
+        assert!(run.finished_at.is_some());
+    }
+
+    #[test]
+    fn settle_terminal_verdicts_mark_open_tasks_failed() {
+        for (run_id, verdict, expected) in [
+            ("run-p", RunVerdict::Partial, "partial"),
+            ("run-f", RunVerdict::Failed, "failed"),
+            ("run-r", RunVerdict::NeedsReview, "needs_review"),
+            ("run-i", RunVerdict::NeedsInput, "needs_input"),
+        ] {
+            let store = BatonStore::memory().unwrap();
+            add_run(&store, run_id, None);
+            add_run_task(&store, run_id, "open", "queued", None);
+            let settlement = store
+                .settle_orchestration_run(run_id, verdict, false)
+                .unwrap();
+            assert_eq!(settlement.tasks, 1);
+            let tasks = store.list_orchestration_tasks(run_id).unwrap();
+            assert_eq!(tasks[0].status, "failed");
+            assert!(tasks[0].error.as_deref().unwrap_or("").contains(expected));
+            assert_eq!(run_row(&store, run_id).status, expected);
+        }
+    }
+
+    #[test]
+    fn settle_refuses_a_missing_or_terminal_run() {
+        let store = BatonStore::memory().unwrap();
+        let error = store
+            .settle_orchestration_run("missing", RunVerdict::Failed, false)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no orchestration run matches"),
+            "{error}"
+        );
+        add_run(&store, "run-t", None);
+        store
+            .finish_orchestration_run("run-t", "completed")
+            .unwrap();
+        let error = store
+            .settle_orchestration_run("run-t", RunVerdict::Cancelled, false)
+            .unwrap_err();
+        assert!(error.to_string().contains("already completed"), "{error}");
+        assert_eq!(run_row(&store, "run-t").status, "completed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settle_refuses_a_live_owner_without_force() {
+        let store = BatonStore::memory().unwrap();
+        add_run(&store, "run-live", Some(std::process::id()));
+        add_run_task(&store, "run-live", "open", "running", None);
+        let error = store
+            .settle_orchestration_run("run-live", RunVerdict::Cancelled, false)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("still owned by live process"),
+            "{error}"
+        );
+        assert_eq!(run_row(&store, "run-live").status, "running");
+        let settlement = store
+            .settle_orchestration_run("run-live", RunVerdict::Cancelled, true)
+            .unwrap();
+        assert_eq!(settlement.tasks, 1);
+        assert_eq!(run_row(&store, "run-live").status, "cancelled");
     }
 
     #[test]

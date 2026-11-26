@@ -60,7 +60,12 @@ fn main_result(started: Instant) -> Result<()> {
     if !serving && !hosted_child {
         reap_startup_processes();
     }
-    if !hosted_child && !matches!(&command, cli::Commands::Chat | cli::Commands::Serve { .. }) {
+    if !hosted_child
+        && !matches!(
+            &command,
+            cli::Commands::Chat | cli::Commands::Serve { .. } | cli::Commands::Runs { .. }
+        )
+    {
         reconcile_startup_orchestrations();
     }
 
@@ -704,6 +709,7 @@ fn main_result(started: Instant) -> Result<()> {
         ),
         cli::Commands::Serve { stdio } => run_serve(&home, stdio),
         cli::Commands::Host { command } => run_host(&home, command),
+        cli::Commands::Runs { command } => run_runs(command),
         cli::Commands::Mcp => {
             let store = open_store(None)?;
             mcp::run_stdio(mcp::McpServer::new(store, home.clone(), cwd.clone()))
@@ -2788,6 +2794,47 @@ fn run_bench(home: &Path, started: Instant, target: &str, json: bool, repeat: u3
 
 fn open_store(host_id: Option<&str>) -> Result<BatonStore> {
     BatonStore::open_client(&paths::baton_db_path(), host_id)
+}
+
+fn run_runs(command: cli::RunCommand) -> Result<()> {
+    match command {
+        cli::RunCommand::Settle {
+            run_id,
+            status,
+            force,
+            json,
+        } => settle_run(&run_id, status, force, json),
+    }
+}
+
+fn settle_run(run_id: &str, status: cli::RunStatus, force: bool, json: bool) -> Result<()> {
+    let verdict = status.verdict();
+    let store = open_store(None)?;
+    let run_id = orchestrate::resolve_run_id(&store, run_id)?;
+    let settlement = store.settle_orchestration_run(&run_id, verdict, force)?;
+    let short = &run_id[..8.min(run_id.len())];
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": orchestrate::SCHEMA_VERSION,
+                "run_id": run_id,
+                "status": verdict.as_str(),
+                "tasks_settled": settlement.tasks,
+                "turns_settled": settlement.turns,
+                "forced": force,
+            }))?
+        );
+    } else if verdict == store::RunVerdict::Completed {
+        println!("settled run {short} as completed; every task was completed and no turn was open");
+    } else {
+        println!("settled run {short} as {}", verdict.as_str());
+        println!(
+            "closed {} open task(s) and settled {} open turn(s)",
+            settlement.tasks, settlement.turns
+        );
+    }
+    Ok(())
 }
 
 fn run_host(home: &Path, command: cli::HostCommand) -> Result<()> {

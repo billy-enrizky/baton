@@ -82,8 +82,9 @@ Site: https://baton.openbrowser.me · Docs: https://baton.openbrowser.me/docs
   - 8.5 [Ship](#85-ship)
   - 8.6 [Follow-ups](#86-follow-ups)
   - 8.7 [Roles and hooks](#87-roles-and-hooks)
-  - 8.8 [Shared directories](#88-shared-directories)
-  - 8.9 [CLI examples](#89-cli-examples)
+  - 8.8 [Settle a stalled run](#88-settle-a-stalled-run)
+  - 8.9 [Shared directories](#89-shared-directories)
+  - 8.10 [CLI examples](#810-cli-examples)
 - 9\. [Git delivery loop](#9-git-delivery-loop)
   - 9.1 [Status, commit, push](#91-status-commit-push)
   - 9.2 [Checks](#92-checks)
@@ -510,7 +511,18 @@ Declared hooks run with a timeout: `before_plan`, `after_plan`, `before_implemen
 
 See [Set up Baton](setup.md) for defaults and complete `roles.json` examples.
 
-### 8.8 Shared directories
+### 8.8 Settle a stalled run
+
+A run whose orchestrator process stopped, or a run created before ownership was recorded, can stay `running` with tasks that will never finish. Record a final status:
+
+```sh
+baton runs settle <run-id> --status cancelled
+baton runs settle <run-id> --status partial --json
+```
+
+Statuses are `completed`, `partial`, `failed`, `cancelled`, `needs_review`, and `needs_input`. `completed` is refused unless every task completed and no turn is open. Every other status closes queued and running tasks, marks their open turns unverified, and writes the final status in one transaction. A run whose recorded owner process is still alive is refused unless you pass `--force`. A short run id works when it is unambiguous.
+
+### 8.9 Shared directories
 
 Large gitignored directories such as `node_modules` or `target` can be shared from the primary checkout. Create `baton.json` in the repository root:
 
@@ -524,7 +536,7 @@ Large gitignored directories such as `node_modules` or `target` can be shared fr
 
 Each listed directory that exists and is gitignored becomes a symlink in the new worktree. Edits inside a shared directory affect the primary checkout, so use it only for build output and dependency caches.
 
-### 8.9 CLI examples
+### 8.10 CLI examples
 
 ```sh
 baton orchestrate --max-tasks 3 "Audit billing, add tests, update docs"
@@ -534,6 +546,7 @@ baton orchestrate --integrate <run-id>
 baton orchestrate --open-prs <run-id>
 baton orchestrate --review <run-id> --task 2
 baton orchestrate --archive <run-id>
+baton runs settle <run-id> --status cancelled
 ```
 
 ## 9. Git delivery loop
@@ -692,6 +705,7 @@ baton orchestrate --review <run-id> [--task N] [--json]
 baton orchestrate --integrate <run-id> [--task N] [--json]
 baton orchestrate --open-prs <run-id> [--task N] [--json]
 baton orchestrate --archive <run-id> [--json]
+baton runs settle <run-id> --status <status> [--force] [--json]
 baton worktrees [--json] [--run <id>]
 baton worktrees --clean [--force] [--run <id>]
 ```

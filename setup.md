@@ -190,6 +190,7 @@ The probe needs an API key in the variable named by `--key-env`, and Python 3.10
 - Cursor rejects a custom endpoint. Remove the cursor `apiBaseUrl` and use `cursor-agent login`.
 - A turn fails auth after the banner looks ready. The harness can still reject an unentitled model or expired login. Run the provider's login command again.
 - `/worktree` refuses a dirty checkout. Commit or stash first, or use `/fork` to stay in the current checkout.
+- A run stays `running` after its process stopped. `baton runs settle <run-id> --status failed` records a final status. `completed` is refused while a task or turn is open, and `--force` settles a run whose recorded owner still looks alive.
 
 ## Next
 

@@ -240,6 +240,11 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Inspect or settle orchestration runs
+    Runs {
+        #[command(subcommand)]
+        command: RunCommand,
+    },
     /// Rewind a thread to before a turn
     Rewind {
         thread_id: Option<String>,
@@ -430,6 +435,49 @@ pub fn login_command(provider: ProviderId) -> Option<Vec<&'static str>> {
         ProviderId::Grok => Some(vec!["grok", "login"]),
         ProviderId::OpenCode => Some(vec!["opencode", "auth", "login"]),
         ProviderId::Antigravity => None,
+    }
+}
+
+#[derive(Subcommand, Clone)]
+pub enum RunCommand {
+    /// Settle a running orchestration with an explicit final status
+    Settle {
+        /// Run id or an unambiguous prefix
+        run_id: String,
+        /// Final status to record
+        #[arg(long, value_enum, value_name = "STATUS")]
+        status: RunStatus,
+        /// Also settle a run whose recorded owner process is still alive
+        #[arg(long)]
+        force: bool,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunStatus {
+    Completed,
+    Partial,
+    Failed,
+    Cancelled,
+    #[value(name = "needs_review", alias = "needs-review")]
+    NeedsReview,
+    #[value(name = "needs_input", alias = "needs-input")]
+    NeedsInput,
+}
+
+impl RunStatus {
+    pub fn verdict(self) -> crate::store::RunVerdict {
+        match self {
+            RunStatus::Completed => crate::store::RunVerdict::Completed,
+            RunStatus::Partial => crate::store::RunVerdict::Partial,
+            RunStatus::Failed => crate::store::RunVerdict::Failed,
+            RunStatus::Cancelled => crate::store::RunVerdict::Cancelled,
+            RunStatus::NeedsReview => crate::store::RunVerdict::NeedsReview,
+            RunStatus::NeedsInput => crate::store::RunVerdict::NeedsInput,
+        }
     }
 }
 
@@ -668,6 +716,72 @@ mod tests {
             }
             _ => panic!("expected the exec command"),
         }
+    }
+
+    #[test]
+    fn runs_settle_accepts_a_status_and_force() {
+        let cli = Cli::try_parse_from([
+            "baton",
+            "runs",
+            "settle",
+            "3f9c1a2b",
+            "--status",
+            "needs-review",
+            "--force",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Runs {
+                command:
+                    RunCommand::Settle {
+                        run_id,
+                        status: RunStatus::NeedsReview,
+                        force: true,
+                        json: true,
+                    },
+            }) => assert_eq!(run_id, "3f9c1a2b"),
+            _ => panic!("expected runs settle"),
+        }
+    }
+
+    #[test]
+    fn runs_settle_accepts_snake_case_status_names() {
+        for (name, status) in [
+            ("completed", RunStatus::Completed),
+            ("partial", RunStatus::Partial),
+            ("failed", RunStatus::Failed),
+            ("cancelled", RunStatus::Cancelled),
+            ("needs_review", RunStatus::NeedsReview),
+            ("needs_input", RunStatus::NeedsInput),
+        ] {
+            let cli =
+                Cli::try_parse_from(["baton", "runs", "settle", "run", "--status", name]).unwrap();
+            match cli.command {
+                Some(Commands::Runs {
+                    command: RunCommand::Settle { status: parsed, .. },
+                }) => assert_eq!(parsed, status, "{name}"),
+                _ => panic!("expected runs settle"),
+            }
+        }
+    }
+
+    #[test]
+    fn runs_settle_rejects_an_unknown_status() {
+        let error =
+            match Cli::try_parse_from(["baton", "runs", "settle", "run", "--status", "done"]) {
+                Ok(_) => panic!("unknown statuses are refused"),
+                Err(error) => error,
+            };
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
+        let error = match Cli::try_parse_from(["baton", "runs", "settle", "run"]) {
+            Ok(_) => panic!("a status is required"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
     }
 
     #[test]

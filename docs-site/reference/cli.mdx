@@ -90,11 +90,14 @@ baton orchestrate --review <run-id> [--task N] [--json]
 baton orchestrate --integrate <run-id> [--task N] [--json]
 baton orchestrate --open-prs <run-id> [--task N] [--json]
 baton orchestrate --archive <run-id> [--json]
+baton runs settle <run-id> --status <status> [--force] [--json]
 baton worktrees [--json] [--run <id>]
 baton worktrees --clean [--force] [--run <id>]
 ```
 
 `--max-tasks` accepts 1 to 16. `--integrate` merges approved worker branches. `--open-prs` pushes each approved branch and opens one pull request.
+
+`baton runs settle` records a final status for a run that nothing is driving. Statuses are `completed`, `partial`, `failed`, `cancelled`, `needs_review`, and `needs_input`. `completed` is refused unless every task completed and no turn is open. Any other status closes open tasks and turns first. A run whose recorded owner is still alive needs `--force`.
 
 ## Files, memory, and data
 

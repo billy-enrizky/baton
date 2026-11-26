@@ -407,7 +407,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/grep` | Search project contents, insert `path:line`, or open the match |
 | `/find` | Search the conversation |
 | `/activity`, `/commands`, `/agents` | Inspect turns, tool calls, and subagent calls |
-| `/usage`, `/context`, `/status`, `/turns` | Inspect usage with a scope and grouping picker, plus context, status, and turn history |
+| `/usage`, `/context`, `/status`, `/turns`, `/limits` | Inspect usage with a scope and grouping picker, plus context, status, turn history, and the rate-limit windows a harness reported |
 | `/memory` | Open Claude and Codex instruction files and project memory |
 
 `/files` and `/grep` use `rg` when it is installed and fall back to `git ls-files` and `git grep` inside a repository. Ctrl+O opens the selected file in `VISUAL` or `EDITOR`.

@@ -177,6 +177,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "every diff in this thread in one scrollable view: /changes [turn]",
     ),
     (
+        "/limits",
+        "rate-limit windows the harness reported, with an unknown state elsewhere",
+    ),
+    (
         "/archive",
         "hide a thread from the default lists and the inbox: /archive [id prefix]",
     ),
@@ -1005,6 +1009,7 @@ pub struct TuiState {
     review: Option<ReviewState>,
     plans: std::collections::HashMap<String, std::collections::HashMap<ProviderId, PlanSnapshot>>,
     plan_scroll_max: std::cell::Cell<usize>,
+    rate_limits: std::collections::HashMap<ProviderId, crate::types::RateLimitInfo>,
     changes_scroll_max: std::cell::Cell<usize>,
     changes_offsets: std::cell::RefCell<Vec<usize>>,
     activity: Option<ActivityView>,
@@ -1156,6 +1161,7 @@ pub fn run_tui(
         review: None,
         plans: std::collections::HashMap::new(),
         plan_scroll_max: std::cell::Cell::new(0),
+        rate_limits: std::collections::HashMap::new(),
         changes_scroll_max: std::cell::Cell::new(0),
         changes_offsets: std::cell::RefCell::new(Vec::new()),
         activity: None,
@@ -3063,6 +3069,9 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                 }),
             }
         }
+        TurnEvent::RateLimits { provider, info } => {
+            state.rate_limits.insert(provider, info);
+        }
         TurnEvent::ProviderTurnId { .. }
         | TurnEvent::ProviderSession { .. }
         | TurnEvent::Usage { .. } => {}
@@ -3635,6 +3644,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/pin", "move") => Some("pin move <id> up or down"),
         ("/snooze", _) => Some("snooze [1h|4h|tomorrow|week|off]"),
         ("/changes", _) => Some("changes [turn]"),
+        ("/limits", _) => Some("limits"),
         ("/archive", _) => Some("archive [thread]"),
         ("/unarchive", _) => Some("unarchive [thread]"),
         ("/threads", "all") => Some("threads all"),
@@ -4240,6 +4250,68 @@ fn move_pinned_thread(
         action: ThreadPickerAction::Pin,
     };
     Some(())
+}
+
+fn rate_limit_lines(state: &TuiState) -> Vec<String> {
+    let now = chrono::Utc::now();
+    let mut ordered = vec![state.thread.current_provider];
+    for provider in PROVIDERS {
+        if provider != state.thread.current_provider {
+            ordered.push(provider);
+        }
+    }
+    let mut lines = Vec::new();
+    let mut seen = false;
+    for provider in ordered {
+        let Some(info) = state.rate_limits.get(&provider) else {
+            lines.push(format!(
+                "{} · no rate-limit data from this harness",
+                provider.as_str()
+            ));
+            continue;
+        };
+        seen = true;
+        lines.push(format!(
+            "{} · {} · reported {}",
+            provider.as_str(),
+            info.plan_type.as_deref().unwrap_or("unknown plan"),
+            info.reported_at
+        ));
+        for (label, window) in [
+            ("primary", info.primary.as_ref()),
+            ("secondary", info.secondary.as_ref()),
+        ] {
+            let Some(window) = window else { continue };
+            let length = window
+                .window_duration_mins
+                .map(|mins| {
+                    if mins % 60 == 0 {
+                        format!("{}h", mins / 60)
+                    } else {
+                        format!("{mins}m")
+                    }
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let reset = window
+                .resets_at
+                .and_then(|stamp| chrono::DateTime::from_timestamp(stamp, 0))
+                .map(|stamp| format!(" · resets {}", crate::snooze::wake_label(stamp, now)))
+                .unwrap_or_default();
+            lines.push(format!(
+                "  {label} · {length} window · {}% used{reset}",
+                window.used_percent
+            ));
+        }
+        if info.credits_unlimited {
+            lines.push("  credits · unlimited".into());
+        } else if let Some(balance) = info.credits_balance.as_deref() {
+            lines.push(format!("  credits · {balance}"));
+        }
+    }
+    if !seen {
+        lines.insert(0, "no rate-limit data yet".into());
+    }
+    lines
 }
 
 fn apply_archive_command(
@@ -11031,6 +11103,17 @@ fn handle_command(
         "/usage" => {
             state.overlay = Overlay::UsagePicker { selected: 0 };
         }
+        "/limits" => {
+            if !args.is_empty() {
+                state.notice = Some("use /limits".into());
+            } else {
+                state.overlay = Overlay::UsageReport {
+                    title: "limits".into(),
+                    lines: rate_limit_lines(state),
+                    scroll: 0,
+                };
+            }
+        }
         "/changes" => {
             let requested = match args.first() {
                 None => Ok(None),
@@ -17505,6 +17588,7 @@ mod tests {
             review: None,
             plans: std::collections::HashMap::new(),
             plan_scroll_max: std::cell::Cell::new(0),
+            rate_limits: std::collections::HashMap::new(),
             changes_scroll_max: std::cell::Cell::new(0),
             changes_offsets: std::cell::RefCell::new(Vec::new()),
             activity: None,
@@ -24055,6 +24139,90 @@ mod tests {
             ),
             created_at: String::new(),
         }
+    }
+
+    fn codex_rate_limits() -> crate::types::RateLimitInfo {
+        crate::types::RateLimitInfo {
+            plan_type: Some("plus".into()),
+            primary: Some(crate::types::RateLimitWindow {
+                used_percent: 12,
+                window_duration_mins: Some(300),
+                resets_at: Some(1_767_000_000),
+            }),
+            secondary: Some(crate::types::RateLimitWindow {
+                used_percent: 48,
+                window_duration_mins: Some(10_080),
+                resets_at: None,
+            }),
+            credits_balance: Some("12.50".into()),
+            credits_unlimited: false,
+            reported_at: "2026-11-26T03:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn limits_reports_a_codex_snapshot() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state
+            .rate_limits
+            .insert(ProviderId::Codex, codex_rate_limits());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/limits");
+        assert!(matches!(state.overlay, Overlay::UsageReport { .. }));
+        let text = buffer_lines(&render_state(&state, 100, 40)).join("\n");
+        assert!(text.contains("limits"), "{text}");
+        assert!(
+            text.contains("codex · plus · reported 2026-11-26T03:00:00Z"),
+            "{text}"
+        );
+        assert!(text.contains("primary · 5h window · 12% used"), "{text}");
+        assert!(
+            text.contains("secondary · 168h window · 48% used"),
+            "{text}"
+        );
+        assert!(text.contains("credits · 12.50"), "{text}");
+        assert!(
+            text.contains("no rate-limit data from this harness"),
+            "{text}"
+        );
+        handle_command(&mut state, &store, &engine_command_sender, "/limits extra");
+        assert_eq!(state.notice.as_deref(), Some("use /limits"));
+    }
+
+    #[test]
+    fn limits_names_every_harness_without_data() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/limits");
+        let text = buffer_lines(&render_state(&state, 100, 40)).join("\n");
+        assert!(text.contains("no rate-limit data yet"), "{text}");
+        for provider in PROVIDERS {
+            assert!(text.contains(provider.as_str()), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_rate_limit_event_updates_the_limits_view() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        apply_turn_event(
+            &mut state,
+            TurnEvent::RateLimits {
+                provider: ProviderId::Codex,
+                info: codex_rate_limits(),
+            },
+        );
+        assert_eq!(state.rate_limits.len(), 1);
+        let lines = rate_limit_lines(&state);
+        assert!(
+            lines.iter().any(|line| line.contains("12% used")),
+            "{lines:?}"
+        );
     }
 
     #[test]

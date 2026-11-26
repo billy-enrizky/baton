@@ -262,6 +262,12 @@ pub enum TurnEvent {
         plan_id: String,
     },
     Usage { usage: TurnUsage },
+    /// A provider-reported rate-limit snapshot. Providers that do not report
+    /// one leave the harness in an explicit unknown state.
+    RateLimits {
+        provider: crate::types::ProviderId,
+        info: crate::types::RateLimitInfo,
+    },
     /// A child agent started. The id is the provider's tool call or child
     /// thread id when it exposes one.
     SubagentStarted {

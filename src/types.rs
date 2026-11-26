@@ -276,6 +276,25 @@ impl TurnPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RateLimitWindow {
+    pub used_percent: i64,
+    pub window_duration_mins: Option<i64>,
+    /// Unix seconds reported by the provider.
+    pub resets_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RateLimitInfo {
+    pub plan_type: Option<String>,
+    pub primary: Option<RateLimitWindow>,
+    pub secondary: Option<RateLimitWindow>,
+    pub credits_balance: Option<String>,
+    pub credits_unlimited: bool,
+    /// When Baton received the snapshot, as an RFC 3339 timestamp.
+    pub reported_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ApprovalChoice {
     pub id: String,
     pub label: String,

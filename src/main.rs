@@ -2458,6 +2458,8 @@ fn main_result(started: Instant) -> Result<()> {
                             "port": row.port,
                             "cwd": row.cwd,
                             "owner_pid": row.owner_pid,
+                            "owner_start": row.owner_start,
+                            "host_id": row.host_id,
                             "owner_running": state.owner_running,
                             "process_alive": state.alive,
                             "command_matches": state.command_matches,
@@ -2846,9 +2848,11 @@ fn takeover_host(home: &Path, pid: u32) -> Result<()> {
             anyhow::bail!("host pid {pid} is no longer live; no takeover was needed")
         }
     };
+    let children = process::terminate_host_children(&store, &claim.host_id);
     let settlement =
         store.settle_open_work_after_takeover(&format!("host pid {} was taken over", taken.pid));
     let released = store.release_host_claim(&host_id);
+    let children = children?;
     let settlement = settlement?;
     if !released? {
         anyhow::bail!("takeover claim disappeared before release");
@@ -2861,6 +2865,13 @@ fn takeover_host(home: &Path, pid: u32) -> Result<()> {
         "baton: settled {} turn(s) and {} orchestration run(s)",
         settlement.turns, settlement.runs
     );
+    println!(
+        "baton: stopped {} provider child(ren) from the old host",
+        children.reaped.len()
+    );
+    for error in &children.errors {
+        eprintln!("baton: child shutdown: {error}");
+    }
     println!("baton: the old host is fenced out; start baton serve for a new host");
     Ok(())
 }
@@ -2960,6 +2971,20 @@ fn run_serve(home: &Path, stdio: bool) -> Result<()> {
         runtime.block_on(serve::stdio_loop(&store))?;
     } else {
         runtime.block_on(wait_for_host_stop())?;
+    }
+    match process::terminate_host_children(&store, &host_id) {
+        Ok(report) => {
+            if !report.reaped.is_empty() {
+                eprintln!(
+                    "baton: stopped {} provider child(ren) for this host",
+                    report.reaped.len()
+                );
+            }
+            for error in &report.errors {
+                eprintln!("baton: child shutdown: {error}");
+            }
+        }
+        Err(error) => eprintln!("baton: child shutdown failed: {error}"),
     }
     if !store.release_host_claim(&host_id)? {
         anyhow::bail!("host claim disappeared before shutdown");

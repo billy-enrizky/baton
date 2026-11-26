@@ -31,6 +31,17 @@ struct HostProcess {
 }
 
 #[cfg(unix)]
+struct ChildGuard(Child);
+
+#[cfg(unix)]
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
 impl Drop for HostProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -248,6 +259,59 @@ fn host_takeover_replaces_the_live_claim_and_allows_a_new_host() {
 
     let (replacement, _host_id) = start_host(home.path());
     drop(replacement);
+    drop(host);
+}
+
+#[cfg(unix)]
+#[test]
+fn host_takeover_stops_the_old_provider_generation() {
+    let home = tempfile::tempdir().unwrap();
+    let (host, host_id) = start_host(home.path());
+    let mut provider = ChildGuard(
+        Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn provider"),
+    );
+    let provider_pid = provider.0.id();
+    let command = baton::process::command_line(provider_pid).unwrap();
+    let start = baton::process::process_start(provider_pid).unwrap();
+    let db = rusqlite::Connection::open(home.path().join("baton.sqlite")).unwrap();
+    db.execute(
+        "INSERT INTO provider_processes (pid, provider, port, command, process_start, cwd, owner_pid, owner_start, host_id, started_at) VALUES (?, 'codex', NULL, ?, ?, ?, ?, ?, ?, ?)",
+        rusqlite::params![
+            provider_pid,
+            command,
+            start,
+            "/tmp/project",
+            host.child.id(),
+            baton::process::process_start(host.child.id()),
+            host_id,
+            chrono::Utc::now().to_rfc3339()
+        ],
+    )
+    .unwrap();
+    drop(db);
+
+    let pid = host.child.id().to_string();
+    let output = run_with_stdin(home.path(), &["host", "takeover", "--pid", &pid], "y\n");
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("stopped 1 provider child(ren) from the old host"),
+        "{stdout}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if provider.0.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "takeover did not stop the old provider child"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
     drop(host);
 }
 

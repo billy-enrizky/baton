@@ -120,6 +120,15 @@ pub enum RunVerdict {
 }
 
 impl RunVerdict {
+    pub const ALL: [RunVerdict; 6] = [
+        RunVerdict::Completed,
+        RunVerdict::Partial,
+        RunVerdict::Failed,
+        RunVerdict::Cancelled,
+        RunVerdict::NeedsReview,
+        RunVerdict::NeedsInput,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             RunVerdict::Completed => "completed",

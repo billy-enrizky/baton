@@ -14,6 +14,9 @@ use super::COLORS;
 
 const TAB_REPLACEMENT: &str = "    ";
 
+/// Rows a long diff keeps in the transcript before Ctrl+T expands it.
+pub const PREVIEW_ROWS: usize = 12;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DiffLineKind {
     Insert,
@@ -55,6 +58,7 @@ struct DiffCacheEntry {
     diff: String,
     width: usize,
     lines: Rc<Vec<Line<'static>>>,
+    preview: Rc<Vec<Line<'static>>>,
 }
 
 #[derive(Default)]
@@ -64,27 +68,38 @@ pub struct DiffCache {
 
 impl DiffCache {
     pub fn render(&mut self, diff: &str, width: usize) -> Rc<Vec<Line<'static>>> {
-        if let Some(index) = self
+        self.entry(diff, width).lines.clone()
+    }
+
+    /// The collapsed form: every changed file keeps its path and counts, and
+    /// each file keeps a bounded preview of its rows.
+    pub fn preview(&mut self, diff: &str, width: usize) -> Rc<Vec<Line<'static>>> {
+        self.entry(diff, width).preview.clone()
+    }
+
+    fn entry(&mut self, diff: &str, width: usize) -> &DiffCacheEntry {
+        let existing = self
             .entries
             .iter()
-            .position(|entry| entry.width == width && entry.diff == diff)
-        {
+            .position(|entry| entry.width == width && entry.diff == diff);
+        if let Some(index) = existing {
             let entry = self.entries.remove(index);
-            let lines = entry.lines.clone();
             self.entries.insert(0, entry);
-            return lines;
+            return &self.entries[0];
         }
         let lines = Rc::new(render_diff_lines(diff, width));
+        let preview = Rc::new(render_diff_preview(diff, width, PREVIEW_ROWS));
         self.entries.insert(
             0,
             DiffCacheEntry {
                 diff: diff.to_string(),
                 width,
-                lines: lines.clone(),
+                lines,
+                preview,
             },
         );
         self.entries.truncate(8);
-        lines
+        &self.entries[0]
     }
 }
 
@@ -239,97 +254,168 @@ pub fn render_diff_lines(diff: &str, width: usize) -> Vec<Line<'static>> {
     if files.is_empty() {
         return Vec::new();
     }
-    let total_added: usize = files.iter().map(|file| file.added).sum();
-    let total_removed: usize = files.iter().map(|file| file.removed).sum();
     let single = files.len() == 1;
-
-    let bold = Style::default().add_modifier(Modifier::BOLD);
-    let dim = Style::default().add_modifier(Modifier::DIM);
-    let mut out: Vec<Line<'static>> = Vec::new();
-    let mut header: Vec<Span<'static>> = vec![Span::styled("• ", dim)];
-    if single {
-        header.push(Span::styled(files[0].verb, bold));
-        header.push(Span::raw(" "));
-        header.push(Span::raw(
-            crate::sanitize::sanitize_terminal_text(&files[0].path).into_owned(),
-        ));
-        header.push(Span::raw(" "));
-        header.extend(counts_summary(files[0].added, files[0].removed));
-    } else {
-        header.push(Span::styled("Edited", bold));
-        header.push(Span::raw(format!(" {} files ", files.len())));
-        header.extend(counts_summary(total_added, total_removed));
-    }
-    out.push(Line::from(header));
-
+    let mut out: Vec<Line<'static>> = vec![header_line(&files)];
     for (index, file) in files.iter().enumerate() {
         if index > 0 {
             out.push(Line::from(""));
         }
         if !single {
-            let mut row: Vec<Span<'static>> = vec![Span::styled("  └ ", dim)];
-            row.push(Span::raw(
-                crate::sanitize::sanitize_terminal_text(&file.path).into_owned(),
-            ));
-            row.push(Span::raw(" "));
-            row.extend(counts_summary(file.added, file.removed));
-            out.push(Line::from(row));
+            out.push(file_header_line(file));
         }
-        let gutter_width = line_number_width(file.max_line_number).max(1);
-        let available = width.saturating_sub(gutter_width + 2).max(1);
-        for (hunk_index, hunk) in file.hunks.iter().enumerate() {
-            if hunk_index > 0 {
-                let spacer = format!("{:width$} ", "", width = gutter_width);
-                out.push(Line::from(vec![
-                    Span::styled(spacer, Style::default().add_modifier(Modifier::DIM)),
-                    Span::styled("⋮", dim),
-                ]));
-            }
-            for row in &hunk.rows {
-                let (line_bg, content_fg) = match row.kind {
-                    DiffLineKind::Insert => (Some(COLORS.diff_add_bg), COLORS.success),
-                    DiffLineKind::Delete => (Some(COLORS.diff_del_bg), COLORS.error),
-                    DiffLineKind::Context => (None, COLORS.text),
-                };
-                let sign = match row.kind {
-                    DiffLineKind::Insert => '+',
-                    DiffLineKind::Delete => '-',
-                    DiffLineKind::Context => ' ',
-                };
-                let gutter_style = Style::default().add_modifier(Modifier::DIM);
-                let number_prefix = Span::styled(
-                    format!("{:>width$} ", row.line_number, width = gutter_width),
-                    gutter_style,
-                );
-                let content_style = Style::default().fg(content_fg);
-                let text = crate::sanitize::sanitize_terminal_text(&row.text);
-                let chars: Vec<char> = text.chars().collect();
-                let mut offset = 0;
-                loop {
-                    let chunk: String = chars.iter().skip(offset).take(available).collect();
-                    if chunk.is_empty() {
-                        break;
-                    }
-                    let mut spans = if offset == 0 {
-                        vec![number_prefix.clone(), Span::styled(sign.to_string(), content_style)]
-                    } else {
-                        vec![Span::styled(
-                            format!("{:width$}  ", "", width = gutter_width),
-                            gutter_style,
-                        )]
-                    };
-                    spans.push(Span::styled(chunk, content_style));
-                    let mut line = Line::from(spans);
-                    if let Some(bg) = line_bg {
-                        line = line.style(Style::default().bg(bg));
-                    }
-                    out.push(line);
-                    offset += available;
-                }
-            }
-        }
+        push_hunk_rows(&mut out, file, width, None);
     }
     out
+}
+
+/// The collapsed form. Every file keeps its path row, and the remaining rows
+/// are split across files so a long change set still names what changed.
+pub fn render_diff_preview(diff: &str, width: usize, max_rows: usize) -> Vec<Line<'static>> {
+    let files = parse_unified_diff(diff);
+    if files.is_empty() || max_rows == 0 {
+        return Vec::new();
+    }
+    let mut out: Vec<Line<'static>> = vec![header_line(&files)];
+    let budget = max_rows - 1;
+    if let [file] = files.as_slice() {
+        push_hunk_rows(&mut out, file, width, Some(budget));
+        return out;
+    }
+    // A path row says more than a preview row, so every file is named before
+    // any preview rows are spent.
+    if budget < files.len() {
+        let shown = budget.saturating_sub(1);
+        for file in files.iter().take(shown) {
+            out.push(file_header_line(file));
+        }
+        if budget > 0 {
+            out.push(Line::styled(
+                format!("  … {} more files", files.len() - shown),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        return out;
+    }
+    let mut body = budget - files.len();
+    let mut files_left = files.len();
+    for file in &files {
+        out.push(file_header_line(file));
+        let share = if files_left <= 1 {
+            body
+        } else {
+            body / files_left
+        };
+        let used = push_hunk_rows(&mut out, file, width, Some(share));
+        body = body.saturating_sub(used);
+        files_left -= 1;
+    }
+    out
+}
+
+fn header_line(files: &[DiffFile]) -> Line<'static> {
+    let total_added: usize = files.iter().map(|file| file.added).sum();
+    let total_removed: usize = files.iter().map(|file| file.removed).sum();
+    let bold = Style::default().add_modifier(Modifier::BOLD);
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut header: Vec<Span<'static>> = vec![Span::styled("• ", dim)];
+    if let [file] = files {
+        header.push(Span::styled(file.verb, bold));
+        header.push(Span::raw(" "));
+        header.push(Span::raw(
+            crate::sanitize::sanitize_terminal_text(&file.path).into_owned(),
+        ));
+        header.push(Span::raw(" "));
+        header.extend(counts_summary(file.added, file.removed));
+    } else {
+        header.push(Span::styled("Edited", bold));
+        header.push(Span::raw(format!(" {} files ", files.len())));
+        header.extend(counts_summary(total_added, total_removed));
+    }
+    Line::from(header)
+}
+
+fn file_header_line(file: &DiffFile) -> Line<'static> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut row: Vec<Span<'static>> = vec![Span::styled("  └ ", dim)];
+    row.push(Span::raw(
+        crate::sanitize::sanitize_terminal_text(&file.path).into_owned(),
+    ));
+    row.push(Span::raw(" "));
+    row.extend(counts_summary(file.added, file.removed));
+    Line::from(row)
+}
+
+/// Writes one file's hunk rows and returns how many terminal rows it used.
+/// `budget` bounds the rows at a diff-row boundary, so a wrapped row is never
+/// split across the budget.
+fn push_hunk_rows(
+    out: &mut Vec<Line<'static>>,
+    file: &DiffFile,
+    width: usize,
+    budget: Option<usize>,
+) -> usize {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let gutter_style = Style::default().add_modifier(Modifier::DIM);
+    let gutter_width = line_number_width(file.max_line_number).max(1);
+    let available = width.saturating_sub(gutter_width + 2).max(1);
+    let mut used = 0usize;
+    for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+        if hunk_index > 0 {
+            if budget.is_some_and(|budget| used >= budget) {
+                return used;
+            }
+            let spacer = format!("{:width$} ", "", width = gutter_width);
+            out.push(Line::from(vec![
+                Span::styled(spacer, gutter_style),
+                Span::styled("⋮", dim),
+            ]));
+            used += 1;
+        }
+        for row in &hunk.rows {
+            let (line_bg, content_fg) = match row.kind {
+                DiffLineKind::Insert => (Some(COLORS.diff_add_bg), COLORS.success),
+                DiffLineKind::Delete => (Some(COLORS.diff_del_bg), COLORS.error),
+                DiffLineKind::Context => (None, COLORS.text),
+            };
+            let sign = match row.kind {
+                DiffLineKind::Insert => '+',
+                DiffLineKind::Delete => '-',
+                DiffLineKind::Context => ' ',
+            };
+            let number_prefix = Span::styled(
+                format!("{:>width$} ", row.line_number, width = gutter_width),
+                gutter_style,
+            );
+            let content_style = Style::default().fg(content_fg);
+            let text = crate::sanitize::sanitize_terminal_text(&row.text);
+            let chars: Vec<char> = text.chars().collect();
+            let wrapped = chars.len().div_ceil(available).max(1);
+            if budget.is_some_and(|budget| used + wrapped > budget) {
+                return used;
+            }
+            let mut offset = 0;
+            while offset < chars.len() {
+                let chunk: String = chars.iter().skip(offset).take(available).collect();
+                let mut spans = if offset == 0 {
+                    vec![number_prefix.clone(), Span::styled(sign.to_string(), content_style)]
+                } else {
+                    vec![Span::styled(
+                        format!("{:width$}  ", "", width = gutter_width),
+                        gutter_style,
+                    )]
+                };
+                spans.push(Span::styled(chunk, content_style));
+                let mut line = Line::from(spans);
+                if let Some(bg) = line_bg {
+                    line = line.style(Style::default().bg(bg));
+                }
+                out.push(line);
+                offset += available;
+            }
+            used += wrapped;
+        }
+    }
+    used
 }
 
 #[cfg(test)]
@@ -420,6 +506,87 @@ mod tests {
         assert!(text[1].ends_with("+abcdefghi"), "first chunk: {}", text[1]);
         assert!(text[2].starts_with("   "), "continuation keeps the gutter indent: {}", text[2]);
         assert!(text[2].ends_with("jklmnopqr"), "second chunk: {}", text[2]);
+    }
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|span| span.content.clone()).collect()
+    }
+
+    const THREE_FILES: &str = "diff --git a/alpha.rs b/alpha.rs\n--- a/alpha.rs\n+++ b/alpha.rs\n@@ -1,2 +1,2 @@\n-a1\n+a2\n-a3\n+a4\ndiff --git a/beta.rs b/beta.rs\n--- a/beta.rs\n+++ b/beta.rs\n@@ -1 +1 @@\n-b1\n+b2\ndiff --git a/gamma.rs b/gamma.rs\n--- a/gamma.rs\n+++ b/gamma.rs\n@@ -1 +1 @@\n-c1\n+c2\n";
+
+    #[test]
+    fn preview_keeps_every_file_path_and_bounds_the_rows() {
+        let preview = render_diff_preview(THREE_FILES, 80, PREVIEW_ROWS);
+        assert!(preview.len() <= PREVIEW_ROWS, "{} rows", preview.len());
+        let text: Vec<String> = preview.iter().map(line_text).collect();
+        for path in ["alpha.rs", "beta.rs", "gamma.rs"] {
+            assert!(
+                text.iter().any(|line| line.contains(path)),
+                "the preview dropped {path}: {text:?}"
+            );
+        }
+        assert!(text[0].contains("Edited 3 files"), "{}", text[0]);
+        for marker in ["a2", "b2", "c2"] {
+            assert!(
+                text.iter()
+                    .any(|line| line.contains('+') && line.ends_with(marker)),
+                "the preview dropped {marker}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_of_a_single_file_is_a_head_prefix() {
+        let added = (0..16)
+            .map(|index| format!("+line-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let diff = format!(
+            "diff --git a/notes.txt b/notes.txt\n--- a/notes.txt\n+++ b/notes.txt\n@@ -1 +1,16 @@\n{added}\n"
+        );
+        let full = render_diff_lines(&diff, 80);
+        let preview = render_diff_preview(&diff, 80, PREVIEW_ROWS);
+        assert_eq!(preview.len(), PREVIEW_ROWS);
+        assert!(preview.len() < full.len());
+        let preview_text: Vec<String> = preview.iter().map(line_text).collect();
+        assert!(
+            preview_text[0].contains("Edited notes.txt"),
+            "{}",
+            preview_text[0]
+        );
+        assert!(preview_text.iter().any(|line| line.contains("line-0")));
+        assert!(!preview_text.iter().any(|line| line.contains("line-15")));
+    }
+
+    #[test]
+    fn preview_caps_the_file_list_when_paths_alone_fill_the_rows() {
+        let mut diff = String::new();
+        for index in 0..20 {
+            diff.push_str(&format!(
+                "diff --git a/f{index}.rs b/f{index}.rs\n--- a/f{index}.rs\n+++ b/f{index}.rs\n@@ -1 +1 @@\n-a\n+b\n"
+            ));
+        }
+        let preview = render_diff_preview(&diff, 80, PREVIEW_ROWS);
+        assert!(preview.len() <= PREVIEW_ROWS, "{} rows", preview.len());
+        let text: Vec<String> = preview.iter().map(line_text).collect();
+        assert!(
+            text.iter().any(|line| line.contains("more files")),
+            "the preview must say how many files it could not name: {text:?}"
+        );
+        assert!(text.iter().any(|line| line.contains("f0.rs")));
+    }
+
+    #[test]
+    fn cache_preview_matches_the_preview_renderer() {
+        let mut cache = DiffCache::default();
+        let first = cache.preview(THREE_FILES, 80);
+        let second = cache.preview(THREE_FILES, 80);
+        assert!(Rc::ptr_eq(&first, &second));
+        assert!(Rc::ptr_eq(
+            &cache.render(THREE_FILES, 80),
+            &cache.render(THREE_FILES, 80)
+        ));
+        assert_eq!(cache.entries.len(), 1, "one entry holds both forms");
     }
 
     #[test]

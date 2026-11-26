@@ -26,7 +26,10 @@ from tui_probe import (  # noqa: E402
 )
 
 LINES = 60
-LAST_LINE = f"probe line {LINES:03d}"
+SECOND_LINES = 40
+# The viewport is bottom-sticky, so the expanded tail shows the last row of the
+# final file rather than of the first.
+LAST_LINE = f"probe line {SECOND_LINES:03d}"
 
 FAKE_CODEX = '''#!/usr/bin/env python3
 import json
@@ -44,13 +47,18 @@ def send(value):
 
 
 def rewrite():
-    target = os.environ.get("BATON_PROBE_FILE")
-    if not target:
-        return
-    count = int(os.environ.get("BATON_PROBE_LINES", "60"))
-    body = "".join(f"probe line {index:03d}\\n" for index in range(1, count + 1))
-    with open(target, "w", encoding="utf-8") as handle:
-        handle.write(body)
+    targets = (
+        ("BATON_PROBE_FILE", "BATON_PROBE_LINES", 60),
+        ("BATON_PROBE_SECOND_FILE", "BATON_PROBE_SECOND_LINES", 40),
+    )
+    for variable, count_variable, default in targets:
+        target = os.environ.get(variable)
+        if not target:
+            continue
+        count = int(os.environ.get(count_variable, str(default)))
+        body = "".join(f"probe line {index:03d}\\n" for index in range(1, count + 1))
+        with open(target, "w", encoding="utf-8") as handle:
+            handle.write(body)
 
 
 for line in sys.stdin:
@@ -164,10 +172,12 @@ def main() -> int:
     write_fake_codex(fake_bin)
 
     source = workdir / "app.txt"
+    second = workdir / "lib.txt"
     source.write_text("".join(f"alpha line {index:03d}\n" for index in range(1, LINES + 1)))
+    second.write_text("".join(f"beta line {index:03d}\n" for index in range(1, SECOND_LINES + 1)))
     for command in (
         ["git", "init", "-q"],
-        ["git", "add", "app.txt"],
+        ["git", "add", "app.txt", "lib.txt"],
         [
             "git",
             "-c",
@@ -193,6 +203,8 @@ def main() -> int:
     env["NO_COLOR"] = "1"
     env["BATON_PROBE_FILE"] = str(source)
     env["BATON_PROBE_LINES"] = str(LINES)
+    env["BATON_PROBE_SECOND_FILE"] = str(second)
+    env["BATON_PROBE_SECOND_LINES"] = str(SECOND_LINES)
 
     pid, master = pty.fork()
     if pid == 0:
@@ -223,8 +235,11 @@ def main() -> int:
         if collapsed is None:
             raise RuntimeError("the collapsed diff still shows the last row")
         (evidence / "collapsed-screen.txt").write_text(collapsed + "\n")
-        if "Edited app.txt (+60 -60)" not in collapsed:
-            raise RuntimeError("the diff header is missing")
+        if "Edited 2 files (+100 -100)" not in collapsed:
+            raise RuntimeError("the multi-file diff header is missing")
+        for name in ("app.txt", "lib.txt"):
+            if name not in collapsed:
+                raise RuntimeError(f"the collapsed preview dropped {name}")
         os.write(master, b"\x14")
         expanded = wait_for_screen(
             master, LAST_LINE, args.timeout, args.width, args.height, transcript

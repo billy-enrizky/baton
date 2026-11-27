@@ -277,7 +277,7 @@ baton threads
 
 Each thread you open stays in a tab strip above the transcript. The active tab is highlighted and shows its position, from `1:` to `9:`. Press Alt plus a number to jump to that tab, so you can move between an implementation thread, a review thread, and a side chat without going back to the picker.
 
-The strip appears once a second tab is open and shows up to nine tabs, then a `...` marker when more are open. A running turn keeps running when you switch away; its tab carries a `*` marker and keeps streaming, and the next visit shows everything it produced. Archiving a thread closes its tab. A tab switch is refused while a request waits for your answer or a picker or full-screen view is open, so the current surface is never torn in the middle. Starting a thread that has not been sent yet keeps it in its tab; send one message to save it.
+The strip appears once a second tab is open and shows up to nine tabs, then a `...` marker when more are open. A running turn keeps running when you switch away; its tab carries a `*` marker and keeps streaming, and the next visit shows everything it produced. A queued follow-up starts automatically when its background turn finishes, unless the thread's harness changed and a handoff preview needs your review; that one stays queued for the next visit. Archiving a thread closes its tab. A tab switch is refused while a request waits for your answer or a picker or full-screen view is open, so the current surface is never torn in the middle. Starting a thread that has not been sent yet keeps it in its tab; send one message to save it.
 
 ### 4.6 Your first prompt
 

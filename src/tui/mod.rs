@@ -1975,13 +1975,21 @@ fn apply_engine_event(
                     .find(|tab| tab.id() == thread_id)
                     .map(|tab| tab.title().to_string());
                 if let Some(title) = title {
-                    let run = state.background_runs.entry(thread_id).or_default();
+                    let run = state.background_runs.entry(thread_id.clone()).or_default();
                     run.running = false;
                     run.queued_provider = None;
                     run.streaming_text.clear();
                     run.tool_lines.clear();
                     run.live_subagents.clear();
-                    if !ok {
+                    if ok {
+                        background_queue_advance(
+                            state,
+                            store,
+                            engine_command_sender,
+                            &thread_id,
+                            &title,
+                        );
+                    } else {
                         let detail = error.unwrap_or_else(|| "unknown error".into());
                         state.notice = Some(format!("background turn in {title} failed: {detail}"));
                     }
@@ -2185,6 +2193,25 @@ fn apply_engine_event(
                         state.queued_messages.len()
                     ));
                 }
+            } else {
+                if let Some(run) = state.background_runs.get_mut(&thread_id) {
+                    run.running = false;
+                    run.queued_provider = None;
+                    run.streaming_text.clear();
+                    run.tool_lines.clear();
+                }
+                if !retry {
+                    let _ = store.lock().unwrap().enqueue_message(&thread_id, &text);
+                }
+                let title = state
+                    .open_tabs
+                    .iter()
+                    .find(|tab| tab.id() == thread_id)
+                    .map(|tab| tab.title().to_string())
+                    .unwrap_or_else(|| thread_id[..8.min(thread_id.len())].to_string());
+                state.notice = Some(format!(
+                    "background turn in {title} rejected: {reason}; queued again"
+                ));
             }
         }
         EngineEvent::SteerRejected {
@@ -3297,6 +3324,95 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
             state.live_subagents.clear();
         }
     }
+}
+
+/// A handoff preview is required when the thread has prior messages that its
+/// current harness has not covered. A background auto-send must not skip that
+/// confirmation, so it keeps the queued message for a manual send instead.
+fn background_handoff_pending(store: &BatonStore, thread: &ThreadRow) -> bool {
+    let Ok(prior) = store.list_messages(&thread.id) else {
+        return true;
+    };
+    if prior.is_empty() {
+        return false;
+    }
+    let covered = store
+        .get_provider_session(&thread.id, thread.current_provider)
+        .ok()
+        .flatten()
+        .map(|session| session.covered_turn)
+        .unwrap_or(0);
+    prior.iter().any(|message| message.turn > covered)
+}
+
+/// Starts the next queued message for a thread whose turn just finished while
+/// another tab was active. The active tab's state is never touched.
+fn background_queue_advance(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    engine_command_sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+    thread_id: &str,
+    title: &str,
+) {
+    let thread = store.lock().unwrap().get_thread(thread_id).ok().flatten();
+    let Some(thread) = thread else {
+        return;
+    };
+    let queued = store
+        .lock()
+        .unwrap()
+        .list_queued_messages(thread_id)
+        .unwrap_or_default();
+    if queued.is_empty() {
+        return;
+    }
+    if background_handoff_pending(&store.lock().unwrap(), &thread) {
+        state.notice = Some(format!(
+            "queued message kept for {title}: switch to that tab to review the handoff"
+        ));
+        return;
+    }
+    let next = store
+        .lock()
+        .unwrap()
+        .pop_queued_message(thread_id)
+        .unwrap_or(None);
+    let Some(next) = next else {
+        return;
+    };
+    let remaining = store
+        .lock()
+        .unwrap()
+        .list_queued_messages(thread_id)
+        .unwrap_or_default()
+        .len();
+    let _ = store.lock().unwrap().record_prompt(&thread.cwd, &next);
+    state.clear_plans_for(thread_id);
+    let preview: String = next.chars().take(60).collect();
+    let text = match (&thread.goal, thread.goal_paused) {
+        (Some(goal), false) => format!("[goal: {goal}]\n{next}"),
+        _ => next,
+    };
+    let run = state
+        .background_runs
+        .entry(thread_id.to_string())
+        .or_default();
+    run.running = true;
+    run.queued_provider = None;
+    run.streaming_text.clear();
+    run.tool_lines.clear();
+    let _ = engine_command_sender.send(EngineCommand::Submit {
+        thread_id: thread_id.to_string(),
+        text,
+        permission_mode: thread.permission_mode,
+        skip_handoff: false,
+        expected_provider: None,
+        retry: false,
+        drain_queued: false,
+    });
+    state.notice = Some(format!(
+        "background turn in {title} finished; sending queued message ({remaining} remaining): {preview}"
+    ));
 }
 
 /// Tracks live turn state for an open tab that is not active. Threads without a
@@ -34345,7 +34461,12 @@ exit 1
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let (mut state, first, _second) = two_thread_state(home.path(), &store);
-        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&first, "queued after failure")
+            .unwrap();
         apply_engine_event(
             &mut state,
             &store,
@@ -34381,6 +34502,203 @@ exit 1
             state.notice
         );
         assert!(!state.background_runs.get(&first).unwrap().running);
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&first).unwrap(),
+            vec!["queued after failure".to_string()]
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_background_finish_starts_the_next_queued_message() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, first, second) = two_thread_state(home.path(), &store);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&first, "queued one")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&first, "queued two")
+            .unwrap();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnStarted {
+                thread_id: first.clone(),
+            },
+            &sender,
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: first.clone(),
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &sender,
+        );
+        match receiver.try_recv() {
+            Ok(EngineCommand::Submit {
+                thread_id, text, ..
+            }) => {
+                assert_eq!(thread_id, first);
+                assert_eq!(text, "queued one");
+            }
+            other => panic!("expected a background submit, got {:?}", other.is_ok()),
+        }
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&first).unwrap(),
+            vec!["queued two".to_string()]
+        );
+        assert!(state.background_runs.get(&first).unwrap().running);
+        assert_eq!(state.thread.id, second);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("sending queued message (1 remaining): queued one"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn a_background_finish_keeps_the_queue_for_a_handoff() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, first, _second) = two_thread_state(home.path(), &store);
+        store
+            .lock()
+            .unwrap()
+            .add_message(&first, 1, "user", None, None, "prior message")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&first, "queued one")
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnStarted {
+                thread_id: first.clone(),
+            },
+            &sender,
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: first.clone(),
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &sender,
+        );
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&first).unwrap(),
+            vec!["queued one".to_string()]
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("review the handoff"),
+            "{:?}",
+            state.notice
+        );
+        assert!(!state.background_runs.get(&first).unwrap().running);
+    }
+
+    #[test]
+    fn a_background_rejection_queues_the_message_again() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, first, _second) = two_thread_state(home.path(), &store);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&first, "queued one")
+            .unwrap();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnStarted {
+                thread_id: first.clone(),
+            },
+            &sender,
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: first.clone(),
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &sender,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(EngineCommand::Submit { .. })
+        ));
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnRejected {
+                thread_id: first.clone(),
+                text: "queued one".into(),
+                reason: "a turn is already running for this thread".into(),
+                retry: false,
+            },
+            &sender,
+        );
+        assert!(!state.background_runs.get(&first).unwrap().running);
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&first).unwrap(),
+            vec!["queued one".to_string()]
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("queued again"),
+            "{:?}",
+            state.notice
+        );
     }
 
     #[test]

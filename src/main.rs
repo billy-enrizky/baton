@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, claim, cli, config, doctor, exec_events, files, grants, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, serve, status, store, tasks, tui, types, usage, worktree};
+use baton::{activity, adapters, attach, checkpoints, claim, cli, config, doctor, exec_events, files, grants, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, serve, status, store, tasks, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -56,11 +56,13 @@ fn main_result(started: Instant) -> Result<()> {
     }
 
     let serving = matches!(&command, cli::Commands::Serve { .. });
+    let read_only_client = matches!(&command, cli::Commands::Attach { .. });
     let hosted_child = cli.host_id.is_some();
-    if !serving && !hosted_child {
+    if !serving && !hosted_child && !read_only_client {
         reap_startup_processes();
     }
     if !hosted_child
+        && !read_only_client
         && !matches!(
             &command,
             cli::Commands::Chat | cli::Commands::Serve { .. } | cli::Commands::Runs { .. }
@@ -708,6 +710,7 @@ fn main_result(started: Instant) -> Result<()> {
             requested_effort,
         ),
         cli::Commands::Serve { stdio, socket } => run_serve(&home, stdio, socket.as_deref()),
+        cli::Commands::Attach { url, json } => run_attach(&home, url, json),
         cli::Commands::Host { command } => run_host(&home, command),
         cli::Commands::Grant { command } => run_grant(&home, command),
         cli::Commands::Runs { command } => run_runs(command),
@@ -2834,6 +2837,23 @@ fn settle_run(run_id: &str, status: cli::RunStatus, force: bool, json: bool) -> 
             "closed {} open task(s) and settled {} open turn(s)",
             settlement.tasks, settlement.turns
         );
+    }
+    Ok(())
+}
+
+fn run_attach(home: &Path, url: Option<String>, json: bool) -> Result<()> {
+    let Some(url) = url else {
+        anyhow::bail!("attach needs --url from the host terminal pair command");
+    };
+    let credential = attach::parse_pairing_url(&url)?;
+    drop(url);
+    let status = attach::query_status(home, &credential, attach::ATTACH_TIMEOUT)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status.json())?);
+    } else {
+        println!("scope: {}", status.scope);
+        println!("threads: {}", status.threads);
+        println!("running turns: {}", status.running_turns);
     }
     Ok(())
 }

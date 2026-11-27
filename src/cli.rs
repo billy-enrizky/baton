@@ -122,6 +122,15 @@ pub enum Commands {
         #[arg(long, value_name = "PATH")]
         socket: Option<String>,
     },
+    /// Connect to a paired host and print its status
+    Attach {
+        /// Pairing URL from the host terminal pair command
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     /// Inspect or change host ownership of the local store
     Host {
         #[command(subcommand)]
@@ -802,6 +811,25 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn attach_accepts_a_pairing_url_and_json() {
+        let cli = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Attach {
+                url: Some(url),
+                json: true,
+            }) => assert!(url.starts_with("baton://local#")),
+            _ => panic!("expected attach"),
+        }
     }
 
     #[test]

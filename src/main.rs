@@ -3130,7 +3130,7 @@ fn run_serve(home: &Path, stdio: bool, socket: Option<&str>) -> Result<()> {
     match (listener, socket_target.as_deref()) {
         (Some(listener), Some(path)) => {
             let shared = Arc::new(Mutex::new(store));
-            let result = runtime.block_on(serve::socket_loop(listener, shared.clone(), path));
+            let result = runtime.block_on(serve::socket_loop(listener, shared.clone(), home, path));
             let store = shared.lock().unwrap();
             let finished = serve::finish_host(&store, &host_id, result);
             drop(store);
@@ -3142,23 +3142,6 @@ fn run_serve(home: &Path, stdio: bool, socket: Option<&str>) -> Result<()> {
         }
     }
     eprintln!("baton: host stopped");
-    Ok(())
-}
-
-async fn wait_for_host_stop() -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut sigterm =
-            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = sigterm.recv() => {}
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::signal::ctrl_c().await?;
-    }
     Ok(())
 }
 

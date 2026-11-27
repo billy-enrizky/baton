@@ -563,6 +563,62 @@ fn status(store: &BatonStore, args: Option<&Value>) -> Result<Value> {
     }
 }
 
+fn message_json(message: &crate::store::MessageRow) -> Value {
+    json!({
+        "id": message.id,
+        "turn": message.turn,
+        "role": message.role,
+        "provider": message.provider,
+        "model": message.model,
+        "text": message.text,
+        "created_at": message.created_at,
+    })
+}
+
+fn messages(store: &BatonStore, args: Option<&Value>) -> Result<Value> {
+    let args = match args {
+        None | Some(Value::Null) => anyhow::bail!("messages args must name a thread"),
+        Some(Value::Object(args)) => args,
+        Some(_) => anyhow::bail!("messages args must be an object"),
+    };
+    let thread = match args.get("thread") {
+        Some(Value::String(thread)) if !thread.is_empty() => thread.as_str(),
+        _ => anyhow::bail!("messages args.thread must be a non-empty string"),
+    };
+    let after = match args.get("after") {
+        None | Some(Value::Null) => 0,
+        Some(value) => value
+            .as_i64()
+            .filter(|after| *after >= 0)
+            .ok_or_else(|| anyhow::anyhow!("messages args.after must be a non-negative integer"))?,
+    };
+    let limit = match args.get("limit") {
+        None | Some(Value::Null) => 50,
+        Some(value) => value
+            .as_u64()
+            .map(|limit| (limit as usize).clamp(1, 200))
+            .ok_or_else(|| anyhow::anyhow!("messages args.limit must be an integer"))?,
+    };
+    if store.get_thread(thread)?.is_none() {
+        return Ok(error_response(
+            Value::Null,
+            "not_found",
+            format!("no thread matches {thread}"),
+        ));
+    }
+    let rows = store.list_messages_after(thread, after, limit)?;
+    let cursor = rows.last().map(|message| message.id).unwrap_or(after);
+    Ok(response(
+        Value::Null,
+        json!({
+            "thread_id": thread,
+            "cursor": cursor,
+            "running_turns": store.count_open_turns(Some(thread))?,
+            "messages": rows.iter().map(message_json).collect::<Vec<_>>(),
+        }),
+    ))
+}
+
 /// Handles one protocol line. `None` means the line produced no response.
 pub fn handle_line(store: &BatonStore, line: &str) -> Option<Value> {
     let value: Value = match serde_json::from_str(line) {
@@ -618,6 +674,13 @@ pub fn handle_line(store: &BatonStore, line: &str) -> Option<Value> {
             Err(error) => Some(error_response(id.clone(), "internal", error.to_string())),
         },
         "status" => match status(store, object.get("args")) {
+            Ok(mut value) => {
+                value["id"] = id.clone();
+                Some(value)
+            }
+            Err(error) => Some(error_response(id.clone(), "internal", error.to_string())),
+        },
+        "messages" => match messages(store, object.get("args")) {
             Ok(mut value) => {
                 value["id"] = id.clone();
                 Some(value)
@@ -769,6 +832,52 @@ mod tests {
         .unwrap();
         assert_eq!(unknown["id"], 11);
         assert_eq!(unknown["error"]["code"], "not_implemented");
+
+        let open_id = store.list_messages(&thread).unwrap()[0].id;
+        let first = store
+            .add_message(&thread, 1, "user", Some("codex"), None, "first")
+            .unwrap();
+        let second = store
+            .add_message(&thread, 1, "assistant", Some("codex"), None, "second")
+            .unwrap();
+        let page = handle_line(
+            &store,
+            &format!(
+                r#"{{"v":1,"kind":"request","id":14,"command":"messages","args":{{"thread":"{thread}","after":0,"limit":2}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(page["id"], 14);
+        assert_eq!(page["result"]["thread_id"], thread);
+        assert_eq!(page["result"]["running_turns"], 1);
+        assert_eq!(page["result"]["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(page["result"]["messages"][0]["id"], open_id);
+        assert_eq!(page["result"]["messages"][1]["id"], first);
+        assert_eq!(page["result"]["cursor"], first);
+
+        let next = handle_line(
+            &store,
+            &format!(
+                r#"{{"v":1,"kind":"request","id":15,"command":"messages","args":{{"thread":"{thread}","after":{first},"limit":50}}}}"#
+            ),
+        )
+        .unwrap();
+        assert_eq!(next["result"]["cursor"], second);
+        assert_eq!(next["result"]["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(next["result"]["messages"][0]["id"], second);
+
+        let missing = handle_line(
+            &store,
+            r#"{"v":1,"kind":"request","id":16,"command":"messages","args":{"thread":"missing"}}"#,
+        )
+        .unwrap();
+        assert_eq!(missing["error"]["code"], "not_found");
+        let malformed = handle_line(
+            &store,
+            r#"{"v":1,"kind":"request","id":17,"command":"messages","args":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(malformed["error"]["code"], "internal");
     }
 
     #[cfg(unix)]

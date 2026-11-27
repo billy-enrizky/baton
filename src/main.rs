@@ -714,7 +714,15 @@ fn main_result(started: Instant) -> Result<()> {
             requested_effort,
         ),
         cli::Commands::Serve { stdio, socket } => run_serve(&home, stdio, socket.as_deref()),
-        cli::Commands::Attach { url, json } => run_attach(&home, url, json),
+        cli::Commands::Attach {
+            url,
+            json,
+            thread,
+            messages,
+            after,
+            limit,
+            follow,
+        } => run_attach(&home, url, json, thread, messages, after, limit, follow),
         cli::Commands::Host { command } => run_host(&home, command),
         cli::Commands::Grant { command } => run_grant(&home, command),
         cli::Commands::Audit { command } => run_audit(command),
@@ -2899,21 +2907,124 @@ fn settle_run(run_id: &str, status: cli::RunStatus, force: bool, json: bool) -> 
     Ok(())
 }
 
-fn run_attach(home: &Path, url: Option<String>, json: bool) -> Result<()> {
+#[allow(clippy::too_many_arguments)]
+fn run_attach(
+    home: &Path,
+    url: Option<String>,
+    json: bool,
+    thread: Option<String>,
+    messages: bool,
+    after: i64,
+    limit: usize,
+    follow: bool,
+) -> Result<()> {
     let Some(url) = url else {
         anyhow::bail!("attach needs --url from the host terminal pair command");
     };
     let credential = attach::parse_pairing_url(&url)?;
     drop(url);
-    let status = attach::query_status(home, &credential, attach::ATTACH_TIMEOUT)?;
+    if follow && json {
+        anyhow::bail!("--follow cannot be combined with --json");
+    }
+    if after < 0 {
+        anyhow::bail!("--after must be a non-negative message id");
+    }
+    if !(1..=200).contains(&limit) {
+        anyhow::bail!("--limit must be between 1 and 200");
+    }
+    let Some(thread) = thread else {
+        if messages || follow || after != 0 {
+            anyhow::bail!("--thread is needed for --messages, --after, or --follow");
+        }
+        let status = attach::query_status(home, &credential, attach::ATTACH_TIMEOUT)?;
+        print_attach_status(&status, json);
+        return Ok(());
+    };
+    if !messages && !follow {
+        let status =
+            attach::query_thread_status(home, &credential, &thread, attach::ATTACH_TIMEOUT)?;
+        print_attach_status(&status, json);
+        return Ok(());
+    }
     if json {
-        println!("{}", serde_json::to_string_pretty(&status.json())?);
-    } else {
-        println!("scope: {}", status.scope);
-        println!("threads: {}", status.threads);
-        println!("running turns: {}", status.running_turns);
+        let page = attach::query_messages(
+            home,
+            &credential,
+            &thread,
+            after,
+            limit,
+            attach::ATTACH_TIMEOUT,
+        )?;
+        println!("{}", serde_json::to_string_pretty(&page.json())?);
+        return Ok(());
+    }
+    let mut cursor = after;
+    let mut idle_pages = 0;
+    let mut printed_cursor = false;
+    loop {
+        let page = attach::query_messages(
+            home,
+            &credential,
+            &thread,
+            cursor,
+            limit,
+            attach::ATTACH_TIMEOUT,
+        )?;
+        for message in &page.messages {
+            let role = sanitize::sanitize_single_line(&message.role);
+            let text = sanitize::sanitize_terminal_text(&message.text);
+            let model = message
+                .model
+                .as_deref()
+                .map(sanitize::sanitize_single_line)
+                .unwrap_or_else(|| "default".to_string());
+            let provider = message
+                .provider
+                .as_deref()
+                .map(sanitize::sanitize_single_line)
+                .unwrap_or_else(|| "-".to_string());
+            println!(
+                "#{} turn {} {role} ({provider}/{model})",
+                message.id, message.turn
+            );
+            for line in text.lines() {
+                println!("  {line}");
+            }
+        }
+        cursor = page.cursor;
+        if !follow {
+            println!("cursor {cursor} · running turns {}", page.running_turns);
+            printed_cursor = true;
+            break;
+        }
+        if page.messages.is_empty() && page.running_turns == 0 {
+            idle_pages += 1;
+            if idle_pages >= 2 {
+                println!("cursor {cursor} · idle");
+                printed_cursor = true;
+                break;
+            }
+        } else {
+            idle_pages = 0;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    if !printed_cursor {
+        println!("cursor {cursor}");
     }
     Ok(())
+}
+
+fn print_attach_status(status: &attach::AttachStatus, json: bool) {
+    if json {
+        if let Ok(text) = serde_json::to_string_pretty(&status.json()) {
+            println!("{text}");
+        }
+        return;
+    }
+    println!("scope: {}", status.scope);
+    println!("threads: {}", status.threads);
+    println!("running turns: {}", status.running_turns);
 }
 
 fn run_audit(command: cli::AuditCommand) -> Result<()> {

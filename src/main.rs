@@ -1,4 +1,4 @@
-use baton::{activity, adapters, attach, audit, checkpoints, claim, cli, config, doctor, exec_events, files, grants, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, serve, status, store, tasks, tui, types, usage, worktree};
+use baton::{activity, adapters, attach, audit, checkpoints, claim, cli, config, doctor, exec_events, files, grants, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, schedule, serve, status, store, tasks, tui, types, usage, worktree};
 
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
@@ -2428,6 +2428,7 @@ fn main_result(started: Instant) -> Result<()> {
             }
             Ok(())
         }
+        cli::Commands::Schedule { command } => run_schedule(&home, &cwd, command),
         cli::Commands::Queue { thread_id, clear, json } => {
             let store = open_store(None)?;
             let thread = match thread_id.as_deref().or(cli.thread.as_deref()) {
@@ -2896,6 +2897,138 @@ fn run_bench(home: &Path, started: Instant, target: &str, json: bool, repeat: u3
 
 fn open_store(host_id: Option<&str>) -> Result<BatonStore> {
     BatonStore::open_client(&paths::baton_db_path(), host_id)
+}
+
+fn run_schedule(home: &Path, cwd: &Path, command: cli::ScheduleCommand) -> Result<()> {
+    let store = open_store(None)?;
+    match command {
+        cli::ScheduleCommand::Add {
+            cron,
+            prompt,
+            thread,
+            json,
+        } => {
+            let expression = schedule::parse(&cron)?;
+            let next = schedule::next_after(&expression, chrono::Utc::now())?;
+            let next_run_at = next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+            let thread = match thread.as_deref() {
+                Some(thread_id) => resolve_thread(&store, thread_id)?,
+                None => store
+                    .list_threads_for_path(cwd)?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("no threads in this directory; start one or pass --thread")
+                    })?,
+            };
+            let row = store.add_schedule(&thread.id, &prompt, &cron, &next_run_at)?;
+            let audit = cli_audit_event(
+                home,
+                audit::AuditAction::ScheduleAdd,
+                Some(&row.id),
+                serde_json::json!({
+                    "thread_id": thread.id,
+                    "expression": cron,
+                    "next_run_at": next_run_at,
+                }),
+            )?;
+            store.append_audit_event(&audit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "id": row.id,
+                        "thread_id": thread.id,
+                        "expression": row.expression,
+                        "next_run_at": row.next_run_at,
+                    }))?
+                );
+            } else {
+                println!(
+                    "schedule {} · thread {} · next {} · {}",
+                    &row.id[..8.min(row.id.len())],
+                    &thread.id[..8.min(thread.id.len())],
+                    row.next_run_at,
+                    row.expression
+                );
+            }
+        }
+        cli::ScheduleCommand::List { json } => {
+            let schedules = store.list_schedules()?;
+            if json {
+                let rows: Vec<serde_json::Value> = schedules
+                    .iter()
+                    .map(|row| {
+                        serde_json::json!({
+                            "id": row.id,
+                            "thread_id": row.thread_id,
+                            "prompt": row.prompt,
+                            "expression": row.expression,
+                            "next_run_at": row.next_run_at,
+                            "last_run_at": row.last_run_at,
+                            "enabled": row.enabled,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "schedules": rows,
+                    }))?
+                );
+            } else if schedules.is_empty() {
+                println!("schedules: empty");
+            } else {
+                for row in schedules {
+                    let prompt: String = row.prompt.chars().take(60).collect();
+                    println!(
+                        "{}  next {}  thread {}  {}  {}",
+                        &row.id[..8.min(row.id.len())],
+                        row.next_run_at,
+                        &row.thread_id[..8.min(row.thread_id.len())],
+                        row.expression,
+                        prompt
+                    );
+                }
+            }
+        }
+        cli::ScheduleCommand::Remove { id, json } => {
+            let matches: Vec<store::ScheduleRow> = store
+                .list_schedules()?
+                .into_iter()
+                .filter(|row| row.id.starts_with(&id))
+                .collect();
+            match matches.as_slice() {
+                [] => anyhow::bail!("no schedule matches {id}"),
+                [row] => {
+                    store.remove_schedule(&row.id)?;
+                    let audit = cli_audit_event(
+                        home,
+                        audit::AuditAction::ScheduleRemove,
+                        Some(&row.id),
+                        serde_json::json!({ "thread_id": row.thread_id }),
+                    )?;
+                    store.append_audit_event(&audit)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "schema_version": status::SCHEMA_VERSION,
+                                "id": row.id,
+                                "removed": true,
+                            }))?
+                        );
+                    } else {
+                        println!("schedule {} removed", &row.id[..8.min(row.id.len())]);
+                    }
+                }
+                _ => anyhow::bail!("schedule prefix {id} is ambiguous"),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_runs(command: cli::RunCommand) -> Result<()> {
@@ -3654,8 +3787,18 @@ fn run_serve(home: &Path, stdio: bool, socket: Option<&str>) -> Result<()> {
             let root = std::env::current_dir()?;
             let mut engine = Some(serve::ServeEngine::start(shared.clone(), home, &root)?);
             let pool = engine.as_ref().map(serve::ServeEngine::pool);
+            let scheduler = pool.as_ref().map(|pool| {
+                runtime.spawn(serve::schedule_loop(
+                    shared.clone(),
+                    home.to_path_buf(),
+                    pool.clone(),
+                ))
+            });
             let result =
                 runtime.block_on(serve::socket_loop(listener, shared.clone(), home, path, pool));
+            if let Some(scheduler) = scheduler {
+                scheduler.abort();
+            }
             if let Some(engine) = engine.as_mut() {
                 engine.stop();
             }

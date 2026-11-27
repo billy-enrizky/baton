@@ -546,6 +546,106 @@ fn serve_shutdown_settles_work_from_stopped_owners() {
 
 #[cfg(unix)]
 #[test]
+fn serve_fires_a_due_schedule_and_audits_it() {
+    use baton::store::BatonStore;
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let harness = bin.join("codex");
+    std::fs::write(&harness, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let (schedule_id, due) = {
+        let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+        let thread = store
+            .create_thread(baton::store::NewThread {
+                title: "scheduled turn".into(),
+                cwd: root.path().to_string_lossy().to_string(),
+                current_provider: baton::types::ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let due = (chrono::Utc::now() - chrono::Duration::minutes(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let schedule = store
+            .add_schedule(&thread.id, "scheduled prompt", "* * * * *", &due)
+            .unwrap();
+        (schedule.id, due)
+    };
+
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_baton"))
+            .arg("serve")
+            .current_dir(root.path())
+            .env("BATON_HOME", home.path())
+            .env("PATH", &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let mut output = String::new();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut ready = false;
+    while Instant::now() < deadline {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                output.push_str(&line);
+                output.push('\n');
+                if line.contains("host ready") {
+                    ready = true;
+                    break;
+                }
+            }
+            Err(_) if child.0.try_wait().unwrap().is_some() => break,
+            Err(_) => {}
+        }
+    }
+    assert!(ready, "serve did not report readiness: {output}");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut fired = false;
+    while Instant::now() < deadline {
+        if let Ok(store) = BatonStore::open_read_only(&home.path().join("baton.sqlite")) {
+            let audit = store.list_audit_events(20).unwrap_or_default();
+            if audit.iter().any(|event| {
+                event.action == "schedule.trigger" && event.target.as_deref() == Some(&schedule_id)
+            }) {
+                let rows = store.list_schedules().unwrap_or_default();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].last_run_at.as_deref(), Some(due.as_str()));
+                assert_ne!(rows[0].next_run_at, due);
+                fired = true;
+                break;
+            }
+        }
+        if child.0.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(fired, "the due schedule did not fire: {output}");
+}
+
+#[cfg(unix)]
+#[test]
 fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
     use baton::store::BatonStore;
     use std::os::unix::fs::PermissionsExt;

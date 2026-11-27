@@ -14,8 +14,10 @@ pub const LOCAL_CLI_CONFIRMATION: &str = "local_cli";
 pub const MCP_STDIO_ACTOR: &str = "mcp_stdio";
 pub const MCP_STDIO_CONFIRMATION: &str = "stdio_spawner";
 pub const HOST_ENGINE_ACTOR: &str = "host_engine";
+pub const SCHEDULER_ACTOR: &str = "scheduler";
 pub const TUI_ACTOR: &str = "tui";
 pub const HOST_SESSION_CONFIRMATION: &str = "host_session";
+pub const SCHEDULER_CONFIRMATION: &str = "host_schedule";
 pub const ADMIN_SCOPE: &str = "admin";
 pub const OPERATE_SCOPE: &str = "operate";
 pub const APPROVE_SCOPE: &str = "approve";
@@ -47,6 +49,9 @@ pub enum AuditAction {
     TurnSubmitRequest,
     QueueClear,
     ThreadFork,
+    ScheduleAdd,
+    ScheduleRemove,
+    ScheduleTrigger,
 }
 
 impl AuditAction {
@@ -72,6 +77,9 @@ impl AuditAction {
             AuditAction::TurnSubmitRequest => "turn.submit_request",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
+            AuditAction::ScheduleAdd => "schedule.add",
+            AuditAction::ScheduleRemove => "schedule.remove",
+            AuditAction::ScheduleTrigger => "schedule.trigger",
         }
     }
 
@@ -83,8 +91,10 @@ impl AuditAction {
             | AuditAction::GrantRenew
             | AuditAction::GrantRevoke
             | AuditAction::QueueClear
-            | AuditAction::ThreadFork => ADMIN_SCOPE,
-            AuditAction::TurnSubmit => OPERATE_SCOPE,
+            | AuditAction::ThreadFork
+            | AuditAction::ScheduleAdd
+            | AuditAction::ScheduleRemove => ADMIN_SCOPE,
+            AuditAction::TurnSubmit | AuditAction::ScheduleTrigger => OPERATE_SCOPE,
             AuditAction::ApprovalDecide | AuditAction::QuestionAnswer => APPROVE_SCOPE,
             AuditAction::GitCommit
             | AuditAction::GitPush
@@ -110,6 +120,7 @@ pub fn confirmation_for(actor: &str) -> &'static str {
         HOST_TERMINAL_ACTOR => HOST_TERMINAL_CONFIRMATION,
         LOCAL_CLI_ACTOR => LOCAL_CLI_CONFIRMATION,
         MCP_STDIO_ACTOR => MCP_STDIO_CONFIRMATION,
+        SCHEDULER_ACTOR => SCHEDULER_CONFIRMATION,
         _ => HOST_SESSION_CONFIRMATION,
     }
 }
@@ -291,6 +302,9 @@ mod tests {
         assert_eq!(AuditAction::MemoryRemove.scope(), SETTINGS_SCOPE);
         assert_eq!(AuditAction::MemoryClear.scope(), SETTINGS_SCOPE);
         assert_eq!(AuditAction::TurnSubmitRequest.scope(), OPERATE_SCOPE);
+        assert_eq!(AuditAction::ScheduleTrigger.scope(), OPERATE_SCOPE);
+        assert_eq!(AuditAction::ScheduleAdd.scope(), ADMIN_SCOPE);
+        assert_eq!(AuditAction::ScheduleRemove.scope(), ADMIN_SCOPE);
     }
 
     #[test]
@@ -306,6 +320,7 @@ mod tests {
             HOST_SESSION_CONFIRMATION
         );
         assert_eq!(confirmation_for(TUI_ACTOR), HOST_SESSION_CONFIRMATION);
+        assert_eq!(confirmation_for(SCHEDULER_ACTOR), SCHEDULER_CONFIRMATION);
     }
 
     #[test]

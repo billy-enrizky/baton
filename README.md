@@ -87,6 +87,7 @@ Site: https://baton.openbrowser.me · Docs: https://baton.openbrowser.me/docs
   - 8.8 [Settle a stalled run](#88-settle-a-stalled-run)
   - 8.9 [Shared directories](#89-shared-directories)
   - 8.10 [CLI examples](#810-cli-examples)
+  - 8.11 [Schedules](#811-schedules)
 - 9\. [Git delivery loop](#9-git-delivery-loop)
   - 9.1 [Status, commit, push](#91-status-commit-push)
   - 9.2 [Checks](#92-checks)
@@ -566,6 +567,16 @@ baton orchestrate --review <run-id> --task 2
 baton orchestrate --archive <run-id>
 baton runs settle <run-id> --status cancelled
 ```
+
+### 8.11 Schedules
+
+```sh
+baton schedule add --thread <id> --cron "0 9 * * 1-5" --prompt "Check the failing tests"
+baton schedule list --json
+baton schedule remove <id>
+```
+
+Cron is five fields in UTC: minute, hour, day of month, month, and weekday. Each field accepts `*`, a number, a list, a range, and a step. `baton serve` checks due schedules every second, claims each tick with a compare-and-set so two schedulers cannot fire the same run, writes a `schedule.trigger` audit row, and posts the prompt into its thread. A due schedule is skipped while its thread is archived or its stored expression is invalid, and the skip is logged. Add or remove schedules while no host or TUI owns the store; the host reads the store when it starts.
 
 ## 9. Git delivery loop
 

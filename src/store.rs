@@ -13,6 +13,18 @@ use uuid::Uuid;
 use crate::types::{PermissionMode, ProviderId, SessionMode, TurnPhase, TurnUsage};
 
 #[derive(Debug, Clone)]
+pub struct ScheduleRow {
+    pub id: String,
+    pub thread_id: String,
+    pub prompt: String,
+    pub expression: String,
+    pub next_run_at: String,
+    pub last_run_at: Option<String>,
+    pub created_at: String,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct ThreadRow {
     pub id: String,
     pub title: String,
@@ -514,6 +526,19 @@ pub struct UsageRow {
     pub created_at: String,
 }
 
+fn schedule_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ScheduleRow> {
+    Ok(ScheduleRow {
+        id: row.get(0)?,
+        thread_id: row.get(1)?,
+        prompt: row.get(2)?,
+        expression: row.get(3)?,
+        next_run_at: row.get(4)?,
+        last_run_at: row.get(5)?,
+        created_at: row.get(6)?,
+        enabled: row.get::<_, i64>(7)? != 0,
+    })
+}
+
 pub struct NewThread {
     pub title: String,
     pub cwd: String,
@@ -536,7 +561,7 @@ fn store_home(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 /// A claim is replayed for this long. After that, a retry starts a new turn
 /// instead of holding store rows forever.
 const IDEMPOTENCY_RETENTION_DAYS: i64 = 7;
@@ -824,6 +849,17 @@ BEFORE DELETE ON audit_events
 BEGIN
   SELECT RAISE(ABORT, 'audit_events_append_only');
 END;
+CREATE TABLE IF NOT EXISTS schedules (
+  id TEXT PRIMARY KEY,
+  thread_id TEXT NOT NULL,
+  prompt TEXT NOT NULL,
+  expression TEXT NOT NULL,
+  next_run_at TEXT NOT NULL,
+  last_run_at TEXT,
+  created_at TEXT NOT NULL,
+  enabled INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS schedules_next_run_idx ON schedules (enabled, next_run_at);
 CREATE TABLE IF NOT EXISTS host_claim (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   host_id TEXT NOT NULL,
@@ -1582,6 +1618,82 @@ impl BatonStore {
                 |row| row.get(0),
             )
             .optional()?)
+    }
+
+    pub fn add_schedule(
+        &self,
+        thread_id: &str,
+        prompt: &str,
+        expression: &str,
+        next_run_at: &str,
+    ) -> Result<ScheduleRow> {
+        let now = now_iso();
+        let row = ScheduleRow {
+            id: Uuid::new_v4().to_string(),
+            thread_id: thread_id.to_string(),
+            prompt: prompt.to_string(),
+            expression: expression.to_string(),
+            next_run_at: next_run_at.to_string(),
+            last_run_at: None,
+            created_at: now.clone(),
+            enabled: true,
+        };
+        self.write_execute(
+            "INSERT INTO schedules (id, thread_id, prompt, expression, next_run_at, created_at, enabled) VALUES (?, ?, ?, ?, ?, ?, 1)",
+            params![
+                row.id,
+                row.thread_id,
+                row.prompt,
+                row.expression,
+                row.next_run_at,
+                row.created_at
+            ],
+        )?;
+        Ok(row)
+    }
+
+    pub fn list_schedules(&self) -> Result<Vec<ScheduleRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, thread_id, prompt, expression, next_run_at, last_run_at, created_at, enabled FROM schedules ORDER BY next_run_at, id",
+        )?;
+        let rows = statement
+            .query_map([], schedule_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn due_schedules_at(&self, now: &str) -> Result<Vec<ScheduleRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, thread_id, prompt, expression, next_run_at, last_run_at, created_at, enabled FROM schedules WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at, id",
+        )?;
+        let rows = statement
+            .query_map(params![now], schedule_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Claims one due tick with an optimistic compare-and-set. A second host
+    /// or scheduler that still holds the old `next_run_at` loses the race.
+    pub fn claim_schedule(
+        &self,
+        id: &str,
+        expected_next_run_at: &str,
+        next_run_at: &str,
+    ) -> Result<bool> {
+        let tx = self.write()?;
+        let changed = tx.execute(
+            "UPDATE schedules SET last_run_at = next_run_at, next_run_at = ? WHERE id = ? AND next_run_at = ? AND enabled = 1",
+            params![next_run_at, id, expected_next_run_at],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    pub fn remove_schedule(&self, id: &str) -> Result<bool> {
+        let tx = self.write()?;
+        let changed = tx.execute("DELETE FROM schedules WHERE id = ?", params![id])?;
+        tx.commit()?;
+        Ok(changed == 1)
     }
 
     pub fn draft_thread(&self, input: NewThread) -> ThreadRow {
@@ -4744,6 +4856,91 @@ mod tests {
             revoked_at: None,
             label: None,
         }
+    }
+
+    #[test]
+    fn schedules_round_trip_and_claim_once() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "scheduled".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let row = store
+            .add_schedule(
+                &thread.id,
+                "run it",
+                "*/15 * * * *",
+                "2026-11-27T10:15:00.000Z",
+            )
+            .unwrap();
+        assert_eq!(store.list_schedules().unwrap().len(), 1);
+        assert!(store
+            .due_schedules_at("2026-11-27T10:14:59.000Z")
+            .unwrap()
+            .is_empty());
+        let due = store.due_schedules_at("2026-11-27T10:15:00.000Z").unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(store
+            .claim_schedule(
+                &row.id,
+                "2026-11-27T10:15:00.000Z",
+                "2026-11-27T10:30:00.000Z"
+            )
+            .unwrap());
+        assert!(!store
+            .claim_schedule(
+                &row.id,
+                "2026-11-27T10:15:00.000Z",
+                "2026-11-27T10:45:00.000Z"
+            )
+            .unwrap());
+        let rows = store.list_schedules().unwrap();
+        assert_eq!(rows[0].next_run_at, "2026-11-27T10:30:00.000Z");
+        assert_eq!(
+            rows[0].last_run_at.as_deref(),
+            Some("2026-11-27T10:15:00.000Z")
+        );
+        assert!(store.remove_schedule(&row.id).unwrap());
+        assert!(store.list_schedules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_schedule_claim_requires_the_expected_due_time() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "scheduled".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let row = store
+            .add_schedule(
+                &thread.id,
+                "run it",
+                "0 * * * *",
+                "2026-11-27T10:00:00.000Z",
+            )
+            .unwrap();
+        assert!(!store
+            .claim_schedule(
+                &row.id,
+                "2026-11-27T09:00:00.000Z",
+                "2026-11-27T11:00:00.000Z"
+            )
+            .unwrap());
+        assert!(store
+            .claim_schedule(
+                &row.id,
+                "2026-11-27T10:00:00.000Z",
+                "2026-11-27T11:00:00.000Z"
+            )
+            .unwrap());
     }
 
     #[test]

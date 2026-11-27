@@ -30,6 +30,7 @@ pub mod redact;
 pub mod resume;
 pub mod roles;
 pub mod runtime;
+pub mod schedule;
 pub mod sanitize;
 pub mod shell;
 pub mod side_chat;

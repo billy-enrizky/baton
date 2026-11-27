@@ -33,6 +33,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Composer file mentions | TUI | typing `@path` offers matching directories with a trailing slash, then ranked project files; Tab or Enter replaces only the mention token, and ordinary text and addresses never start an index load |
 | Shell completions | CLI | `baton completions <shell>` generates from the clap command graph and handles a broken pipe |
 | Issue tasks | CLI and TUI | `/task [number]` or `baton task <number>` reads an open issue from `origin` and creates a linked worktree; no number opens an issue picker |
+| Schedules | CLI and host | `baton schedule add --thread <id> --cron "<minute hour day month weekday>" --prompt "..."` stores a UTC cron schedule; `list` and `remove` manage it; `baton serve` claims each due tick once, writes a `schedule.trigger` audit row, and posts the prompt into the thread; `tests/schedule_cli.rs`, `serve_fires_a_due_schedule_and_audits_it`, and the `schedule-claim-state-machine` gate prove it |
 | Side chat | TUI | `/btw` forks the thread, marks it as a side chat of the source, opens it, and prefills an optional prompt; the source is unchanged |
 | Fork | CLI | `baton fork --json` creates a new thread without changing the source |
 | Native fork | CLI | `baton fork --native` attaches a Codex or OpenCode native session to the fork |

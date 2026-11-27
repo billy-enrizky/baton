@@ -12,7 +12,10 @@ pub const HOST_TERMINAL_CONFIRMATION: &str = "host_terminal";
 pub const LOCAL_CLI_CONFIRMATION: &str = "local_cli";
 pub const MCP_STDIO_ACTOR: &str = "mcp_stdio";
 pub const MCP_STDIO_CONFIRMATION: &str = "stdio_spawner";
+pub const HOST_ENGINE_ACTOR: &str = "host_engine";
+pub const HOST_SESSION_CONFIRMATION: &str = "host_session";
 pub const ADMIN_SCOPE: &str = "admin";
+pub const OPERATE_SCOPE: &str = "operate";
 pub const DURABLE_RETENTION: &str = "durable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +23,7 @@ pub enum AuditAction {
     GrantMint,
     GrantRenew,
     GrantRevoke,
+    TurnSubmit,
     QueueClear,
     ThreadFork,
 }
@@ -30,6 +34,7 @@ impl AuditAction {
             AuditAction::GrantMint => "grant.mint",
             AuditAction::GrantRenew => "grant.renew",
             AuditAction::GrantRevoke => "grant.revoke",
+            AuditAction::TurnSubmit => "turn.submit",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
         }
@@ -106,6 +111,7 @@ mod tests {
         assert_eq!(event.retention, DURABLE_RETENTION);
         assert_eq!(event.payload_digest.len(), 64);
         assert_eq!(AuditAction::GrantRenew.as_str(), "grant.renew");
+        assert_eq!(AuditAction::TurnSubmit.as_str(), "turn.submit");
         assert_eq!(AuditAction::QueueClear.as_str(), "queue.clear");
         assert_eq!(AuditAction::ThreadFork.as_str(), "thread.fork");
     }

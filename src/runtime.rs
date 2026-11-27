@@ -1074,7 +1074,30 @@ async fn execute_turn(
         let provider = current.current_provider;
         let prior = store.list_messages(thread_id)?;
         let session = store.get_provider_session(thread_id, provider)?;
-        let turn = store.submit_turn(thread_id, provider, Some(&model), text, drain_queued)?;
+        let audit = crate::audit::event(
+            crate::audit::HOST_ENGINE_ACTOR,
+            &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+            Some(thread_id),
+            crate::audit::AuditAction::TurnSubmit,
+            crate::audit::OPERATE_SCOPE,
+            crate::audit::HOST_SESSION_CONFIRMATION,
+            &serde_json::json!({
+                "thread_id": thread_id,
+                "provider": provider.as_str(),
+                "model": model,
+                "drain_queued": drain_queued,
+            }),
+        )?;
+        let turn = store
+            .submit_turn_with_audit(
+                thread_id,
+                provider,
+                Some(&model),
+                text,
+                drain_queued,
+                &audit,
+            )?
+            .0;
         (prior, turn, session)
     };
 
@@ -3575,6 +3598,20 @@ mod tests {
         assert_eq!(turn.provider_turn_id.as_deref(), Some("provider-turn-1"));
         let messages = store.lock().unwrap().list_messages(&thread_id).unwrap();
         assert!(messages.iter().any(|message| message.role == "assistant" && message.text == "done"));
+        let events = store.lock().unwrap().list_audit_events(10).unwrap();
+        let submit = events
+            .iter()
+            .find(|event| event.action == "turn.submit")
+            .expect("the engine writes one turn.submit row");
+        assert_eq!(submit.actor, crate::audit::HOST_ENGINE_ACTOR);
+        assert_eq!(submit.scope, crate::audit::OPERATE_SCOPE);
+        assert_eq!(submit.confirmation, crate::audit::HOST_SESSION_CONFIRMATION);
+        assert_eq!(submit.thread_id.as_deref(), Some(thread_id.as_str()));
+        assert_eq!(
+            events.len(),
+            1,
+            "one accepted turn writes one row: {events:?}"
+        );
     }
 
     #[tokio::test]

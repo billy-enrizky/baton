@@ -146,6 +146,7 @@ fn main_result(started: Instant) -> Result<()> {
                 eprintln!("usage: baton exec <prompt>");
                 std::process::exit(2);
             }
+            claim::ensure_installation_id(&home)?;
             let store = Arc::new(Mutex::new(open_store(cli.host_id.as_deref())?));
             let resolved = resolve_config(&home, &cwd);
             let requested_provider = cli.provider.as_deref().and_then(ProviderId::parse);
@@ -3428,6 +3429,7 @@ fn run_chat(
     initial_prompt: Option<String>,
     requested_effort: Option<String>,
 ) -> Result<()> {
+    claim::ensure_installation_id(home)?;
     let (store, client_refusal) = claim::open_tui_store(&paths::baton_db_path())?;
     let store = Arc::new(Mutex::new(store));
     let resolved = resolve_config(home, cwd);

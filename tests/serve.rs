@@ -8,6 +8,20 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+fn turn_event(thread_id: &str) -> baton::store::NewAuditEvent {
+    baton::audit::event(
+        baton::audit::HOST_ENGINE_ACTOR,
+        "installation",
+        Some(thread_id),
+        baton::audit::AuditAction::TurnSubmit,
+        baton::audit::OPERATE_SCOPE,
+        baton::audit::HOST_SESSION_CONFIRMATION,
+        &serde_json::json!({"thread_id": thread_id}),
+    )
+    .unwrap()
+}
+
+#[cfg(unix)]
 struct ChildGuard(std::process::Child);
 
 #[cfg(unix)]
@@ -353,7 +367,14 @@ fn serve_shutdown_settles_work_from_stopped_owners() {
             })
             .unwrap();
         store
-            .submit_turn(&thread.id, ProviderId::Codex, None, "child work", false)
+            .submit_turn_with_audit(
+                &thread.id,
+                ProviderId::Codex,
+                None,
+                "child work",
+                false,
+                &turn_event(&thread.id),
+            )
             .unwrap();
         store
             .create_orchestration_run_owned(
@@ -400,7 +421,14 @@ fn serve_shutdown_settles_work_from_stopped_owners() {
             })
             .unwrap();
         store
-            .submit_turn(&host_thread.id, ProviderId::Codex, None, "host work", false)
+            .submit_turn_with_audit(
+                &host_thread.id,
+                ProviderId::Codex,
+                None,
+                "host work",
+                false,
+                &turn_event(&host_thread.id),
+            )
             .unwrap();
         store
             .create_orchestration_run_owned(

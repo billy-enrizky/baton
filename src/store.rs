@@ -2553,9 +2553,29 @@ impl BatonStore {
         Ok(())
     }
 
-    /// Inserts the user message and the running turn row in one immediate
-    /// transaction, after proving no other work owns the thread. A queue drain
-    /// skips only the queue guard because the caller already popped one row.
+    /// Inserts a turn and its audit event in one immediate transaction. A
+    /// refused or failed submission leaves neither the message, the turn row,
+    /// nor the event behind.
+    pub fn submit_turn_with_audit(
+        &self,
+        thread_id: &str,
+        provider: ProviderId,
+        model: Option<&str>,
+        text: &str,
+        drain_queued: bool,
+        event: &NewAuditEvent,
+    ) -> Result<(i64, AuditEventRow)> {
+        let created_at = now_iso();
+        let tx = self.write()?;
+        let turn = Self::insert_turn_on(&tx, thread_id, provider, model, text, drain_queued)?;
+        let id = Self::insert_audit_event_in(&tx, event, &created_at)?;
+        tx.commit()?;
+        Ok((turn, Self::audit_event_row(id, created_at, event)))
+    }
+
+    /// Test seeding path without an audit event. Production submissions use
+    /// `submit_turn_with_audit` so the append-only log names every turn.
+    #[cfg(test)]
     pub fn submit_turn(
         &self,
         thread_id: &str,
@@ -2565,7 +2585,23 @@ impl BatonStore {
         drain_queued: bool,
     ) -> Result<i64> {
         let tx = self.write()?;
-        if let Some(work) = Self::thread_open_work_on(&tx, thread_id, drain_queued)? {
+        let turn = Self::insert_turn_on(&tx, thread_id, provider, model, text, drain_queued)?;
+        tx.commit()?;
+        Ok(turn)
+    }
+
+    /// Inserts the user message and the running turn row, after proving no
+    /// other work owns the thread. A queue drain skips only the queue guard
+    /// because the caller already popped one row.
+    fn insert_turn_on(
+        tx: &Connection,
+        thread_id: &str,
+        provider: ProviderId,
+        model: Option<&str>,
+        text: &str,
+        drain_queued: bool,
+    ) -> Result<i64> {
+        if let Some(work) = Self::thread_open_work_on(tx, thread_id, drain_queued)? {
             return Err(SubmitRefused(work).into());
         }
         let turn: i64 = tx.query_row(
@@ -2599,7 +2635,6 @@ impl BatonStore {
             "UPDATE threads SET updated_at = ? WHERE id = ?",
             params![now_iso(), thread_id],
         )?;
-        tx.commit()?;
         Ok(turn)
     }
 
@@ -5394,6 +5429,78 @@ mod tests {
             .unwrap();
         assert_eq!(outcome, RenewGrantOutcome::Missing);
         assert_eq!(store.list_audit_events(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_turn_and_its_audit_event_commit_together() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "audited".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let event = |thread_id: &str| {
+            let mut event = sample_audit_event("turn.submit");
+            event.actor = "host_engine".into();
+            event.scope = "operate".into();
+            event.confirmation = "host_session".into();
+            event.thread_id = Some(thread_id.to_string());
+            event
+        };
+
+        let mut invalid = event(&thread.id);
+        invalid.payload_digest = "short".into();
+        assert!(store
+            .submit_turn_with_audit(
+                &thread.id,
+                ProviderId::Codex,
+                None,
+                "hello",
+                false,
+                &invalid
+            )
+            .is_err());
+        assert!(store.list_messages(&thread.id).unwrap().is_empty());
+        assert!(store.get_turn_record(&thread.id, 1).unwrap().is_none());
+        assert!(store.list_audit_events(10).unwrap().is_empty());
+
+        let (turn, written) = store
+            .submit_turn_with_audit(
+                &thread.id,
+                ProviderId::Codex,
+                None,
+                "hello",
+                false,
+                &event(&thread.id),
+            )
+            .unwrap();
+        assert_eq!(turn, 1);
+        assert_eq!(written.action, "turn.submit");
+        assert_eq!(written.actor, "host_engine");
+        assert_eq!(written.scope, "operate");
+        assert_eq!(written.confirmation, "host_session");
+        assert_eq!(written.thread_id.as_deref(), Some(thread.id.as_str()));
+        assert_eq!(store.list_messages(&thread.id).unwrap().len(), 1);
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
+
+        let refused = store
+            .submit_turn_with_audit(
+                &thread.id,
+                ProviderId::Codex,
+                None,
+                "again",
+                false,
+                &event(&thread.id),
+            )
+            .unwrap_err();
+        assert!(
+            refused.downcast_ref::<SubmitRefused>().is_some(),
+            "{refused}"
+        );
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
     }
 
     #[test]

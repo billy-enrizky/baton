@@ -169,6 +169,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/threads", "list threads in this directory; /threads all includes archived"),
     ("/pane", "show another open tab in a second pane"),
+    (
+        "/schedule",
+        "list schedules and pause, resume, or remove one",
+    ),
     ("/pin", "pin, unpin, or move a pinned thread"),
     (
         "/snooze",
@@ -843,6 +847,11 @@ enum Overlay {
     },
     SnoozePicker {
         selected: usize,
+    },
+    SchedulePicker {
+        selected: usize,
+        remove_armed: bool,
+        rows: Vec<crate::store::ScheduleRow>,
     },
     ThreadPicker {
         selected: usize,
@@ -4157,6 +4166,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/pin", "move") => Some("pin move <id> up or down"),
         ("/pane", _) => Some("pane [open <tab>|close|focus]"),
         ("/snooze", _) => Some("snooze [1h|4h|tomorrow|week|off]"),
+        ("/schedule", _) => Some("schedule [list|pause <id>|resume <id>|remove <id>]"),
         ("/changes", _) => Some("changes [turn]"),
         ("/limits", _) => Some("limits"),
         ("/archive", _) => Some("archive [thread]"),
@@ -4232,6 +4242,22 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                     );
                 }
             }
+        }
+        "/schedule" => {
+            push_suggestion(&mut suggestions, command, "list", "open the schedule view");
+            push_suggestion(&mut suggestions, command, "pause", "pause a schedule by id");
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "resume",
+                "resume a schedule by id",
+            );
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "remove",
+                "remove a schedule by id",
+            );
         }
         "/pane" => {
             push_suggestion(&mut suggestions, command, "close", "close the second pane");
@@ -5003,6 +5029,159 @@ fn apply_snooze_command(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, va
             ));
         }
         Err(error) => state.notice = Some(format!("cannot snooze: {error}")),
+    }
+}
+
+fn record_schedule_change(
+    store: &Arc<Mutex<BatonStore>>,
+    state: &TuiState,
+    action: crate::audit::AuditAction,
+    row: &crate::store::ScheduleRow,
+    payload: serde_json::Value,
+) -> anyhow::Result<()> {
+    let event = crate::audit::event(
+        crate::audit::TUI_ACTOR,
+        &crate::claim::installation_id(&state.home).unwrap_or_else(|| "unclaimed".into()),
+        Some(&row.id),
+        Some(&row.thread_id),
+        action,
+        &payload,
+    )?;
+    store.lock().unwrap().append_audit_event(&event)?;
+    Ok(())
+}
+
+fn open_schedule_picker(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
+    let rows = store.lock().unwrap().list_schedules().unwrap_or_default();
+    if rows.is_empty() {
+        state.notice = Some(
+            "no schedules · add one with baton schedule add --thread <id> --cron \"<expr>\" --prompt \"<text>\""
+                .into(),
+        );
+        return;
+    }
+    state.overlay = Overlay::SchedulePicker {
+        selected: 0,
+        remove_armed: false,
+        rows,
+    };
+}
+
+fn refresh_schedule_picker(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, selected: usize) {
+    let rows = store.lock().unwrap().list_schedules().unwrap_or_default();
+    if rows.is_empty() {
+        state.overlay = Overlay::None;
+        return;
+    }
+    let selected = selected.min(rows.len() - 1);
+    state.overlay = Overlay::SchedulePicker {
+        selected,
+        remove_armed: false,
+        rows,
+    };
+}
+
+/// One pause, resume, or remove from the TUI. The store write lands first and
+/// its audit row follows, so a failed audit is reported on a change that really
+/// happened instead of hiding it.
+fn apply_schedule_verb(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    verb: &str,
+    prefix: &str,
+) -> String {
+    let rows = store.lock().unwrap().list_schedules().unwrap_or_default();
+    let matches: Vec<crate::store::ScheduleRow> = rows
+        .into_iter()
+        .filter(|row| row.id.starts_with(prefix))
+        .collect();
+    let row = match matches.as_slice() {
+        [] => return format!("no schedule matches {prefix}"),
+        [row] => row.clone(),
+        _ => return format!("schedule prefix {prefix} is ambiguous"),
+    };
+    let short = &row.id[..8.min(row.id.len())];
+    match verb {
+        "pause" => {
+            let paused = store.lock().unwrap().pause_schedule(&row.id);
+            match paused {
+                Ok(true) => {
+                    let audit = record_schedule_change(
+                        store,
+                        state,
+                        crate::audit::AuditAction::SchedulePause,
+                        &row,
+                        serde_json::json!({
+                            "thread_id": row.thread_id,
+                            "expression": row.expression,
+                        }),
+                    );
+                    match audit {
+                        Ok(()) => format!("schedule {short} paused"),
+                        Err(error) => format!("schedule {short} paused but audit failed: {error}"),
+                    }
+                }
+                Ok(false) => format!("schedule {short} is already paused"),
+                Err(error) => format!("cannot pause schedule: {error}"),
+            }
+        }
+        "resume" => {
+            if row.enabled {
+                return format!("schedule {short} is already running");
+            }
+            let expression = match crate::schedule::parse(&row.expression) {
+                Ok(expression) => expression,
+                Err(error) => return error.to_string(),
+            };
+            let next = match crate::schedule::next_after(&expression, chrono::Utc::now()) {
+                Ok(next) => next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                Err(error) => return error.to_string(),
+            };
+            let resumed = store.lock().unwrap().resume_schedule(&row.id, &next);
+            match resumed {
+                Ok(true) => {
+                    let audit = record_schedule_change(
+                        store,
+                        state,
+                        crate::audit::AuditAction::ScheduleResume,
+                        &row,
+                        serde_json::json!({
+                            "thread_id": row.thread_id,
+                            "expression": row.expression,
+                            "next_run_at": next,
+                        }),
+                    );
+                    match audit {
+                        Ok(()) => format!("schedule {short} resumed next {next}"),
+                        Err(error) => {
+                            format!("schedule {short} resumed but audit failed: {error}")
+                        }
+                    }
+                }
+                Ok(false) => format!("schedule {short} is already running"),
+                Err(error) => format!("cannot resume schedule: {error}"),
+            }
+        }
+        "remove" => {
+            let removed = store.lock().unwrap().remove_schedule(&row.id);
+            match removed {
+                Ok(_) => {
+                    let audit = record_schedule_change(
+                        store,
+                        state,
+                        crate::audit::AuditAction::ScheduleRemove,
+                        &row,
+                        serde_json::json!({ "thread_id": row.thread_id }),
+                    );
+                    match audit {
+                        Ok(()) => format!("schedule {short} removed"),
+                        Err(error) => format!("schedule {short} removed but audit failed: {error}"),
+                    }
+                }
+                Err(error) => format!("cannot remove schedule: {error}"),
+            }
+        }
+        _ => "use /schedule list, pause <id>, resume <id>, or remove <id>".to_string(),
     }
 }
 
@@ -6619,6 +6798,83 @@ fn handle_key(
                 }
                 _ => {
                     state.overlay = Overlay::SnoozePicker { selected };
+                }
+            }
+        }
+        Overlay::SchedulePicker {
+            mut selected,
+            remove_armed,
+            rows,
+        } => {
+            let count = rows.len();
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Up | KeyCode::Char('k') => {
+                    if count > 0 {
+                        selected = (selected + count - 1) % count;
+                    }
+                    state.overlay = Overlay::SchedulePicker {
+                        selected,
+                        remove_armed: false,
+                        rows,
+                    };
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    if count > 0 {
+                        selected = (selected + 1) % count;
+                    }
+                    state.overlay = Overlay::SchedulePicker {
+                        selected,
+                        remove_armed: false,
+                        rows,
+                    };
+                }
+                KeyCode::Char('p') => {
+                    if let Some(row) = rows.get(selected) {
+                        let verb = if row.enabled { "pause" } else { "resume" };
+                        let notice = apply_schedule_verb(state, store, verb, &row.id);
+                        state.notice = Some(notice);
+                    }
+                    refresh_schedule_picker(state, store, selected);
+                }
+                KeyCode::Char('d') => {
+                    if !remove_armed {
+                        state.notice = Some("press d again to remove this schedule".into());
+                        state.overlay = Overlay::SchedulePicker {
+                            selected,
+                            remove_armed: true,
+                            rows,
+                        };
+                    } else {
+                        if let Some(row) = rows.get(selected) {
+                            let notice = apply_schedule_verb(state, store, "remove", &row.id);
+                            state.notice = Some(notice);
+                        }
+                        refresh_schedule_picker(state, store, selected);
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(row) = rows.get(selected) {
+                        let notice = format!(
+                            "opened schedule thread {}",
+                            &row.thread_id[..8.min(row.thread_id.len())]
+                        );
+                        open_thread_by_id(state, store, &row.thread_id);
+                        state.notice = Some(notice);
+                    } else {
+                        state.overlay = Overlay::SchedulePicker {
+                            selected,
+                            remove_armed,
+                            rows,
+                        };
+                    }
+                }
+                _ => {
+                    state.overlay = Overlay::SchedulePicker {
+                        selected,
+                        remove_armed,
+                        rows,
+                    };
                 }
             }
         }
@@ -11888,6 +12144,21 @@ fn handle_command(
                 apply_snooze_command(state, store, args.first().map(String::as_str));
             }
         }
+        "/schedule" => match args.first().map(String::as_str) {
+            None | Some("list") if args.len() <= 1 => open_schedule_picker(state, store),
+            Some(verb @ ("pause" | "resume" | "remove")) => {
+                if args.len() != 2 {
+                    state.notice = Some(format!("use /schedule {verb} <id>"));
+                } else {
+                    let notice = apply_schedule_verb(state, store, verb, &args[1]);
+                    state.notice = Some(notice);
+                }
+            }
+            _ => {
+                state.notice =
+                    Some("use /schedule [list|pause <id>|resume <id>|remove <id>]".into());
+            }
+        },
         "/inbox" => {
             let items = {
                 let guard = store.lock().unwrap();
@@ -13331,6 +13602,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             }
             Overlay::EffortPicker { .. } => 10,
             Overlay::SnoozePicker { .. } => 9,
+            Overlay::SchedulePicker { rows, .. } => rows.len().min(8) + 6,
             Overlay::OrchestrationPreview { preview } => preview.plan.tasks.len().min(8) * 2 + 8,
             Overlay::HandoffPreview { .. } => 14,
         }
@@ -13577,6 +13849,11 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::SnoozePicker { selected } => {
                 draw_snooze_picker(frame, chunks[2], state, *selected)
             }
+            Overlay::SchedulePicker {
+                selected,
+                remove_armed,
+                rows,
+            } => draw_schedule_picker(frame, chunks[2], rows, *selected, *remove_armed),
             Overlay::OrchestrationPreview { preview } => {
                 draw_orchestration_preview(frame, chunks[2], state, preview)
             }
@@ -15191,6 +15468,57 @@ fn draw_snooze_picker(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, 
         let cursor = if index == selected { "❯" } else { " " };
         lines.push(Line::styled(
             format!("{cursor} {value:<8} {description}"),
+            style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_schedule_picker(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    rows: &[crate::store::ScheduleRow],
+    selected: usize,
+    remove_armed: bool,
+) {
+    let footer = if remove_armed {
+        "press d again to remove · esc cancels"
+    } else {
+        "enter open thread · p pause/resume · d remove · esc close"
+    };
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!("schedules · {} · {footer}", rows.len()),
+        Style::default().fg(COLORS.muted),
+    )];
+    if rows.is_empty() {
+        lines.push(Line::styled(
+            "no schedules · add one with baton schedule add --thread <id> --cron \"<expr>\" --prompt \"<text>\"",
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    for (index, row) in rows.iter().enumerate() {
+        let style = if index == selected {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let cursor = if index == selected { "❯" } else { " " };
+        let state = if row.enabled { "on " } else { "off" };
+        let prompt: String = row.prompt.chars().take(48).collect();
+        lines.push(Line::styled(
+            format!(
+                "{cursor} {state} {}  next {}  thread {}  {}  {}",
+                &row.id[..8.min(row.id.len())],
+                row.next_run_at,
+                &row.thread_id[..8.min(row.thread_id.len())],
+                row.expression,
+                prompt
+            ),
             style,
         ));
     }
@@ -26276,6 +26604,160 @@ mod tests {
         assert!(text.contains("snooze · test"), "{text}");
         assert!(text.contains("enter apply"), "{text}");
         assert!(text.contains("wake now"), "{text}");
+    }
+
+    #[test]
+    fn schedule_command_opens_the_view_and_toggles_pause() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let row = store
+            .lock()
+            .unwrap()
+            .add_schedule(
+                &thread_id,
+                "check the tests",
+                "0 9 * * 1-5",
+                "2026-11-30T09:00:00.000Z",
+            )
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/schedule");
+        assert!(matches!(
+            state.overlay,
+            Overlay::SchedulePicker {
+                selected: 0,
+                remove_armed: false,
+                ..
+            }
+        ));
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("0 9 * * 1-5"), "{text}");
+        assert!(text.contains("check the tests"), "{text}");
+        assert!(text.contains("p pause/resume"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert_eq!(rows[0].id, row.id);
+        assert!(!rows[0].enabled);
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("paused"), "{notice}");
+        let shows_off = matches!(
+            &state.overlay,
+            Overlay::SchedulePicker { rows, .. } if !rows[0].enabled
+        );
+        assert!(shows_off, "the picker shows the paused row");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        );
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert!(rows[0].enabled);
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("resumed next"), "{notice}");
+        let audit = store.lock().unwrap().list_audit_events(10).unwrap();
+        let tui_rows: Vec<_> = audit
+            .iter()
+            .filter(|event| event.actor == crate::audit::TUI_ACTOR)
+            .collect();
+        assert_eq!(tui_rows.len(), 2, "{tui_rows:?}");
+        assert!(tui_rows
+            .iter()
+            .any(|event| event.action == "schedule.pause"));
+        assert!(tui_rows
+            .iter()
+            .any(|event| event.action == "schedule.resume"));
+    }
+
+    #[test]
+    fn schedule_picker_removes_only_after_a_second_press() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        store
+            .lock()
+            .unwrap()
+            .add_schedule(
+                &thread_id,
+                "check the tests",
+                "0 9 * * 1-5",
+                "2026-11-30T09:00:00.000Z",
+            )
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/schedule");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert_eq!(store.lock().unwrap().list_schedules().unwrap().len(), 1);
+        let armed = matches!(
+            state.overlay,
+            Overlay::SchedulePicker {
+                remove_armed: true,
+                ..
+            }
+        );
+        assert!(armed, "the first press only arms the remove");
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("press d again"));
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        );
+        assert!(store.lock().unwrap().list_schedules().unwrap().is_empty());
+        assert!(matches!(state.overlay, Overlay::None));
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or_default()
+            .contains("removed"));
+        let audit = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert!(audit
+            .iter()
+            .any(|event| event.action == "schedule.remove" && event.actor == "tui"));
+    }
+
+    #[test]
+    fn schedule_command_without_rows_says_how_to_add_one() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/schedule");
+        assert!(matches!(state.overlay, Overlay::None));
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("no schedules"), "{notice}");
+        assert!(notice.contains("baton schedule add"), "{notice}");
+
+        handle_command(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "/schedule pause abc",
+        );
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("no schedule matches abc"), "{notice}");
     }
 
     #[test]

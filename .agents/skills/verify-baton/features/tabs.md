@@ -18,7 +18,7 @@ Goals:
 
 Non-goals:
 
-- Advancing a background thread's queued follow-ups on its own. A finished background turn leaves its queue for the next visit.
+- Skipping the handoff preview for a background queued follow-up. When the current harness has not covered the thread's prior messages, the message stays queued for a manual send.
 - Running a tab switch under an orchestration, `/multi`, review, activity, report, picker, or pending request surface.
 - A secondary pane, split view, or draggable layout.
 - Reordering, renaming, or closing tabs by mouse.
@@ -36,6 +36,8 @@ Non-goals:
 - A tab whose turn is still running shows a `*` after its title. The marker clears when that turn settles, whether it was active or in the background.
 - Turn events for a non-active open tab update its stored stream and rows. A background finish clears its live buffers; the next visit reloads the finished transcript from the store.
 - A failed background turn sets a notice that names the tab title and the error, so a failure is not silent while another tab is active.
+- A successful background finish starts the thread's next queued message as a new background turn, records the prompt, clears that thread's plans, uses the thread's goal and permission mode, and updates the `*` marker and notice. The active tab is not touched.
+- A successful finish keeps the queue when the thread needs a handoff preview, and says so. A failed finish keeps the queue.
 - A switch is refused with a notice while an orchestration or `/multi` run is active, a review, activity, or run report is open, a picker is open, or an approval or question waits for an answer.
 - Archiving a thread removes its tab. Archiving the active thread still starts `/new`, and the new draft gets its own tab.
 - A draft that has never been sent has no store row. Its tab stores the whole thread row, so switching back restores its title, provider, model, cwd, permission mode, and goal before the first message persists it.
@@ -77,7 +79,8 @@ The key handler reads Alt plus a digit before overlay handling. It checks the pe
 | Switching tears a live turn | `save_run_state` and `restore_run_state` move the running flag, queued provider, stream, tool rows, and live subagents with the thread. The `thread-run-state-machine` gate checks that a switch preserves every thread's state. |
 | A background finish leaves a tab stuck running | The non-active `TurnFinished` branch clears the stored running flag and live buffers even when another tab is active. |
 | A worker thread grows the background map | Only a thread with an open tab is tracked; `a_worker_turn_does_not_create_a_background_tab` proves it. |
-| A background turn's queued message is forgotten | The queue stays in the store and reloads on the next visit. It is not auto-sent; the feature doc and the acceptance record name that limit. |
+| A background queued message is sent without a handoff preview | `background_handoff_pending` checks the thread's messages against its native session coverage and keeps the queue when a preview is needed. The `background-queue-state-machine` gate rejects a handoff auto-start. |
+| A failed background turn starts the queue | The advance runs only in the `ok` branch. The gate's `failure` mutant rejects a failure auto-start. |
 | Switching under a picker or report leaves stale content | The key handler refuses while any picker or full-screen surface is open. |
 | A long title breaks the layout | Titles pass through `sanitize_terminal_text` and `truncate_chars(18)`; the loop stops when the next label would overflow the width. |
 | Monochrome loses the active marker | The active style uses reverse video when palette colors are disabled. |
@@ -111,11 +114,12 @@ The background turn probe starts a fake Codex turn that streams `alpha `, waits,
 - `a_background_turn_keeps_streaming_in_its_tab`
 - `a_background_turn_finish_clears_its_run_state`
 - `a_background_failure_reports_in_the_notice`
+- `a_background_finish_starts_the_next_queued_message`
+- `a_background_finish_keeps_the_queue_for_a_handoff`
 - `a_worker_turn_does_not_create_a_background_tab`
 - `tabs_probe.py`
 - `background_turn_probe.py`
 
 ## Limits
 
-- A background thread's queued follow-ups do not auto-send when its turn finishes. The queue stays stored and reloads on the next visit.
 - A background finish does not ring the terminal bell. The `*` marker is the signal.

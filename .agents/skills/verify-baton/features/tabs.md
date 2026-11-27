@@ -42,6 +42,7 @@ Non-goals:
 - Archiving a thread removes its tab. Archiving the active thread still starts `/new`, and the new draft gets its own tab.
 - A draft that has never been sent has no store row. Its tab stores the whole thread row, so switching back restores its title, provider, model, cwd, permission mode, and goal before the first message persists it.
 - Composer text is saved under the current thread id on every thread open and restored for the thread being opened, so a tab switch never sends one thread's draft to another. Archiving a thread drops its saved composer text.
+- A tab whose working directory differs from the previous tab reloads that directory's prompt history, custom commands, and banner. `/new`, `/task`, `/open`, `/threads`, and every tab switch use the same refresh.
 - Permission mode, session mode, goal, and an orchestration-derived title refresh the active tab's stored row.
 - The strip is only drawn on the normal transcript surface. Full-screen report, multi, review, and activity surfaces keep their existing layouts.
 
@@ -112,6 +113,7 @@ The background turn probe starts a fake Codex turn that streams `alpha `, waits,
 - `alt_number_without_a_tab_reports_it`
 - `alt_number_restores_an_unsaved_draft_tab`
 - `tab_switches_keep_a_draft_per_thread`
+- `opening_a_thread_refreshes_cwd_history_and_commands`
 - `a_background_turn_keeps_streaming_in_its_tab`
 - `a_background_turn_finish_clears_its_run_state`
 - `a_background_failure_reports_in_the_notice`

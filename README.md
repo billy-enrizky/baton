@@ -382,7 +382,7 @@ Ctrl+K opens the command palette. It filters built-in actions, threads, and rece
 
 #### 6.5.6 Thread tabs
 
-Alt+1 through Alt+9 switch to the tab in that position. Alt+0 does nothing. The strip only appears when more than one thread is open, and every open thread keeps its own transcript, composer draft, goal, permission mode, and live turn state. A tab whose turn is still running shows a `*` after its title until that turn settles.
+Alt+1 through Alt+9 switch to the tab in that position. Alt+0 does nothing. The strip only appears when more than one thread is open, and every open thread keeps its own transcript, composer draft, prompt history, goal, permission mode, and live turn state. A tab in another working directory also reloads that directory's custom commands. A tab whose turn is still running shows a `*` after its title until that turn settles.
 
 ## 7. Slash commands
 

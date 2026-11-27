@@ -3614,6 +3614,7 @@ fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     drop(guard);
     state.restore_composer();
     state.restore_run_state();
+    refresh_cwd_state(state, store, &thread.cwd);
     state.notice = Some(format!("opened {}", thread.title));
     hydrate_plans(state, &thread.id);
 }
@@ -5715,9 +5716,11 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     } else {
         format!("opened {}", thread.title)
     });
+    drop(guard);
     state.overlay = Overlay::None;
     state.restore_composer();
     state.restore_run_state();
+    refresh_cwd_state(state, store, &thread.cwd);
 }
 
 fn open_command_palette(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
@@ -8546,6 +8549,8 @@ fn begin_issue_task(
     state.banner_cache.borrow_mut().take();
     state.restore_composer();
     state.restore_run_state();
+    let cwd = state.thread.cwd.clone();
+    refresh_cwd_state(state, store, &cwd);
     state.set_input(plan.issue.prompt());
     let thread = state.thread.clone();
     remember_open_thread(state, &thread);
@@ -11188,6 +11193,8 @@ fn handle_command(
             state.scroll_offset = 0;
             state.restore_composer();
             state.restore_run_state();
+            let cwd = state.thread.cwd.clone();
+            refresh_cwd_state(state, store, &cwd);
             let thread = state.thread.clone();
             remember_open_thread(state, &thread);
             state.notice = Some("new thread, unsaved until you send a message".into());
@@ -11614,13 +11621,8 @@ fn handle_command(
             fork.cwd = worktree_path;
             fork.session_mode = SessionMode::Single;
             load_thread_state(state, store, fork);
-            state.prompt_history = store
-                .lock()
-                .unwrap()
-                .list_prompt_history(&state.thread.cwd)
-                .unwrap_or_default();
-            state.prompt_history_index = None;
-            state.custom_commands = discover_custom_commands(&state.thread.cwd);
+            let cwd = state.thread.cwd.clone();
+            refresh_cwd_state(state, store, &cwd);
             state.overlay = Overlay::None;
             state.multi = None;
             state.review = None;
@@ -13410,6 +13412,20 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     }
     draw_composer(frame, state, chunks[4], &suggestions);
     draw_status(frame, state, chunks[5]);
+}
+
+/// Reloads the state that belongs to a working directory. A tab can point at a
+/// different worktree or task checkout, so prompt history, custom commands, and
+/// the cached banner must follow the thread.
+fn refresh_cwd_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, cwd: &str) {
+    state.prompt_history = store
+        .lock()
+        .unwrap()
+        .list_prompt_history(cwd)
+        .unwrap_or_default();
+    state.prompt_history_index = None;
+    state.custom_commands = discover_custom_commands(cwd);
+    state.banner_cache.borrow_mut().take();
 }
 
 fn discover_custom_commands(cwd: &str) -> Vec<(String, String)> {
@@ -34220,6 +34236,55 @@ exit 1
         assert!(!state.background_runs.contains_key(&second.id));
         assert_eq!(state.open_tabs[0].id(), first);
         assert_eq!(state.thread.id, first);
+    }
+
+    #[test]
+    fn opening_a_thread_refreshes_cwd_history_and_commands() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let first_id = state.thread.id.clone();
+        let first_cwd = state.thread.cwd.clone();
+        let other_dir = home.path().join("other");
+        std::fs::create_dir_all(other_dir.join(".baton").join("commands")).unwrap();
+        std::fs::write(
+            other_dir.join(".baton").join("commands").join("deploy.md"),
+            "ship it\n",
+        )
+        .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .record_prompt(&first_cwd, "first prompt")
+            .unwrap();
+        store
+            .lock()
+            .unwrap()
+            .record_prompt(&other_dir.to_string_lossy(), "other prompt")
+            .unwrap();
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "other".into(),
+                cwd: other_dir.to_string_lossy().to_string(),
+                current_provider: state.thread.current_provider,
+                current_model: None,
+            })
+            .unwrap();
+
+        open_thread_by_id(&mut state, &store, &other.id);
+        assert_eq!(state.thread.id, other.id);
+        assert_eq!(state.prompt_history, vec!["other prompt".to_string()]);
+        assert_eq!(
+            state.custom_commands,
+            vec![("/deploy".to_string(), "ship it".to_string())]
+        );
+
+        open_thread_by_id(&mut state, &store, &first_id);
+        assert_eq!(state.thread.id, first_id);
+        assert_eq!(state.prompt_history, vec!["first prompt".to_string()]);
+        assert!(state.custom_commands.is_empty());
     }
 
     #[test]

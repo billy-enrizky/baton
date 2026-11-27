@@ -148,6 +148,9 @@ pub enum Commands {
         /// Submit one prompt to the thread over the socket
         #[arg(long, value_name = "TEXT", requires = "thread")]
         submit: Option<String>,
+        /// Reuse a key so a retried submit returns the original result
+        #[arg(long, value_name = "KEY", requires = "submit")]
+        idempotency_key: Option<String>,
     },
     /// Inspect or change host ownership of the local store
     Host {
@@ -934,6 +937,7 @@ mod tests {
                 limit: 50,
                 follow: false,
                 submit: None,
+                idempotency_key: None,
             }) => assert!(url.starts_with("baton://local#")),
             _ => panic!("expected attach"),
         }
@@ -972,19 +976,37 @@ mod tests {
             "thread",
             "--submit",
             "remote hello",
+            "--idempotency-key",
+            "remote-1",
         ])
         .unwrap();
         match cli.command {
             Some(Commands::Attach {
                 thread: Some(thread),
                 submit: Some(text),
+                idempotency_key: Some(key),
                 ..
             }) => {
                 assert_eq!(thread, "thread");
                 assert_eq!(text, "remote hello");
+                assert_eq!(key, "remote-1");
             }
             _ => panic!("expected a submit"),
         }
+        let key_without_submit = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--thread",
+            "thread",
+            "--idempotency-key",
+            "remote-1",
+        ]);
+        assert!(
+            key_without_submit.is_err(),
+            "--idempotency-key needs --submit"
+        );
         let conflict = Cli::try_parse_from([
             "baton",
             "attach",

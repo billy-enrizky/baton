@@ -83,6 +83,7 @@ impl AttachStatus {
 pub struct AttachSubmit {
     pub thread_id: String,
     pub accepted: bool,
+    pub replayed: bool,
 }
 
 impl AttachSubmit {
@@ -100,9 +101,14 @@ impl AttachSubmit {
             .get("accepted")
             .and_then(Value::as_bool)
             .ok_or_else(|| anyhow::anyhow!("host response has no accepted flag"))?;
+        let replayed = result
+            .get("replayed")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         Ok(AttachSubmit {
             thread_id,
             accepted,
+            replayed,
         })
     }
 
@@ -111,6 +117,7 @@ impl AttachSubmit {
             "schema_version": crate::status::SCHEMA_VERSION,
             "thread_id": self.thread_id,
             "accepted": self.accepted,
+            "replayed": self.replayed,
         })
     }
 }
@@ -350,13 +357,18 @@ pub fn submit(
     credential: &PairingCredential,
     thread: &str,
     text: &str,
+    idempotency_key: &str,
     timeout: Duration,
 ) -> Result<AttachSubmit> {
     let response = request(
         home,
         credential,
         "submit",
-        json!({ "thread": thread, "text": text }),
+        json!({
+            "thread": thread,
+            "text": text,
+            "idempotency_key": idempotency_key,
+        }),
         SUBMIT_REQUEST_ID,
         timeout,
     )?;
@@ -398,6 +410,7 @@ pub fn submit(
     _credential: &PairingCredential,
     _thread: &str,
     _text: &str,
+    _idempotency_key: &str,
     _timeout: Duration,
 ) -> Result<AttachSubmit> {
     anyhow::bail!("attach is supported only on Unix")
@@ -545,6 +558,7 @@ mod tests {
         let accepted = AttachSubmit::from_response(&response).unwrap();
         assert_eq!(accepted.thread_id, "thread");
         assert!(accepted.accepted);
+        assert!(!accepted.replayed);
         assert_eq!(accepted.json()["accepted"], true);
         let missing = json!({
             "v": crate::serve::PROTOCOL_VERSION,

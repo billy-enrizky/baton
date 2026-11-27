@@ -582,6 +582,25 @@ fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink
     })
 }
 
+const SUBMIT_OPERATION: &str = "submit";
+
+/// A replay returns the original result with `replayed: true`, so a client can
+/// tell that no second turn started.
+fn replay_response(id: Value, stored: &str) -> Value {
+    match serde_json::from_str::<Value>(stored) {
+        Ok(mut body @ Value::Object(_)) => {
+            body["replayed"] = json!(true);
+            response(id, body)
+        }
+        Ok(_) => error_response(id, "internal", "stored response is not an object"),
+        Err(error) => error_response(
+            id,
+            "internal",
+            format!("stored response is not JSON: {error}"),
+        ),
+    }
+}
+
 fn submit_request(
     store: &BatonStore,
     engine: Option<&EngineLink>,
@@ -620,6 +639,26 @@ fn submit_request(
             )
         }
     };
+    let key =
+        match args.get("idempotency_key") {
+            Some(Value::String(key))
+                if !key.is_empty()
+                    && key.chars().count() <= 128
+                    && !key.chars().any(char::is_control) =>
+            {
+                key.as_str()
+            }
+            _ => return error_response(
+                id,
+                "malformed_line",
+                "submit args.idempotency_key must be a non-empty string of at most 128 characters",
+            ),
+        };
+    match store.replay_idempotent_request(key, SUBMIT_OPERATION) {
+        Ok(Some(stored)) => return replay_response(id, &stored),
+        Ok(None) => {}
+        Err(error) => return error_response(id, "idempotency_conflict", error.to_string()),
+    }
     let thread = match store.get_thread(thread_id) {
         Ok(Some(thread)) => thread,
         Ok(None) => {
@@ -646,6 +685,12 @@ fn submit_request(
             "the thread runs with bypassPermissions; set a safe mode before submitting remotely",
         );
     }
+    let body = json!({ "thread_id": thread_id, "accepted": true });
+    match store.claim_idempotent_request(key, SUBMIT_OPERATION, thread_id, &body.to_string()) {
+        Ok(Some(stored)) => return replay_response(id, &stored),
+        Ok(None) => {}
+        Err(error) => return error_response(id, "idempotency_conflict", error.to_string()),
+    }
     let audit = match crate::audit::grant_event(
         &grant.grant_id,
         &engine.environment(),
@@ -658,15 +703,20 @@ fn submit_request(
         }),
     ) {
         Ok(audit) => audit,
-        Err(error) => return error_response(id, "internal", error.to_string()),
+        Err(error) => {
+            let _ = store.forget_idempotent_request(key, SUBMIT_OPERATION);
+            return error_response(id, "internal", error.to_string());
+        }
     };
     if let Err(error) = store.append_audit_event(&audit) {
+        let _ = store.forget_idempotent_request(key, SUBMIT_OPERATION);
         return error_response(id, "internal", error.to_string());
     }
     if !engine.submit(thread_id, text, thread.permission_mode) {
+        let _ = store.forget_idempotent_request(key, SUBMIT_OPERATION);
         return error_response(id, "internal", "the host engine is not running");
     }
-    response(id, json!({ "thread_id": thread_id, "accepted": true }))
+    response(id, body)
 }
 
 #[cfg(unix)]
@@ -1180,22 +1230,33 @@ mod tests {
             home: home.path().to_path_buf(),
             root: root.path().to_path_buf(),
         };
-        let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64| {
+        let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64, key: &str| {
             format!(
-                r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{thread}","text":"remote hello"}}}}"#,
+                r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{thread}","text":"remote hello","idempotency_key":"{key}"}}}}"#,
                 grant.summary.grant_id, grant.secret
             )
         };
 
-        let denied = handle_socket_line(&store, &request(&read, &inside.id, 1), Some(&engine));
+        let denied = handle_socket_line(
+            &store,
+            &request(&read, &inside.id, 1, "k-denied"),
+            Some(&engine),
+        );
         assert_eq!(denied["error"]["code"], "not_permitted");
         assert!(receiver.try_recv().is_err());
 
-        let missing = handle_socket_line(&store, &request(&operate, "missing", 2), Some(&engine));
+        let missing = handle_socket_line(
+            &store,
+            &request(&operate, "missing", 2, "k-missing"),
+            Some(&engine),
+        );
         assert_eq!(missing["error"]["code"], "not_found");
 
-        let elsewhere =
-            handle_socket_line(&store, &request(&operate, &outside.id, 3), Some(&engine));
+        let elsewhere = handle_socket_line(
+            &store,
+            &request(&operate, &outside.id, 3, "k-elsewhere"),
+            Some(&engine),
+        );
         assert_eq!(elsewhere["error"]["code"], "wrong_project");
 
         let malformed = handle_socket_line(
@@ -1208,9 +1269,32 @@ mod tests {
         );
         assert_eq!(malformed["error"]["code"], "malformed_line");
 
-        let accepted = handle_socket_line(&store, &request(&operate, &inside.id, 5), Some(&engine));
+        let missing_key = handle_socket_line(
+            &store,
+            &format!(
+                r#"{{"v":1,"kind":"request","id":5,"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{}","text":"remote hello"}}}}"#,
+                operate.summary.grant_id, operate.secret, inside.id
+            ),
+            Some(&engine),
+        );
+        assert_eq!(missing_key["error"]["code"], "malformed_line");
+
+        let long_key = "x".repeat(129);
+        let long = handle_socket_line(
+            &store,
+            &request(&operate, &inside.id, 6, &long_key),
+            Some(&engine),
+        );
+        assert_eq!(long["error"]["code"], "malformed_line");
+
+        let accepted = handle_socket_line(
+            &store,
+            &request(&operate, &inside.id, 7, "k-accepted"),
+            Some(&engine),
+        );
         assert_eq!(accepted["ok"], true, "{accepted}");
         assert_eq!(accepted["result"]["accepted"], true);
+        assert_eq!(accepted["result"].get("replayed"), None);
         let command = receiver.try_recv().expect("the engine receives the submit");
         match command {
             crate::runtime::EngineCommand::Submit {
@@ -1221,11 +1305,32 @@ mod tests {
             }
             _ => panic!("expected a submit command"),
         }
+        let replay = handle_socket_line(
+            &store,
+            &request(&operate, &inside.id, 8, "k-accepted"),
+            Some(&engine),
+        );
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(replay["result"]["accepted"], true);
+        assert_eq!(replay["result"]["replayed"], true);
+        assert_eq!(replay["result"]["thread_id"], inside.id);
+        assert!(
+            receiver.try_recv().is_err(),
+            "a replay must not start a second turn"
+        );
         let events = store.list_audit_events(10).unwrap();
         let event = events
             .iter()
             .find(|event| event.action == "turn.submit_request")
             .expect("the remote request writes its row");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == "turn.submit_request")
+                .count(),
+            1,
+            "a replay must not write a second request row"
+        );
         assert_eq!(event.actor, operate.summary.grant_id);
         assert_eq!(event.confirmation, crate::audit::SOCKET_GRANT_CONFIRMATION);
         assert_eq!(event.scope, crate::audit::OPERATE_SCOPE);
@@ -1268,7 +1373,7 @@ mod tests {
         let refused = handle_socket_line(
             &store,
             &format!(
-                r#"{{"v":1,"kind":"request","id":1,"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{}","text":"run"}}}}"#,
+                r#"{{"v":1,"kind":"request","id":1,"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{}","text":"run","idempotency_key":"k-bypass"}}}}"#,
                 operate.summary.grant_id, operate.secret, thread.id
             ),
             Some(&engine),

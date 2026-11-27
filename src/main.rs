@@ -723,8 +723,18 @@ fn main_result(started: Instant) -> Result<()> {
             limit,
             follow,
             submit,
+            idempotency_key,
         } => run_attach(
-            &home, url, json, thread, messages, after, limit, follow, submit,
+            &home,
+            url,
+            json,
+            thread,
+            messages,
+            after,
+            limit,
+            follow,
+            submit,
+            idempotency_key,
         ),
         cli::Commands::Host { command } => run_host(&home, command),
         cli::Commands::Grant { command } => run_grant(&home, command),
@@ -2921,6 +2931,7 @@ fn run_attach(
     limit: usize,
     follow: bool,
     submit: Option<String>,
+    idempotency_key: Option<String>,
 ) -> Result<()> {
     let Some(url) = url else {
         anyhow::bail!("attach needs --url from the host terminal pair command");
@@ -2948,17 +2959,32 @@ fn run_attach(
         if messages || follow || after != 0 {
             anyhow::bail!("--submit cannot be combined with --messages, --follow, or --after");
         }
-        let accepted = attach::submit(home, &credential, &thread, &submit, attach::ATTACH_TIMEOUT)?;
+        let key = idempotency_key
+            .filter(|key| !key.trim().is_empty())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let accepted = attach::submit(
+            home,
+            &credential,
+            &thread,
+            &submit,
+            &key,
+            attach::ATTACH_TIMEOUT,
+        )?;
         if json {
             println!("{}", serde_json::to_string_pretty(&accepted.json())?);
         } else {
             println!(
-                "submitted to {} · {}",
+                "submitted to {} · {}{}",
                 accepted.thread_id,
                 if accepted.accepted {
                     "accepted"
                 } else {
                     "refused"
+                },
+                if accepted.replayed {
+                    " · replayed"
+                } else {
+                    ""
                 }
             );
         }

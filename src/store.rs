@@ -525,13 +525,21 @@ pub(crate) fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn idempotency_cutoff() -> String {
+    (chrono::Utc::now() - chrono::Duration::days(IDEMPOTENCY_RETENTION_DAYS))
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+}
+
 fn store_home(path: &Path) -> Option<PathBuf> {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .map(Path::to_path_buf)
 }
 
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
+/// A claim is replayed for this long. After that, a retry starts a new turn
+/// instead of holding store rows forever.
+const IDEMPOTENCY_RETENTION_DAYS: i64 = 7;
 /// The first schema with the `host_claim` table. A client can check ownership
 /// only from this version on, before it runs any migration DDL.
 const HOST_CLAIM_SCHEMA_VERSION: i64 = 2;
@@ -771,6 +779,15 @@ CREATE TABLE IF NOT EXISTS provider_rate_limits (
   info TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS idempotent_requests (
+  key TEXT PRIMARY KEY CHECK (length(key) > 0),
+  operation TEXT NOT NULL CHECK (length(operation) > 0),
+  thread_id TEXT NOT NULL,
+  response TEXT NOT NULL CHECK (length(response) > 0),
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idempotent_requests_created_idx
+  ON idempotent_requests (created_at);
 CREATE TABLE IF NOT EXISTS grants (
   grant_id TEXT PRIMARY KEY,
   installation_id TEXT NOT NULL,
@@ -3140,6 +3157,74 @@ impl BatonStore {
         Ok(rows)
     }
 
+    /// The stored response for a replayed request. An operation mismatch on
+    /// the same key is a refusal, not a replay, because returning another
+    /// operation's response would be a lie.
+    pub fn replay_idempotent_request(&self, key: &str, operation: &str) -> Result<Option<String>> {
+        let row: Option<(String, String)> = self
+            .db
+            .query_row(
+                "SELECT operation, response FROM idempotent_requests WHERE key = ? AND created_at >= ?",
+                params![key, idempotency_cutoff()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        match row {
+            None => Ok(None),
+            Some((stored_operation, response)) if stored_operation == operation => {
+                Ok(Some(response))
+            }
+            Some((stored_operation, _)) => {
+                anyhow::bail!("idempotency key was used for {stored_operation}, not {operation}")
+            }
+        }
+    }
+
+    /// Claims a key and stores its response in one transaction. Returns the
+    /// stored response when another request already claimed the key.
+    pub fn claim_idempotent_request(
+        &self,
+        key: &str,
+        operation: &str,
+        thread_id: &str,
+        response: &str,
+    ) -> Result<Option<String>> {
+        let tx = self.write()?;
+        tx.execute(
+            "DELETE FROM idempotent_requests WHERE created_at < ?",
+            params![idempotency_cutoff()],
+        )?;
+        let row: Option<(String, String)> = tx
+            .query_row(
+                "SELECT operation, response FROM idempotent_requests WHERE key = ?",
+                params![key],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((stored_operation, stored_response)) = row {
+            tx.commit()?;
+            if stored_operation == operation {
+                return Ok(Some(stored_response));
+            }
+            anyhow::bail!("idempotency key was used for {stored_operation}, not {operation}");
+        }
+        tx.execute(
+            "INSERT INTO idempotent_requests (key, operation, thread_id, response, created_at) VALUES (?, ?, ?, ?, ?)",
+            params![key, operation, thread_id, response, now_iso()],
+        )?;
+        tx.commit()?;
+        Ok(None)
+    }
+
+    /// Releases a claim whose request never reached the engine.
+    pub fn forget_idempotent_request(&self, key: &str, operation: &str) -> Result<()> {
+        self.write_execute(
+            "DELETE FROM idempotent_requests WHERE key = ? AND operation = ?",
+            params![key, operation],
+        )?;
+        Ok(())
+    }
+
     fn insert_grant_in(db: &Connection, grant: &GrantRow) -> Result<()> {
         db.execute(
             "INSERT INTO grants (grant_id, installation_id, secret_hash, scopes, permission_ceiling, project_allowlist, issued_at, expires_at, revoked_at, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -4674,6 +4759,137 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(journal.to_ascii_lowercase(), "wal");
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn idempotency_claims_replay_and_can_be_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        {
+            let store = BatonStore::open(&path).unwrap();
+            assert!(store
+                .replay_idempotent_request("key", "submit")
+                .unwrap()
+                .is_none());
+            assert!(store
+                .claim_idempotent_request("key", "submit", "thread", r#"{"accepted":true}"#)
+                .unwrap()
+                .is_none());
+            assert_eq!(
+                store
+                    .replay_idempotent_request("key", "submit")
+                    .unwrap()
+                    .as_deref(),
+                Some(r#"{"accepted":true}"#)
+            );
+            assert_eq!(
+                store
+                    .claim_idempotent_request("key", "submit", "thread", r#"{"accepted":false}"#)
+                    .unwrap()
+                    .as_deref(),
+                Some(r#"{"accepted":true}"#)
+            );
+
+            let error = store
+                .replay_idempotent_request("key", "cancel")
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("idempotency key was used for submit, not cancel"),
+                "{error}"
+            );
+            let error = store
+                .claim_idempotent_request("key", "cancel", "thread", "{}")
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("idempotency key was used for submit, not cancel"),
+                "{error}"
+            );
+
+            store.forget_idempotent_request("key", "cancel").unwrap();
+            assert!(store
+                .replay_idempotent_request("key", "submit")
+                .unwrap()
+                .is_some());
+            store.forget_idempotent_request("key", "submit").unwrap();
+            assert!(store
+                .replay_idempotent_request("key", "submit")
+                .unwrap()
+                .is_none());
+
+            store
+                .write_execute(
+                    "INSERT INTO idempotent_requests (key, operation, thread_id, response, created_at) VALUES (?, ?, ?, ?, ?)",
+                    params![
+                        "stale",
+                        "submit",
+                        "thread",
+                        r#"{"accepted":true}"#,
+                        "2000-01-01T00:00:00.000Z"
+                    ],
+                )
+                .unwrap();
+            assert!(
+                store
+                    .replay_idempotent_request("stale", "submit")
+                    .unwrap()
+                    .is_none(),
+                "a claim past its retention window does not replay"
+            );
+            assert!(store
+                .claim_idempotent_request("fresh", "submit", "thread", r#"{"accepted":true}"#)
+                .unwrap()
+                .is_none());
+            assert!(
+                store
+                    .replay_idempotent_request("stale", "submit")
+                    .unwrap()
+                    .is_none(),
+                "a claim past its retention window is dropped"
+            );
+
+            assert!(store
+                .claim_idempotent_request("reopen", "submit", "thread", r#"{"accepted":true}"#)
+                .unwrap()
+                .is_none());
+        }
+        let store = BatonStore::open(&path).unwrap();
+        assert_eq!(
+            store
+                .replay_idempotent_request("reopen", "submit")
+                .unwrap()
+                .as_deref(),
+            Some(r#"{"accepted":true}"#),
+            "a completed claim survives reopening the store"
+        );
+    }
+
+    #[test]
+    fn a_version_seven_store_gains_idempotent_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", 7).unwrap();
+        drop(db);
+
+        let store = BatonStore::open(&path).unwrap();
+        drop(store);
+        let db = Connection::open(&path).unwrap();
+        let table: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'idempotent_requests'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "the migration creates the idempotent table");
         let version: i64 = db
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();

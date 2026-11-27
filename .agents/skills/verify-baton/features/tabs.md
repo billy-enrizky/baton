@@ -81,6 +81,7 @@ The key handler reads Alt plus a digit before overlay handling. It checks the pe
 | A worker thread grows the background map | Only a thread with an open tab is tracked; `a_worker_turn_does_not_create_a_background_tab` proves it. |
 | A background queued message is sent without a handoff preview | `background_handoff_pending` checks the thread's messages against its native session coverage and keeps the queue when a preview is needed. The `background-queue-state-machine` gate rejects a handoff auto-start. |
 | A failed background turn starts the queue | The advance runs only in the `ok` branch. The gate's `failure` mutant rejects a failure auto-start. |
+| A rejected background submit loses the message or leaves a stuck marker | The non-active `TurnRejected` branch clears the run state, re-queues the message unless it was a retry, and names the tab and reason in the notice. |
 | Switching under a picker or report leaves stale content | The key handler refuses while any picker or full-screen surface is open. |
 | A long title breaks the layout | Titles pass through `sanitize_terminal_text` and `truncate_chars(18)`; the loop stops when the next label would overflow the width. |
 | Monochrome loses the active marker | The active style uses reverse video when palette colors are disabled. |
@@ -116,6 +117,7 @@ The background turn probe starts a fake Codex turn that streams `alpha `, waits,
 - `a_background_failure_reports_in_the_notice`
 - `a_background_finish_starts_the_next_queued_message`
 - `a_background_finish_keeps_the_queue_for_a_handoff`
+- `a_background_rejection_queues_the_message_again`
 - `a_worker_turn_does_not_create_a_background_tab`
 - `tabs_probe.py`
 - `background_turn_probe.py`

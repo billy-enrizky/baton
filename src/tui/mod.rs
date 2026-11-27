@@ -2193,6 +2193,25 @@ fn apply_engine_event(
                         state.queued_messages.len()
                     ));
                 }
+            } else {
+                if let Some(run) = state.background_runs.get_mut(&thread_id) {
+                    run.running = false;
+                    run.queued_provider = None;
+                    run.streaming_text.clear();
+                    run.tool_lines.clear();
+                }
+                if !retry {
+                    let _ = store.lock().unwrap().enqueue_message(&thread_id, &text);
+                }
+                let title = state
+                    .open_tabs
+                    .iter()
+                    .find(|tab| tab.id() == thread_id)
+                    .map(|tab| tab.title().to_string())
+                    .unwrap_or_else(|| thread_id[..8.min(thread_id.len())].to_string());
+                state.notice = Some(format!(
+                    "background turn in {title} rejected: {reason}; queued again"
+                ));
             }
         }
         EngineEvent::SteerRejected {
@@ -34613,6 +34632,73 @@ exit 1
             state.notice
         );
         assert!(!state.background_runs.get(&first).unwrap().running);
+    }
+
+    #[test]
+    fn a_background_rejection_queues_the_message_again() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, first, _second) = two_thread_state(home.path(), &store);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        store
+            .lock()
+            .unwrap()
+            .enqueue_message(&first, "queued one")
+            .unwrap();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnStarted {
+                thread_id: first.clone(),
+            },
+            &sender,
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: first.clone(),
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &sender,
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(EngineCommand::Submit { .. })
+        ));
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnRejected {
+                thread_id: first.clone(),
+                text: "queued one".into(),
+                reason: "a turn is already running for this thread".into(),
+                retry: false,
+            },
+            &sender,
+        );
+        assert!(!state.background_runs.get(&first).unwrap().running);
+        assert_eq!(
+            store.lock().unwrap().list_queued_messages(&first).unwrap(),
+            vec!["queued one".to_string()]
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("queued again"),
+            "{:?}",
+            state.notice
+        );
     }
 
     #[test]

@@ -43,16 +43,16 @@ pub fn spawn_tracked_provider(
     )
 }
 
-pub fn build_codex_adapter(store: &SharedStore, cwd: &PathBuf) -> SharedAdapter {
+pub fn build_codex_adapter(store: &SharedStore, cwd: &std::path::Path) -> SharedAdapter {
     let recorder = ProcessRecorder::new(store.clone(), cwd.to_string_lossy().to_string());
     build_codex_adapter_with_recorder(cwd, recorder)
 }
 
 pub fn build_codex_adapter_with_recorder(
-    cwd: &PathBuf,
+    cwd: &std::path::Path,
     recorder: ProcessRecorder,
 ) -> SharedAdapter {
-    let cwd_for_codex = cwd.clone();
+    let cwd_for_codex = cwd.to_path_buf();
     let spawner = Arc::new(
         move |auth_env: &[(String, String)]| -> Result<TransportHalves> {
             let mut command = tokio::process::Command::new("codex");
@@ -72,13 +72,13 @@ pub fn build_codex_adapter_with_recorder(
     ))
 }
 
-pub fn build_opencode_adapter(store: &SharedStore, cwd: &PathBuf) -> SharedAdapter {
+pub fn build_opencode_adapter(store: &SharedStore, cwd: &std::path::Path) -> SharedAdapter {
     let recorder = ProcessRecorder::new(store.clone(), cwd.to_string_lossy().to_string());
     build_opencode_adapter_with_recorder(cwd, recorder)
 }
 
 pub fn build_opencode_adapter_with_recorder(
-    _cwd: &PathBuf,
+    _cwd: &std::path::Path,
     recorder: ProcessRecorder,
 ) -> SharedAdapter {
     let recorder_for_spawner = recorder.clone();

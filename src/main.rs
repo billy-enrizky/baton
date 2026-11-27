@@ -239,7 +239,7 @@ fn main_result(started: Instant) -> Result<()> {
             let tokio_runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            let adapters = build_all_adapters(&store, &home, &cwd);
+            let adapters = baton::runtime::build_adapters(&store, &home, &cwd);
             let interrupt_handles: Vec<(ProviderId, Arc<dyn Fn() + Send + Sync>)> =
                 tokio_runtime.block_on(async {
                     let mut handles = Vec::new();
@@ -722,7 +722,10 @@ fn main_result(started: Instant) -> Result<()> {
             after,
             limit,
             follow,
-        } => run_attach(&home, url, json, thread, messages, after, limit, follow),
+            submit,
+        } => run_attach(
+            &home, url, json, thread, messages, after, limit, follow, submit,
+        ),
         cli::Commands::Host { command } => run_host(&home, command),
         cli::Commands::Grant { command } => run_grant(&home, command),
         cli::Commands::Audit { command } => run_audit(command),
@@ -2917,6 +2920,7 @@ fn run_attach(
     after: i64,
     limit: usize,
     follow: bool,
+    submit: Option<String>,
 ) -> Result<()> {
     let Some(url) = url else {
         anyhow::bail!("attach needs --url from the host terminal pair command");
@@ -2933,13 +2937,33 @@ fn run_attach(
         anyhow::bail!("--limit must be between 1 and 200");
     }
     let Some(thread) = thread else {
-        if messages || follow || after != 0 {
-            anyhow::bail!("--thread is needed for --messages, --after, or --follow");
+        if messages || follow || after != 0 || submit.is_some() {
+            anyhow::bail!("--thread is needed for --messages, --after, --follow, or --submit");
         }
         let status = attach::query_status(home, &credential, attach::ATTACH_TIMEOUT)?;
         print_attach_status(&status, json);
         return Ok(());
     };
+    if let Some(submit) = submit {
+        if messages || follow || after != 0 {
+            anyhow::bail!("--submit cannot be combined with --messages, --follow, or --after");
+        }
+        let accepted = attach::submit(home, &credential, &thread, &submit, attach::ATTACH_TIMEOUT)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&accepted.json())?);
+        } else {
+            println!(
+                "submitted to {} · {}",
+                accepted.thread_id,
+                if accepted.accepted {
+                    "accepted"
+                } else {
+                    "refused"
+                }
+            );
+        }
+        return Ok(());
+    }
     if !messages && !follow {
         let status =
             attach::query_thread_status(home, &credential, &thread, attach::ATTACH_TIMEOUT)?;
@@ -3431,7 +3455,14 @@ fn run_serve(home: &Path, stdio: bool, socket: Option<&str>) -> Result<()> {
     match (listener, socket_target.as_deref()) {
         (Some(listener), Some(path)) => {
             let shared = Arc::new(Mutex::new(store));
-            let result = runtime.block_on(serve::socket_loop(listener, shared.clone(), home, path));
+            let root = std::env::current_dir()?;
+            let mut engine = Some(serve::ServeEngine::start(shared.clone(), home, &root)?);
+            let link = engine.as_ref().map(serve::ServeEngine::link);
+            let result =
+                runtime.block_on(serve::socket_loop(listener, shared.clone(), home, path, link));
+            if let Some(engine) = engine.as_mut() {
+                engine.stop();
+            }
             let store = shared.lock().unwrap();
             let finished = serve::finish_host(&store, &host_id, result);
             drop(store);
@@ -3444,107 +3475,6 @@ fn run_serve(home: &Path, stdio: bool, socket: Option<&str>) -> Result<()> {
     }
     eprintln!("baton: host stopped");
     Ok(())
-}
-
-fn build_all_adapters(
-    store: &SharedStore,
-    home: &PathBuf,
-    cwd: &PathBuf,
-) -> Vec<SharedAdapter> {
-    let process_recorder = process::ProcessRecorder::new(
-        store.clone(),
-        cwd.to_string_lossy().to_string(),
-    );
-    let claude_recorder = process_recorder.clone();
-    let grok_recorder = process_recorder.clone();
-    let cwd_for_grok = cwd.clone();
-    let grok_spawner = Arc::new(
-        move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
-            let mut command = tokio::process::Command::new("grok");
-            command.args(["agent", "stdio"]);
-            command.current_dir(&cwd_for_grok);
-            command.env("GROK_OAUTH2_REFERRER", "baton");
-            command.stdin(std::process::Stdio::piped());
-            command.stdout(std::process::Stdio::piped());
-            command.stderr(std::process::Stdio::null());
-            for (key, value) in auth_env {
-                command.env(key, value);
-            }
-            provider_runtime::spawn_tracked_provider(command, ProviderId::Grok, &grok_recorder)
-        },
-    );
-    let antigravity_recorder = process_recorder.clone();
-    let cwd_for_antigravity = cwd.clone();
-    let antigravity_home = home.join("antigravity");
-    let antigravity_gemini = antigravity_home.join("gemini");
-    let antigravity_spawner = Arc::new(
-        move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
-            std::fs::create_dir_all(&antigravity_gemini)?;
-            // The agy CLI serves ACP itself. The explicit gemini dir and app
-            // data dir keep baton's profile isolated from the user's IDE.
-            let mut command = tokio::process::Command::new("agy");
-            command.arg("acp");
-            command.arg("--gemini-dir").arg(&antigravity_gemini);
-            command.arg("--app-data-dir").arg("antigravity-acp");
-            command.current_dir(&cwd_for_antigravity);
-            command.env("AGY_ACP_FORCE_FILE_STORAGE", "1");
-            command.env("GEMINI_HOME", &antigravity_gemini);
-            if !auth_env.iter().any(|(key, _)| key == "GEMINI_API_KEY" || key == "GOOGLE_API_KEY") {
-                command.env_remove("GEMINI_API_KEY");
-                command.env_remove("GOOGLE_API_KEY");
-            }
-            command.stdin(std::process::Stdio::piped());
-            command.stdout(std::process::Stdio::piped());
-            command.stderr(std::process::Stdio::null());
-            for (key, value) in auth_env {
-                command.env(key, value);
-            }
-            provider_runtime::spawn_tracked_provider(command, ProviderId::Antigravity, &antigravity_recorder)
-        },
-    );
-    let cursor_recorder = process_recorder.clone();
-    let cwd_for_cursor = cwd.clone();
-    let cursor_spawner = Arc::new(
-        move |auth_env: &[(String, String)]| -> anyhow::Result<baton::adapters::TransportHalves> {
-            // Cursor's ACP authenticate opens a browser login. Fail fast with
-            // a clear hint instead of hanging a headless turn.
-            if auth_env.is_empty() {
-                let status = std::process::Command::new("cursor-agent")
-                    .arg("status")
-                    .output()?;
-                let text = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&status.stdout),
-                    String::from_utf8_lossy(&status.stderr)
-                );
-                if !status.status.success()
-                    || text.to_ascii_lowercase().contains("not logged in")
-                {
-                    anyhow::bail!(
-                        "cursor-agent is not logged in; run `cursor-agent login`, then retry"
-                    );
-                }
-            }
-            let mut command = tokio::process::Command::new("cursor-agent");
-            command.arg("acp");
-            command.current_dir(&cwd_for_cursor);
-            command.stdin(std::process::Stdio::piped());
-            command.stdout(std::process::Stdio::piped());
-            command.stderr(std::process::Stdio::null());
-            for (key, value) in auth_env {
-                command.env(key, value);
-            }
-            provider_runtime::spawn_tracked_provider(command, ProviderId::Cursor, &cursor_recorder)
-        },
-    );
-    vec![
-        Arc::new(tokio::sync::Mutex::new(Box::new(ClaudeAdapter::new(ClaudeAdapter::real_spawner_with_recorder(claude_recorder))) as Box<dyn BatonAdapter>)),
-        provider_runtime::build_codex_adapter(store, cwd),
-        Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Cursor, cursor_spawner)) as Box<dyn BatonAdapter>)),
-        Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Grok, grok_spawner)) as Box<dyn BatonAdapter>)),
-        provider_runtime::build_opencode_adapter(store, cwd),
-        Arc::new(tokio::sync::Mutex::new(Box::new(AcpAdapter::new(ProviderId::Antigravity, antigravity_spawner)) as Box<dyn BatonAdapter>)),
-    ]
 }
 
 fn search_snippet(text: &str, query: &str) -> String {
@@ -3663,7 +3593,7 @@ fn run_chat(
         .enable_all()
         .build()?;
 
-    let adapters = build_all_adapters(&store, &home, &cwd);
+    let adapters = baton::runtime::build_adapters(&store, &home, &cwd);
     let (interrupt_handles, steer_handles, adapter_lifecycles) = tokio_runtime.block_on(async {
         let mut handles = Vec::new();
         let mut steer_handles = Vec::new();

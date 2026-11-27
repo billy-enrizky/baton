@@ -464,6 +464,140 @@ fn persist_tool_records(
     Ok(())
 }
 
+/// Builds one adapter per provider for a working directory. The spawners
+/// capture the directory because each provider CLI starts there; a host that
+/// serves one project reuses this set for every turn.
+pub fn build_adapters(
+    store: &SharedStore,
+    home: &std::path::Path,
+    cwd: &std::path::Path,
+) -> Vec<SharedAdapter> {
+    let process_recorder =
+        crate::process::ProcessRecorder::new(store.clone(), cwd.to_string_lossy().to_string());
+    let claude_recorder = process_recorder.clone();
+    let grok_recorder = process_recorder.clone();
+    let cwd_for_grok = cwd.to_path_buf();
+    let grok_spawner = Arc::new(
+        move |auth_env: &[(String, String)]| -> anyhow::Result<crate::adapters::TransportHalves> {
+            let mut command = tokio::process::Command::new("grok");
+            command.args(["agent", "stdio"]);
+            command.current_dir(&cwd_for_grok);
+            command.env("GROK_OAUTH2_REFERRER", "baton");
+            command.stdin(std::process::Stdio::piped());
+            command.stdout(std::process::Stdio::piped());
+            command.stderr(std::process::Stdio::null());
+            for (key, value) in auth_env {
+                command.env(key, value);
+            }
+            crate::provider_runtime::spawn_tracked_provider(
+                command,
+                ProviderId::Grok,
+                &grok_recorder,
+            )
+        },
+    );
+    let antigravity_recorder = process_recorder.clone();
+    let cwd_for_antigravity = cwd.to_path_buf();
+    let antigravity_home = home.join("antigravity");
+    let antigravity_gemini = antigravity_home.join("gemini");
+    let antigravity_spawner = Arc::new(
+        move |auth_env: &[(String, String)]| -> anyhow::Result<crate::adapters::TransportHalves> {
+            std::fs::create_dir_all(&antigravity_gemini)?;
+            // The agy CLI serves ACP itself. The explicit gemini dir and app
+            // data dir keep baton's profile isolated from the user's IDE.
+            let mut command = tokio::process::Command::new("agy");
+            command.arg("acp");
+            command.arg("--gemini-dir").arg(&antigravity_gemini);
+            command.arg("--app-data-dir").arg("antigravity-acp");
+            command.current_dir(&cwd_for_antigravity);
+            command.env("AGY_ACP_FORCE_FILE_STORAGE", "1");
+            command.env("GEMINI_HOME", &antigravity_gemini);
+            if !auth_env
+                .iter()
+                .any(|(key, _)| key == "GEMINI_API_KEY" || key == "GOOGLE_API_KEY")
+            {
+                command.env_remove("GEMINI_API_KEY");
+                command.env_remove("GOOGLE_API_KEY");
+            }
+            command.stdin(std::process::Stdio::piped());
+            command.stdout(std::process::Stdio::piped());
+            command.stderr(std::process::Stdio::null());
+            for (key, value) in auth_env {
+                command.env(key, value);
+            }
+            crate::provider_runtime::spawn_tracked_provider(
+                command,
+                ProviderId::Antigravity,
+                &antigravity_recorder,
+            )
+        },
+    );
+    let cursor_recorder = process_recorder.clone();
+    let cwd_for_cursor = cwd.to_path_buf();
+    let cursor_spawner = Arc::new(
+        move |auth_env: &[(String, String)]| -> anyhow::Result<crate::adapters::TransportHalves> {
+            // Cursor's ACP authenticate opens a browser login. Fail fast with
+            // a clear hint instead of hanging a headless turn.
+            if auth_env.is_empty() {
+                let status = std::process::Command::new("cursor-agent")
+                    .arg("status")
+                    .output()?;
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&status.stdout),
+                    String::from_utf8_lossy(&status.stderr)
+                );
+                if !status.status.success() || text.to_ascii_lowercase().contains("not logged in") {
+                    anyhow::bail!(
+                        "cursor-agent is not logged in; run `cursor-agent login`, then retry"
+                    );
+                }
+            }
+            let mut command = tokio::process::Command::new("cursor-agent");
+            command.arg("acp");
+            command.current_dir(&cwd_for_cursor);
+            command.stdin(std::process::Stdio::piped());
+            command.stdout(std::process::Stdio::piped());
+            command.stderr(std::process::Stdio::null());
+            for (key, value) in auth_env {
+                command.env(key, value);
+            }
+            crate::provider_runtime::spawn_tracked_provider(
+                command,
+                ProviderId::Cursor,
+                &cursor_recorder,
+            )
+        },
+    );
+    vec![
+        Arc::new(tokio::sync::Mutex::new(
+            Box::new(crate::adapters::claude::ClaudeAdapter::new(
+                crate::adapters::claude::ClaudeAdapter::real_spawner_with_recorder(claude_recorder),
+            )) as Box<dyn crate::adapters::BatonAdapter>,
+        )),
+        crate::provider_runtime::build_codex_adapter(store, cwd),
+        Arc::new(tokio::sync::Mutex::new(
+            Box::new(crate::adapters::acp::AcpAdapter::new(
+                ProviderId::Cursor,
+                cursor_spawner,
+            )) as Box<dyn crate::adapters::BatonAdapter>,
+        )),
+        Arc::new(tokio::sync::Mutex::new(
+            Box::new(crate::adapters::acp::AcpAdapter::new(
+                ProviderId::Grok,
+                grok_spawner,
+            )) as Box<dyn crate::adapters::BatonAdapter>,
+        )),
+        crate::provider_runtime::build_opencode_adapter(store, cwd),
+        Arc::new(tokio::sync::Mutex::new(
+            Box::new(crate::adapters::acp::AcpAdapter::new(
+                ProviderId::Antigravity,
+                antigravity_spawner,
+            )) as Box<dyn crate::adapters::BatonAdapter>,
+        )),
+    ]
+}
+
 pub async fn run_engine(
     store: SharedStore,
     home: std::path::PathBuf,

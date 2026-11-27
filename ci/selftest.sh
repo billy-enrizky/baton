@@ -15,6 +15,11 @@ if [ -z "$repo_root" ]; then
     fi
 fi
 
+if ! bash "$root/budget.sh" 10 env | grep -qx 'CARGO_INCREMENTAL=0'; then
+  echo "budget wrapper must disable Cargo incremental builds" >&2
+  exit 1
+fi
+
 for fixture in "$root"/fixtures/paths/*.txt; do
   expected="${fixture%.txt}.expected"
   actual=$(bash "$root/classify-paths.sh" --files "$fixture" . .)

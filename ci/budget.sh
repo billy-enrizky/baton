@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# CI restores a source-independent target cache, so incremental artifacts add
+# compile and restore work without surviving a source change.
+export CARGO_INCREMENTAL=0
+
 if [[ $# -lt 2 ]]; then
   echo "usage: ci/budget.sh <seconds> <command...>" >&2
   exit 2

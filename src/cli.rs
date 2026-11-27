@@ -544,6 +544,43 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Manage cron schedules owned by baton serve
+    Schedule {
+        #[command(subcommand)]
+        command: ScheduleCommand,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+pub enum ScheduleCommand {
+    /// Add a cron schedule that posts a turn into a thread
+    Add {
+        /// Cron expression in UTC: minute hour day month weekday
+        #[arg(long)]
+        cron: String,
+        /// Prompt to post on each run
+        #[arg(long)]
+        prompt: String,
+        /// Thread id or prefix; defaults to the latest thread in this directory
+        #[arg(long)]
+        thread: Option<String>,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// List schedules
+    List {
+        /// Emit a JSON array instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove a schedule by id or unique prefix
+    Remove {
+        id: String,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The interactive login command for a provider. Antigravity has no CLI

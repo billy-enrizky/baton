@@ -2024,12 +2024,215 @@ pub async fn stdio_loop(store: &BatonStore) -> Result<()> {
     Ok(())
 }
 
+/// Runs the due-schedule tick for the host. The claim is a compare-and-set on
+/// the due `next_run_at`, so a second scheduler that sees the same row loses.
+pub async fn schedule_loop(store: Arc<Mutex<BatonStore>>, home: PathBuf, pool: EnginePool) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        if let Err(error) = fire_due_schedules(&store, &home, &pool) {
+            eprintln!("baton: scheduler: {error}");
+        }
+    }
+}
+
+pub fn fire_due_schedules(
+    store: &Arc<Mutex<BatonStore>>,
+    home: &Path,
+    pool: &EnginePool,
+) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    let now_text = now.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let due = store.lock().unwrap().due_schedules_at(&now_text)?;
+    for row in due {
+        let short = &row.id[..8.min(row.id.len())];
+        let expression = match crate::schedule::parse(&row.expression) {
+            Ok(expression) => expression,
+            Err(error) => {
+                let retry = (now + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let _ = store
+                    .lock()
+                    .unwrap()
+                    .claim_schedule(&row.id, &row.next_run_at, &retry);
+                eprintln!("baton: schedule {short} has an invalid expression: {error}");
+                continue;
+            }
+        };
+        let next = match crate::schedule::next_after(&expression, now) {
+            Ok(next) => next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            Err(error) => {
+                let retry = (now + chrono::Duration::hours(1))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                let _ = store
+                    .lock()
+                    .unwrap()
+                    .claim_schedule(&row.id, &row.next_run_at, &retry);
+                eprintln!("baton: schedule {short} cannot compute its next run: {error}");
+                continue;
+            }
+        };
+        if !store
+            .lock()
+            .unwrap()
+            .claim_schedule(&row.id, &row.next_run_at, &next)?
+        {
+            continue;
+        }
+        let thread = store.lock().unwrap().get_thread(&row.thread_id)?;
+        let Some(thread) = thread else {
+            eprintln!(
+                "baton: schedule {short} points at missing thread {}",
+                &row.thread_id[..8.min(row.thread_id.len())]
+            );
+            continue;
+        };
+        if thread.archived_at.is_some() {
+            eprintln!("baton: schedule {short} skipped; its thread is archived");
+            continue;
+        }
+        let payload = serde_json::json!({
+            "thread_id": thread.id,
+            "expression": row.expression,
+            "fired_for": row.next_run_at,
+            "next_run_at": next,
+        });
+        let audit = crate::audit::event(
+            crate::audit::SCHEDULER_ACTOR,
+            &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+            Some(&row.id),
+            Some(&thread.id),
+            crate::audit::AuditAction::ScheduleTrigger,
+            &payload,
+        );
+        let audit = match audit {
+            Ok(audit) => audit,
+            Err(error) => {
+                eprintln!("baton: schedule {short} audit failed: {error}; run skipped");
+                continue;
+            }
+        };
+        if let Err(error) = store.lock().unwrap().append_audit_event(&audit) {
+            eprintln!("baton: schedule {short} audit failed: {error}; run skipped");
+            continue;
+        }
+        let link = pool.engine_for(Path::new(&thread.cwd))?;
+        let text = match (&thread.goal, thread.goal_paused) {
+            (Some(goal), false) => format!("[goal: {goal}]\n{}", row.prompt),
+            _ => row.prompt.clone(),
+        };
+        if !link.submit(&thread.id, &text, thread.permission_mode) {
+            eprintln!(
+                "baton: schedule {short} could not start a turn for {}",
+                &thread.id[..8.min(thread.id.len())]
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::claim::{acquire, ClaimOutcome, SystemProbe};
     use crate::store::NewThread;
     use crate::types::ProviderId;
+
+    fn scheduled_thread(store: &BatonStore, work: &std::path::Path) -> crate::store::ThreadRow {
+        store
+            .create_thread(NewThread {
+                title: "scheduled".into(),
+                cwd: work.to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+    }
+
+    fn due_expression() -> String {
+        (chrono::Utc::now() - chrono::Duration::minutes(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    }
+
+    fn fake_pool(
+        home: &std::path::Path,
+        work: &std::path::Path,
+    ) -> (
+        EnginePool,
+        tokio::sync::mpsc::UnboundedReceiver<crate::runtime::EngineCommand>,
+    ) {
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+        let link = EngineLink::new(
+            sender,
+            home.to_path_buf(),
+            work.to_path_buf(),
+            Arc::new(Mutex::new(RemoteApprovals::default())),
+            Arc::new(Mutex::new(RemoteQuestions::default())),
+        );
+        (EnginePool::from_link(link), receiver)
+    }
+
+    #[test]
+    fn fire_due_schedules_submits_and_advances() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = scheduled_thread(&store.lock().unwrap(), work.path());
+        let due = due_expression();
+        let row = store
+            .lock()
+            .unwrap()
+            .add_schedule(&thread.id, "run it", "* * * * *", &due)
+            .unwrap();
+        let (pool, mut receiver) = fake_pool(home.path(), work.path());
+        fire_due_schedules(&store, home.path(), &pool).unwrap();
+        match receiver.try_recv() {
+            Ok(crate::runtime::EngineCommand::Submit {
+                thread_id, text, ..
+            }) => {
+                assert_eq!(thread_id, thread.id);
+                assert_eq!(text, "run it");
+            }
+            other => panic!("expected a schedule submit, got {:?}", other.is_ok()),
+        }
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert_eq!(rows[0].last_run_at.as_deref(), Some(due.as_str()));
+        assert_ne!(rows[0].next_run_at, due);
+        let audit = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert!(audit
+            .iter()
+            .any(|event| event.action == "schedule.trigger"
+                && event.target.as_deref() == Some(&row.id)));
+        fire_due_schedules(&store, home.path(), &pool).unwrap();
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn fire_due_schedules_skips_an_archived_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = scheduled_thread(&store.lock().unwrap(), work.path());
+        assert_eq!(
+            store.lock().unwrap().archive_thread(&thread.id).unwrap(),
+            crate::store::ArchiveOutcome::Archived
+        );
+        store
+            .lock()
+            .unwrap()
+            .add_schedule(&thread.id, "run it", "* * * * *", &due_expression())
+            .unwrap();
+        let (pool, mut receiver) = fake_pool(home.path(), work.path());
+        fire_due_schedules(&store, home.path(), &pool).unwrap();
+        assert!(receiver.try_recv().is_err());
+        assert!(!store
+            .lock()
+            .unwrap()
+            .list_audit_events(10)
+            .unwrap()
+            .iter()
+            .any(|event| event.action == "schedule.trigger"));
+    }
 
     #[cfg(unix)]
     fn claimed_store() -> (tempfile::TempDir, BatonStore) {

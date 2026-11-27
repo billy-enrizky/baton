@@ -130,6 +130,9 @@ baton grant revoke <id> [--json]
 baton audit list [--limit N] [--json]
 baton checkpoints <thread-id>
 baton queue [-t id] [--clear] [--json]
+baton schedule add --thread <id> --cron "<minute hour day month weekday>" --prompt "..." [--json]
+baton schedule list [--json]
+baton schedule remove <id> [--json]
 baton auth [provider] [subscription|api]
 baton secret check [--json]
 baton roles [--json]
@@ -141,6 +144,10 @@ baton bench startup [--json] [--repeat N]
 baton completions <shell>
 baton update
 ```
+
+## Schedules
+
+`baton serve` owns scheduled runs. A schedule stores a five-field cron expression in UTC, a prompt, and a thread. Each field accepts `*`, a number, a list, a range, and a step; weekdays are 0 for Sunday through 6 for Saturday, and day-of-month and day-of-week use the traditional OR rule when both are restricted. The host checks due schedules every second, claims the tick with a compare-and-set, writes a `schedule.trigger` audit row, and posts the prompt into the thread with that thread's goal and permission mode. A due schedule is skipped while its thread is archived or its expression is invalid. Add or remove schedules while no host or TUI owns the store.
 
 ## MCP
 

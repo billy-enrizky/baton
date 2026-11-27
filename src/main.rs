@@ -757,9 +757,13 @@ fn main_result(started: Instant) -> Result<()> {
             http,
             token_file,
             trusted_overlay,
+            read_only,
         } => {
             let store = open_store(None)?;
-            let server = mcp::McpServer::new(store, home.clone(), cwd.clone());
+            let mut server = mcp::McpServer::new(store, home.clone(), cwd.clone());
+            if read_only {
+                server = server.read_only();
+            }
             match http {
                 Some(addr) => {
                     let token_file =

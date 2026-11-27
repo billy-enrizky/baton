@@ -234,6 +234,9 @@ pub enum Commands {
         /// Allow a non-loopback HTTP bind on a trusted overlay
         #[arg(long, requires = "http")]
         trusted_overlay: bool,
+        /// Hide fork and refuse queue clearing
+        #[arg(long)]
+        read_only: bool,
     },
     /// Inspect every turn's tool calls, diff, and usage
     Activity {
@@ -968,6 +971,7 @@ mod tests {
                 http: Some(addr),
                 token_file: Some(path),
                 trusted_overlay: false,
+                read_only: false,
             }) => {
                 assert_eq!(addr, "127.0.0.1:8787");
                 assert_eq!(path, PathBuf::from("/tmp/baton-mcp-token"));
@@ -981,6 +985,16 @@ mod tests {
             overlay_without_http.is_err(),
             "--trusted-overlay needs --http"
         );
+        let read_only = Cli::try_parse_from(["baton", "mcp", "--read-only"]).unwrap();
+        match read_only.command {
+            Some(Commands::Mcp {
+                http: None,
+                token_file: None,
+                trusted_overlay: false,
+                read_only: true,
+            }) => {}
+            _ => panic!("expected read-only MCP stdio"),
+        }
     }
 
     #[test]

@@ -149,6 +149,10 @@ Workflow invariants:
 | CI017 | A required command that does not run under `ci/budget.sh` |
 | CI018 | The `changes` job reads a file list without the immutable event head SHA, or reads `refs/pull/`, which can name the previous head |
 
+## Action pin maintenance
+
+`actions/upload-artifact` is pinned to v7.0.2 at `cf430e030ddbb5b0abf93d22962f4752f3646cd9` in both the CI and release workflows. The previous v4.6.2 pin emitted a Node 20 deprecation warning because GitHub forced that action onto Node 24. The v7 input schema used here (`name`, `path`, and `retention-days`) is unchanged. This is a `ci-repair` change: local `actionlint`, `ci/selftest.sh`, `ci/check-ci.sh --base <main workflow> --allow-change`, and a full `cargo test --locked` pass before merge. The PR `Verify` job is expected to fail the base comparison by design; the main push after the owner merge is the proof.
+
 Gate-integrity rules:
 
 | Rule | Rejects |

@@ -1,13 +1,13 @@
-//! Newline-delimited JSON protocol for `baton serve --stdio`.
+//! Newline-delimited JSON protocol for `baton serve` and `--stdio`.
 //!
-//! Stdout carries protocol responses only. Diagnostics stay on stderr. P2 is
-//! request/response only: no events, resume cursor, or idempotency key.
+//! Stdout carries protocol responses only. Diagnostics stay on stderr.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 #[cfg(unix)]
 use std::os::unix::net::UnixListener as StdUnixListener;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -146,18 +146,155 @@ pub fn bind_socket(_path: &Path) -> Result<()> {
     anyhow::bail!("the host socket is Unix-only")
 }
 
-/// Accepts same-user clients until a signal arrives. Every client task is
-/// aborted before the socket file is removed, so the store lock can be
-/// released and shutdown cannot race a request.
+struct PendingApproval {
+    id: String,
+    thread_id: String,
+    kind: String,
+    summary: String,
+    choices: Vec<crate::types::ApprovalChoice>,
+    respond: tokio::sync::oneshot::Sender<crate::types::ApprovalDecision>,
+    sequence: u64,
+}
+
+struct TakenApproval {
+    pending: PendingApproval,
+    choice: crate::types::ApprovalChoice,
+}
+
+/// Approvals wait here until a paired client answers or the turn ends. A
+/// dropped sender is a denial, so a closed entry is pruned instead of listed.
+#[derive(Default)]
+struct RemoteApprovals {
+    pending: BTreeMap<String, PendingApproval>,
+    next_sequence: u64,
+}
+
+impl RemoteApprovals {
+    fn insert(
+        &mut self,
+        thread_id: String,
+        id: String,
+        kind: String,
+        summary: String,
+        choices: Vec<crate::types::ApprovalChoice>,
+        respond: tokio::sync::oneshot::Sender<crate::types::ApprovalDecision>,
+    ) {
+        self.next_sequence += 1;
+        let choices = if choices.is_empty() {
+            crate::adapters::standard_approval_choices()
+        } else {
+            choices
+        };
+        let sequence = self.next_sequence;
+        self.pending.insert(
+            id.clone(),
+            PendingApproval {
+                id,
+                thread_id,
+                kind,
+                summary,
+                choices,
+                respond,
+                sequence,
+            },
+        );
+    }
+
+    fn list(&mut self, thread: Option<&str>) -> Vec<Value> {
+        self.pending
+            .retain(|_, approval| !approval.respond.is_closed());
+        let mut rows: Vec<&PendingApproval> = self
+            .pending
+            .values()
+            .filter(|approval| thread.is_none_or(|thread| approval.thread_id == thread))
+            .collect();
+        rows.sort_by_key(|approval| approval.sequence);
+        rows.into_iter()
+            .map(|approval| {
+                json!({
+                    "request_id": approval.id,
+                    "thread_id": approval.thread_id,
+                    "kind": approval.kind,
+                    "summary": approval.summary,
+                    "choices": approval.choices.iter().map(|choice| json!({
+                        "id": choice.id,
+                        "label": choice.label,
+                        "kind": choice.kind,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    }
+
+    fn take(&mut self, request: &str, choice: &str) -> Option<TakenApproval> {
+        let pending = self.pending.get(request)?;
+        if pending.respond.is_closed() {
+            self.pending.remove(request);
+            return None;
+        }
+        let choice = pending
+            .choices
+            .iter()
+            .find(|item| item.id == choice)?
+            .clone();
+        let pending = self.pending.remove(request)?;
+        Some(TakenApproval { pending, choice })
+    }
+
+    fn put_back(&mut self, taken: TakenApproval) {
+        self.pending.insert(taken.pending.id.clone(), taken.pending);
+    }
+
+    fn clear_thread(&mut self, thread_id: &str) {
+        self.pending
+            .retain(|_, approval| approval.thread_id != thread_id);
+    }
+}
+
 /// The handle a socket client uses to submit work to the host engine.
 #[derive(Clone)]
 pub struct EngineLink {
     sender: tokio::sync::mpsc::UnboundedSender<crate::runtime::EngineCommand>,
     home: std::path::PathBuf,
     root: std::path::PathBuf,
+    approvals: Arc<Mutex<RemoteApprovals>>,
 }
 
 impl EngineLink {
+    fn new(
+        sender: tokio::sync::mpsc::UnboundedSender<crate::runtime::EngineCommand>,
+        home: std::path::PathBuf,
+        root: std::path::PathBuf,
+        approvals: Arc<Mutex<RemoteApprovals>>,
+    ) -> EngineLink {
+        EngineLink {
+            sender,
+            home,
+            root,
+            approvals,
+        }
+    }
+
+    pub fn list_approvals(&self, thread: Option<&str>) -> Vec<Value> {
+        self.approvals
+            .lock()
+            .map(|mut approvals| approvals.list(thread))
+            .unwrap_or_default()
+    }
+
+    fn take_approval(&self, request: &str, choice: &str) -> Option<TakenApproval> {
+        self.approvals
+            .lock()
+            .ok()
+            .and_then(|mut approvals| approvals.take(request, choice))
+    }
+
+    fn put_back_approval(&self, taken: TakenApproval) {
+        if let Ok(mut approvals) = self.approvals.lock() {
+            approvals.put_back(taken);
+        }
+    }
+
     pub fn submit(
         &self,
         thread_id: &str,
@@ -199,10 +336,41 @@ impl ServeEngine {
         let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
         let (engine_event_sender, engine_event_receiver) = std::sync::mpsc::channel();
         let (turn_event_sender, turn_event_receiver) = std::sync::mpsc::channel();
-        // The host has no UI to consume events, and keeping the receivers alive
-        // without draining would buffer every event for the life of the host.
+        let approvals = Arc::new(Mutex::new(RemoteApprovals::default()));
+        // The host has no UI to consume engine events. Turn events are read to
+        // keep remote approvals alive and to drop them when their turn ends.
         std::thread::spawn(move || for _ in engine_event_receiver {});
-        std::thread::spawn(move || for _ in turn_event_receiver {});
+        let approval_sink = approvals.clone();
+        std::thread::spawn(move || {
+            for (thread_id, event) in turn_event_receiver {
+                match event {
+                    crate::adapters::TurnEvent::ApprovalRequest {
+                        id,
+                        kind,
+                        summary,
+                        choices,
+                        respond,
+                    } => {
+                        if let Ok(mut approvals) = approval_sink.lock() {
+                            approvals.insert(thread_id, id, kind, summary, choices, respond);
+                        }
+                    }
+                    crate::adapters::TurnEvent::QuestionRequest { respond, .. } => {
+                        // Remote question answering is a separate slice. Answer
+                        // empty so the provider is not left waiting.
+                        let _ = respond.send(Vec::new());
+                    }
+                    crate::adapters::TurnEvent::TurnCompleted { .. }
+                    | crate::adapters::TurnEvent::TurnFailed { .. }
+                    | crate::adapters::TurnEvent::TurnInterrupted { .. } => {
+                        if let Ok(mut approvals) = approval_sink.lock() {
+                            approvals.clear_thread(&thread_id);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
         let engine_store = store.clone();
         let engine_home = home.to_path_buf();
         let thread = std::thread::spawn(move || {
@@ -238,11 +406,12 @@ impl ServeEngine {
             }
         });
         Ok(ServeEngine {
-            link: EngineLink {
-                sender: command_sender,
-                home: home.to_path_buf(),
-                root: root.to_path_buf(),
-            },
+            link: EngineLink::new(
+                command_sender,
+                home.to_path_buf(),
+                root.to_path_buf(),
+                approvals,
+            ),
             thread: Some(thread),
         })
     }
@@ -265,6 +434,9 @@ impl Drop for ServeEngine {
     }
 }
 
+/// Accepts same-user clients until a signal arrives. Every client task is
+/// aborted before the socket file is removed, so the store lock can be
+/// released and shutdown cannot race a request.
 #[cfg(unix)]
 pub async fn socket_loop(
     listener: StdUnixListener,
@@ -560,10 +732,10 @@ fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink
         else {
             return error_response(id, "unauthenticated", "grant_id and secret are required");
         };
-        let required = if command == "submit" {
-            "operate"
-        } else {
-            "read"
+        let required = match command {
+            "submit" => "operate",
+            "respond" => "approve",
+            _ => "read",
         };
         match crate::grants::verify(store, grant_id, secret) {
             Ok(verified) => {
@@ -588,6 +760,13 @@ fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink
         let grant = grant.expect("submit requires a verified grant");
         return submit_request(store, engine, &grant, id, &value);
     }
+    if command == "respond" {
+        let grant = grant.expect("respond requires a verified grant");
+        return respond_request(store, engine, &grant, id, &value);
+    }
+    if command == "approvals" {
+        return approvals_request(engine, id, &value);
+    }
     handle_line(store, line).unwrap_or_else(|| {
         error_response(
             id,
@@ -598,6 +777,24 @@ fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink
 }
 
 const SUBMIT_OPERATION: &str = "submit";
+const RESPOND_OPERATION: &str = "respond";
+
+fn request_key<'a>(args: &'a Map<String, Value>, id: &Value) -> Result<&'a str, Value> {
+    match args.get("idempotency_key") {
+        Some(Value::String(key))
+            if !key.is_empty()
+                && key.chars().count() <= 128
+                && !key.chars().any(char::is_control) =>
+        {
+            Ok(key.as_str())
+        }
+        _ => Err(error_response(
+            id.clone(),
+            "malformed_line",
+            "args.idempotency_key must be a non-empty string of at most 128 characters",
+        )),
+    }
+}
 
 /// A replay returns the original result with `replayed: true`, so a client can
 /// tell that no second turn started.
@@ -654,21 +851,10 @@ fn submit_request(
             )
         }
     };
-    let key =
-        match args.get("idempotency_key") {
-            Some(Value::String(key))
-                if !key.is_empty()
-                    && key.chars().count() <= 128
-                    && !key.chars().any(char::is_control) =>
-            {
-                key.as_str()
-            }
-            _ => return error_response(
-                id,
-                "malformed_line",
-                "submit args.idempotency_key must be a non-empty string of at most 128 characters",
-            ),
-        };
+    let key = match request_key(args, &id) {
+        Ok(key) => key,
+        Err(error) => return error,
+    };
     match store.replay_idempotent_request(key, SUBMIT_OPERATION) {
         Ok(Some(stored)) => return replay_response(id, &stored),
         Ok(None) => {}
@@ -751,6 +937,155 @@ fn submit_request(
         let _ = store.forget_idempotent_request(key, SUBMIT_OPERATION);
         return error_response(id, "internal", "the host engine is not running");
     }
+    response(id, body)
+}
+
+fn approvals_request(engine: Option<&EngineLink>, id: Value, value: &Value) -> Value {
+    let Some(engine) = engine else {
+        return error_response(
+            id,
+            "not_implemented",
+            "this host has no engine; start baton serve without --stdio",
+        );
+    };
+    let thread = match value.get("args") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(args)) => match args.get("thread") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(thread)) if !thread.is_empty() => Some(thread.as_str()),
+            _ => {
+                return error_response(
+                    id,
+                    "malformed_line",
+                    "approvals args.thread must be a non-empty string",
+                )
+            }
+        },
+        _ => return error_response(id, "malformed_line", "approvals args must be an object"),
+    };
+    response(id, json!({ "approvals": engine.list_approvals(thread) }))
+}
+
+fn respond_request(
+    store: &BatonStore,
+    engine: Option<&EngineLink>,
+    grant: &crate::store::GrantSummary,
+    id: Value,
+    value: &Value,
+) -> Value {
+    let Some(engine) = engine else {
+        return error_response(
+            id,
+            "not_implemented",
+            "this host has no engine; start baton serve without --stdio",
+        );
+    };
+    let args = match value.get("args") {
+        Some(Value::Object(args)) => args,
+        _ => return error_response(id, "malformed_line", "respond args must be an object"),
+    };
+    let request_id = match args.get("request") {
+        Some(Value::String(request))
+            if !request.is_empty()
+                && request.chars().count() <= 256
+                && !request.chars().any(char::is_control) =>
+        {
+            request.as_str()
+        }
+        _ => {
+            return error_response(
+                id,
+                "malformed_line",
+                "respond args.request must be a non-empty string of at most 256 characters",
+            )
+        }
+    };
+    let choice_id = match args.get("choice") {
+        Some(Value::String(choice))
+            if !choice.is_empty()
+                && choice.chars().count() <= 128
+                && !choice.chars().any(char::is_control) =>
+        {
+            choice.as_str()
+        }
+        _ => {
+            return error_response(
+                id,
+                "malformed_line",
+                "respond args.choice must be a non-empty string of at most 128 characters",
+            )
+        }
+    };
+    let key = match request_key(args, &id) {
+        Ok(key) => key,
+        Err(error) => return error,
+    };
+    match store.replay_idempotent_request(key, RESPOND_OPERATION) {
+        Ok(Some(stored)) => return replay_response(id, &stored),
+        Ok(None) => {}
+        Err(error) => return error_response(id, "idempotency_conflict", error.to_string()),
+    }
+    let Some(taken) = engine.take_approval(request_id, choice_id) else {
+        return match store.replay_idempotent_request(key, RESPOND_OPERATION) {
+            Ok(Some(stored)) => replay_response(id, &stored),
+            Ok(None) => error_response(
+                id,
+                "not_found",
+                format!("no pending approval matches {request_id} with choice {choice_id}"),
+            ),
+            Err(error) => error_response(id, "idempotency_conflict", error.to_string()),
+        };
+    };
+    let decision = taken.choice.decision();
+    let body = json!({
+        "request_id": taken.pending.id,
+        "thread_id": taken.pending.thread_id,
+        "choice": taken.choice.id,
+        "decision": decision.as_str(),
+        "answered": true,
+    });
+    match store.claim_idempotent_request(
+        key,
+        RESPOND_OPERATION,
+        &taken.pending.thread_id,
+        &body.to_string(),
+    ) {
+        Ok(Some(stored)) => {
+            engine.put_back_approval(taken);
+            return replay_response(id, &stored);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            engine.put_back_approval(taken);
+            return error_response(id, "idempotency_conflict", error.to_string());
+        }
+    }
+    let audit = match crate::audit::grant_event(
+        &grant.grant_id,
+        &engine.environment(),
+        Some(&taken.pending.id),
+        Some(&taken.pending.thread_id),
+        crate::audit::AuditAction::ApprovalDecide,
+        &json!({
+            "request_id": taken.pending.id,
+            "kind": taken.pending.kind,
+            "decision": decision.as_str(),
+            "label": taken.choice.label,
+        }),
+    ) {
+        Ok(audit) => audit,
+        Err(error) => {
+            engine.put_back_approval(taken);
+            let _ = store.forget_idempotent_request(key, RESPOND_OPERATION);
+            return error_response(id, "internal", error.to_string());
+        }
+    };
+    if let Err(error) = store.append_audit_event(&audit) {
+        engine.put_back_approval(taken);
+        let _ = store.forget_idempotent_request(key, RESPOND_OPERATION);
+        return error_response(id, "internal", error.to_string());
+    }
+    let _ = taken.pending.respond.send(decision);
     response(id, body)
 }
 
@@ -1269,11 +1604,12 @@ mod tests {
             })
             .unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let engine = EngineLink {
+        let engine = EngineLink::new(
             sender,
-            home: home.path().to_path_buf(),
-            root: root.path().to_path_buf(),
-        };
+            home.path().to_path_buf(),
+            root.path().to_path_buf(),
+            Arc::new(Mutex::new(RemoteApprovals::default())),
+        );
         let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64, key: &str| {
             format!(
                 r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{thread}","text":"remote hello","idempotency_key":"{key}"}}}}"#,
@@ -1409,11 +1745,12 @@ mod tests {
             .set_thread_permission_mode(&thread.id, crate::types::PermissionMode::BypassPermissions)
             .unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let engine = EngineLink {
+        let engine = EngineLink::new(
             sender,
-            home: home.path().to_path_buf(),
-            root: root.path().to_path_buf(),
-        };
+            home.path().to_path_buf(),
+            root.path().to_path_buf(),
+            Arc::new(Mutex::new(RemoteApprovals::default())),
+        );
         let refused = handle_socket_line(
             &store,
             &format!(
@@ -1468,11 +1805,12 @@ mod tests {
         plan_request.permission_ceiling = PermissionMode::Plan;
         let plan_grant = mint(&store, home.path(), &plan_request).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let engine = EngineLink {
+        let engine = EngineLink::new(
             sender,
-            home: home.path().to_path_buf(),
-            root: root.path().to_path_buf(),
-        };
+            home.path().to_path_buf(),
+            root.path().to_path_buf(),
+            Arc::new(Mutex::new(RemoteApprovals::default())),
+        );
         let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64| {
             format!(
                 r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{thread}","text":"remote hello","idempotency_key":"k-{id}"}}}}"#,
@@ -1503,6 +1841,171 @@ mod tests {
         );
         assert_eq!(accepted["ok"], true, "{accepted}");
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn a_finished_turn_drops_its_pending_approvals() {
+        let mut approvals = RemoteApprovals::default();
+        let (first, mut first_receiver) = tokio::sync::oneshot::channel();
+        let (second, _second_receiver) = tokio::sync::oneshot::channel();
+        approvals.insert(
+            "thread-1".into(),
+            "req-1".into(),
+            "command".into(),
+            "first".into(),
+            Vec::new(),
+            first,
+        );
+        approvals.insert(
+            "thread-2".into(),
+            "req-2".into(),
+            "command".into(),
+            "second".into(),
+            Vec::new(),
+            second,
+        );
+        approvals.clear_thread("thread-1");
+        assert!(first_receiver.try_recv().is_err());
+        let listed = approvals.list(None);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["request_id"], "req-2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn approvals_require_approve_scope_and_answer_once() {
+        use crate::grants::{mint, GrantRequest, Scope};
+
+        let (_dir, store) = claimed_store();
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let read = mint(&store, home.path(), &GrantRequest::new(vec![Scope::Read])).unwrap();
+        let approve = mint(
+            &store,
+            home.path(),
+            &GrantRequest::new(vec![Scope::Read, Scope::Approve]),
+        )
+        .unwrap();
+        let thread = store.list_threads(None).unwrap().remove(0);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let engine = EngineLink::new(
+            sender,
+            home.path().to_path_buf(),
+            root.path().to_path_buf(),
+            Arc::new(Mutex::new(RemoteApprovals::default())),
+        );
+        let (respond, mut decision_receiver) = tokio::sync::oneshot::channel();
+        engine.approvals.lock().unwrap().insert(
+            thread.id.clone(),
+            "req-1".into(),
+            "command".into(),
+            "run tests".into(),
+            Vec::new(),
+            respond,
+        );
+        let request = |grant: &crate::grants::MintedGrant, id: u64, command: &str, args: &str| {
+            format!(
+                r#"{{"v":1,"kind":"request","id":{id},"command":"{command}","grant_id":"{}","secret":"{}","args":{args}}}"#,
+                grant.summary.grant_id, grant.secret
+            )
+        };
+
+        let listed =
+            handle_socket_line(&store, &request(&read, 1, "approvals", "{}"), Some(&engine));
+        assert_eq!(listed["ok"], true, "{listed}");
+        assert_eq!(listed["result"]["approvals"][0]["request_id"], "req-1");
+        assert_eq!(
+            listed["result"]["approvals"][0]["choices"][0]["id"],
+            "accept"
+        );
+
+        let denied = handle_socket_line(
+            &store,
+            &request(
+                &read,
+                2,
+                "respond",
+                r#"{"request":"req-1","choice":"accept","idempotency_key":"k-read"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(denied["error"]["code"], "not_permitted");
+
+        let wrong = handle_socket_line(
+            &store,
+            &request(
+                &approve,
+                3,
+                "respond",
+                r#"{"request":"req-1","choice":"missing","idempotency_key":"k-wrong"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(wrong["error"]["code"], "not_found");
+        assert!(engine.list_approvals(None).len() == 1);
+
+        let accepted = handle_socket_line(
+            &store,
+            &request(
+                &approve,
+                4,
+                "respond",
+                r#"{"request":"req-1","choice":"accept","idempotency_key":"k-respond"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(accepted["result"]["answered"], true);
+        assert_eq!(accepted["result"]["decision"], "accept");
+        assert_eq!(
+            decision_receiver.try_recv().unwrap(),
+            crate::types::ApprovalDecision::Accept
+        );
+        assert!(engine.list_approvals(None).is_empty());
+
+        let replay = handle_socket_line(
+            &store,
+            &request(
+                &approve,
+                5,
+                "respond",
+                r#"{"request":"req-1","choice":"accept","idempotency_key":"k-respond"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(replay["result"]["replayed"], true);
+
+        let again = handle_socket_line(
+            &store,
+            &request(
+                &approve,
+                6,
+                "respond",
+                r#"{"request":"req-1","choice":"accept","idempotency_key":"k-other"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(again["error"]["code"], "not_found");
+
+        let events = store.list_audit_events(20).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.action == "approval.decide")
+            .expect("the answer writes its row");
+        assert_eq!(event.actor, approve.summary.grant_id);
+        assert_eq!(event.confirmation, crate::audit::SOCKET_GRANT_CONFIRMATION);
+        assert_eq!(event.scope, crate::audit::APPROVE_SCOPE);
+        assert_eq!(event.target.as_deref(), Some("req-1"));
+        assert_eq!(event.thread_id.as_deref(), Some(thread.id.as_str()));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == "approval.decide")
+                .count(),
+            1,
+            "a replay does not write a second row"
+        );
     }
 
     #[cfg(unix)]

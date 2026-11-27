@@ -851,6 +851,124 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
 }
 
 #[cfg(unix)]
+fn fake_attach_host(
+    home: &std::path::Path,
+    response: serde_json::Value,
+) -> std::thread::JoinHandle<serde_json::Value> {
+    use std::os::unix::net::UnixListener;
+    let listener = UnixListener::bind(home.join("serve.sock")).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        BufReader::new(stream.try_clone().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+        let mut text = serde_json::to_string(&response).unwrap();
+        text.push('\n');
+        stream.write_all(text.as_bytes()).unwrap();
+        request
+    })
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_lists_pending_approvals_over_the_socket() {
+    let home = tempfile::tempdir().unwrap();
+    let url = format!(
+        "baton://local#grant=00000000-0000-4000-8000-000000000000&secret={}",
+        "a".repeat(64)
+    );
+    let response = serde_json::json!({
+        "v": baton::serve::PROTOCOL_VERSION,
+        "kind": "response",
+        "id": 4,
+        "ok": true,
+        "result": {
+            "approvals": [{
+                "request_id": "req-1",
+                "thread_id": "thread",
+                "kind": "command",
+                "summary": "run tests",
+                "choices": [{"id":"accept","label":"Allow once","kind":"allow_once"}]
+            }]
+        }
+    });
+    let host = fake_attach_host(home.path(), response);
+    let output = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--thread",
+            "thread",
+            "--approvals",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let request = host.join().unwrap();
+    assert_eq!(request["command"], "approvals");
+    assert_eq!(request["args"]["thread"], "thread");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["approvals"][0]["request_id"], "req-1");
+    assert_eq!(value["approvals"][0]["choices"][0]["id"], "accept");
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_answers_an_approval_over_the_socket() {
+    let home = tempfile::tempdir().unwrap();
+    let url = format!(
+        "baton://local#grant=00000000-0000-4000-8000-000000000000&secret={}",
+        "a".repeat(64)
+    );
+    let response = serde_json::json!({
+        "v": baton::serve::PROTOCOL_VERSION,
+        "kind": "response",
+        "id": 5,
+        "ok": true,
+        "result": {
+            "request_id": "req-1",
+            "thread_id": "thread",
+            "choice": "accept",
+            "decision": "accept",
+            "answered": true,
+            "replayed": false
+        }
+    });
+    let host = fake_attach_host(home.path(), response);
+    let output = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--respond",
+            "req-1",
+            "--choice",
+            "accept",
+            "--idempotency-key",
+            "answer-1",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let request = host.join().unwrap();
+    assert_eq!(request["command"], "respond");
+    assert_eq!(request["args"]["request"], "req-1");
+    assert_eq!(request["args"]["choice"], "accept");
+    assert_eq!(request["args"]["idempotency_key"], "answer-1");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["request_id"], "req-1");
+    assert_eq!(value["decision"], "accept");
+    assert_eq!(value["answered"], true);
+}
+
+#[cfg(unix)]
 #[test]
 fn serve_socket_answers_ping_and_requires_a_read_grant() {
     use baton::grants::{mint, GrantRequest, Scope};

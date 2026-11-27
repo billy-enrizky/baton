@@ -16914,12 +16914,7 @@ fn git_audit_note(result: anyhow::Result<()>) -> String {
 }
 
 fn approval_decision_name(decision: &ApprovalDecision) -> String {
-    match decision {
-        ApprovalDecision::Accept => "accept".to_string(),
-        ApprovalDecision::AcceptAlways => "accept_always".to_string(),
-        ApprovalDecision::Deny => "deny".to_string(),
-        ApprovalDecision::Choose(option) => format!("choose:{option}"),
-    }
+    decision.as_str()
 }
 
 /// Records one answer before it is sent. A failed write returns the error so
@@ -16949,12 +16944,7 @@ fn record_approval(
 }
 
 fn decision_for_choice(choice: &ApprovalChoice) -> ApprovalDecision {
-    match choice.id.as_str() {
-        "accept" => ApprovalDecision::Accept,
-        "accept_always" => ApprovalDecision::AcceptAlways,
-        "deny" => ApprovalDecision::Deny,
-        _ => ApprovalDecision::Choose(choice.id.clone()),
-    }
+    choice.decision()
 }
 
 enum QuestionKey {

@@ -854,6 +854,7 @@ enum Overlay {
         rows: Vec<crate::store::ScheduleRow>,
     },
     ScheduleAdd {
+        thread: String,
         cron: String,
         prompt: String,
         field: usize,
@@ -5071,9 +5072,11 @@ fn record_schedule_change(
 fn submit_schedule_add(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
+    thread_prefix: &str,
     cron: &str,
     prompt: &str,
 ) -> std::result::Result<String, String> {
+    let thread_prefix = thread_prefix.trim();
     let cron = cron.trim();
     let prompt = prompt.trim();
     if cron.is_empty() {
@@ -5082,6 +5085,23 @@ fn submit_schedule_add(
     if prompt.is_empty() {
         return Err("enter a prompt".into());
     }
+    let thread_id = if thread_prefix.is_empty() {
+        state.thread.id.clone()
+    } else {
+        let matches: Vec<crate::store::ThreadRow> = store
+            .lock()
+            .unwrap()
+            .list_threads(None)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|thread| thread.id.starts_with(thread_prefix))
+            .collect();
+        match matches.as_slice() {
+            [] => return Err(format!("no thread matches {thread_prefix}")),
+            [thread] => thread.id.clone(),
+            _ => return Err(format!("thread prefix {thread_prefix} is ambiguous")),
+        }
+    };
     let expression = crate::schedule::parse(cron).map_err(|error| error.to_string())?;
     let next = crate::schedule::next_after(&expression, chrono::Utc::now())
         .map_err(|error| error.to_string())?;
@@ -5089,7 +5109,7 @@ fn submit_schedule_add(
     let row = store
         .lock()
         .unwrap()
-        .add_schedule(&state.thread.id, prompt, cron, &next_run_at)
+        .add_schedule(&thread_id, prompt, cron, &next_run_at)
         .map_err(|error| format!("cannot add schedule: {error}"))?;
     let audit = record_schedule_change(
         store,
@@ -5097,14 +5117,17 @@ fn submit_schedule_add(
         crate::audit::AuditAction::ScheduleAdd,
         &row,
         serde_json::json!({
-            "thread_id": state.thread.id,
+            "thread_id": thread_id,
             "expression": cron,
             "next_run_at": next_run_at,
         }),
     );
     let short = &row.id[..8.min(row.id.len())];
     match audit {
-        Ok(()) => Ok(format!("schedule {short} added next {next_run_at}")),
+        Ok(()) => Ok(format!(
+            "schedule {short} added for thread {} next {next_run_at}",
+            &thread_id[..8.min(thread_id.len())]
+        )),
         Err(error) => {
             let _ = store.lock().unwrap().remove_schedule(&row.id);
             Err(format!("cannot audit schedule: {error}; not added"))
@@ -6940,17 +6963,36 @@ fn handle_key(
             }
         }
         Overlay::ScheduleAdd {
+            mut thread,
             mut cron,
             mut prompt,
             mut field,
             mut error,
         } => {
-            let active = if field == 0 { &mut cron } else { &mut prompt };
+            let active = if field == 0 {
+                &mut thread
+            } else if field == 1 {
+                &mut cron
+            } else {
+                &mut prompt
+            };
             match key.code {
                 KeyCode::Esc => {}
                 KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
-                    field = 1 - field.min(1);
+                    field = (field + 1) % 3;
                     state.overlay = Overlay::ScheduleAdd {
+                        thread,
+                        cron,
+                        prompt,
+                        field,
+                        error,
+                    };
+                }
+                KeyCode::Enter if field < 2 => {
+                    field += 1;
+                    error = None;
+                    state.overlay = Overlay::ScheduleAdd {
+                        thread,
                         cron,
                         prompt,
                         field,
@@ -6958,29 +7000,19 @@ fn handle_key(
                     };
                 }
                 KeyCode::Enter => {
-                    if field == 0 {
-                        field = 1;
-                        error = None;
-                        state.overlay = Overlay::ScheduleAdd {
-                            cron,
-                            prompt,
-                            field,
-                            error,
-                        };
-                    } else {
-                        match submit_schedule_add(state, store, &cron, &prompt) {
-                            Ok(notice) => {
-                                state.notice = Some(notice);
-                                refresh_schedule_picker(state, store, 0);
-                            }
-                            Err(message) => {
-                                state.overlay = Overlay::ScheduleAdd {
-                                    cron,
-                                    prompt,
-                                    field,
-                                    error: Some(message),
-                                };
-                            }
+                    match submit_schedule_add(state, store, &thread, &cron, &prompt) {
+                        Ok(notice) => {
+                            state.notice = Some(notice);
+                            refresh_schedule_picker(state, store, 0);
+                        }
+                        Err(message) => {
+                            state.overlay = Overlay::ScheduleAdd {
+                                thread,
+                                cron,
+                                prompt,
+                                field,
+                                error: Some(message),
+                            };
                         }
                     }
                 }
@@ -6988,6 +7020,7 @@ fn handle_key(
                     active.pop();
                     error = None;
                     state.overlay = Overlay::ScheduleAdd {
+                        thread,
                         cron,
                         prompt,
                         field,
@@ -6998,6 +7031,7 @@ fn handle_key(
                     active.clear();
                     error = None;
                     state.overlay = Overlay::ScheduleAdd {
+                        thread,
                         cron,
                         prompt,
                         field,
@@ -7008,6 +7042,7 @@ fn handle_key(
                     active.push(character);
                     error = None;
                     state.overlay = Overlay::ScheduleAdd {
+                        thread,
                         cron,
                         prompt,
                         field,
@@ -7016,6 +7051,7 @@ fn handle_key(
                 }
                 _ => {
                     state.overlay = Overlay::ScheduleAdd {
+                        thread,
                         cron,
                         prompt,
                         field,
@@ -12294,6 +12330,7 @@ fn handle_command(
             None | Some("list") if args.len() <= 1 => open_schedule_picker(state, store),
             Some("add") if args.len() == 1 => {
                 state.overlay = Overlay::ScheduleAdd {
+                    thread: String::new(),
                     cron: String::new(),
                     prompt: String::new(),
                     field: 0,
@@ -13760,7 +13797,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::EffortPicker { .. } => 10,
             Overlay::SnoozePicker { .. } => 9,
             Overlay::SchedulePicker { rows, .. } => rows.len().min(8) + 6,
-            Overlay::ScheduleAdd { .. } => 8,
+            Overlay::ScheduleAdd { .. } => 9,
             Overlay::OrchestrationPreview { preview } => preview.plan.tasks.len().min(8) * 2 + 8,
             Overlay::HandoffPreview { .. } => 14,
         }
@@ -14013,6 +14050,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 rows,
             } => draw_schedule_picker(frame, chunks[2], rows, *selected, *remove_armed),
             Overlay::ScheduleAdd {
+                thread,
                 cron,
                 prompt,
                 field,
@@ -14021,10 +14059,13 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 frame,
                 chunks[2],
                 state,
-                cron,
-                prompt,
-                *field,
-                error.as_deref(),
+                ScheduleAddView {
+                    thread,
+                    cron,
+                    prompt,
+                    field: *field,
+                    error: error.as_deref(),
+                },
             ),
             Overlay::OrchestrationPreview { preview } => {
                 draw_orchestration_preview(frame, chunks[2], state, preview)
@@ -15700,15 +15741,27 @@ fn draw_schedule_picker(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+struct ScheduleAddView<'a> {
+    thread: &'a str,
+    cron: &'a str,
+    prompt: &'a str,
+    field: usize,
+    error: Option<&'a str>,
+}
+
 fn draw_schedule_add(
     frame: &mut ratatui::Frame,
     area: Rect,
     state: &TuiState,
-    cron: &str,
-    prompt: &str,
-    field: usize,
-    error: Option<&str>,
+    view: ScheduleAddView,
 ) {
+    let ScheduleAddView {
+        thread,
+        cron,
+        prompt,
+        field,
+        error,
+    } = view;
     let mut lines: Vec<Line> = vec![Line::styled(
         format!(
             "add schedule · thread {} · tab switch · enter next or add · esc close",
@@ -15716,7 +15769,10 @@ fn draw_schedule_add(
         ),
         Style::default().fg(COLORS.muted),
     )];
-    for (index, (label, value)) in [("cron", cron), ("prompt", prompt)].iter().enumerate() {
+    for (index, (label, value)) in [("thread", thread), ("cron", cron), ("prompt", prompt)]
+        .iter()
+        .enumerate()
+    {
         let style = if field == index {
             Style::default()
                 .fg(COLORS.accent)
@@ -15728,7 +15784,7 @@ fn draw_schedule_add(
         lines.push(Line::styled(format!("{cursor} {label:<6} {value}"), style));
     }
     lines.push(Line::styled(
-        "cron accepts minute hour day month weekday in UTC",
+        "thread: blank uses this thread, or type an id prefix · cron: minute hour day month weekday in UTC",
         Style::default().fg(COLORS.muted),
     ));
     if let Some(error) = error {
@@ -27004,7 +27060,6 @@ mod tests {
             state.overlay,
             Overlay::ScheduleAdd { field: 0, .. }
         ));
-        type_into_schedule_form(&mut state, &store, &engine_command_sender, "0 9 * * 1-5");
         handle_key(
             &mut state,
             &store,
@@ -27014,6 +27069,17 @@ mod tests {
         assert!(matches!(
             state.overlay,
             Overlay::ScheduleAdd { field: 1, .. }
+        ));
+        type_into_schedule_form(&mut state, &store, &engine_command_sender, "0 9 * * 1-5");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            state.overlay,
+            Overlay::ScheduleAdd { field: 2, .. }
         ));
         type_into_schedule_form(
             &mut state,
@@ -27034,7 +27100,7 @@ mod tests {
         assert_eq!(rows[0].prompt, "check the tests");
         assert!(rows[0].enabled);
         let notice = state.notice.clone().unwrap_or_default();
-        assert!(notice.contains("added next"), "{notice}");
+        assert!(notice.contains("added for thread"), "{notice}");
         assert!(matches!(
             state.overlay,
             Overlay::SchedulePicker { selected: 0, .. }
@@ -27058,6 +27124,12 @@ mod tests {
         let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
 
         handle_command(&mut state, &store, &engine_command_sender, "/schedule add");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         type_into_schedule_form(&mut state, &store, &engine_command_sender, "not a cron");
         handle_key(
             &mut state,
@@ -27086,6 +27158,12 @@ mod tests {
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         );
         handle_command(&mut state, &store, &engine_command_sender, "/schedule add");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
         type_into_schedule_form(&mut state, &store, &engine_command_sender, "0 9 * * *");
         handle_key(
             &mut state,
@@ -27105,6 +27183,57 @@ mod tests {
             _ => String::new(),
         };
         assert!(message.contains("prompt"), "{message}");
+    }
+
+    #[test]
+    fn schedule_add_form_targets_another_thread_by_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let other = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "other".into(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Claude,
+                current_model: None,
+            })
+            .unwrap();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/schedule add");
+        type_into_schedule_form(&mut state, &store, &engine_command_sender, &other.id[..8]);
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        type_into_schedule_form(&mut state, &store, &engine_command_sender, "0 9 * * *");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        type_into_schedule_form(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "other thread job",
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].thread_id, other.id);
+        assert_eq!(rows[0].prompt, "other thread job");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains(&other.id[..8]), "{notice}");
     }
 
     #[test]

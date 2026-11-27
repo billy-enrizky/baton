@@ -145,6 +145,9 @@ pub enum Commands {
         /// Keep polling until the thread is idle
         #[arg(long, requires = "thread", conflicts_with = "json")]
         follow: bool,
+        /// Submit one prompt to the thread over the socket
+        #[arg(long, value_name = "TEXT", requires = "thread")]
+        submit: Option<String>,
     },
     /// Inspect or change host ownership of the local store
     Host {
@@ -930,6 +933,7 @@ mod tests {
                 after: 0,
                 limit: 50,
                 follow: false,
+                submit: None,
             }) => assert!(url.starts_with("baton://local#")),
             _ => panic!("expected attach"),
         }
@@ -958,6 +962,28 @@ mod tests {
                 ..
             }) => assert_eq!(thread, "thread"),
             _ => panic!("expected a message page"),
+        }
+        let cli = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--thread",
+            "thread",
+            "--submit",
+            "remote hello",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Attach {
+                thread: Some(thread),
+                submit: Some(text),
+                ..
+            }) => {
+                assert_eq!(thread, "thread");
+                assert_eq!(text, "remote hello");
+            }
+            _ => panic!("expected a submit"),
         }
         let conflict = Cli::try_parse_from([
             "baton",

@@ -16,6 +16,7 @@ pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIRING_PREFIX: &str = "baton://local#";
 const STATUS_REQUEST_ID: u64 = 1;
 const MESSAGES_REQUEST_ID: u64 = 2;
+const SUBMIT_REQUEST_ID: u64 = 3;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingCredential {
@@ -74,6 +75,42 @@ impl AttachStatus {
             "scope": self.scope,
             "threads": self.threads,
             "running_turns": self.running_turns,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachSubmit {
+    pub thread_id: String,
+    pub accepted: bool,
+}
+
+impl AttachSubmit {
+    pub fn from_response(value: &Value) -> Result<AttachSubmit> {
+        let result = value
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("host response has no result object"))?;
+        let thread_id = result
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("host response has no thread id"))?
+            .to_string();
+        let accepted = result
+            .get("accepted")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow::anyhow!("host response has no accepted flag"))?;
+        Ok(AttachSubmit {
+            thread_id,
+            accepted,
+        })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "schema_version": crate::status::SCHEMA_VERSION,
+            "thread_id": self.thread_id,
+            "accepted": self.accepted,
         })
     }
 }
@@ -308,6 +345,25 @@ pub fn query_thread_status(
 }
 
 #[cfg(unix)]
+pub fn submit(
+    home: &Path,
+    credential: &PairingCredential,
+    thread: &str,
+    text: &str,
+    timeout: Duration,
+) -> Result<AttachSubmit> {
+    let response = request(
+        home,
+        credential,
+        "submit",
+        json!({ "thread": thread, "text": text }),
+        SUBMIT_REQUEST_ID,
+        timeout,
+    )?;
+    AttachSubmit::from_response(&response)
+}
+
+#[cfg(unix)]
 pub fn query_messages(
     home: &Path,
     credential: &PairingCredential,
@@ -333,6 +389,17 @@ pub fn query_status(
     _credential: &PairingCredential,
     _timeout: Duration,
 ) -> Result<AttachStatus> {
+    anyhow::bail!("attach is supported only on Unix")
+}
+
+#[cfg(not(unix))]
+pub fn submit(
+    _home: &Path,
+    _credential: &PairingCredential,
+    _thread: &str,
+    _text: &str,
+    _timeout: Duration,
+) -> Result<AttachSubmit> {
     anyhow::bail!("attach is supported only on Unix")
 }
 
@@ -463,6 +530,30 @@ mod tests {
             "result": {"scope": "elsewhere", "threads": 2, "running_turns": 0}
         });
         assert!(AttachStatus::from_response(&unknown).is_err());
+    }
+
+    #[test]
+    fn submit_response_is_typed() {
+        let response = json!({
+            "v": crate::serve::PROTOCOL_VERSION,
+            "kind": "response",
+            "id": SUBMIT_REQUEST_ID,
+            "ok": true,
+            "result": {"thread_id": "thread", "accepted": true}
+        });
+        validate_response(&response, SUBMIT_REQUEST_ID).unwrap();
+        let accepted = AttachSubmit::from_response(&response).unwrap();
+        assert_eq!(accepted.thread_id, "thread");
+        assert!(accepted.accepted);
+        assert_eq!(accepted.json()["accepted"], true);
+        let missing = json!({
+            "v": crate::serve::PROTOCOL_VERSION,
+            "kind": "response",
+            "id": SUBMIT_REQUEST_ID,
+            "ok": true,
+            "result": {"thread_id": "thread"}
+        });
+        assert!(AttachSubmit::from_response(&missing).is_err());
     }
 
     #[test]

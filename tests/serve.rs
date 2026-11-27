@@ -546,6 +546,245 @@ fn serve_shutdown_settles_work_from_stopped_owners() {
 
 #[cfg(unix)]
 #[test]
+fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
+    use baton::store::BatonStore;
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::net::UnixStream;
+
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let bin = root.path().join("fake-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let harness = bin.join("codex");
+    std::fs::write(&harness, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&harness, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let thread_id = {
+        let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+        let thread = store
+            .create_thread(baton::store::NewThread {
+                title: "remote submit".into(),
+                cwd: root.path().to_string_lossy().to_string(),
+                current_provider: baton::types::ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        thread.id
+    };
+
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_baton"))
+            .arg("serve")
+            .current_dir(root.path())
+            .env("BATON_HOME", home.path())
+            .env("PATH", &path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (out_sender, out_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if out_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let (err_sender, err_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if err_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let mut output = String::new();
+    let mut ready = false;
+    while Instant::now() < deadline {
+        match err_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                output.push_str(&line);
+                output.push('\n');
+                if line.contains("host ready") {
+                    ready = true;
+                    break;
+                }
+            }
+            Err(_) if child.0.try_wait().unwrap().is_some() => break,
+            Err(_) => {}
+        }
+    }
+    assert!(ready, "serve did not report readiness: {output}");
+
+    writeln!(stdin, "pair --scope read --scope operate").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut url = String::new();
+    while Instant::now() < deadline {
+        match out_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line.starts_with("baton://local#") => {
+                url = line;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(!url.is_empty(), "pair did not print a URL: {output}");
+    let fragment = url.trim().strip_prefix("baton://local#").unwrap();
+    let mut grant_id = None;
+    let mut secret = None;
+    for field in fragment.split('&') {
+        let (key, value) = field.split_once('=').expect("key=value");
+        match key {
+            "grant" => grant_id = Some(value.to_string()),
+            "secret" => secret = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let grant_id = grant_id.expect("grant id in the pairing URL");
+    let secret = secret.expect("secret in the pairing URL");
+
+    let socket = home.path().join("serve.sock");
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut next_id = 1u64;
+    let mut ask = |value: serde_json::Value| -> serde_json::Value {
+        let mut line = serde_json::to_string(&value).unwrap();
+        line.push('\n');
+        stream.write_all(line.as_bytes()).unwrap();
+        let mut response = String::new();
+        reader.read_line(&mut response).unwrap();
+        serde_json::from_str(&response).unwrap()
+    };
+    let submit = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--thread",
+            &thread_id,
+            "--submit",
+            "remote hello",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(submit.status.success(), "{submit:?}");
+    let submit: serde_json::Value = serde_json::from_slice(&submit.stdout).unwrap();
+    assert_eq!(submit["thread_id"], thread_id);
+    assert_eq!(submit["accepted"], true);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut saw_message = false;
+    while Instant::now() < deadline {
+        let page = ask(serde_json::json!({
+            "v":1,
+            "kind":"request",
+            "id": next_id,
+            "command":"messages",
+            "grant_id": grant_id,
+            "secret": secret,
+            "args": {"thread": thread_id, "after": 0, "limit": 50},
+        }));
+        next_id += 1;
+        let messages = page["result"]["messages"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if messages
+            .iter()
+            .any(|message| message["text"] == "remote hello")
+        {
+            saw_message = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut tail = String::new();
+    while let Ok(line) = err_receiver.try_recv() {
+        tail.push_str(&line);
+        tail.push('\n');
+    }
+    let state = BatonStore::open_read_only(&home.path().join("baton.sqlite"))
+        .map(|store| {
+            format!(
+                "messages={:?} turn={:?} events={:?}",
+                store
+                    .list_messages(&thread_id)
+                    .map(|rows| rows.iter().map(|row| row.text.clone()).collect::<Vec<_>>()),
+                store
+                    .get_turn_record(&thread_id, 1)
+                    .map(|row| row.map(|row| row.phase)),
+                store.list_audit_events(10).map(|rows| rows
+                    .iter()
+                    .map(|row| row.action.clone())
+                    .collect::<Vec<_>>()),
+            )
+        })
+        .unwrap_or_else(|error| format!("store read failed: {error}"));
+    assert!(
+        saw_message,
+        "the engine did not run the remote turn: {output}\n{tail}\n{state}"
+    );
+
+    let audit = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["audit", "list", "--json", "--limit", "10"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(audit.status.success(), "{audit:?}");
+    let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    let events = audit["events"].as_array().unwrap();
+    assert!(
+        events.iter().any(|event| {
+            event["action"] == "turn.submit_request"
+                && event["actor"] == grant_id
+                && event["confirmation"] == "socket_grant"
+                && event["target"] == thread_id
+                && event["scope"] == "operate"
+        }),
+        "{events:?}"
+    );
+    assert!(
+        events.iter().any(|event| {
+            event["action"] == "turn.submit"
+                && event["actor"] == "host_engine"
+                && event["target"] == thread_id
+        }),
+        "{events:?}"
+    );
+
+    unsafe {
+        libc::kill(child.0.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.0.kill();
+            panic!("serve did not stop after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(!socket.exists(), "shutdown removes the socket");
+}
+
+#[cfg(unix)]
+#[test]
 fn serve_socket_answers_ping_and_requires_a_read_grant() {
     use baton::grants::{mint, GrantRequest, Scope};
     use baton::store::BatonStore;

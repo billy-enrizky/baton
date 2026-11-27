@@ -149,12 +149,129 @@ pub fn bind_socket(_path: &Path) -> Result<()> {
 /// Accepts same-user clients until a signal arrives. Every client task is
 /// aborted before the socket file is removed, so the store lock can be
 /// released and shutdown cannot race a request.
+/// The handle a socket client uses to submit work to the host engine.
+#[derive(Clone)]
+pub struct EngineLink {
+    sender: tokio::sync::mpsc::UnboundedSender<crate::runtime::EngineCommand>,
+    home: std::path::PathBuf,
+    root: std::path::PathBuf,
+}
+
+impl EngineLink {
+    pub fn submit(
+        &self,
+        thread_id: &str,
+        text: &str,
+        permission_mode: crate::types::PermissionMode,
+    ) -> bool {
+        self.sender
+            .send(crate::runtime::EngineCommand::Submit {
+                thread_id: thread_id.to_string(),
+                text: text.to_string(),
+                permission_mode,
+                skip_handoff: false,
+                expected_provider: None,
+                retry: false,
+                drain_queued: false,
+            })
+            .is_ok()
+    }
+
+    pub fn environment(&self) -> String {
+        crate::claim::installation_id(&self.home).unwrap_or_else(|| "unclaimed".into())
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+/// The host's provider engine. A socket host owns one engine for the project
+/// directory it started in.
+pub struct ServeEngine {
+    link: EngineLink,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl ServeEngine {
+    pub fn start(store: Arc<Mutex<BatonStore>>, home: &Path, root: &Path) -> Result<ServeEngine> {
+        let adapters = crate::runtime::build_adapters(&store, home, root);
+        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_event_sender, engine_event_receiver) = std::sync::mpsc::channel();
+        let (turn_event_sender, turn_event_receiver) = std::sync::mpsc::channel();
+        // The host has no UI to consume events, and keeping the receivers alive
+        // without draining would buffer every event for the life of the host.
+        std::thread::spawn(move || for _ in engine_event_receiver {});
+        std::thread::spawn(move || for _ in turn_event_receiver {});
+        let engine_store = store.clone();
+        let engine_home = home.to_path_buf();
+        let thread = std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("baton: engine runtime: {error}");
+                    return;
+                }
+            };
+            let interrupts = runtime.block_on(async {
+                let mut handles = Vec::new();
+                for adapter in &adapters {
+                    let adapter = adapter.lock().await;
+                    handles.push((adapter.id(), adapter.interrupt_handle()));
+                }
+                handles
+            });
+            if let Err(error) = runtime.block_on(crate::runtime::run_engine(
+                engine_store,
+                engine_home,
+                adapters,
+                interrupts,
+                Vec::new(),
+                command_receiver,
+                engine_event_sender,
+                turn_event_sender,
+            )) {
+                eprintln!("baton: engine stopped: {error}");
+            }
+        });
+        Ok(ServeEngine {
+            link: EngineLink {
+                sender: command_sender,
+                home: home.to_path_buf(),
+                root: root.to_path_buf(),
+            },
+            thread: Some(thread),
+        })
+    }
+
+    pub fn link(&self) -> EngineLink {
+        self.link.clone()
+    }
+
+    pub fn stop(&mut self) {
+        let _ = self.link.sender.send(crate::runtime::EngineCommand::Quit);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for ServeEngine {
+    fn drop(&mut self) {
+        let _ = self.link.sender.send(crate::runtime::EngineCommand::Quit);
+    }
+}
+
 #[cfg(unix)]
 pub async fn socket_loop(
     listener: StdUnixListener,
     store: Arc<Mutex<BatonStore>>,
     home: &Path,
     path: &Path,
+    engine: Option<EngineLink>,
 ) -> Result<()> {
     let listener = TokioUnixListener::from_std(listener).context("register the host socket")?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -186,8 +303,9 @@ pub async fn socket_loop(
                 match accepted {
                     Ok((stream, _address)) => {
                         let store = store.clone();
+                        let engine = engine.clone();
                         clients.push(tokio::spawn(async move {
-                            if let Err(error) = serve_socket_client(store, stream).await {
+                            if let Err(error) = serve_socket_client(store, stream, engine).await {
                                 eprintln!("baton: socket client ended: {error}");
                             }
                         }));
@@ -218,6 +336,7 @@ pub async fn socket_loop(
     _store: Arc<Mutex<BatonStore>>,
     _home: &Path,
     _path: &Path,
+    _engine: Option<EngineLink>,
 ) -> Result<()> {
     anyhow::bail!("the host socket is Unix-only")
 }
@@ -376,7 +495,11 @@ fn pair_url(minted: &crate::grants::MintedGrant) -> String {
 }
 
 #[cfg(unix)]
-async fn serve_socket_client(store: Arc<Mutex<BatonStore>>, stream: UnixStream) -> Result<()> {
+async fn serve_socket_client(
+    store: Arc<Mutex<BatonStore>>,
+    stream: UnixStream,
+    engine: Option<EngineLink>,
+) -> Result<()> {
     let peer = socket_peer_uid(&stream)?;
     let host = unsafe { libc::getuid() };
     if !same_user(peer, host) {
@@ -396,7 +519,7 @@ async fn serve_socket_client(store: Arc<Mutex<BatonStore>>, stream: UnixStream) 
     while let Some(line) = lines.next_line().await? {
         let response = {
             let store = store.lock().unwrap();
-            handle_socket_line(&store, &line)
+            handle_socket_line(&store, &line, engine.as_ref())
         };
         let mut text = serde_json::to_string(&response)?;
         text.push('\n');
@@ -407,7 +530,7 @@ async fn serve_socket_client(store: Arc<Mutex<BatonStore>>, stream: UnixStream) 
 
 /// Socket requests carry a grant id and secret. `ping` is the only request
 /// answered without one, so a readiness probe needs no credential.
-fn handle_socket_line(store: &BatonStore, line: &str) -> Value {
+fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink>) -> Value {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return error_response(Value::Null, "malformed_line", "line is not JSON");
     };
@@ -416,16 +539,27 @@ fn handle_socket_line(store: &BatonStore, line: &str) -> Value {
     }
     let id = value["id"].clone();
     let command = value["command"].as_str().unwrap_or_default();
+    let mut grant = None;
     if command != "ping" {
         let (Some(grant_id), Some(secret)) = (value["grant_id"].as_str(), value["secret"].as_str())
         else {
             return error_response(id, "unauthenticated", "grant_id and secret are required");
         };
+        let required = if command == "submit" {
+            "operate"
+        } else {
+            "read"
+        };
         match crate::grants::verify(store, grant_id, secret) {
-            Ok(grant) => {
-                if !grant.scopes.iter().any(|scope| scope == "read") {
-                    return error_response(id, "not_permitted", "the grant lacks the read scope");
+            Ok(verified) => {
+                if !verified.scopes.iter().any(|scope| scope == required) {
+                    return error_response(
+                        id,
+                        "not_permitted",
+                        format!("the grant lacks the {required} scope"),
+                    );
                 }
+                grant = Some(verified);
             }
             Err(error) => {
                 if let Some(refusal) = error.downcast_ref::<crate::grants::GrantRefusal>() {
@@ -435,6 +569,10 @@ fn handle_socket_line(store: &BatonStore, line: &str) -> Value {
             }
         }
     }
+    if command == "submit" {
+        let grant = grant.expect("submit requires a verified grant");
+        return submit_request(store, engine, &grant, id, &value);
+    }
     handle_line(store, line).unwrap_or_else(|| {
         error_response(
             id,
@@ -442,6 +580,93 @@ fn handle_socket_line(store: &BatonStore, line: &str) -> Value {
             format!("command {command} is not implemented"),
         )
     })
+}
+
+fn submit_request(
+    store: &BatonStore,
+    engine: Option<&EngineLink>,
+    grant: &crate::store::GrantSummary,
+    id: Value,
+    value: &Value,
+) -> Value {
+    let Some(engine) = engine else {
+        return error_response(
+            id,
+            "not_implemented",
+            "this host has no engine; start baton serve without --stdio",
+        );
+    };
+    let args = match value.get("args") {
+        Some(Value::Object(args)) => args,
+        _ => return error_response(id, "malformed_line", "submit args must be an object"),
+    };
+    let thread_id = match args.get("thread") {
+        Some(Value::String(thread)) if !thread.is_empty() => thread.as_str(),
+        _ => {
+            return error_response(
+                id,
+                "malformed_line",
+                "submit args.thread must be a non-empty string",
+            )
+        }
+    };
+    let text = match args.get("text") {
+        Some(Value::String(text)) if !text.trim().is_empty() => text.as_str(),
+        _ => {
+            return error_response(
+                id,
+                "malformed_line",
+                "submit args.text must be a non-empty string",
+            )
+        }
+    };
+    let thread = match store.get_thread(thread_id) {
+        Ok(Some(thread)) => thread,
+        Ok(None) => {
+            return error_response(id, "not_found", format!("no thread matches {thread_id}"))
+        }
+        Err(error) => return error_response(id, "internal", error.to_string()),
+    };
+    let root = std::fs::canonicalize(engine.root()).unwrap_or_else(|_| engine.root().to_path_buf());
+    let cwd = std::fs::canonicalize(&thread.cwd).unwrap_or_else(|_| thread.cwd.clone().into());
+    if !cwd.starts_with(&root) {
+        return error_response(
+            id,
+            "wrong_project",
+            format!(
+                "thread {thread_id} is outside the served project {}",
+                root.display()
+            ),
+        );
+    }
+    if thread.permission_mode == crate::types::PermissionMode::BypassPermissions {
+        return error_response(
+            id,
+            "ceiling",
+            "the thread runs with bypassPermissions; set a safe mode before submitting remotely",
+        );
+    }
+    let audit = match crate::audit::grant_event(
+        &grant.grant_id,
+        &engine.environment(),
+        Some(thread_id),
+        Some(thread_id),
+        crate::audit::AuditAction::TurnSubmitRequest,
+        &json!({
+            "thread_id": thread_id,
+            "text_len": text.chars().count(),
+        }),
+    ) {
+        Ok(audit) => audit,
+        Err(error) => return error_response(id, "internal", error.to_string()),
+    };
+    if let Err(error) = store.append_audit_event(&audit) {
+        return error_response(id, "internal", error.to_string());
+    }
+    if !engine.submit(thread_id, text, thread.permission_mode) {
+        return error_response(id, "internal", "the host engine is not running");
+    }
+    response(id, json!({ "thread_id": thread_id, "accepted": true }))
 }
 
 #[cfg(unix)]
@@ -919,6 +1144,145 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn submit_requires_operate_scope_and_a_thread_in_the_project() {
+        use crate::grants::{mint, GrantRequest, Scope};
+
+        let (_dir, store) = claimed_store();
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let read = mint(&store, home.path(), &GrantRequest::new(vec![Scope::Read])).unwrap();
+        let operate = mint(
+            &store,
+            home.path(),
+            &GrantRequest::new(vec![Scope::Read, Scope::Operate]),
+        )
+        .unwrap();
+        let thread = store.list_threads(None).unwrap().remove(0);
+        let inside = store
+            .create_thread(NewThread {
+                title: "inside".into(),
+                cwd: root.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let outside = store
+            .create_thread(NewThread {
+                title: "outside".into(),
+                cwd: "/elsewhere".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let engine = EngineLink {
+            sender,
+            home: home.path().to_path_buf(),
+            root: root.path().to_path_buf(),
+        };
+        let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64| {
+            format!(
+                r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{thread}","text":"remote hello"}}}}"#,
+                grant.summary.grant_id, grant.secret
+            )
+        };
+
+        let denied = handle_socket_line(&store, &request(&read, &inside.id, 1), Some(&engine));
+        assert_eq!(denied["error"]["code"], "not_permitted");
+        assert!(receiver.try_recv().is_err());
+
+        let missing = handle_socket_line(&store, &request(&operate, "missing", 2), Some(&engine));
+        assert_eq!(missing["error"]["code"], "not_found");
+
+        let elsewhere =
+            handle_socket_line(&store, &request(&operate, &outside.id, 3), Some(&engine));
+        assert_eq!(elsewhere["error"]["code"], "wrong_project");
+
+        let malformed = handle_socket_line(
+            &store,
+            &format!(
+                r#"{{"v":1,"kind":"request","id":4,"command":"submit","grant_id":"{}","secret":"{}","args":{{}}}}"#,
+                operate.summary.grant_id, operate.secret
+            ),
+            Some(&engine),
+        );
+        assert_eq!(malformed["error"]["code"], "malformed_line");
+
+        let accepted = handle_socket_line(&store, &request(&operate, &inside.id, 5), Some(&engine));
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(accepted["result"]["accepted"], true);
+        let command = receiver.try_recv().expect("the engine receives the submit");
+        match command {
+            crate::runtime::EngineCommand::Submit {
+                thread_id, text, ..
+            } => {
+                assert_eq!(thread_id, inside.id);
+                assert_eq!(text, "remote hello");
+            }
+            _ => panic!("expected a submit command"),
+        }
+        let events = store.list_audit_events(10).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.action == "turn.submit_request")
+            .expect("the remote request writes its row");
+        assert_eq!(event.actor, operate.summary.grant_id);
+        assert_eq!(event.confirmation, crate::audit::SOCKET_GRANT_CONFIRMATION);
+        assert_eq!(event.scope, crate::audit::OPERATE_SCOPE);
+        assert_eq!(event.target.as_deref(), Some(inside.id.as_str()));
+        assert_eq!(event.thread_id.as_deref(), Some(inside.id.as_str()));
+        assert_ne!(thread.id, inside.id);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_refuses_a_bypass_thread() {
+        use crate::grants::{mint, GrantRequest, Scope};
+
+        let (_dir, store) = claimed_store();
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let operate = mint(
+            &store,
+            home.path(),
+            &GrantRequest::new(vec![Scope::Read, Scope::Operate]),
+        )
+        .unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "bypass".into(),
+                cwd: root.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .set_thread_permission_mode(&thread.id, crate::types::PermissionMode::BypassPermissions)
+            .unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let engine = EngineLink {
+            sender,
+            home: home.path().to_path_buf(),
+            root: root.path().to_path_buf(),
+        };
+        let refused = handle_socket_line(
+            &store,
+            &format!(
+                r#"{{"v":1,"kind":"request","id":1,"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{}","text":"run"}}}}"#,
+                operate.summary.grant_id, operate.secret, thread.id
+            ),
+            Some(&engine),
+        );
+        assert_eq!(refused["error"]["code"], "ceiling");
+        assert!(!store
+            .list_audit_events(10)
+            .unwrap()
+            .iter()
+            .any(|event| event.action == "turn.submit_request"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn renew_parses_a_grant_id_and_days() {
         let (grant_id, days) = parse_renew(vec!["00000000-0000-4000-8000-000000000000"]).unwrap();
         assert_eq!(grant_id, "00000000-0000-4000-8000-000000000000");
@@ -960,12 +1324,14 @@ mod tests {
         let ping = handle_socket_line(
             &store,
             r#"{"v":1,"kind":"request","id":1,"command":"ping"}"#,
+            None,
         );
         assert_eq!(ping["result"]["pong"], true);
 
         let bare = handle_socket_line(
             &store,
             r#"{"v":1,"kind":"request","id":2,"command":"status"}"#,
+            None,
         );
         assert_eq!(bare["error"]["code"], "unauthenticated");
 
@@ -975,6 +1341,7 @@ mod tests {
                 r#"{{"v":1,"kind":"request","id":3,"command":"status","grant_id":"{}","secret":"{}"}}"#,
                 read.summary.grant_id, read.secret
             ),
+            None,
         );
         assert_eq!(with["ok"], true, "{with}");
         assert_eq!(with["result"]["scope"], "host");
@@ -985,6 +1352,7 @@ mod tests {
                 r#"{{"v":1,"kind":"request","id":4,"command":"status","grant_id":"{}","secret":"wrong"}}"#,
                 read.summary.grant_id
             ),
+            None,
         );
         assert_eq!(wrong["error"]["code"], "bad_secret");
 
@@ -994,6 +1362,7 @@ mod tests {
                 r#"{{"v":1,"kind":"request","id":5,"command":"status","grant_id":"{}","secret":"{}"}}"#,
                 operate.summary.grant_id, operate.secret
             ),
+            None,
         );
         assert_eq!(narrow["error"]["code"], "not_permitted");
 
@@ -1004,6 +1373,7 @@ mod tests {
                 r#"{{"v":1,"kind":"request","id":6,"command":"status","grant_id":"{}","secret":"{}"}}"#,
                 read.summary.grant_id, read.secret
             ),
+            None,
         );
         assert_eq!(revoked["error"]["code"], "revoked");
     }

@@ -20,6 +20,7 @@ pub const OPERATE_SCOPE: &str = "operate";
 pub const APPROVE_SCOPE: &str = "approve";
 pub const GIT_SCOPE: &str = "git";
 pub const SETTINGS_SCOPE: &str = "settings";
+pub const SOCKET_GRANT_CONFIRMATION: &str = "socket_grant";
 pub const ORCHESTRATE_SCOPE: &str = "orchestrate";
 pub const DURABLE_RETENTION: &str = "durable";
 
@@ -42,6 +43,7 @@ pub enum AuditAction {
     MemoryAdd,
     MemoryRemove,
     MemoryClear,
+    TurnSubmitRequest,
     QueueClear,
     ThreadFork,
 }
@@ -66,6 +68,7 @@ impl AuditAction {
             AuditAction::MemoryAdd => "memory.add",
             AuditAction::MemoryRemove => "memory.remove",
             AuditAction::MemoryClear => "memory.clear",
+            AuditAction::TurnSubmitRequest => "turn.submit_request",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
         }
@@ -93,6 +96,7 @@ impl AuditAction {
             AuditAction::MemoryAdd | AuditAction::MemoryRemove | AuditAction::MemoryClear => {
                 SETTINGS_SCOPE
             }
+            AuditAction::TurnSubmitRequest => OPERATE_SCOPE,
         }
     }
 }
@@ -137,6 +141,21 @@ pub fn event(
     })
 }
 
+/// A request made by a paired client. The actor is the grant id, and the
+/// confirmation names the socket grant rather than the host session.
+pub fn grant_event(
+    actor: &str,
+    environment: &str,
+    target: Option<&str>,
+    thread_id: Option<&str>,
+    action: AuditAction,
+    payload: &Value,
+) -> Result<NewAuditEvent> {
+    let mut event = event(actor, environment, target, thread_id, action, payload)?;
+    event.confirmation = SOCKET_GRANT_CONFIRMATION.to_string();
+    Ok(event)
+}
+
 pub fn list(store: &BatonStore, limit: usize) -> Result<Vec<AuditEventRow>> {
     store.list_audit_events(limit)
 }
@@ -178,6 +197,7 @@ mod tests {
         assert_eq!(AuditAction::MemoryAdd.scope(), SETTINGS_SCOPE);
         assert_eq!(AuditAction::MemoryRemove.scope(), SETTINGS_SCOPE);
         assert_eq!(AuditAction::MemoryClear.scope(), SETTINGS_SCOPE);
+        assert_eq!(AuditAction::TurnSubmitRequest.scope(), OPERATE_SCOPE);
     }
 
     #[test]
@@ -232,6 +252,10 @@ mod tests {
             "orchestration.settle"
         );
         assert_eq!(AuditAction::MemoryAdd.as_str(), "memory.add");
+        assert_eq!(
+            AuditAction::TurnSubmitRequest.as_str(),
+            "turn.submit_request"
+        );
         assert_eq!(AuditAction::QueueClear.as_str(), "queue.clear");
         assert_eq!(AuditAction::ThreadFork.as_str(), "thread.fork");
     }

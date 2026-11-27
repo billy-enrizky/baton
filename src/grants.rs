@@ -177,10 +177,9 @@ pub fn mint(store: &BatonStore, home: &Path, request: &GrantRequest) -> Result<M
     let audit = crate::audit::event(
         crate::audit::HOST_TERMINAL_ACTOR,
         &row.installation_id,
+        Some(&row.grant_id),
         None,
         crate::audit::AuditAction::GrantMint,
-        crate::audit::ADMIN_SCOPE,
-        crate::audit::HOST_TERMINAL_CONFIRMATION,
         &serde_json::json!({
             "grant_id": row.grant_id,
             "installation_id": row.installation_id,
@@ -280,10 +279,9 @@ pub fn renew(store: &BatonStore, grant_id: &str, days: i64) -> Result<RenewOutco
     let audit = crate::audit::event(
         crate::audit::LOCAL_CLI_ACTOR,
         &grant.installation_id,
+        Some(grant_id),
         None,
         crate::audit::AuditAction::GrantRenew,
-        crate::audit::ADMIN_SCOPE,
-        crate::audit::LOCAL_CLI_CONFIRMATION,
         &serde_json::json!({
             "grant_id": grant_id,
             "previous_expires_at": grant.expires_at,
@@ -313,10 +311,9 @@ pub fn revoke(store: &BatonStore, home: &Path, grant_id: &str) -> Result<bool> {
     let audit = crate::audit::event(
         crate::audit::LOCAL_CLI_ACTOR,
         &grant.installation_id,
+        Some(grant_id),
         None,
         crate::audit::AuditAction::GrantRevoke,
-        crate::audit::ADMIN_SCOPE,
-        crate::audit::LOCAL_CLI_CONFIRMATION,
         &serde_json::json!({ "grant_id": grant_id }),
     )?;
     let existed = store
@@ -509,6 +506,10 @@ mod tests {
         let events = crate::audit::list(&store, 10).unwrap();
         assert_eq!(events.len(), 3, "{events:?}");
         assert_eq!(events[0].action, "grant.renew");
+        assert_eq!(
+            events[0].target.as_deref(),
+            Some(minted.summary.grant_id.as_str())
+        );
         assert_eq!(events[0].actor, crate::audit::LOCAL_CLI_ACTOR);
         assert_eq!(events[0].scope, crate::audit::ADMIN_SCOPE);
         assert_eq!(events[0].confirmation, crate::audit::LOCAL_CLI_CONFIRMATION);
@@ -572,6 +573,7 @@ mod tests {
         let event = &events[0];
         assert_eq!(event.actor, crate::audit::HOST_TERMINAL_ACTOR);
         assert_eq!(event.environment, row.installation_id);
+        assert_eq!(event.target.as_deref(), Some(row.grant_id.as_str()));
         assert_eq!(event.action, "grant.mint");
         assert_eq!(event.scope, "admin");
         assert_eq!(event.confirmation, "host_terminal");

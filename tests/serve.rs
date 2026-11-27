@@ -13,9 +13,8 @@ fn turn_event(thread_id: &str) -> baton::store::NewAuditEvent {
         baton::audit::HOST_ENGINE_ACTOR,
         "installation",
         Some(thread_id),
+        Some(thread_id),
         baton::audit::AuditAction::TurnSubmit,
-        baton::audit::OPERATE_SCOPE,
-        baton::audit::HOST_SESSION_CONFIRMATION,
         &serde_json::json!({"thread_id": thread_id}),
     )
     .unwrap()

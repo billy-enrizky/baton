@@ -2910,6 +2910,9 @@ fn list_audit(limit: usize, json: bool) -> Result<()> {
             event.id, created_at, action, result, scope, confirmation
         );
         println!("   actor={actor} environment={environment} retention={retention}");
+        if let Some(target) = &event.target {
+            println!("   target={}", sanitize::sanitize_single_line(target));
+        }
         if let Some(thread) = &event.thread_id {
             println!("   thread={}", sanitize::sanitize_single_line(thread));
         }
@@ -2923,6 +2926,7 @@ fn audit_event_json(event: &store::AuditEventRow) -> serde_json::Value {
         "id": event.id,
         "actor": event.actor,
         "environment": event.environment,
+        "target": event.target,
         "thread_id": event.thread_id,
         "action": event.action,
         "scope": event.scope,

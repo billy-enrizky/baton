@@ -1078,9 +1078,8 @@ async fn execute_turn(
             crate::audit::HOST_ENGINE_ACTOR,
             &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
             Some(thread_id),
+            Some(thread_id),
             crate::audit::AuditAction::TurnSubmit,
-            crate::audit::OPERATE_SCOPE,
-            crate::audit::HOST_SESSION_CONFIRMATION,
             &serde_json::json!({
                 "thread_id": thread_id,
                 "provider": provider.as_str(),
@@ -3605,6 +3604,7 @@ mod tests {
             .expect("the engine writes one turn.submit row");
         assert_eq!(submit.actor, crate::audit::HOST_ENGINE_ACTOR);
         assert_eq!(submit.scope, crate::audit::OPERATE_SCOPE);
+        assert_eq!(submit.target.as_deref(), Some(thread_id.as_str()));
         assert_eq!(submit.confirmation, crate::audit::HOST_SESSION_CONFIRMATION);
         assert_eq!(submit.thread_id.as_deref(), Some(thread_id.as_str()));
         assert_eq!(

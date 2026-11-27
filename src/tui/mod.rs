@@ -5097,6 +5097,7 @@ fn create_git_merge(
                 store,
                 state,
                 crate::audit::AuditAction::GitMerge,
+                &plan.number.to_string(),
                 serde_json::json!({
                     "number": plan.number,
                     "method": plan.method.as_str(),
@@ -5151,6 +5152,7 @@ fn create_git_review(
                 store,
                 state,
                 crate::audit::AuditAction::GitReview,
+                &plan.number.to_string(),
                 serde_json::json!({
                     "number": plan.number,
                     "action": plan.action.as_str(),
@@ -5196,6 +5198,7 @@ fn create_git_pr(
                 store,
                 state,
                 crate::audit::AuditAction::GitPr,
+                &outcome.url,
                 serde_json::json!({
                     "url": &outcome.url,
                     "number": outcome.number,
@@ -5239,6 +5242,7 @@ fn commit_git_plan(
                 store,
                 state,
                 crate::audit::AuditAction::GitCommit,
+                &outcome.sha,
                 serde_json::json!({
                     "sha": &outcome.sha,
                     "files": outcome.files,
@@ -5328,6 +5332,7 @@ fn push_git_plan(
                 store,
                 state,
                 crate::audit::AuditAction::GitPush,
+                &plan.remote_ref,
                 serde_json::json!({
                     "remote": &outcome.remote,
                     "remote_branch": &outcome.remote_branch,
@@ -16799,10 +16804,9 @@ fn record_question_answers(
     let event = crate::audit::event(
         crate::audit::TUI_ACTOR,
         &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+        Some(&question.id),
         Some(&question.thread_id),
         crate::audit::AuditAction::QuestionAnswer,
-        crate::audit::APPROVE_SCOPE,
-        crate::audit::HOST_SESSION_CONFIRMATION,
         &question_answer_payload(question),
     )?;
     store.lock().unwrap().append_audit_event(&event)?;
@@ -16815,15 +16819,15 @@ fn record_git_action(
     store: &Arc<Mutex<BatonStore>>,
     state: &TuiState,
     action: crate::audit::AuditAction,
+    target: &str,
     payload: serde_json::Value,
 ) -> anyhow::Result<()> {
     let event = crate::audit::event(
         crate::audit::TUI_ACTOR,
         &crate::claim::installation_id(&state.home).unwrap_or_else(|| "unclaimed".into()),
+        Some(target),
         Some(&state.thread.id),
         action,
-        crate::audit::GIT_SCOPE,
-        crate::audit::HOST_SESSION_CONFIRMATION,
         &payload,
     )?;
     store.lock().unwrap().append_audit_event(&event)?;
@@ -16858,10 +16862,9 @@ fn record_approval(
     let event = crate::audit::event(
         crate::audit::TUI_ACTOR,
         &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+        Some(&approval.id),
         Some(&approval.thread_id),
         crate::audit::AuditAction::ApprovalDecide,
-        crate::audit::APPROVE_SCOPE,
-        crate::audit::HOST_SESSION_CONFIRMATION,
         &serde_json::json!({
             "request_id": approval.id,
             "kind": approval.kind,
@@ -20515,6 +20518,8 @@ mod tests {
             events[0].thread_id.as_deref(),
             Some(state.thread.id.as_str())
         );
+        assert_eq!(events[0].target.as_deref(), Some("first"));
+        assert_eq!(events[1].target.as_deref(), Some("second"));
         assert_eq!(events[0].payload_digest.len(), 64);
         assert_ne!(
             events[0].payload_digest, events[1].payload_digest,
@@ -20620,6 +20625,7 @@ mod tests {
             &store,
             &state,
             crate::audit::AuditAction::GitPush,
+            "refs/heads/main",
             serde_json::json!({"remote": "origin", "branch": "main"}),
         )
         .unwrap();
@@ -20660,6 +20666,15 @@ mod tests {
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].action, "git.commit");
         assert_eq!(events[0].scope, crate::audit::GIT_SCOPE);
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "--short", "HEAD"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(
+            events[0].target.as_deref(),
+            Some(String::from_utf8_lossy(&head.stdout).trim())
+        );
         assert_eq!(
             events[0].thread_id.as_deref(),
             Some(state.thread.id.as_str())
@@ -20908,6 +20923,7 @@ mod tests {
         let events = store.lock().unwrap().list_audit_events(10).unwrap();
         assert_eq!(events.len(), 1, "{events:?}");
         assert_eq!(events[0].action, "question.answer");
+        assert_eq!(events[0].target.as_deref(), Some("question-request"));
         assert_eq!(events[0].actor, crate::audit::TUI_ACTOR);
         assert_eq!(events[0].scope, crate::audit::APPROVE_SCOPE);
         assert_eq!(

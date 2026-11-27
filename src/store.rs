@@ -102,6 +102,7 @@ pub struct GrantSummary {
 pub struct NewAuditEvent {
     pub actor: String,
     pub environment: String,
+    pub target: Option<String>,
     pub thread_id: Option<String>,
     pub action: String,
     pub scope: String,
@@ -116,6 +117,7 @@ pub struct AuditEventRow {
     pub id: i64,
     pub actor: String,
     pub environment: String,
+    pub target: Option<String>,
     pub thread_id: Option<String>,
     pub action: String,
     pub scope: String,
@@ -529,7 +531,7 @@ fn store_home(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 /// The first schema with the `host_claim` table. A client can check ownership
 /// only from this version on, before it runs any migration DDL.
 const HOST_CLAIM_SCHEMA_VERSION: i64 = 2;
@@ -785,6 +787,7 @@ CREATE TABLE IF NOT EXISTS audit_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   actor TEXT NOT NULL CHECK (length(actor) > 0),
   environment TEXT NOT NULL CHECK (length(environment) > 0),
+  target TEXT CHECK (target IS NULL OR length(target) > 0),
   thread_id TEXT,
   action TEXT NOT NULL CHECK (length(action) > 0),
   scope TEXT NOT NULL CHECK (length(scope) > 0),
@@ -848,6 +851,7 @@ fn apply_schema(db: &Connection) -> Result<()> {
     ensure_column(db, "orchestration_runs", "owner_start", "TEXT")?;
     ensure_column(db, "provider_processes", "owner_start", "TEXT")?;
     ensure_column(db, "provider_processes", "host_id", "TEXT")?;
+    ensure_column(db, "audit_events", "target", "TEXT")?;
     db.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     Ok(())
 }
@@ -3008,10 +3012,11 @@ impl BatonStore {
         created_at: &str,
     ) -> Result<i64> {
         db.execute(
-            "INSERT INTO audit_events (actor, environment, thread_id, action, scope, confirmation, payload_digest, result, created_at, retention) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO audit_events (actor, environment, target, thread_id, action, scope, confirmation, payload_digest, result, created_at, retention) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 event.actor,
                 event.environment,
+                event.target,
                 event.thread_id,
                 event.action,
                 event.scope,
@@ -3030,6 +3035,7 @@ impl BatonStore {
             id,
             actor: event.actor.clone(),
             environment: event.environment.clone(),
+            target: event.target.clone(),
             thread_id: event.thread_id.clone(),
             action: event.action.clone(),
             scope: event.scope.clone(),
@@ -3052,7 +3058,7 @@ impl BatonStore {
     pub fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEventRow>> {
         let limit = limit.min(i64::MAX as usize) as i64;
         let mut statement = self.db.prepare(
-            "SELECT id, actor, environment, thread_id, action, scope, confirmation, payload_digest, result, created_at, retention FROM audit_events ORDER BY id DESC LIMIT ?",
+            "SELECT id, actor, environment, target, thread_id, action, scope, confirmation, payload_digest, result, created_at, retention FROM audit_events ORDER BY id DESC LIMIT ?",
         )?;
         let rows = statement
             .query_map(params![limit], Self::map_audit_event)?
@@ -3198,14 +3204,15 @@ impl BatonStore {
             id: row.get(0)?,
             actor: row.get(1)?,
             environment: row.get(2)?,
-            thread_id: row.get(3)?,
-            action: row.get(4)?,
-            scope: row.get(5)?,
-            confirmation: row.get(6)?,
-            payload_digest: row.get(7)?,
-            result: row.get(8)?,
-            created_at: row.get(9)?,
-            retention: row.get(10)?,
+            target: row.get(3)?,
+            thread_id: row.get(4)?,
+            action: row.get(5)?,
+            scope: row.get(6)?,
+            confirmation: row.get(7)?,
+            payload_digest: row.get(8)?,
+            result: row.get(9)?,
+            created_at: row.get(10)?,
+            retention: row.get(11)?,
         })
     }
 
@@ -4444,6 +4451,7 @@ mod tests {
         NewAuditEvent {
             actor: "host_terminal".into(),
             environment: "installation".into(),
+            target: None,
             thread_id: None,
             action: action.into(),
             scope: "admin".into(),
@@ -5296,6 +5304,63 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_version_six_store_gains_the_audit_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(
+            r#"
+CREATE TABLE audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor TEXT NOT NULL,
+  environment TEXT NOT NULL,
+  thread_id TEXT,
+  action TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  confirmation TEXT NOT NULL,
+  payload_digest TEXT NOT NULL,
+  result TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  retention TEXT NOT NULL
+);
+"#,
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO audit_events (actor, environment, thread_id, action, scope, confirmation, payload_digest, result, created_at, retention) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                "host_terminal",
+                "installation",
+                None::<String>,
+                "grant.mint",
+                "admin",
+                "host_terminal",
+                "a".repeat(64),
+                "ok",
+                "2026-11-01T00:00:00.000Z",
+                "durable"
+            ],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 6).unwrap();
+        drop(db);
+
+        let store = BatonStore::open(&path).unwrap();
+        let events = store.list_audit_events(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].target, None,
+            "a row written before the column has no target"
+        );
+        let mut event = sample_audit_event("grant.mint");
+        event.target = Some("grant-1".into());
+        store.append_audit_event(&event).unwrap();
+        let events = store.list_audit_events(10).unwrap();
+        assert_eq!(events[0].target.as_deref(), Some("grant-1"));
+        assert_eq!(events[1].target, None);
     }
 
     #[test]

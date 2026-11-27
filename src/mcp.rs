@@ -35,9 +35,8 @@ impl McpServer {
             crate::audit::MCP_STDIO_ACTOR,
             &environment,
             Some(thread_id),
+            Some(thread_id),
             action,
-            crate::audit::ADMIN_SCOPE,
-            crate::audit::MCP_STDIO_CONFIRMATION,
             payload,
         )
     }

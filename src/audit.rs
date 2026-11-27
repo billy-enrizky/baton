@@ -20,6 +20,7 @@ pub const OPERATE_SCOPE: &str = "operate";
 pub const APPROVE_SCOPE: &str = "approve";
 pub const GIT_SCOPE: &str = "git";
 pub const SETTINGS_SCOPE: &str = "settings";
+pub const ORCHESTRATE_SCOPE: &str = "orchestrate";
 pub const DURABLE_RETENTION: &str = "durable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,8 @@ pub enum AuditAction {
     GitReview,
     GitMerge,
     SettingsWrite,
+    OrchestrationStart,
+    OrchestrationSettle,
     QueueClear,
     ThreadFork,
 }
@@ -55,6 +58,8 @@ impl AuditAction {
             AuditAction::GitReview => "git.review",
             AuditAction::GitMerge => "git.merge",
             AuditAction::SettingsWrite => "settings.write",
+            AuditAction::OrchestrationStart => "orchestration.start",
+            AuditAction::OrchestrationSettle => "orchestration.settle",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
         }
@@ -77,6 +82,8 @@ impl AuditAction {
             | AuditAction::GitReview
             | AuditAction::GitMerge => GIT_SCOPE,
             AuditAction::SettingsWrite => SETTINGS_SCOPE,
+            AuditAction::OrchestrationStart => ORCHESTRATE_SCOPE,
+            AuditAction::OrchestrationSettle => ADMIN_SCOPE,
         }
     }
 }
@@ -157,6 +164,8 @@ mod tests {
         assert_eq!(AuditAction::GitReview.scope(), GIT_SCOPE);
         assert_eq!(AuditAction::GitMerge.scope(), GIT_SCOPE);
         assert_eq!(AuditAction::SettingsWrite.scope(), SETTINGS_SCOPE);
+        assert_eq!(AuditAction::OrchestrationStart.scope(), ORCHESTRATE_SCOPE);
+        assert_eq!(AuditAction::OrchestrationSettle.scope(), ADMIN_SCOPE);
     }
 
     #[test]
@@ -202,6 +211,14 @@ mod tests {
         assert_eq!(AuditAction::GitCommit.as_str(), "git.commit");
         assert_eq!(AuditAction::GitMerge.as_str(), "git.merge");
         assert_eq!(AuditAction::SettingsWrite.as_str(), "settings.write");
+        assert_eq!(
+            AuditAction::OrchestrationStart.as_str(),
+            "orchestration.start"
+        );
+        assert_eq!(
+            AuditAction::OrchestrationSettle.as_str(),
+            "orchestration.settle"
+        );
         assert_eq!(AuditAction::QueueClear.as_str(), "queue.clear");
         assert_eq!(AuditAction::ThreadFork.as_str(), "thread.fork");
     }

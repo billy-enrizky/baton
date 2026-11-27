@@ -2820,7 +2820,19 @@ fn settle_run(run_id: &str, status: cli::RunStatus, force: bool, json: bool) -> 
     let verdict = status.verdict();
     let store = open_store(None)?;
     let run_id = orchestrate::resolve_run_id(&store, run_id)?;
-    let settlement = store.settle_orchestration_run(&run_id, verdict, force)?;
+    let audit = audit::event(
+        audit::LOCAL_CLI_ACTOR,
+        &claim::installation_id(&paths::baton_home()).unwrap_or_else(|| "unclaimed".into()),
+        Some(&run_id),
+        None,
+        audit::AuditAction::OrchestrationSettle,
+        &serde_json::json!({
+            "run_id": run_id,
+            "verdict": verdict.as_str(),
+            "forced": force,
+        }),
+    )?;
+    let settlement = store.settle_orchestration_run_with_audit(&run_id, verdict, force, &audit)?;
     let short = &run_id[..8.min(run_id.len())];
     if json {
         println!(

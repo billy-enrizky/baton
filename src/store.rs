@@ -3872,7 +3872,72 @@ impl BatonStore {
         owner_pid: Option<u32>,
         owner_start: Option<&str>,
     ) -> Result<()> {
-        self.write_execute(
+        let tx = self.write()?;
+        Self::insert_orchestration_run(
+            &tx,
+            id,
+            goal,
+            coordinator_provider,
+            coordinator_model,
+            summary,
+            plan_json,
+            dirty_source,
+            owner_pid,
+            owner_start,
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Creates a run and its audit event in one transaction, so a run cannot
+    /// exist without the row that names it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_orchestration_run_owned_with_audit(
+        &self,
+        id: &str,
+        goal: &str,
+        coordinator_provider: ProviderId,
+        coordinator_model: &str,
+        summary: Option<&str>,
+        plan_json: &str,
+        dirty_source: bool,
+        owner_pid: Option<u32>,
+        owner_start: Option<&str>,
+        event: &NewAuditEvent,
+    ) -> Result<AuditEventRow> {
+        let created_at = now_iso();
+        let tx = self.write()?;
+        Self::insert_orchestration_run(
+            &tx,
+            id,
+            goal,
+            coordinator_provider,
+            coordinator_model,
+            summary,
+            plan_json,
+            dirty_source,
+            owner_pid,
+            owner_start,
+        )?;
+        let event_id = Self::insert_audit_event_in(&tx, event, &created_at)?;
+        tx.commit()?;
+        Ok(Self::audit_event_row(event_id, created_at, event))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_orchestration_run(
+        tx: &Connection,
+        id: &str,
+        goal: &str,
+        coordinator_provider: ProviderId,
+        coordinator_model: &str,
+        summary: Option<&str>,
+        plan_json: &str,
+        dirty_source: bool,
+        owner_pid: Option<u32>,
+        owner_start: Option<&str>,
+    ) -> Result<()> {
+        tx.execute(
             "INSERT INTO orchestration_runs (id, goal, coordinator_provider, coordinator_model, summary, plan_json, status, dirty_source, created_at, owner_pid, owner_start) VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?, ?)",
             params![
                 id,
@@ -3966,6 +4031,28 @@ impl BatonStore {
         verdict: RunVerdict,
         force: bool,
     ) -> Result<RunSettlement> {
+        self.settle_orchestration_run_inner(run_id, verdict, force, None)
+    }
+
+    /// Settles a run and appends its audit event in the same transaction, so a
+    /// refused settlement writes no event and a rejected event rolls back.
+    pub fn settle_orchestration_run_with_audit(
+        &self,
+        run_id: &str,
+        verdict: RunVerdict,
+        force: bool,
+        event: &NewAuditEvent,
+    ) -> Result<RunSettlement> {
+        self.settle_orchestration_run_inner(run_id, verdict, force, Some(event))
+    }
+
+    fn settle_orchestration_run_inner(
+        &self,
+        run_id: &str,
+        verdict: RunVerdict,
+        force: bool,
+        event: Option<&NewAuditEvent>,
+    ) -> Result<RunSettlement> {
         let short = &run_id[..8.min(run_id.len())];
         let now = now_iso();
         let tx = self.write()?;
@@ -4049,6 +4136,9 @@ impl BatonStore {
         )?;
         if closed != 1 {
             anyhow::bail!("run {short} changed while it was being settled; retry");
+        }
+        if let Some(event) = event {
+            Self::insert_audit_event_in(&tx, event, &now)?;
         }
         tx.commit()?;
         Ok(RunSettlement { tasks, turns })
@@ -4852,6 +4942,85 @@ mod tests {
             .into_iter()
             .find(|run| run.id == id)
             .unwrap()
+    }
+
+    #[test]
+    fn a_run_and_its_audit_event_commit_together() {
+        let store = BatonStore::memory().unwrap();
+        let mut invalid = sample_audit_event("orchestration.start");
+        invalid.payload_digest = "short".into();
+        assert!(store
+            .create_orchestration_run_owned_with_audit(
+                "run-audit",
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+                None,
+                None,
+                &invalid,
+            )
+            .is_err());
+        assert!(store
+            .find_orchestration_runs("run-audit")
+            .unwrap()
+            .is_empty());
+        assert!(store.list_audit_events(10).unwrap().is_empty());
+
+        let mut event = sample_audit_event("orchestration.start");
+        event.target = Some("run-audit".into());
+        let wrote = store
+            .create_orchestration_run_owned_with_audit(
+                "run-audit",
+                "goal",
+                ProviderId::Codex,
+                "model",
+                None,
+                "{}",
+                false,
+                None,
+                None,
+                &event,
+            )
+            .unwrap();
+        assert_eq!(wrote.action, "orchestration.start");
+        assert_eq!(wrote.target.as_deref(), Some("run-audit"));
+        assert_eq!(store.find_orchestration_runs("run-audit").unwrap().len(), 1);
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_settlement_and_its_audit_event_commit_together() {
+        let store = BatonStore::memory().unwrap();
+        add_run(&store, "run-settle", None);
+        add_run_task(&store, "run-settle", "queued", "queued", None);
+        let mut invalid = sample_audit_event("orchestration.settle");
+        invalid.payload_digest = "short".into();
+        assert!(store
+            .settle_orchestration_run_with_audit(
+                "run-settle",
+                RunVerdict::Cancelled,
+                false,
+                &invalid,
+            )
+            .is_err());
+        assert_eq!(run_row(&store, "run-settle").status, "running");
+        assert!(store.list_audit_events(10).unwrap().is_empty());
+
+        let mut event = sample_audit_event("orchestration.settle");
+        event.target = Some("run-settle".into());
+        let settlement = store
+            .settle_orchestration_run_with_audit("run-settle", RunVerdict::Cancelled, false, &event)
+            .unwrap();
+        assert_eq!(settlement.tasks, 1);
+        let run = run_row(&store, "run-settle");
+        assert_eq!(run.status, "cancelled");
+        let events = store.list_audit_events(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, "orchestration.settle");
+        assert_eq!(events[0].target.as_deref(), Some("run-settle"));
     }
 
     #[test]

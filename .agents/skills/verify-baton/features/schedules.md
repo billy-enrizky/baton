@@ -32,7 +32,7 @@ Non-goals:
 - The expression supports `*`, a number, a list, a range, and a step in each of the five fields. Weekdays are 0 for Sunday through 6 for Saturday. Day-of-month and day-of-week use the traditional OR rule when both are restricted.
 - `baton serve` checks due schedules every second. A due row is claimed with a compare-and-set on its `next_run_at`; only the winner fires.
 - `/schedule` opens a TUI view of every row with its on or off state, id, next run, thread, expression, and prompt. `p` pauses or resumes the selected row, `d` removes it after a second press, and Enter opens its thread. `/schedule pause <id>`, `/schedule resume <id>`, and `/schedule remove <id>` act directly. Each real change writes an audit row as `tui`.
-- `/schedule add` opens a two-field form for the active thread: cron, then prompt. Tab switches fields, Enter moves to the prompt and then submits, and Esc cancels. An invalid expression or an empty prompt shows an error in the form and changes nothing. A successful add inserts the row, writes `schedule.add` as `tui`, and opens the refreshed view; a failed audit deletes the row.
+- `/schedule add` opens a three-field form: an optional thread id prefix, the cron, and the prompt. A blank thread uses the active one. Tab cycles fields, Enter advances and then submits, and Esc cancels. An invalid expression, an empty prompt, or an unknown or ambiguous thread prefix shows an error in the form and changes nothing. A successful add inserts the row, writes `schedule.add` as `tui`, and opens the refreshed view; a failed audit deletes the row.
 - A claimed run writes `schedule.trigger` with actor `scheduler`, confirmation `host_schedule`, the schedule id as the target, and the thread id. A failed audit write skips the run instead of starting an unaudited turn.
 - The host posts the prompt into the thread through its project engine pool, using the thread's permission mode and prepending its active goal.
 - An archived thread or a stored expression that no longer parses is skipped and logged. The claim has already advanced, so neither path hot-loops.
@@ -113,6 +113,7 @@ The live integration test starts a host against a real SQLite store and a fake h
 - `tui::tests::schedule_command_without_rows_says_how_to_add_one`
 - `tui::tests::schedule_add_form_creates_a_row_and_audits_it`
 - `tui::tests::schedule_add_form_rejects_a_bad_expression_and_an_empty_prompt`
+- `tui::tests::schedule_add_form_targets_another_thread_by_prefix`
 - `tests/serve.rs::serve_stdin_schedule_commands_manage_the_live_host`
 - `tests/serve.rs::serve_fires_a_due_schedule_and_audits_it`
 - `serve::tests::host_tokens_keep_quoted_spaces`
@@ -122,5 +123,5 @@ The live integration test starts a host against a real SQLite store and a fake h
 ## Limits
 
 - A host with stdin closed cannot use the host terminal commands. The socket and TUI management paths remain.
-- The TUI add form targets the active thread and cannot pick another one; other threads need the CLI or the host terminal.
+- The TUI add form accepts a thread id prefix rather than a picker.
 - Cron is UTC only; there is no local timezone, missed-run catch-up, notification, or retry.

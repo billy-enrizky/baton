@@ -428,7 +428,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/find` | Search the conversation |
 | `/activity`, `/commands`, `/agents` | Inspect turns, tool calls, and subagent calls |
 | `/usage`, `/context`, `/status`, `/turns`, `/limits` | Inspect usage with a scope and grouping picker, plus context, status, turn history, and live or stored rate-limit windows |
-| `/memory` | Open Claude and Codex instruction files and project memory |
+| `/memory` | Open Claude and Codex instruction files, project memory, and any parent `CLAUDE.md` between the repository root and the working directory |
 
 `/files` and `/grep` use `rg` when it is installed and fall back to `git ls-files` and `git grep` inside a repository. Ctrl+O opens the selected file in `VISUAL` or `EDITOR`.
 
@@ -474,7 +474,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 
 | Command | What it does |
 |---|---|
-| `/memory` | Open instruction files, rules, and auto-memory topics |
+| `/memory` | Open instruction files, rules, auto-memory topics, and parent `CLAUDE.md` files from the repository root down to the working directory |
 | `/skills` | Pick a Claude or Codex skill, insert its invocation, or install, update, or remove its project copy |
 | `/mcp` | List, add, remove, or sync MCP servers |
 | `/init` | Create a starter `CLAUDE.md` project memory file |

@@ -1902,7 +1902,17 @@ fn main_result(started: Instant) -> Result<()> {
                         anyhow::bail!("usage: baton memories add [--global] <text>");
                     }
                     let scope = if global { "global" } else { "project" };
-                    let id = store.add_memory(scope, &project, &text)?;
+                    let audit = cli_audit_event(
+                        &home,
+                        audit::AuditAction::MemoryAdd,
+                        None,
+                        serde_json::json!({
+                            "scope": scope,
+                            "project": project,
+                            "text_len": text.chars().count(),
+                        }),
+                    )?;
+                    let (id, _) = store.add_memory_with_audit(scope, &project, &text, &audit)?;
                     if json {
                         println!(
                             "{}",
@@ -1918,7 +1928,16 @@ fn main_result(started: Instant) -> Result<()> {
                     }
                 }
                 Some(cli::MemoriesCommand::Remove { id }) => {
-                    if !store.remove_memory(&project, id)? {
+                    let audit = cli_audit_event(
+                        &home,
+                        audit::AuditAction::MemoryRemove,
+                        None,
+                        serde_json::json!({ "project": project, "id": id }),
+                    )?;
+                    if store
+                        .remove_memory_with_audit(&project, id, &audit)?
+                        .is_none()
+                    {
                         anyhow::bail!("memory {id} not found for this project");
                     }
                     if json {
@@ -1939,8 +1958,14 @@ fn main_result(started: Instant) -> Result<()> {
                     if global && !yes {
                         anyhow::bail!("refusing to clear every global memory without --yes");
                     }
-                    let cleared = store.clear_memories(&project, global)?;
                     let scope = if global { "global" } else { "project" };
+                    let audit = cli_audit_event(
+                        &home,
+                        audit::AuditAction::MemoryClear,
+                        Some(if global { "global" } else { project.as_str() }),
+                        serde_json::json!({ "project": project, "global": global }),
+                    )?;
+                    let (cleared, _) = store.clear_memories_with_audit(&project, global, &audit)?;
                     if json {
                         println!(
                             "{}",
@@ -2816,17 +2841,33 @@ fn run_runs(command: cli::RunCommand) -> Result<()> {
     }
 }
 
+/// One CLI-originated audit event. The environment is created on demand, so a
+/// first write still records a real installation id.
+fn cli_audit_event(
+    home: &Path,
+    action: audit::AuditAction,
+    target: Option<&str>,
+    payload: serde_json::Value,
+) -> Result<store::NewAuditEvent> {
+    audit::event(
+        audit::LOCAL_CLI_ACTOR,
+        &claim::ensure_installation_id(home)?,
+        target,
+        None,
+        action,
+        &payload,
+    )
+}
+
 fn settle_run(run_id: &str, status: cli::RunStatus, force: bool, json: bool) -> Result<()> {
     let verdict = status.verdict();
     let store = open_store(None)?;
     let run_id = orchestrate::resolve_run_id(&store, run_id)?;
-    let audit = audit::event(
-        audit::LOCAL_CLI_ACTOR,
-        &claim::installation_id(&paths::baton_home()).unwrap_or_else(|| "unclaimed".into()),
-        Some(&run_id),
-        None,
+    let audit = cli_audit_event(
+        &paths::baton_home(),
         audit::AuditAction::OrchestrationSettle,
-        &serde_json::json!({
+        Some(&run_id),
+        serde_json::json!({
             "run_id": run_id,
             "verdict": verdict.as_str(),
             "forced": force,

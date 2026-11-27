@@ -8,6 +8,56 @@ fn baton() -> Command {
 }
 
 #[test]
+fn memory_writes_are_recorded_with_their_ids() {
+    let home = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let project_arg = project.path().to_string_lossy().to_string();
+    let run = |args: &[&str]| {
+        baton()
+            .args(args)
+            .env("BATON_HOME", home.path())
+            .output()
+            .unwrap()
+    };
+
+    let add = run(&["-C", &project_arg, "memories", "add", "--json", "Use tabs"]);
+    assert!(add.status.success(), "{add:?}");
+    let value: serde_json::Value = serde_json::from_slice(&add.stdout).unwrap();
+    let id = value["id"].as_i64().unwrap().to_string();
+    let remove = run(&["-C", &project_arg, "memories", "remove", &id, "--json"]);
+    assert!(remove.status.success(), "{remove:?}");
+    let global = run(&[
+        "-C",
+        &project_arg,
+        "memories",
+        "add",
+        "--global",
+        "Answer briefly",
+    ]);
+    assert!(global.status.success(), "{global:?}");
+    let clear = run(&["-C", &project_arg, "memories", "clear", "--global", "--yes"]);
+    assert!(clear.status.success(), "{clear:?}");
+
+    let audit = run(&["audit", "list", "--json"]);
+    assert!(audit.status.success(), "{audit:?}");
+    let value: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    let events = value["events"].as_array().unwrap();
+    assert_eq!(events.len(), 4, "{events:?}");
+    assert_eq!(events[0]["action"], "memory.clear");
+    assert_eq!(events[0]["target"], "global");
+    assert_eq!(events[1]["action"], "memory.add");
+    assert_eq!(events[2]["action"], "memory.remove");
+    assert_eq!(events[2]["target"], id);
+    assert_eq!(events[3]["action"], "memory.add");
+    assert_eq!(events[3]["target"], id);
+    assert!(events.iter().all(|event| event["actor"] == "local_cli"));
+    assert!(events.iter().all(|event| event["scope"] == "settings"));
+    assert!(events
+        .iter()
+        .all(|event| event["environment"].as_str().unwrap().len() == 36));
+}
+
+#[test]
 fn audit_list_reports_grant_events_and_respects_the_limit() {
     let home = tempfile::tempdir().unwrap();
     let path = home.path().join("baton.sqlite");

@@ -10,6 +10,8 @@ pub const HOST_TERMINAL_ACTOR: &str = "host_terminal";
 pub const LOCAL_CLI_ACTOR: &str = "local_cli";
 pub const HOST_TERMINAL_CONFIRMATION: &str = "host_terminal";
 pub const LOCAL_CLI_CONFIRMATION: &str = "local_cli";
+pub const MCP_STDIO_ACTOR: &str = "mcp_stdio";
+pub const MCP_STDIO_CONFIRMATION: &str = "stdio_spawner";
 pub const ADMIN_SCOPE: &str = "admin";
 pub const DURABLE_RETENTION: &str = "durable";
 
@@ -17,6 +19,8 @@ pub const DURABLE_RETENTION: &str = "durable";
 pub enum AuditAction {
     GrantMint,
     GrantRevoke,
+    QueueClear,
+    ThreadFork,
 }
 
 impl AuditAction {
@@ -24,6 +28,8 @@ impl AuditAction {
         match self {
             AuditAction::GrantMint => "grant.mint",
             AuditAction::GrantRevoke => "grant.revoke",
+            AuditAction::QueueClear => "queue.clear",
+            AuditAction::ThreadFork => "thread.fork",
         }
     }
 }
@@ -97,5 +103,7 @@ mod tests {
         assert_eq!(event.result, "ok");
         assert_eq!(event.retention, DURABLE_RETENTION);
         assert_eq!(event.payload_digest.len(), 64);
+        assert_eq!(AuditAction::QueueClear.as_str(), "queue.clear");
+        assert_eq!(AuditAction::ThreadFork.as_str(), "thread.fork");
     }
 }

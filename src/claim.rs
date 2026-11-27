@@ -221,6 +221,13 @@ pub fn ensure_installation_id(home: &Path) -> Result<String> {
     }
 }
 
+/// Reads the installation id without creating it or changing the home
+/// directory's mode. Engine paths call this, so a turn never turns home into
+/// a private directory as a side effect.
+pub fn installation_id(home: &Path) -> Option<String> {
+    read_installation_id(&home.join("installation-id")).ok()
+}
+
 fn read_installation_id(path: &Path) -> Result<String> {
     let mut file = open_private_read(path)?;
     let metadata = file.metadata()?;

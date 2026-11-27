@@ -161,6 +161,150 @@ struct TakenApproval {
     choice: crate::types::ApprovalChoice,
 }
 
+struct PendingQuestion {
+    id: String,
+    thread_id: String,
+    questions: Vec<crate::types::QuestionPrompt>,
+    respond: tokio::sync::oneshot::Sender<Vec<crate::types::QuestionAnswer>>,
+    sequence: u64,
+}
+
+struct TakenQuestion {
+    pending: PendingQuestion,
+    answers: Vec<crate::types::QuestionAnswer>,
+}
+
+enum QuestionTakeError {
+    NotFound,
+    Invalid(String),
+}
+
+/// Questions wait here until a paired client answers or the turn ends.
+#[derive(Default)]
+struct RemoteQuestions {
+    pending: BTreeMap<String, PendingQuestion>,
+    next_sequence: u64,
+}
+
+impl RemoteQuestions {
+    fn insert(
+        &mut self,
+        thread_id: String,
+        id: String,
+        questions: Vec<crate::types::QuestionPrompt>,
+        respond: tokio::sync::oneshot::Sender<Vec<crate::types::QuestionAnswer>>,
+    ) {
+        self.next_sequence += 1;
+        let sequence = self.next_sequence;
+        self.pending.insert(
+            id.clone(),
+            PendingQuestion {
+                id,
+                thread_id,
+                questions,
+                respond,
+                sequence,
+            },
+        );
+    }
+
+    fn list(&mut self, thread: Option<&str>) -> Vec<Value> {
+        self.pending
+            .retain(|_, question| !question.respond.is_closed());
+        let mut rows: Vec<&PendingQuestion> = self
+            .pending
+            .values()
+            .filter(|question| thread.is_none_or(|thread| question.thread_id == thread))
+            .collect();
+        rows.sort_by_key(|question| question.sequence);
+        rows.into_iter()
+            .map(|question| {
+                json!({
+                    "request_id": question.id,
+                    "thread_id": question.thread_id,
+                    "questions": question.questions.iter().map(|prompt| json!({
+                        "id": prompt.id,
+                        "header": prompt.header,
+                        "question": prompt.question,
+                        "options": prompt.options.iter().map(|option| json!({
+                            "label": option.label,
+                            "description": option.description,
+                        })).collect::<Vec<_>>(),
+                        "allow_custom": prompt.allow_custom,
+                        "multi_select": prompt.multi_select,
+                        "secret": prompt.secret,
+                    })).collect::<Vec<_>>(),
+                })
+            })
+            .collect()
+    }
+
+    fn take(
+        &mut self,
+        request: &str,
+        answers: &[crate::types::QuestionAnswer],
+    ) -> std::result::Result<TakenQuestion, QuestionTakeError> {
+        let pending = self
+            .pending
+            .get(request)
+            .ok_or(QuestionTakeError::NotFound)?;
+        if pending.respond.is_closed() {
+            self.pending.remove(request);
+            return Err(QuestionTakeError::NotFound);
+        }
+        if answers.len() != pending.questions.len() {
+            return Err(QuestionTakeError::Invalid(format!(
+                "answer every prompt: expected {} answers, got {}",
+                pending.questions.len(),
+                answers.len()
+            )));
+        }
+        let mut seen = Vec::with_capacity(answers.len());
+        for answer in answers {
+            if seen.contains(&answer.id) {
+                return Err(QuestionTakeError::Invalid(format!(
+                    "prompt {} is answered twice",
+                    answer.id
+                )));
+            }
+            seen.push(answer.id.clone());
+            let Some(prompt) = pending
+                .questions
+                .iter()
+                .find(|prompt| prompt.id == answer.id)
+            else {
+                return Err(QuestionTakeError::Invalid(format!(
+                    "no prompt matches {}",
+                    answer.id
+                )));
+            };
+            if !prompt.accepts(&answer.answers) {
+                return Err(QuestionTakeError::Invalid(format!(
+                    "prompt {} does not accept that answer",
+                    answer.id
+                )));
+            }
+        }
+        let pending = self
+            .pending
+            .remove(request)
+            .ok_or(QuestionTakeError::NotFound)?;
+        Ok(TakenQuestion {
+            pending,
+            answers: answers.to_vec(),
+        })
+    }
+
+    fn put_back(&mut self, taken: TakenQuestion) {
+        self.pending.insert(taken.pending.id.clone(), taken.pending);
+    }
+
+    fn clear_thread(&mut self, thread_id: &str) {
+        self.pending
+            .retain(|_, question| question.thread_id != thread_id);
+    }
+}
+
 /// Approvals wait here until a paired client answers or the turn ends. A
 /// dropped sender is a denial, so a closed entry is pruned instead of listed.
 #[derive(Default)]
@@ -258,6 +402,7 @@ pub struct EngineLink {
     home: std::path::PathBuf,
     root: std::path::PathBuf,
     approvals: Arc<Mutex<RemoteApprovals>>,
+    questions: Arc<Mutex<RemoteQuestions>>,
 }
 
 impl EngineLink {
@@ -266,12 +411,14 @@ impl EngineLink {
         home: std::path::PathBuf,
         root: std::path::PathBuf,
         approvals: Arc<Mutex<RemoteApprovals>>,
+        questions: Arc<Mutex<RemoteQuestions>>,
     ) -> EngineLink {
         EngineLink {
             sender,
             home,
             root,
             approvals,
+            questions,
         }
     }
 
@@ -292,6 +439,30 @@ impl EngineLink {
     fn put_back_approval(&self, taken: TakenApproval) {
         if let Ok(mut approvals) = self.approvals.lock() {
             approvals.put_back(taken);
+        }
+    }
+
+    pub fn list_questions(&self, thread: Option<&str>) -> Vec<Value> {
+        self.questions
+            .lock()
+            .map(|mut questions| questions.list(thread))
+            .unwrap_or_default()
+    }
+
+    fn take_question(
+        &self,
+        request: &str,
+        answers: &[crate::types::QuestionAnswer],
+    ) -> std::result::Result<TakenQuestion, QuestionTakeError> {
+        self.questions
+            .lock()
+            .map_err(|_| QuestionTakeError::NotFound)?
+            .take(request, answers)
+    }
+
+    fn put_back_question(&self, taken: TakenQuestion) {
+        if let Ok(mut questions) = self.questions.lock() {
+            questions.put_back(taken);
         }
     }
 
@@ -337,10 +508,12 @@ impl ServeEngine {
         let (engine_event_sender, engine_event_receiver) = std::sync::mpsc::channel();
         let (turn_event_sender, turn_event_receiver) = std::sync::mpsc::channel();
         let approvals = Arc::new(Mutex::new(RemoteApprovals::default()));
+        let questions = Arc::new(Mutex::new(RemoteQuestions::default()));
         // The host has no UI to consume engine events. Turn events are read to
-        // keep remote approvals alive and to drop them when their turn ends.
+        // keep remote interactions alive and to drop them when their turn ends.
         std::thread::spawn(move || for _ in engine_event_receiver {});
         let approval_sink = approvals.clone();
+        let question_sink = questions.clone();
         std::thread::spawn(move || {
             for (thread_id, event) in turn_event_receiver {
                 match event {
@@ -355,16 +528,25 @@ impl ServeEngine {
                             approvals.insert(thread_id, id, kind, summary, choices, respond);
                         }
                     }
-                    crate::adapters::TurnEvent::QuestionRequest { respond, .. } => {
-                        // Remote question answering is a separate slice. Answer
-                        // empty so the provider is not left waiting.
-                        let _ = respond.send(Vec::new());
+                    crate::adapters::TurnEvent::QuestionRequest {
+                        id,
+                        questions,
+                        respond,
+                    } => {
+                        if questions.is_empty() {
+                            let _ = respond.send(Vec::new());
+                        } else if let Ok(mut pending) = question_sink.lock() {
+                            pending.insert(thread_id, id, questions, respond);
+                        }
                     }
                     crate::adapters::TurnEvent::TurnCompleted { .. }
                     | crate::adapters::TurnEvent::TurnFailed { .. }
                     | crate::adapters::TurnEvent::TurnInterrupted { .. } => {
                         if let Ok(mut approvals) = approval_sink.lock() {
                             approvals.clear_thread(&thread_id);
+                        }
+                        if let Ok(mut questions) = question_sink.lock() {
+                            questions.clear_thread(&thread_id);
                         }
                     }
                     _ => {}
@@ -411,6 +593,7 @@ impl ServeEngine {
                 home.to_path_buf(),
                 root.to_path_buf(),
                 approvals,
+                questions,
             ),
             thread: Some(thread),
         })
@@ -734,7 +917,7 @@ fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink
         };
         let required = match command {
             "submit" => "operate",
-            "respond" => "approve",
+            "respond" | "answer" => "approve",
             _ => "read",
         };
         match crate::grants::verify(store, grant_id, secret) {
@@ -767,6 +950,13 @@ fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink
     if command == "approvals" {
         return approvals_request(engine, id, &value);
     }
+    if command == "answer" {
+        let grant = grant.expect("answer requires a verified grant");
+        return answer_request(store, engine, &grant, id, &value);
+    }
+    if command == "questions" {
+        return questions_request(engine, id, &value);
+    }
     handle_line(store, line).unwrap_or_else(|| {
         error_response(
             id,
@@ -778,6 +968,57 @@ fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink
 
 const SUBMIT_OPERATION: &str = "submit";
 const RESPOND_OPERATION: &str = "respond";
+const ANSWER_OPERATION: &str = "answer";
+
+fn parse_question_answers(
+    args: &Map<String, Value>,
+) -> std::result::Result<Vec<crate::types::QuestionAnswer>, String> {
+    let Some(Value::Object(answers)) = args.get("answers") else {
+        return Err("answer args.answers must be an object mapped by prompt id".into());
+    };
+    let mut parsed = Vec::with_capacity(answers.len());
+    for (prompt_id, value) in answers {
+        if prompt_id.is_empty()
+            || prompt_id.chars().count() > 128
+            || prompt_id.chars().any(char::is_control)
+        {
+            return Err(
+                "answer prompt ids must be non-empty strings of at most 128 characters".into(),
+            );
+        }
+        let values = match value {
+            Value::String(text) => {
+                if text.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![text.clone()]
+                }
+            }
+            Value::Array(items) => items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| "answer values must be strings".to_string())
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+            _ => return Err("answer values must be a string or an array of strings".into()),
+        };
+        for text in &values {
+            if text.chars().count() > 4096 || text.chars().any(char::is_control) {
+                return Err(
+                    "answer text is at most 4096 characters and cannot contain control characters"
+                        .into(),
+                );
+            }
+        }
+        parsed.push(crate::types::QuestionAnswer {
+            id: prompt_id.clone(),
+            answers: values,
+        });
+    }
+    Ok(parsed)
+}
 
 fn request_key<'a>(args: &'a Map<String, Value>, id: &Value) -> Result<&'a str, Value> {
     match args.get("idempotency_key") {
@@ -1086,6 +1327,146 @@ fn respond_request(
         return error_response(id, "internal", error.to_string());
     }
     let _ = taken.pending.respond.send(decision);
+    response(id, body)
+}
+
+fn questions_request(engine: Option<&EngineLink>, id: Value, value: &Value) -> Value {
+    let Some(engine) = engine else {
+        return error_response(
+            id,
+            "not_implemented",
+            "this host has no engine; start baton serve without --stdio",
+        );
+    };
+    let thread = match value.get("args") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(args)) => match args.get("thread") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(thread)) if !thread.is_empty() => Some(thread.as_str()),
+            _ => {
+                return error_response(
+                    id,
+                    "malformed_line",
+                    "questions args.thread must be a non-empty string",
+                )
+            }
+        },
+        _ => return error_response(id, "malformed_line", "questions args must be an object"),
+    };
+    response(id, json!({ "questions": engine.list_questions(thread) }))
+}
+
+fn answer_request(
+    store: &BatonStore,
+    engine: Option<&EngineLink>,
+    grant: &crate::store::GrantSummary,
+    id: Value,
+    value: &Value,
+) -> Value {
+    let Some(engine) = engine else {
+        return error_response(
+            id,
+            "not_implemented",
+            "this host has no engine; start baton serve without --stdio",
+        );
+    };
+    let args = match value.get("args") {
+        Some(Value::Object(args)) => args,
+        _ => return error_response(id, "malformed_line", "answer args must be an object"),
+    };
+    let request_id = match args.get("request") {
+        Some(Value::String(request))
+            if !request.is_empty()
+                && request.chars().count() <= 256
+                && !request.chars().any(char::is_control) =>
+        {
+            request.as_str()
+        }
+        _ => {
+            return error_response(
+                id,
+                "malformed_line",
+                "answer args.request must be a non-empty string of at most 256 characters",
+            )
+        }
+    };
+    let answers = match parse_question_answers(args) {
+        Ok(answers) => answers,
+        Err(error) => return error_response(id, "malformed_line", error),
+    };
+    let key = match request_key(args, &id) {
+        Ok(key) => key,
+        Err(error) => return error,
+    };
+    match store.replay_idempotent_request(key, ANSWER_OPERATION) {
+        Ok(Some(stored)) => return replay_response(id, &stored),
+        Ok(None) => {}
+        Err(error) => return error_response(id, "idempotency_conflict", error.to_string()),
+    }
+    let taken = match engine.take_question(request_id, &answers) {
+        Ok(taken) => taken,
+        Err(QuestionTakeError::NotFound) => {
+            return match store.replay_idempotent_request(key, ANSWER_OPERATION) {
+                Ok(Some(stored)) => replay_response(id, &stored),
+                Ok(None) => error_response(
+                    id,
+                    "not_found",
+                    format!("no pending question matches {request_id}"),
+                ),
+                Err(error) => error_response(id, "idempotency_conflict", error.to_string()),
+            }
+        }
+        Err(QuestionTakeError::Invalid(error)) => {
+            return error_response(id, "malformed_line", error)
+        }
+    };
+    let body = json!({
+        "request_id": taken.pending.id,
+        "thread_id": taken.pending.thread_id,
+        "prompts": taken.pending.questions.len(),
+        "answered": true,
+    });
+    match store.claim_idempotent_request(
+        key,
+        ANSWER_OPERATION,
+        &taken.pending.thread_id,
+        &body.to_string(),
+    ) {
+        Ok(Some(stored)) => {
+            engine.put_back_question(taken);
+            return replay_response(id, &stored);
+        }
+        Ok(None) => {}
+        Err(error) => {
+            engine.put_back_question(taken);
+            return error_response(id, "idempotency_conflict", error.to_string());
+        }
+    }
+    let audit = match crate::audit::grant_event(
+        &grant.grant_id,
+        &engine.environment(),
+        Some(&taken.pending.id),
+        Some(&taken.pending.thread_id),
+        crate::audit::AuditAction::QuestionAnswer,
+        &crate::audit::question_answer_payload(
+            &taken.pending.id,
+            &taken.pending.questions,
+            &taken.answers,
+        ),
+    ) {
+        Ok(audit) => audit,
+        Err(error) => {
+            engine.put_back_question(taken);
+            let _ = store.forget_idempotent_request(key, ANSWER_OPERATION);
+            return error_response(id, "internal", error.to_string());
+        }
+    };
+    if let Err(error) = store.append_audit_event(&audit) {
+        engine.put_back_question(taken);
+        let _ = store.forget_idempotent_request(key, ANSWER_OPERATION);
+        return error_response(id, "internal", error.to_string());
+    }
+    let _ = taken.pending.respond.send(taken.answers);
     response(id, body)
 }
 
@@ -1609,6 +1990,7 @@ mod tests {
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
+            Arc::new(Mutex::new(RemoteQuestions::default())),
         );
         let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64, key: &str| {
             format!(
@@ -1750,6 +2132,7 @@ mod tests {
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
+            Arc::new(Mutex::new(RemoteQuestions::default())),
         );
         let refused = handle_socket_line(
             &store,
@@ -1810,6 +2193,7 @@ mod tests {
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
+            Arc::new(Mutex::new(RemoteQuestions::default())),
         );
         let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64| {
             format!(
@@ -1893,6 +2277,7 @@ mod tests {
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
+            Arc::new(Mutex::new(RemoteQuestions::default())),
         );
         let (respond, mut decision_receiver) = tokio::sync::oneshot::channel();
         engine.approvals.lock().unwrap().insert(
@@ -2002,6 +2387,219 @@ mod tests {
             events
                 .iter()
                 .filter(|event| event.action == "approval.decide")
+                .count(),
+            1,
+            "a replay does not write a second row"
+        );
+    }
+
+    #[test]
+    fn a_finished_turn_drops_its_pending_questions() {
+        let mut questions = RemoteQuestions::default();
+        let (first, mut first_receiver) = tokio::sync::oneshot::channel();
+        questions.insert("thread-1".into(), "q-1".into(), Vec::new(), first);
+        questions.clear_thread("thread-1");
+        assert!(first_receiver.try_recv().is_err());
+        assert!(questions.list(None).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn questions_require_approve_scope_and_answer_once() {
+        use crate::grants::{mint, GrantRequest, Scope};
+        use crate::types::{QuestionAnswer, QuestionOption, QuestionPrompt};
+
+        let (_dir, store) = claimed_store();
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let read = mint(&store, home.path(), &GrantRequest::new(vec![Scope::Read])).unwrap();
+        let approve = mint(
+            &store,
+            home.path(),
+            &GrantRequest::new(vec![Scope::Read, Scope::Approve]),
+        )
+        .unwrap();
+        let thread = store.list_threads(None).unwrap().remove(0);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let engine = EngineLink::new(
+            sender,
+            home.path().to_path_buf(),
+            root.path().to_path_buf(),
+            Arc::new(Mutex::new(RemoteApprovals::default())),
+            Arc::new(Mutex::new(RemoteQuestions::default())),
+        );
+        let (respond, mut answer_receiver) = tokio::sync::oneshot::channel();
+        let prompts = vec![
+            QuestionPrompt {
+                id: "features".into(),
+                header: "Features".into(),
+                question: "Which features?".into(),
+                options: vec![
+                    QuestionOption {
+                        label: "CI".into(),
+                        description: String::new(),
+                    },
+                    QuestionOption {
+                        label: "Installer".into(),
+                        description: String::new(),
+                    },
+                ],
+                allow_custom: false,
+                multi_select: true,
+                secret: false,
+            },
+            QuestionPrompt {
+                id: "note".into(),
+                header: "Note".into(),
+                question: "Anything else?".into(),
+                options: Vec::new(),
+                allow_custom: true,
+                multi_select: false,
+                secret: true,
+            },
+        ];
+        engine.questions.lock().unwrap().insert(
+            thread.id.clone(),
+            "q-1".into(),
+            prompts.clone(),
+            respond,
+        );
+        let request = |grant: &crate::grants::MintedGrant, id: u64, command: &str, args: &str| {
+            format!(
+                r#"{{"v":1,"kind":"request","id":{id},"command":"{command}","grant_id":"{}","secret":"{}","args":{args}}}"#,
+                grant.summary.grant_id, grant.secret
+            )
+        };
+
+        let listed =
+            handle_socket_line(&store, &request(&read, 1, "questions", "{}"), Some(&engine));
+        assert_eq!(listed["ok"], true, "{listed}");
+        assert_eq!(listed["result"]["questions"][0]["request_id"], "q-1");
+        assert_eq!(
+            listed["result"]["questions"][0]["questions"][0]["options"][0]["label"],
+            "CI"
+        );
+
+        let denied = handle_socket_line(
+            &store,
+            &request(
+                &read,
+                2,
+                "answer",
+                r#"{"request":"q-1","answers":{"features":["CI"],"note":"x"},"idempotency_key":"q-read"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(denied["error"]["code"], "not_permitted");
+
+        let missing = handle_socket_line(
+            &store,
+            &request(
+                &approve,
+                3,
+                "answer",
+                r#"{"request":"q-1","answers":{"features":["CI"]},"idempotency_key":"q-missing"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(missing["error"]["code"], "malformed_line");
+
+        let unknown = handle_socket_line(
+            &store,
+            &request(
+                &approve,
+                4,
+                "answer",
+                r#"{"request":"q-1","answers":{"features":["Android"],"note":"x"},"idempotency_key":"q-unknown"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(unknown["error"]["code"], "malformed_line");
+
+        let accepted = handle_socket_line(
+            &store,
+            &request(
+                &approve,
+                5,
+                "answer",
+                r#"{"request":"q-1","answers":{"features":["CI","Installer"],"note":"private"},"idempotency_key":"q-answer"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert_eq!(accepted["result"]["answered"], true);
+        assert_eq!(accepted["result"]["prompts"], 2);
+        let answers = answer_receiver.try_recv().unwrap();
+        assert_eq!(
+            answers,
+            vec![
+                QuestionAnswer {
+                    id: "features".into(),
+                    answers: vec!["CI".into(), "Installer".into()]
+                },
+                QuestionAnswer {
+                    id: "note".into(),
+                    answers: vec!["private".into()]
+                }
+            ]
+        );
+        assert!(engine.list_questions(None).is_empty());
+
+        let replay = handle_socket_line(
+            &store,
+            &request(
+                &approve,
+                6,
+                "answer",
+                r#"{"request":"q-1","answers":{"features":["CI"],"note":""},"idempotency_key":"q-answer"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(replay["ok"], true, "{replay}");
+        assert_eq!(replay["result"]["replayed"], true);
+
+        let again = handle_socket_line(
+            &store,
+            &request(
+                &approve,
+                7,
+                "answer",
+                r#"{"request":"q-1","answers":{"features":["CI"],"note":""},"idempotency_key":"q-other"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(again["error"]["code"], "not_found");
+
+        let events = store.list_audit_events(20).unwrap();
+        let event = events
+            .iter()
+            .find(|event| event.action == "question.answer")
+            .expect("the answer writes its row");
+        assert_eq!(event.actor, approve.summary.grant_id);
+        assert_eq!(event.confirmation, crate::audit::SOCKET_GRANT_CONFIRMATION);
+        assert_eq!(event.scope, crate::audit::APPROVE_SCOPE);
+        assert_eq!(event.target.as_deref(), Some("q-1"));
+        assert_eq!(event.thread_id.as_deref(), Some(thread.id.as_str()));
+        let expected = crate::audit::payload_digest(&crate::audit::question_answer_payload(
+            "q-1",
+            &prompts,
+            &[
+                QuestionAnswer {
+                    id: "features".into(),
+                    answers: vec!["CI".into(), "Installer".into()],
+                },
+                QuestionAnswer {
+                    id: "note".into(),
+                    answers: vec!["private".into()],
+                },
+            ],
+        ))
+        .unwrap();
+        assert_eq!(event.payload_digest, expected);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.action == "question.answer")
                 .count(),
             1,
             "a replay does not write a second row"

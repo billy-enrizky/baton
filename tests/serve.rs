@@ -970,6 +970,108 @@ fn attach_answers_an_approval_over_the_socket() {
 
 #[cfg(unix)]
 #[test]
+fn attach_lists_pending_questions_over_the_socket() {
+    let home = tempfile::tempdir().unwrap();
+    let url = format!(
+        "baton://local#grant=00000000-0000-4000-8000-000000000000&secret={}",
+        "a".repeat(64)
+    );
+    let response = serde_json::json!({
+        "v": baton::serve::PROTOCOL_VERSION,
+        "kind": "response",
+        "id": 6,
+        "ok": true,
+        "result": {
+            "questions": [{
+                "request_id": "question-1",
+                "thread_id": "thread",
+                "questions": [{
+                    "id": "features",
+                    "header": "Features",
+                    "question": "Which features?",
+                    "options": [{"label":"CI","description":"Keep it fast"}],
+                    "allow_custom": false,
+                    "multi_select": false,
+                    "secret": false
+                }]
+            }]
+        }
+    });
+    let host = fake_attach_host(home.path(), response);
+    let output = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--thread",
+            "thread",
+            "--questions",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let request = host.join().unwrap();
+    assert_eq!(request["command"], "questions");
+    assert_eq!(request["args"]["thread"], "thread");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["questions"][0]["request_id"], "question-1");
+    assert_eq!(value["questions"][0]["questions"][0]["id"], "features");
+}
+
+#[cfg(unix)]
+#[test]
+fn attach_answers_a_question_over_the_socket() {
+    let home = tempfile::tempdir().unwrap();
+    let url = format!(
+        "baton://local#grant=00000000-0000-4000-8000-000000000000&secret={}",
+        "a".repeat(64)
+    );
+    let response = serde_json::json!({
+        "v": baton::serve::PROTOCOL_VERSION,
+        "kind": "response",
+        "id": 7,
+        "ok": true,
+        "result": {
+            "request_id": "question-1",
+            "thread_id": "thread",
+            "prompts": 1,
+            "answered": true,
+            "replayed": false
+        }
+    });
+    let host = fake_attach_host(home.path(), response);
+    let output = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--answer",
+            "question-1",
+            "--answers",
+            r#"{"features":"CI"}"#,
+            "--idempotency-key",
+            "question-key",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let request = host.join().unwrap();
+    assert_eq!(request["command"], "answer");
+    assert_eq!(request["args"]["request"], "question-1");
+    assert_eq!(request["args"]["answers"]["features"], "CI");
+    assert_eq!(request["args"]["idempotency_key"], "question-key");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["request_id"], "question-1");
+    assert_eq!(value["prompts"], 1);
+    assert_eq!(value["answered"], true);
+}
+
+#[cfg(unix)]
+#[test]
 fn serve_socket_answers_ping_and_requires_a_read_grant() {
     use baton::grants::{mint, GrantRequest, Scope};
     use baton::store::BatonStore;

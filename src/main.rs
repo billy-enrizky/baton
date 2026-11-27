@@ -1,7 +1,8 @@
 use baton::{activity, adapters, attach, audit, checkpoints, claim, cli, config, doctor, exec_events, files, grants, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, serve, status, store, tasks, tui, types, usage, worktree};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::io::{BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -726,6 +727,9 @@ fn main_result(started: Instant) -> Result<()> {
             approvals,
             respond,
             choice,
+            questions,
+            answer,
+            answers,
             idempotency_key,
         } => run_attach(
             &home,
@@ -740,6 +744,9 @@ fn main_result(started: Instant) -> Result<()> {
             approvals,
             respond,
             choice,
+            questions,
+            answer,
+            answers,
             idempotency_key,
         ),
         cli::Commands::Host { command } => run_host(&home, command),
@@ -2940,6 +2947,9 @@ fn run_attach(
     approvals: bool,
     respond: Option<String>,
     choice: Option<String>,
+    questions: bool,
+    answer: Option<String>,
+    answers: Option<String>,
     idempotency_key: Option<String>,
 ) -> Result<()> {
     let Some(url) = url else {
@@ -2956,8 +2966,8 @@ fn run_attach(
     if !(1..=200).contains(&limit) {
         anyhow::bail!("--limit must be between 1 and 200");
     }
-    if idempotency_key.is_some() && submit.is_none() && respond.is_none() {
-        anyhow::bail!("--idempotency-key needs --submit or --respond");
+    if idempotency_key.is_some() && submit.is_none() && respond.is_none() && answer.is_none() {
+        anyhow::bail!("--idempotency-key needs --submit, --respond, or --answer");
     }
     if approvals {
         let pending =
@@ -2966,6 +2976,69 @@ fn run_attach(
             println!("{}", serde_json::to_string_pretty(&pending.json())?);
         } else {
             print!("{}", pending.text());
+        }
+        return Ok(());
+    }
+    if questions {
+        let pending =
+            attach::query_questions(home, &credential, thread.as_deref(), attach::ATTACH_TIMEOUT)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&pending.json())?);
+        } else {
+            print!("{}", pending.text());
+        }
+        return Ok(());
+    }
+    if let Some(request) = answer {
+        if messages || follow || after != 0 {
+            anyhow::bail!("--answer cannot be combined with --messages, --follow, or --after");
+        }
+        let raw = answers.ok_or_else(|| anyhow::anyhow!("--answer needs --answers"))?;
+        let raw = match raw.strip_prefix('@') {
+            Some(path) => std::fs::read_to_string(path)
+                .with_context(|| format!("read answers from {path}"))?,
+            None => raw,
+        };
+        let answers: Value =
+            serde_json::from_str(&raw).context("--answers is not a JSON object")?;
+        if !answers.is_object() {
+            anyhow::bail!("--answers must be a JSON object mapped by prompt id");
+        }
+        let key = idempotency_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let answered = attach::answer_questions(
+            home,
+            &credential,
+            &request,
+            &answers,
+            &key,
+            attach::ATTACH_TIMEOUT,
+        )?;
+        if let Some(thread) = thread.as_deref() {
+            if answered.thread_id != thread {
+                anyhow::bail!(
+                    "host answered question for thread {}, not {thread}",
+                    answered.thread_id
+                );
+            }
+        }
+        if json {
+            println!("{}", serde_json::to_string_pretty(&answered.json())?);
+        } else {
+            println!(
+                "answered {} · question {} · {} prompt(s){}",
+                sanitize::sanitize_single_line(&answered.thread_id),
+                sanitize::sanitize_single_line(&answered.request_id),
+                answered.prompts,
+                if answered.replayed {
+                    " · replayed"
+                } else {
+                    ""
+                }
+            );
         }
         return Ok(());
     }

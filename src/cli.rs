@@ -125,7 +125,7 @@ pub enum Commands {
     /// Connect to a paired host and print its status
     #[command(group(
         clap::ArgGroup::new("mutation")
-            .args(["submit", "respond"])
+            .args(["submit", "respond", "answer"])
             .multiple(true)
     ))]
     Attach {
@@ -170,6 +170,39 @@ pub enum Commands {
         /// Choice id for --respond
         #[arg(long, value_name = "CHOICE", requires = "respond")]
         choice: Option<String>,
+        /// List pending questions from the host
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "submit",
+                "messages",
+                "follow",
+                "approvals",
+                "respond",
+                "answer",
+                "after"
+            ]
+        )]
+        questions: bool,
+        /// Answer one pending question request
+        #[arg(
+            long,
+            value_name = "REQUEST",
+            requires = "answers",
+            conflicts_with_all = [
+                "submit",
+                "messages",
+                "follow",
+                "approvals",
+                "respond",
+                "questions",
+                "after"
+            ]
+        )]
+        answer: Option<String>,
+        /// JSON object mapping prompt ids to a string or array of strings
+        #[arg(long, value_name = "JSON", requires = "answer")]
+        answers: Option<String>,
         /// Reuse a key so a retried submit or respond returns the original result
         #[arg(long, value_name = "KEY", requires = "mutation")]
         idempotency_key: Option<String>,
@@ -962,6 +995,9 @@ mod tests {
                 approvals: false,
                 respond: None,
                 choice: None,
+                questions: false,
+                answer: None,
+                answers: None,
                 idempotency_key: None,
             }) => assert!(url.starts_with("baton://local#")),
             _ => panic!("expected attach"),
@@ -1069,6 +1105,57 @@ mod tests {
             "req-1",
         ]);
         assert!(missing_choice.is_err(), "--respond needs --choice");
+        let cli = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--questions",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Attach {
+                questions: true,
+                answer: None,
+                ..
+            }) => {}
+            _ => panic!("expected questions"),
+        }
+        let cli = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--answer",
+            "question-1",
+            "--answers",
+            r#"{"features":["CI"]}"#,
+            "--idempotency-key",
+            "question-key",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Attach {
+                answer: Some(request),
+                answers: Some(answers),
+                idempotency_key: Some(key),
+                ..
+            }) => {
+                assert_eq!(request, "question-1");
+                assert_eq!(answers, r#"{"features":["CI"]}"#);
+                assert_eq!(key, "question-key");
+            }
+            _ => panic!("expected an answer"),
+        }
+        let missing_answers = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--answer",
+            "question-1",
+        ]);
+        assert!(missing_answers.is_err(), "--answer needs --answers");
         let key_without_mutation = Cli::try_parse_from([
             "baton",
             "attach",

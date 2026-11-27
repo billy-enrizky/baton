@@ -138,6 +138,39 @@ def run(binary: str, evidence: Path) -> dict:
         read_only_exit = read_only_process.wait(timeout=15)
         read_only_stderr = read_only_process.stderr.read()
 
+        allow_process = subprocess.Popen(
+            [
+                binary,
+                "mcp",
+                "--allow-tool",
+                "baton_status",
+                "--allow-tool",
+                "baton_queue",
+            ],
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        allow = Rpc(allow_process)
+        allow_init = allow.call("initialize", {"protocolVersion": "2025-06-18"})
+        allow_tools = [tool["name"] for tool in allow.call("tools/list")["result"]["tools"]]
+        allow_status_error, allow_status = allow.tool("baton_status")
+        allow_turns_response = allow.call(
+            "tools/call", {"name": "baton_turns", "arguments": {}}
+        )
+        allow_fork_response = allow.call(
+            "tools/call", {"name": "baton_fork", "arguments": {}}
+        )
+        allow_queue_error, allow_queue = allow.tool(
+            "baton_queue", {"thread": thread_id}
+        )
+        allow_process.stdin.close()
+        allow_exit = allow_process.wait(timeout=15)
+        allow_stderr = allow_process.stderr.read()
+
         result = {
             "protocol_version": initialized["result"]["protocolVersion"],
             "server": server,
@@ -175,6 +208,17 @@ def run(binary: str, evidence: Path) -> dict:
             "read_only_queue_count": queue_read.get("count"),
             "read_only_exit_code": read_only_exit,
             "read_only_stderr": read_only_stderr[-300:],
+            "allow_tool_count": len(allow_tools),
+            "allow_tools": allow_tools,
+            "allow_instructions": allow_init["result"]["instructions"],
+            "allow_status_error": allow_status_error,
+            "allow_status_provider": allow_status.get("provider"),
+            "allow_turns_error": (allow_turns_response.get("error") or {}).get("code"),
+            "allow_fork_error": (allow_fork_response.get("error") or {}).get("code"),
+            "allow_queue_list_error": allow_queue_error,
+            "allow_queue_count": allow_queue.get("count"),
+            "allow_exit_code": allow_exit,
+            "allow_stderr": allow_stderr[-300:],
         }
         passed = (
             result["protocol_version"] == "2025-06-18"
@@ -207,6 +251,18 @@ def run(binary: str, evidence: Path) -> dict:
             and result["read_only_queue_count"] == 0
             and read_only_exit == 0
             and not read_only_stderr
+            and result["allow_tool_count"] == 2
+            and result["allow_tools"] == ["baton_status", "baton_queue"]
+            and "baton_status" in result["allow_instructions"]
+            and "baton_queue" in result["allow_instructions"]
+            and not result["allow_status_error"]
+            and result["allow_status_provider"] == provider
+            and result["allow_turns_error"] == -32003
+            and result["allow_fork_error"] == -32003
+            and not result["allow_queue_list_error"]
+            and result["allow_queue_count"] == 0
+            and allow_exit == 0
+            and not allow_stderr
         )
         result["passed"] = passed
         (evidence / "summary.json").write_text(json.dumps(result, indent=2) + "\n")

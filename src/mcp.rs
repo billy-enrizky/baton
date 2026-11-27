@@ -4,6 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -22,11 +23,19 @@ pub enum McpAccess {
     ReadOnly,
 }
 
+pub fn known_tool_names() -> Vec<String> {
+    tool_descriptors(McpAccess::ReadWrite)
+        .iter()
+        .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+        .collect()
+}
+
 pub struct McpServer {
     store: BatonStore,
     home: PathBuf,
     cwd: PathBuf,
     access: McpAccess,
+    allowed_tools: Option<BTreeSet<String>>,
 }
 
 impl McpServer {
@@ -36,11 +45,17 @@ impl McpServer {
             home,
             cwd,
             access: McpAccess::ReadWrite,
+            allowed_tools: None,
         }
     }
 
     pub fn read_only(mut self) -> Self {
         self.access = McpAccess::ReadOnly;
+        self
+    }
+
+    pub fn with_allowed_tools(mut self, tools: impl IntoIterator<Item = String>) -> Self {
+        self.allowed_tools = Some(tools.into_iter().collect());
         self
     }
 
@@ -70,31 +85,40 @@ impl McpServer {
         let id = id.unwrap_or(Value::Null);
         let params = frame.get("params").cloned().unwrap_or(Value::Null);
         let result = match method {
-            "initialize" => Ok(json!({
-                "protocolVersion": params
-                    .get("protocolVersion")
-                    .and_then(Value::as_str)
-                    .unwrap_or("2024-11-05"),
-                "capabilities": { "tools": {} },
-                "serverInfo": {
-                    "name": "baton",
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "title": "Baton thread state"
-                },
-                "instructions": if self.access == McpAccess::ReadOnly {
-                    "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_agents, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. This server is read-only; baton_fork and queue clearing are disabled."
+            "initialize" => {
+                let mut instructions = if self.access == McpAccess::ReadOnly {
+                    "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_agents, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. This server is read-only; baton_fork and queue clearing are disabled.".to_string()
                 } else {
-                    "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_agents, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. baton_fork creates a new thread from an existing conversation; set native=true for a Codex or OpenCode native fork."
+                    "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_agents, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. baton_fork creates a new thread from an existing conversation; set native=true for a Codex or OpenCode native fork.".to_string()
+                };
+                if let Some(allowed) = &self.allowed_tools {
+                    instructions.push_str(&format!(
+                        " This server allows only these tools: {}.",
+                        allowed.iter().cloned().collect::<Vec<_>>().join(", ")
+                    ));
                 }
-            })),
+                Ok(json!({
+                    "protocolVersion": params
+                        .get("protocolVersion")
+                        .and_then(Value::as_str)
+                        .unwrap_or("2024-11-05"),
+                    "capabilities": { "tools": {} },
+                    "serverInfo": {
+                        "name": "baton",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "title": "Baton thread state"
+                    },
+                    "instructions": instructions
+                }))
+            }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tool_descriptors(self.access) })),
+            "tools/list" => Ok(json!({ "tools": self.visible_tools() })),
             "tools/call" => {
-                if let Some(tool) = self.refused_tool(&params) {
+                if let Some(reason) = self.refusal_reason(&params) {
                     return Some(json!({
                         "jsonrpc": "2.0",
                         "id": id,
-                        "error": { "code": -32003, "message": format!("read-only MCP server refuses {tool}") }
+                        "error": { "code": -32003, "message": reason }
                     }));
                 }
                 self.call_tool(&params)
@@ -117,23 +141,41 @@ impl McpServer {
         })
     }
 
-    fn refused_tool(&self, params: &Value) -> Option<&'static str> {
+    fn refusal_reason(&self, params: &Value) -> Option<String> {
+        let name = params.get("name").and_then(Value::as_str)?;
+        if let Some(allowed) = &self.allowed_tools {
+            if !allowed.contains(name) {
+                return Some(format!("MCP server does not allow {name}"));
+            }
+        }
         if self.access != McpAccess::ReadOnly {
             return None;
         }
-        match params.get("name").and_then(Value::as_str)? {
-            "baton_fork" => Some("baton_fork"),
-            "baton_queue"
-                if params
-                    .get("arguments")
-                    .and_then(|arguments| arguments.get("clear"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false) =>
-            {
-                Some("baton_queue")
-            }
-            _ => None,
+        if name == "baton_fork" {
+            return Some("read-only MCP server refuses baton_fork".to_string());
         }
+        if name == "baton_queue"
+            && params
+                .get("arguments")
+                .and_then(|arguments| arguments.get("clear"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            return Some("read-only MCP server refuses baton_queue".to_string());
+        }
+        None
+    }
+
+    fn visible_tools(&self) -> Vec<Value> {
+        let mut tools = tool_descriptors(self.access);
+        if let Some(allowed) = &self.allowed_tools {
+            tools.retain(|tool| {
+                tool.get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(|name| allowed.contains(name))
+            });
+        }
+        tools
     }
 
     fn call_tool(&self, params: &Value) -> Result<Value> {
@@ -1585,6 +1627,59 @@ mod tests {
 
         let queue = tool_json(&server, "baton_queue", json!({}));
         assert_eq!(queue["count"], 1);
+    }
+
+    #[test]
+    fn allowlist_limits_the_callable_tools() {
+        let server = server()
+            .with_allowed_tools(vec!["baton_status".to_string(), "baton_queue".to_string()]);
+        let tools = request(&server, 1, "tools/list", json!({}));
+        let names = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["baton_status", "baton_queue"]);
+
+        let init = request(&server, 2, "initialize", json!({}));
+        let instructions = init["result"]["instructions"].as_str().unwrap();
+        assert!(instructions.contains("baton_status"));
+        assert!(instructions.contains("baton_queue"));
+
+        let status = tool_json(&server, "baton_status", json!({}));
+        assert_eq!(status["provider"], "codex");
+        let refused = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "baton_turns", "arguments": {} }),
+        );
+        assert_eq!(refused["error"]["code"], -32003);
+        let fork = request(
+            &server,
+            4,
+            "tools/call",
+            json!({ "name": "baton_fork", "arguments": {} }),
+        );
+        assert_eq!(fork["error"]["code"], -32003);
+        assert_eq!(server.store.list_threads(None).unwrap().len(), 1);
+        assert!(crate::audit::list(&server.store, 10).unwrap().is_empty());
+
+        let queue = tool_json(&server, "baton_queue", json!({}));
+        assert_eq!(queue["count"], 1);
+    }
+
+    #[test]
+    fn known_tool_names_match_the_tool_list() {
+        let names = known_tool_names();
+        let descriptors = tool_descriptors(McpAccess::ReadWrite)
+            .iter()
+            .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        assert_eq!(names, descriptors);
+        assert_eq!(names.len(), 15);
+        assert!(names.contains(&"baton_fork".to_string()));
     }
 
     #[test]

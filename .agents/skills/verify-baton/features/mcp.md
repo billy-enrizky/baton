@@ -8,6 +8,7 @@
 - `baton_fork` creates a new thread or attaches a native Codex/OpenCode session
 - `baton_queue` can clear the queue explicitly; everything else is read-only
 - `--read-only` hides `baton_fork` and refuses queue clearing; queue listing and every other read tool stay available
+- Repeatable `--allow-tool` exposes only the named tools and refuses every other name with `-32003`
 - Unknown tools return a tool result with `isError: true` and `unknown baton tool <name>`
 
 ## How to get to it

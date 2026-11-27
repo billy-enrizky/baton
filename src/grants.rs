@@ -238,6 +238,22 @@ pub fn state(summary: &GrantSummary) -> &'static str {
     }
 }
 
+/// An empty allowlist means every project. Entries and the project are
+/// canonicalized, so a symlink cannot escape an allowed root.
+pub fn allows_project(allowlist: &[String], project: &Path) -> bool {
+    if allowlist.is_empty() {
+        return true;
+    }
+    let Ok(project) = project.canonicalize() else {
+        return false;
+    };
+    allowlist.iter().any(|allowed| {
+        Path::new(allowed)
+            .canonicalize()
+            .is_ok_and(|allowed| project == allowed || project.starts_with(&allowed))
+    })
+}
+
 pub fn list(store: &BatonStore) -> Result<Vec<GrantSummary>> {
     Ok(store
         .list_grant_rows()?
@@ -636,6 +652,24 @@ mod tests {
             refused.downcast_ref::<GrantRefusal>(),
             Some(&GrantRefusal::Expired)
         );
+    }
+
+    #[test]
+    fn project_allowlists_accept_children_and_reject_siblings() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("repo").join("src");
+        std::fs::create_dir_all(&child).unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let allowed = vec![root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()];
+        assert!(allows_project(&allowed, &child));
+        assert!(allows_project(&allowed, root.path()));
+        assert!(!allows_project(&allowed, sibling.path()));
+        assert!(allows_project(&[], sibling.path()));
     }
 
     #[test]

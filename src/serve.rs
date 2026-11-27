@@ -706,7 +706,7 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
     let command = tokens.next().unwrap_or_default();
     match command {
         "help" => eprintln!(
-            "baton: host commands: pair [--label <name>] [--scope <s>]... [--ceiling <mode>] [--expires-days N]; renew <id> [--days N]; help"
+            "baton: host commands: pair [--label <name>] [--scope <s>]... [--ceiling <mode>] [--project <path>]... [--expires-days N]; renew <id> [--days N]; help"
         ),
         "pair" => match parse_pair(tokens.collect()) {
             Ok(request) => {
@@ -718,10 +718,11 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
                     Ok(minted) => {
                         println!("{}", pair_url(&minted));
                         eprintln!(
-                            "baton: paired {} with {} scopes, ceiling {}, expires {}",
+                            "baton: paired {} with {} scopes, ceiling {}, projects {}, expires {}",
                             minted.summary.grant_id,
                             minted.summary.scopes.join(","),
                             minted.summary.permission_ceiling,
+                            minted.summary.project_allowlist.len(),
                             minted.summary.expires_at
                         );
                     }
@@ -796,6 +797,7 @@ fn parse_pair(args: Vec<&str>) -> Result<crate::grants::GrantRequest> {
     let mut scopes_set = false;
     let mut label = None;
     let mut ceiling = PermissionMode::Default;
+    let mut projects = Vec::new();
     let mut expires_days = DEFAULT_GRANT_DAYS;
     let mut index = 0;
     while index < args.len() {
@@ -833,6 +835,23 @@ fn parse_pair(args: Vec<&str>) -> Result<crate::grants::GrantRequest> {
                 ceiling = PermissionMode::parse(value)
                     .ok_or_else(|| anyhow::anyhow!("unknown ceiling {value}"))?;
             }
+            "--project" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--project needs a path"))?;
+                let path = Path::new(value);
+                if !path.is_absolute() {
+                    anyhow::bail!("--project must be absolute: {value}");
+                }
+                let canonical = path
+                    .canonicalize()
+                    .with_context(|| format!("resolve project {}", path.display()))?;
+                let canonical = canonical.to_string_lossy().to_string();
+                if !projects.contains(&canonical) {
+                    projects.push(canonical);
+                }
+            }
             "--expires-days" => {
                 index += 1;
                 let value = args
@@ -852,6 +871,7 @@ fn parse_pair(args: Vec<&str>) -> Result<crate::grants::GrantRequest> {
     let mut request = GrantRequest::new(scopes);
     request.label = label;
     request.permission_ceiling = ceiling;
+    request.project_allowlist = projects;
     request.expires_at = expiry_after_days(expires_days);
     Ok(request)
 }
@@ -948,14 +968,16 @@ fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink
         return respond_request(store, engine, &grant, id, &value);
     }
     if command == "approvals" {
-        return approvals_request(engine, id, &value);
+        let grant = grant.expect("approvals requires a verified grant");
+        return approvals_request(engine, &grant, id, &value);
     }
     if command == "answer" {
         let grant = grant.expect("answer requires a verified grant");
         return answer_request(store, engine, &grant, id, &value);
     }
     if command == "questions" {
-        return questions_request(engine, id, &value);
+        let grant = grant.expect("questions requires a verified grant");
+        return questions_request(engine, &grant, id, &value);
     }
     handle_line(store, line).unwrap_or_else(|| {
         error_response(
@@ -1120,6 +1142,13 @@ fn submit_request(
             ),
         );
     }
+    if !crate::grants::allows_project(&grant.project_allowlist, &cwd) {
+        return error_response(
+            id,
+            "not_permitted",
+            format!("the grant does not allow project {}", cwd.display()),
+        );
+    }
     if thread.permission_mode == crate::types::PermissionMode::BypassPermissions {
         return error_response(
             id,
@@ -1181,7 +1210,12 @@ fn submit_request(
     response(id, body)
 }
 
-fn approvals_request(engine: Option<&EngineLink>, id: Value, value: &Value) -> Value {
+fn approvals_request(
+    engine: Option<&EngineLink>,
+    grant: &crate::store::GrantSummary,
+    id: Value,
+    value: &Value,
+) -> Value {
     let Some(engine) = engine else {
         return error_response(
             id,
@@ -1189,6 +1223,16 @@ fn approvals_request(engine: Option<&EngineLink>, id: Value, value: &Value) -> V
             "this host has no engine; start baton serve without --stdio",
         );
     };
+    if !crate::grants::allows_project(&grant.project_allowlist, engine.root()) {
+        return error_response(
+            id,
+            "not_permitted",
+            format!(
+                "the grant does not allow project {}",
+                engine.root().display()
+            ),
+        );
+    }
     let thread = match value.get("args") {
         None | Some(Value::Null) => None,
         Some(Value::Object(args)) => match args.get("thread") {
@@ -1221,6 +1265,16 @@ fn respond_request(
             "this host has no engine; start baton serve without --stdio",
         );
     };
+    if !crate::grants::allows_project(&grant.project_allowlist, engine.root()) {
+        return error_response(
+            id,
+            "not_permitted",
+            format!(
+                "the grant does not allow project {}",
+                engine.root().display()
+            ),
+        );
+    }
     let args = match value.get("args") {
         Some(Value::Object(args)) => args,
         _ => return error_response(id, "malformed_line", "respond args must be an object"),
@@ -1330,7 +1384,12 @@ fn respond_request(
     response(id, body)
 }
 
-fn questions_request(engine: Option<&EngineLink>, id: Value, value: &Value) -> Value {
+fn questions_request(
+    engine: Option<&EngineLink>,
+    grant: &crate::store::GrantSummary,
+    id: Value,
+    value: &Value,
+) -> Value {
     let Some(engine) = engine else {
         return error_response(
             id,
@@ -1338,6 +1397,16 @@ fn questions_request(engine: Option<&EngineLink>, id: Value, value: &Value) -> V
             "this host has no engine; start baton serve without --stdio",
         );
     };
+    if !crate::grants::allows_project(&grant.project_allowlist, engine.root()) {
+        return error_response(
+            id,
+            "not_permitted",
+            format!(
+                "the grant does not allow project {}",
+                engine.root().display()
+            ),
+        );
+    }
     let thread = match value.get("args") {
         None | Some(Value::Null) => None,
         Some(Value::Object(args)) => match args.get("thread") {
@@ -1370,6 +1439,16 @@ fn answer_request(
             "this host has no engine; start baton serve without --stdio",
         );
     };
+    if !crate::grants::allows_project(&grant.project_allowlist, engine.root()) {
+        return error_response(
+            id,
+            "not_permitted",
+            format!(
+                "the grant does not allow project {}",
+                engine.root().display()
+            ),
+        );
+    }
     let args = match value.get("args") {
         Some(Value::Object(args)) => args,
         _ => return error_response(id, "malformed_line", "answer args must be an object"),
@@ -1917,6 +1996,8 @@ mod tests {
         assert!(request.label.is_none());
         assert_eq!(request.permission_ceiling, PermissionMode::Default);
 
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().to_string_lossy().to_string();
         let request = parse_pair(vec![
             "--label",
             "laptop",
@@ -1926,6 +2007,8 @@ mod tests {
             "git",
             "--ceiling",
             "acceptEdits",
+            "--project",
+            &project_path,
             "--expires-days",
             "7",
         ])
@@ -1933,6 +2016,15 @@ mod tests {
         assert_eq!(request.scopes, vec![Scope::Read, Scope::Git]);
         assert_eq!(request.label.as_deref(), Some("laptop"));
         assert_eq!(request.permission_ceiling, PermissionMode::AcceptEdits);
+        assert_eq!(
+            request.project_allowlist,
+            vec![project
+                .path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .to_string()]
+        );
         let expiry = request
             .expires_at
             .parse::<chrono::DateTime<chrono::Utc>>()
@@ -1948,6 +2040,8 @@ mod tests {
         assert!(error.to_string().contains("not grantable"), "{error}");
         let error = parse_pair(vec!["--ceiling", "nope"]).unwrap_err();
         assert!(error.to_string().contains("unknown ceiling"), "{error}");
+        let error = parse_pair(vec!["--project", "relative"]).unwrap_err();
+        assert!(error.to_string().contains("absolute"), "{error}");
         let error = parse_pair(vec!["--bogus"]).unwrap_err();
         assert!(error.to_string().contains("unknown pair option"), "{error}");
     }
@@ -2270,6 +2364,15 @@ mod tests {
             &GrantRequest::new(vec![Scope::Read, Scope::Approve]),
         )
         .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut wrong_request = GrantRequest::new(vec![Scope::Read, Scope::Approve]);
+        wrong_request.project_allowlist = vec![outside
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()];
+        let wrong = mint(&store, home.path(), &wrong_request).unwrap();
         let thread = store.list_threads(None).unwrap().remove(0);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let engine = EngineLink::new(
@@ -2294,6 +2397,24 @@ mod tests {
                 grant.summary.grant_id, grant.secret
             )
         };
+
+        let denied_list = handle_socket_line(
+            &store,
+            &request(&wrong, 1, "approvals", "{}"),
+            Some(&engine),
+        );
+        assert_eq!(denied_list["error"]["code"], "not_permitted");
+        let denied_answer = handle_socket_line(
+            &store,
+            &request(
+                &wrong,
+                2,
+                "respond",
+                r#"{"request":"req-1","choice":"accept","idempotency_key":"k-wrong-project"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(denied_answer["error"]["code"], "not_permitted");
 
         let listed =
             handle_socket_line(&store, &request(&read, 1, "approvals", "{}"), Some(&engine));
@@ -2419,6 +2540,15 @@ mod tests {
             &GrantRequest::new(vec![Scope::Read, Scope::Approve]),
         )
         .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let mut wrong_request = GrantRequest::new(vec![Scope::Read, Scope::Approve]);
+        wrong_request.project_allowlist = vec![outside
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()];
+        let wrong = mint(&store, home.path(), &wrong_request).unwrap();
         let thread = store.list_threads(None).unwrap().remove(0);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let engine = EngineLink::new(
@@ -2470,6 +2600,24 @@ mod tests {
                 grant.summary.grant_id, grant.secret
             )
         };
+
+        let denied_list = handle_socket_line(
+            &store,
+            &request(&wrong, 1, "questions", "{}"),
+            Some(&engine),
+        );
+        assert_eq!(denied_list["error"]["code"], "not_permitted");
+        let denied_answer = handle_socket_line(
+            &store,
+            &request(
+                &wrong,
+                2,
+                "answer",
+                r#"{"request":"q-1","answers":{"features":["CI"],"note":""},"idempotency_key":"q-wrong-project"}"#,
+            ),
+            Some(&engine),
+        );
+        assert_eq!(denied_answer["error"]["code"], "not_permitted");
 
         let listed =
             handle_socket_line(&store, &request(&read, 1, "questions", "{}"), Some(&engine));
@@ -2604,6 +2752,63 @@ mod tests {
             1,
             "a replay does not write a second row"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_refuses_a_project_outside_the_grant_allowlist() {
+        use crate::grants::{mint, GrantRequest, Scope};
+
+        let (_dir, store) = claimed_store();
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "allowed".into(),
+                cwd: root.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let mut wrong_request = GrantRequest::new(vec![Scope::Read, Scope::Operate]);
+        wrong_request.project_allowlist = vec![sibling
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()];
+        let wrong = mint(&store, home.path(), &wrong_request).unwrap();
+        let mut right_request = GrantRequest::new(vec![Scope::Read, Scope::Operate]);
+        right_request.project_allowlist = vec![root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string()];
+        let right = mint(&store, home.path(), &right_request).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let engine = EngineLink::new(
+            sender,
+            home.path().to_path_buf(),
+            root.path().to_path_buf(),
+            Arc::new(Mutex::new(RemoteApprovals::default())),
+            Arc::new(Mutex::new(RemoteQuestions::default())),
+        );
+        let request = |grant: &crate::grants::MintedGrant, id: u64| {
+            format!(
+                r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{}","text":"remote hello","idempotency_key":"k-{id}"}}}}"#,
+                grant.summary.grant_id, grant.secret, thread.id
+            )
+        };
+
+        let refused = handle_socket_line(&store, &request(&wrong, 1), Some(&engine));
+        assert_eq!(refused["error"]["code"], "not_permitted");
+        assert!(receiver.try_recv().is_err());
+
+        let accepted = handle_socket_line(&store, &request(&right, 2), Some(&engine));
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert!(receiver.try_recv().is_ok());
     }
 
     #[cfg(unix)]

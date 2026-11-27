@@ -576,7 +576,7 @@ baton schedule list --json
 baton schedule remove <id>
 ```
 
-Cron is five fields in UTC: minute, hour, day of month, month, and weekday. Each field accepts `*`, a number, a list, a range, and a step. `baton serve` checks due schedules every second, claims each tick with a compare-and-set so two schedulers cannot fire the same run, writes a `schedule.trigger` audit row, and posts the prompt into its thread. A due schedule is skipped while its thread is archived or its stored expression is invalid, and the skip is logged. Add or remove schedules while no host or TUI owns the store; the host reads the store when it starts.
+Cron is five fields in UTC: minute, hour, day of month, month, and weekday. Each field accepts `*`, a number, a list, a range, and a step. `baton serve` checks due schedules every second, claims each tick with a compare-and-set so two schedulers cannot fire the same run, writes a `schedule.trigger` audit row, and posts the prompt into its thread. A due schedule is skipped while its thread is archived or its stored expression is invalid, and the skip is logged. Manage schedules from the CLI while no host or TUI owns the store, or type `schedule add --thread <id> --cron "<expr>" --prompt "<text>"`, `schedule list`, and `schedule remove <id>` at the `baton serve` host terminal. A host with stdin closed cannot use the terminal commands.
 
 ## 9. Git delivery loop
 

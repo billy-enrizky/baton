@@ -16,7 +16,7 @@ Goals:
 
 Non-goals:
 
-- Adding or removing a schedule while a host or TUI owns the store. The next slice adds a host command or socket path for live management.
+- Adding or removing a schedule from any client while a host owns the store. The host terminal commands cover the attached host; a socket or TUI path is the next slice.
 - A TUI schedule view, pause/resume, or per-schedule enable flags.
 - Local timezones, DST policy, or missed-run catch-up.
 - Notifications, retries, or a per-schedule concurrency limit.
@@ -26,6 +26,7 @@ Non-goals:
 - `baton schedule add --thread <id> --cron "<minute hour day month weekday>" --prompt "<text>"` validates the expression, computes the next UTC occurrence, stores the row, and writes a `schedule.add` audit row.
 - `baton schedule list [--json]` shows the id, next run, thread, expression, prompt preview, and enabled state.
 - `baton schedule remove <id> [--json]` accepts a unique id prefix, deletes the row, and writes a `schedule.remove` audit row.
+- At the `baton serve` host terminal, `schedule add --thread <id> --cron "<expr>" --prompt "<text>"`, `schedule list`, and `schedule remove <id>` manage the live host's rows. A quoted prompt or cron may contain spaces. The host writes `schedule.add` or `schedule.remove` with actor `host_terminal`.
 - The expression supports `*`, a number, a list, a range, and a step in each of the five fields. Weekdays are 0 for Sunday through 6 for Saturday. Day-of-month and day-of-week use the traditional OR rule when both are restricted.
 - `baton serve` checks due schedules every second. A due row is claimed with a compare-and-set on its `next_run_at`; only the winner fires.
 - A claimed run writes `schedule.trigger` with actor `scheduler`, confirmation `host_schedule`, the schedule id as the target, and the thread id. A failed audit write skips the run instead of starting an unaudited turn.
@@ -65,14 +66,17 @@ Non-goals:
 
 ## How to get to it (user POV)
 
-Stop any TUI or host that owns the store. Add a schedule, list it, start `baton serve`, and watch the audit log:
+Add a schedule before starting a host, or manage a running host from its terminal:
 
 ```sh
 baton schedule add --thread <id> --cron "0 9 * * 1-5" --prompt "Check the failing tests"
 baton schedule list --json
 baton serve
+# At the host terminal:
+schedule add --thread <id> --cron "0 9 * * 1-5" --prompt "Check the failing tests"
+schedule list
+schedule remove <id>
 baton audit list --json
-baton schedule remove <id>
 ```
 
 The live integration test starts a host against a real SQLite store and a fake harness, with a due schedule, and waits for the `schedule.trigger` row and the advanced next run.
@@ -93,11 +97,14 @@ The live integration test starts a host against a real SQLite store and a fake h
 - `serve::tests::fire_due_schedules_skips_an_archived_thread`
 - `tests/schedule_cli.rs::schedule_add_list_remove_and_audit`
 - `tests/schedule_cli.rs::schedule_add_refuses_an_invalid_expression`
+- `tests/serve.rs::serve_stdin_schedule_commands_manage_the_live_host`
 - `tests/serve.rs::serve_fires_a_due_schedule_and_audits_it`
+- `serve::tests::host_tokens_keep_quoted_spaces`
+- `serve::tests::host_schedule_add_list_remove`
 - `schedule-claim-state-machine` gate
 
 ## Limits
 
-- Add and remove schedules while no host or TUI owns the store.
+- A host with stdin closed cannot use the host terminal commands. The socket and TUI management paths remain.
 - The TUI does not fire or display schedules yet.
 - Cron is UTC only; there is no pause/resume, local timezone, missed-run catch-up, notification, or retry.

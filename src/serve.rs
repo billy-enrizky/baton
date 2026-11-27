@@ -892,13 +892,13 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
     if trimmed.is_empty() {
         return;
     }
-    let mut tokens = trimmed.split_whitespace();
-    let command = tokens.next().unwrap_or_default();
+    let tokens = host_tokens(trimmed);
+    let command = tokens.first().map(String::as_str).unwrap_or_default();
     match command {
         "help" => eprintln!(
-            "baton: host commands: pair [--label <name>] [--scope <s>]... [--ceiling <mode>] [--project <path>]... [--expires-days N]; renew <id> [--days N]; help"
+            "baton: host commands: pair [--label <name>] [--scope <s>]... [--ceiling <mode>] [--project <path>]... [--expires-days N]; renew <id> [--days N]; schedule add --thread <id> --cron \"<expr>\" --prompt \"<text>\"; schedule list; schedule remove <id>; help"
         ),
-        "pair" => match parse_pair(tokens.collect()) {
+        "pair" => match parse_pair(tokens.iter().skip(1).map(String::as_str).collect()) {
             Ok(request) => {
                 let minted = {
                     let store = store.lock().unwrap();
@@ -921,7 +921,7 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
             }
             Err(error) => eprintln!("baton: {error}"),
         },
-        "renew" => match parse_renew(tokens.collect()) {
+        "renew" => match parse_renew(tokens.iter().skip(1).map(String::as_str).collect()) {
             Ok((grant_id, days)) => {
                 let renewed = {
                     let store = store.lock().unwrap();
@@ -943,8 +943,256 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
             }
             Err(error) => eprintln!("baton: {error}"),
         },
+        "schedule" => handle_host_schedule(store, home, &tokens[1..]),
         other => eprintln!("baton: unknown host command {other}; type help"),
     }
+}
+
+/// Splits a host-terminal line into tokens. A single or double quoted token may
+/// contain spaces, and a backslash escapes the next character.
+fn host_tokens(line: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for character in line.chars() {
+        if escaped {
+            current.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if let Some(open) = quote {
+            if character == open {
+                quote = None;
+            } else {
+                current.push(character);
+            }
+            continue;
+        }
+        if character == '"' || character == '\'' {
+            quote = Some(character);
+            continue;
+        }
+        if character.is_whitespace() {
+            if !current.is_empty() {
+                tokens.push(std::mem::take(&mut current));
+            }
+        } else {
+            current.push(character);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    tokens
+}
+
+#[cfg(unix)]
+fn handle_host_schedule(store: &Arc<Mutex<BatonStore>>, home: &Path, args: &[String]) {
+    let Some(action) = args.first().map(String::as_str) else {
+        eprintln!("baton: use schedule add|list|remove");
+        return;
+    };
+    match action {
+        "add" => {
+            let parsed = match parse_host_schedule_add(&args[1..]) {
+                Ok(parsed) => parsed,
+                Err(error) => {
+                    eprintln!("baton: {error}");
+                    return;
+                }
+            };
+            let thread = {
+                let guard = store.lock().unwrap();
+                match guard.get_thread(&parsed.thread) {
+                    Ok(Some(thread)) => thread,
+                    Ok(None) => match guard
+                        .list_threads(None)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .find(|thread| thread.id.starts_with(&parsed.thread))
+                    {
+                        Some(thread) => thread,
+                        None => {
+                            eprintln!("baton: no thread matches {}", parsed.thread);
+                            return;
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("baton: cannot read thread: {error}");
+                        return;
+                    }
+                }
+            };
+            let expression = match crate::schedule::parse(&parsed.cron) {
+                Ok(expression) => expression,
+                Err(error) => {
+                    eprintln!("baton: {error}");
+                    return;
+                }
+            };
+            let next = match crate::schedule::next_after(&expression, chrono::Utc::now()) {
+                Ok(next) => next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                Err(error) => {
+                    eprintln!("baton: {error}");
+                    return;
+                }
+            };
+            let row = {
+                let guard = store.lock().unwrap();
+                match guard.add_schedule(&thread.id, &parsed.prompt, &parsed.cron, &next) {
+                    Ok(row) => row,
+                    Err(error) => {
+                        eprintln!("baton: cannot add schedule: {error}");
+                        return;
+                    }
+                }
+            };
+            let audit = crate::audit::event(
+                crate::audit::HOST_TERMINAL_ACTOR,
+                &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+                Some(&row.id),
+                Some(&thread.id),
+                crate::audit::AuditAction::ScheduleAdd,
+                &serde_json::json!({
+                    "thread_id": thread.id,
+                    "expression": row.expression,
+                    "next_run_at": row.next_run_at,
+                }),
+            );
+            let audit = match audit {
+                Ok(audit) => audit,
+                Err(error) => {
+                    let _ = store.lock().unwrap().remove_schedule(&row.id);
+                    eprintln!("baton: cannot audit schedule: {error}; not added");
+                    return;
+                }
+            };
+            if let Err(error) = store.lock().unwrap().append_audit_event(&audit) {
+                let _ = store.lock().unwrap().remove_schedule(&row.id);
+                eprintln!("baton: cannot audit schedule: {error}; not added");
+                return;
+            }
+            eprintln!(
+                "baton: schedule {} next {} thread {} {}",
+                &row.id[..8.min(row.id.len())],
+                row.next_run_at,
+                &thread.id[..8.min(thread.id.len())],
+                row.expression
+            );
+        }
+        "list" => {
+            let schedules = store.lock().unwrap().list_schedules().unwrap_or_default();
+            if schedules.is_empty() {
+                eprintln!("baton: schedules: empty");
+            } else {
+                for row in schedules {
+                    let prompt: String = row.prompt.chars().take(60).collect();
+                    eprintln!(
+                        "baton: {} next {} thread {} {} {}",
+                        &row.id[..8.min(row.id.len())],
+                        row.next_run_at,
+                        &row.thread_id[..8.min(row.thread_id.len())],
+                        row.expression,
+                        prompt
+                    );
+                }
+            }
+        }
+        "remove" => {
+            let Some(prefix) = args.get(1) else {
+                eprintln!("baton: schedule remove needs an id");
+                return;
+            };
+            let schedules = store.lock().unwrap().list_schedules().unwrap_or_default();
+            let matches: Vec<_> = schedules
+                .into_iter()
+                .filter(|row| row.id.starts_with(prefix))
+                .collect();
+            let row = match matches.as_slice() {
+                [] => {
+                    eprintln!("baton: no schedule matches {prefix}");
+                    return;
+                }
+                [row] => row.clone(),
+                _ => {
+                    eprintln!("baton: schedule prefix {prefix} is ambiguous");
+                    return;
+                }
+            };
+            if let Err(error) = store.lock().unwrap().remove_schedule(&row.id) {
+                eprintln!("baton: cannot remove schedule: {error}");
+                return;
+            }
+            let audit = crate::audit::event(
+                crate::audit::HOST_TERMINAL_ACTOR,
+                &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+                Some(&row.id),
+                Some(&row.thread_id),
+                crate::audit::AuditAction::ScheduleRemove,
+                &serde_json::json!({ "thread_id": row.thread_id }),
+            );
+            match audit.and_then(|audit| store.lock().unwrap().append_audit_event(&audit)) {
+                Ok(_) => eprintln!("baton: schedule {} removed", &row.id[..8.min(row.id.len())]),
+                Err(error) => eprintln!("baton: schedule removed but audit failed: {error}"),
+            }
+        }
+        other => eprintln!("baton: unknown schedule action {other}; use add, list, or remove"),
+    }
+}
+
+#[cfg(unix)]
+fn parse_host_schedule_add(args: &[String]) -> Result<HostScheduleAdd> {
+    let mut thread = None;
+    let mut cron = None;
+    let mut prompt = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--thread" => {
+                index += 1;
+                thread = args.get(index).cloned();
+                if thread.is_none() {
+                    anyhow::bail!("--thread needs an id");
+                }
+            }
+            "--cron" => {
+                index += 1;
+                cron = args.get(index).cloned();
+                if cron.is_none() {
+                    anyhow::bail!("--cron needs an expression");
+                }
+            }
+            "--prompt" => {
+                index += 1;
+                prompt = args.get(index).cloned();
+                if prompt.is_none() {
+                    anyhow::bail!("--prompt needs text");
+                }
+            }
+            other => anyhow::bail!("unknown schedule add option {other}"),
+        }
+        index += 1;
+    }
+    Ok(HostScheduleAdd {
+        thread: thread.ok_or_else(|| anyhow::anyhow!("schedule add needs --thread"))?,
+        cron: cron.ok_or_else(|| anyhow::anyhow!("schedule add needs --cron"))?,
+        prompt: prompt.ok_or_else(|| anyhow::anyhow!("schedule add needs --prompt"))?,
+    })
+}
+
+#[cfg(unix)]
+struct HostScheduleAdd {
+    thread: String,
+    cron: String,
+    prompt: String,
 }
 
 #[cfg(unix)]
@@ -2232,6 +2480,62 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.action == "schedule.trigger"));
+    }
+
+    #[test]
+    fn host_tokens_keep_quoted_spaces() {
+        assert_eq!(
+            host_tokens("schedule add --prompt \"check the tests\" --cron '0 * * * *'"),
+            vec![
+                "schedule",
+                "add",
+                "--prompt",
+                "check the tests",
+                "--cron",
+                "0 * * * *"
+            ]
+        );
+        assert_eq!(host_tokens(r#"a\ b "c d""#), vec!["a b", "c d"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_schedule_add_list_remove() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = scheduled_thread(&store.lock().unwrap(), work.path());
+        handle_host_command(
+            &store,
+            home.path(),
+            &format!(
+                "schedule add --thread {} --cron \"*/5 * * * *\" --prompt \"check the tests\"",
+                thread.id
+            ),
+        );
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].prompt, "check the tests");
+        assert_eq!(rows[0].expression, "*/5 * * * *");
+        let id = rows[0].id.clone();
+        handle_host_command(&store, home.path(), "schedule list");
+        handle_host_command(
+            &store,
+            home.path(),
+            &format!("schedule remove {}", &id[..8]),
+        );
+        assert!(store.lock().unwrap().list_schedules().unwrap().is_empty());
+        let audit = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert!(audit.iter().any(|event| {
+            event.action == "schedule.add"
+                && event.actor == crate::audit::HOST_TERMINAL_ACTOR
+                && event.target.as_deref() == Some(&id)
+        }));
+        assert!(audit.iter().any(|event| {
+            event.action == "schedule.remove"
+                && event.actor == crate::audit::HOST_TERMINAL_ACTOR
+                && event.target.as_deref() == Some(&id)
+        }));
     }
 
     #[cfg(unix)]

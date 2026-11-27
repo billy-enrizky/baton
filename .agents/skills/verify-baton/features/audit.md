@@ -4,18 +4,18 @@
 
 Each event carries:
 
-- actor: `host_terminal` for the pairing command, `local_cli` for `grant renew` and `grant revoke`, `host_engine` for accepted turns, `mcp_stdio` for MCP fork and queue clear
+- actor: `host_terminal` for the pairing command, `local_cli` for `grant renew` and `grant revoke`, `host_engine` for accepted turns, `tui` for approval answers, `mcp_stdio` for MCP fork and queue clear
 - environment: the installation id
 - optional thread id
-- action: `grant.mint`, `grant.renew`, `grant.revoke`, `turn.submit`, `queue.clear`, or `thread.fork`
-- scope: `admin` for grants, MCP fork, and queue clear; `operate` for turn submission
+- action: `grant.mint`, `grant.renew`, `grant.revoke`, `turn.submit`, `approval.decide`, `queue.clear`, or `thread.fork`
+- scope: `admin` for grants, MCP fork, and queue clear; `operate` for turn submission; `approve` for approval answers
 - confirmation: `host_terminal`, `local_cli`, `host_session`, or `stdio_spawner`
 - payload digest: SHA-256 of the canonical JSON payload, without the secret
 - result: `ok`
 - created time
 - retention: `durable`
 
-The `audit_events` table rejects UPDATE and DELETE with the `audit_events_append_only` trigger. `insert_grant_with_audit`, `renew_grant_row_with_audit`, `revoke_grant_row_with_audit`, `submit_turn_with_audit`, `clear_queued_messages_with_audit`, and `fork_thread_through_turn_with_audit` commit the mutation and its event in one transaction. The renewal event payload digests the grant id, the previous expiry, and the requested expiry. The turn event digests the thread id, provider, model, and queue-drain flag, so prompt text never reaches the log. The fork event thread id is the new thread id; its payload digest covers the source, title, cutoff, and native flag.
+The `audit_events` table rejects UPDATE and DELETE with the `audit_events_append_only` trigger. `insert_grant_with_audit`, `renew_grant_row_with_audit`, `revoke_grant_row_with_audit`, `submit_turn_with_audit`, `clear_queued_messages_with_audit`, and `fork_thread_through_turn_with_audit` commit the mutation and its event in one transaction. The renewal event payload digests the grant id, the previous expiry, and the requested expiry. The turn event digests the thread id, provider, model, and queue-drain flag, so prompt text never reaches the log. The approval event digests the request id, kind, decision, and chosen label, and the summary text is deliberately excluded. The fork event thread id is the new thread id; its payload digest covers the source, title, cutoff, and native flag.
 
 ## Proof
 
@@ -23,6 +23,8 @@ The `audit_events` table rejects UPDATE and DELETE with the `audit_events_append
 - `src/store.rs` `a_version_five_store_gains_append_only_audit_events`, `audit_events_are_newest_first_and_append_only`, `a_grant_and_its_audit_event_commit_together`, `a_renewal_and_its_audit_event_commit_together`, `a_revoke_and_its_audit_event_commit_together`
 - `src/grants.rs` `mint_records_a_host_terminal_audit_event`, `renew_extends_only_forward_and_keeps_the_credential_working`, `revoke_records_a_local_cli_audit_event`
 - `src/runtime.rs` `runtime::tests::a_completed_turn_is_recorded` asserts one `turn.submit` row per accepted engine turn
+- `src/tui/mod.rs` `approvals_stack_over_pickers_without_losing_them` asserts one row per answer with distinct digests, `an_approval_that_cannot_be_recorded_is_denied` proves the denial fallback, and `approval_decision_names_cover_every_choice` fixes the decision names
+- `.agents/skills/verify-baton/scripts/approval_probe.py` drives the real TUI through a fake ACP approval and asserts the `approval.decide` row, its actor and scope, the thread id, and a real installation id
 - `tests/audit_cli.rs::audit_list_reports_grant_events_and_respects_the_limit`
 - `mcp::tests::messages_queue_and_diff_are_readable` and `mcp::tests::fork_creates_a_branch_through_a_completed_turn` for MCP audit rows
 - `store::tests::a_turn_and_its_audit_event_commit_together`, `store::tests::a_queue_clear_and_its_audit_event_commit_together`, and `store::tests::a_fork_and_its_audit_event_commit_together`
@@ -31,4 +33,4 @@ The `audit_events` table rejects UPDATE and DELETE with the `audit_events_append
 
 ## Not yet covered
 
-Approvals, git actions, orchestration, settings, and MCP mutations beyond fork and queue clear do not write audit rows yet. The engine records `unclaimed` as the environment when no installation id exists yet, which only happens on an unclaimed store. The MCP stdio server records its spawner as `stdio_spawner` with `admin` scope, but HTTP and remote scope enforcement remain.
+Git actions, orchestration, settings, and MCP mutations beyond fork and queue clear do not write audit rows yet. Approval rows are written by the TUI, so a provider answer that arrives without a TUI is not covered. The engine records `unclaimed` as the environment when no installation id exists yet, which only happens on an unclaimed store. The MCP stdio server records its spawner as `stdio_spawner` with `admin` scope, but HTTP and remote scope enforcement remain.

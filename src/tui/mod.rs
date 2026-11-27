@@ -250,6 +250,10 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/mcp", "manage MCP servers and sync across harnesses"),
     ("/skills", "insert, install, update, or remove a skill"),
+    (
+        "/snippets",
+        "list, add, or remove project prompt commands",
+    ),
     ("/copy", "copy the latest assistant reply to the clipboard"),
     ("/clear", "clear panels and notices"),
     ("/quit", "exit baton"),
@@ -4245,6 +4249,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/skills", _) => {
             Some("skills (enter insert · i install · u update · d remove)")
         }
+        ("/snippets", _) => Some("snippets [list|add <name> <template>|remove <name>]"),
         ("/clear", _) => Some("clear (no arguments)"),
         ("/quit", _) => Some("quit (no arguments)"),
         ("/exit", _) => Some("exit (no arguments)"),
@@ -4255,6 +4260,34 @@ fn command_usage(input: &str) -> Option<&'static str> {
 fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestion> {
     let mut suggestions = Vec::new();
     match command {
+        "/snippets" => {
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "list",
+                "list this directory's prompt commands",
+            );
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "add",
+                "write a command under .baton/commands",
+            );
+            let dir = std::path::PathBuf::from(&state.thread.cwd)
+                .join(".baton")
+                .join("commands");
+            for (name, _) in &state.custom_commands {
+                let short = name.trim_start_matches('/');
+                if dir.join(format!("{short}.md")).exists() {
+                    push_suggestion(
+                        &mut suggestions,
+                        command,
+                        &format!("remove {short}"),
+                        format!("delete the {name} command file"),
+                    );
+                }
+            }
+        }
         "/switch" => {
             for provider in PROVIDERS {
                 push_suggestion(
@@ -5166,6 +5199,120 @@ fn submit_schedule_add(
             let _ = store.lock().unwrap().remove_schedule(&row.id);
             Err(format!("cannot audit schedule: {error}; not added"))
         }
+    }
+}
+
+fn snippet_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || character == '-' || character == '_'
+        })
+}
+
+fn snippets_notice(state: &TuiState) -> String {
+    if state.custom_commands.is_empty() {
+        return "no snippets · add one with /snippets add <name> <template>".into();
+    }
+    let mut lines = vec![format!("snippets · {}", state.custom_commands.len())];
+    for (name, template) in &state.custom_commands {
+        let first: String = template
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(60)
+            .collect();
+        lines.push(format!("{name:<16} {first}"));
+    }
+    lines.join("\n")
+}
+
+fn record_snippet(
+    store: &Arc<Mutex<BatonStore>>,
+    state: &TuiState,
+    action: crate::audit::AuditAction,
+    name: &str,
+    payload: serde_json::Value,
+) -> anyhow::Result<()> {
+    let event = crate::audit::event(
+        crate::audit::TUI_ACTOR,
+        &crate::claim::installation_id(&state.home).unwrap_or_else(|| "unclaimed".into()),
+        Some(name),
+        Some(&state.thread.id),
+        action,
+        &payload,
+    )?;
+    store.lock().unwrap().append_audit_event(&event)?;
+    Ok(())
+}
+
+fn write_snippet(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    name: &str,
+    template: &str,
+) -> String {
+    if !snippet_name_ok(name) {
+        return format!("snippet name {name:?} must use letters, digits, dash, or underscore");
+    }
+    let dir = std::path::PathBuf::from(&state.thread.cwd)
+        .join(".baton")
+        .join("commands");
+    let path = dir.join(format!("{name}.md"));
+    if path.exists() {
+        return format!("snippet /{name} already exists; remove it first");
+    }
+    if let Err(error) = std::fs::create_dir_all(&dir) {
+        return format!("cannot create {}: {error}", dir.display());
+    }
+    let body = format!("{}\n", template.trim());
+    if let Err(error) = std::fs::write(&path, &body) {
+        return format!("cannot write {}: {error}", path.display());
+    }
+    let audit = record_snippet(
+        store,
+        state,
+        crate::audit::AuditAction::SnippetAdd,
+        name,
+        serde_json::json!({
+            "name": name,
+            "path": path.display().to_string(),
+            "bytes": body.trim().len(),
+        }),
+    );
+    state.custom_commands = discover_custom_commands(&state.thread.cwd);
+    match audit {
+        Ok(()) => format!("snippet /{name} written; use /{name} <args>"),
+        Err(error) => format!("snippet /{name} written but audit failed: {error}"),
+    }
+}
+
+fn remove_snippet(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, name: &str) -> String {
+    if !snippet_name_ok(name) {
+        return format!("snippet name {name:?} must use letters, digits, dash, or underscore");
+    }
+    let path = std::path::PathBuf::from(&state.thread.cwd)
+        .join(".baton")
+        .join("commands")
+        .join(format!("{name}.md"));
+    if !path.exists() {
+        return format!("no snippet /{name} under .baton/commands");
+    }
+    if let Err(error) = std::fs::remove_file(&path) {
+        return format!("cannot remove {}: {error}", path.display());
+    }
+    let audit = record_snippet(
+        store,
+        state,
+        crate::audit::AuditAction::SnippetRemove,
+        name,
+        serde_json::json!({ "name": name, "path": path.display().to_string() }),
+    );
+    state.custom_commands = discover_custom_commands(&state.thread.cwd);
+    match audit {
+        Ok(()) => format!("snippet /{name} removed"),
+        Err(error) => format!("snippet /{name} removed but audit failed: {error}"),
     }
 }
 
@@ -11611,6 +11758,29 @@ fn handle_command(
                 state.overlay = Overlay::McpPicker { selected: 0 };
             }
         }
+        "/snippets" => match (args.first().map(String::as_str), args.len()) {
+            (None, _) | (Some("list"), 1) => {
+                state.notice = Some(snippets_notice(state));
+            }
+            (Some("add"), count) if count >= 3 => {
+                let name = args[1].clone();
+                let template = args[2..].join(" ");
+                state.notice = Some(write_snippet(state, store, &name, &template));
+            }
+            (Some("add"), _) => {
+                state.notice = Some("use /snippets add <name> <template>".into());
+            }
+            (Some("remove"), 2) => {
+                let name = args[1].clone();
+                state.notice = Some(remove_snippet(state, store, &name));
+            }
+            (Some("remove"), _) => {
+                state.notice = Some("use /snippets remove <name>".into());
+            }
+            _ => {
+                state.notice = Some("snippets [list|add <name> <template>|remove <name>]".into());
+            }
+        },
         "/skills" => {
             let cwd = std::path::PathBuf::from(&state.thread.cwd);
             let skills: Vec<SkillChoice> = sync::scan_skills_in(&cwd)
@@ -27291,6 +27461,99 @@ mod tests {
         assert_eq!(rows[0].prompt, "other thread job");
         let notice = state.notice.clone().unwrap_or_default();
         assert!(notice.contains(&other.id[..8]), "{notice}");
+    }
+
+    #[test]
+    fn snippets_add_list_remove_round_trip() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &sender,
+            "/snippets add deploy ship {{args}} from {{cwd}}",
+        );
+        let path = home.path().join(".baton/commands/deploy.md");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "ship {{args}} from {{cwd}}\n"
+        );
+        assert!(state
+            .custom_commands
+            .iter()
+            .any(|(name, _)| name == "/deploy"));
+
+        handle_command(&mut state, &store, &sender, "/snippets list");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("snippets · 1"), "{notice}");
+        assert!(notice.contains("/deploy"), "{notice}");
+
+        handle_command(&mut state, &store, &sender, "/snippets remove deploy");
+        assert!(!path.exists());
+        assert!(state.custom_commands.is_empty());
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("removed"), "{notice}");
+
+        let audit = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert!(audit
+            .iter()
+            .any(|event| event.action == "snippet.add" && event.actor == "tui"));
+        assert!(audit
+            .iter()
+            .any(|event| event.action == "snippet.remove" && event.actor == "tui"));
+    }
+
+    #[test]
+    fn snippets_refuse_bad_names_and_overwrites() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        for name in ["../escape", ".hidden", "bad/name"] {
+            handle_command(
+                &mut state,
+                &store,
+                &sender,
+                &format!("/snippets add {name} body"),
+            );
+            let notice = state.notice.clone().unwrap_or_default();
+            assert!(notice.contains("must use letters"), "{name}: {notice}");
+        }
+        assert!(!home.path().join(".baton").exists());
+
+        handle_command(&mut state, &store, &sender, "/snippets add deploy first");
+        handle_command(&mut state, &store, &sender, "/snippets add deploy second");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("already exists"), "{notice}");
+        let path = home.path().join(".baton/commands/deploy.md");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "first\n");
+    }
+
+    #[test]
+    fn snippets_remove_leaves_a_claude_command() {
+        let home = tempfile::tempdir().unwrap();
+        let claude = home.path().join(".claude/commands");
+        std::fs::create_dir_all(&claude).unwrap();
+        std::fs::write(claude.join("deploy.md"), "from claude").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.custom_commands = discover_custom_commands(&state.thread.cwd);
+        assert!(state
+            .custom_commands
+            .iter()
+            .any(|(name, _)| name == "/deploy"));
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/snippets remove deploy");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("no snippet /deploy under .baton/commands"),
+            "{notice}"
+        );
+        assert!(claude.join("deploy.md").exists());
     }
 
     #[test]

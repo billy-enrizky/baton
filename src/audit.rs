@@ -46,6 +46,8 @@ pub enum AuditAction {
     MemoryAdd,
     MemoryRemove,
     MemoryClear,
+    SnippetAdd,
+    SnippetRemove,
     TurnSubmitRequest,
     QueueClear,
     ThreadFork,
@@ -76,6 +78,8 @@ impl AuditAction {
             AuditAction::MemoryAdd => "memory.add",
             AuditAction::MemoryRemove => "memory.remove",
             AuditAction::MemoryClear => "memory.clear",
+            AuditAction::SnippetAdd => "snippet.add",
+            AuditAction::SnippetRemove => "snippet.remove",
             AuditAction::TurnSubmitRequest => "turn.submit_request",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
@@ -99,7 +103,9 @@ impl AuditAction {
             | AuditAction::ScheduleAdd
             | AuditAction::ScheduleRemove
             | AuditAction::SchedulePause
-            | AuditAction::ScheduleResume => ADMIN_SCOPE,
+            | AuditAction::ScheduleResume
+            | AuditAction::SnippetAdd
+            | AuditAction::SnippetRemove => ADMIN_SCOPE,
             AuditAction::TurnSubmit | AuditAction::ScheduleTrigger => OPERATE_SCOPE,
             AuditAction::ApprovalDecide | AuditAction::QuestionAnswer => APPROVE_SCOPE,
             AuditAction::GitCommit

@@ -31,6 +31,7 @@ Non-goals:
 - At the `baton serve` host terminal, `schedule add --thread <id> --cron "<expr>" --prompt "<text>"`, `schedule list`, `schedule pause <id>`, `schedule resume <id>`, and `schedule remove <id>` manage the live host's rows. A quoted prompt or cron may contain spaces. The host writes `schedule.add`, `schedule.pause`, `schedule.resume`, or `schedule.remove` with actor `host_terminal`.
 - The expression supports `*`, a number, a list, a range, and a step in each of the five fields. Weekdays are 0 for Sunday through 6 for Saturday. Day-of-month and day-of-week use the traditional OR rule when both are restricted.
 - `baton serve` checks due schedules every second. A due row is claimed with a compare-and-set on its `next_run_at`; only the winner fires.
+- `/schedule` opens a TUI view of every row with its on or off state, id, next run, thread, expression, and prompt. `p` pauses or resumes the selected row, `d` removes it after a second press, and Enter opens its thread. `/schedule pause <id>`, `/schedule resume <id>`, and `/schedule remove <id>` act directly. Each real change writes an audit row as `tui`.
 - A claimed run writes `schedule.trigger` with actor `scheduler`, confirmation `host_schedule`, the schedule id as the target, and the thread id. A failed audit write skips the run instead of starting an unaudited turn.
 - The host posts the prompt into the thread through its project engine pool, using the thread's permission mode and prepending its active goal.
 - An archived thread or a stored expression that no longer parses is skipped and logged. The claim has already advanced, so neither path hot-loops.
@@ -106,6 +107,9 @@ The live integration test starts a host against a real SQLite store and a fake h
 - `tests/schedule_cli.rs::schedule_pause_and_resume_skip_due_runs`
 - `store::tests::a_paused_schedule_leaves_the_due_query_until_it_resumes`
 - `serve::tests::host_schedule_pause_and_resume`
+- `tui::tests::schedule_command_opens_the_view_and_toggles_pause`
+- `tui::tests::schedule_picker_removes_only_after_a_second_press`
+- `tui::tests::schedule_command_without_rows_says_how_to_add_one`
 - `tests/serve.rs::serve_stdin_schedule_commands_manage_the_live_host`
 - `tests/serve.rs::serve_fires_a_due_schedule_and_audits_it`
 - `serve::tests::host_tokens_keep_quoted_spaces`
@@ -115,5 +119,5 @@ The live integration test starts a host against a real SQLite store and a fake h
 ## Limits
 
 - A host with stdin closed cannot use the host terminal commands. The socket and TUI management paths remain.
-- The TUI does not display schedules yet.
+- The TUI view is read and toggle only; adding a schedule still needs the CLI or the host terminal.
 - Cron is UTC only; there is no local timezone, missed-run catch-up, notification, or retry.

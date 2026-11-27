@@ -9096,10 +9096,22 @@ fn settle_run_from_report(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, 
         return;
     };
     let verdict = RunVerdict::ALL[index.min(RunVerdict::ALL.len() - 1)];
-    let result = {
+    let audit = crate::audit::event(
+        crate::audit::TUI_ACTOR,
+        &crate::claim::installation_id(&state.home).unwrap_or_else(|| "unclaimed".into()),
+        Some(&run_id),
+        None,
+        crate::audit::AuditAction::OrchestrationSettle,
+        &serde_json::json!({
+            "run_id": run_id,
+            "verdict": verdict.as_str(),
+            "forced": false,
+        }),
+    );
+    let result = audit.and_then(|audit| {
         let guard = store.lock().unwrap();
-        guard.settle_orchestration_run(&run_id, verdict, false)
-    };
+        guard.settle_orchestration_run_with_audit(&run_id, verdict, false, &audit)
+    });
     state.orchestration_settle = None;
     let settlement = match result {
         Ok(settlement) => settlement,
@@ -11125,6 +11137,26 @@ fn handle_command(
                 .current_model
                 .clone()
                 .unwrap_or_else(|| resolved.for_provider(source_provider).model.clone());
+            let audit = match crate::audit::event(
+                crate::audit::TUI_ACTOR,
+                &crate::claim::installation_id(&state.home).unwrap_or_else(|| "unclaimed".into()),
+                Some(&run_id),
+                None,
+                crate::audit::AuditAction::OrchestrationStart,
+                &serde_json::json!({
+                    "run_id": run_id,
+                    "coordinator_provider": source_provider.as_str(),
+                    "coordinator_model": model,
+                    "tasks": 1,
+                    "dirty_source": false,
+                }),
+            ) {
+                Ok(audit) => audit,
+                Err(error) => {
+                    state.notice = Some(format!("cannot record worktree run: {error}"));
+                    return;
+                }
+            };
             let plan = orchestrate::Plan {
                 summary: Some(format!("thread worktree from {short_thread}")),
                 role_defaults_applied: false,
@@ -11145,7 +11177,7 @@ fn handle_command(
                 serde_json::to_string(&plan)
                     .map_err(anyhow::Error::from)
                     .and_then(|plan_json| {
-                        guard.create_orchestration_run(
+                        guard.create_orchestration_run_owned_with_audit(
                             &run_id,
                             &title,
                             source_provider,
@@ -11153,9 +11185,12 @@ fn handle_command(
                             Some("thread worktree"),
                             &plan_json,
                             false,
+                            None,
+                            None,
+                            &audit,
                         )
                     })
-                    .and_then(|()| {
+                    .and_then(|_| {
                         guard.add_orchestration_task(
                             &task_id,
                             &run_id,

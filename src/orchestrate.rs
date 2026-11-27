@@ -2990,7 +2990,21 @@ fn run_with_worker_bin_and_progress(
     let summary = plan.summary.clone();
     let owner_pid = std::process::id();
     let owner_start = crate::process::process_start(owner_pid);
-    store.create_orchestration_run_owned(
+    let audit = crate::audit::event(
+        crate::audit::LOCAL_CLI_ACTOR,
+        &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+        Some(&run_id),
+        None,
+        crate::audit::AuditAction::OrchestrationStart,
+        &serde_json::json!({
+            "run_id": run_id,
+            "coordinator_provider": coordinator_provider.as_str(),
+            "coordinator_model": coordinator_model,
+            "tasks": plan.tasks.len(),
+            "dirty_source": dirty_source,
+        }),
+    )?;
+    store.create_orchestration_run_owned_with_audit(
         &run_id,
         goal,
         coordinator_provider,
@@ -3000,6 +3014,7 @@ fn run_with_worker_bin_and_progress(
         dirty_source,
         Some(owner_pid),
         owner_start.as_deref(),
+        &audit,
     )?;
     emit(
         progress,
@@ -5368,6 +5383,14 @@ exit 1
                 && String::from_utf8_lossy(&worktree_status.stdout).trim().is_empty(),
             "worker worktree is clean after its commit"
         );
+        let events = store.list_audit_events(10).unwrap();
+        let start = events
+            .iter()
+            .find(|event| event.action == "orchestration.start")
+            .expect("a started run writes its row");
+        assert_eq!(start.target.as_deref(), Some(report.run_id.as_str()));
+        assert_eq!(start.scope, crate::audit::ORCHESTRATE_SCOPE);
+        assert_eq!(start.actor, crate::audit::LOCAL_CLI_ACTOR);
         assert_eq!(
             std::fs::read_to_string(repo.path().join("a.txt")).unwrap(),
             "dirty\n"

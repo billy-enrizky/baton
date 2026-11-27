@@ -853,6 +853,12 @@ enum Overlay {
         remove_armed: bool,
         rows: Vec<crate::store::ScheduleRow>,
     },
+    ScheduleAdd {
+        cron: String,
+        prompt: String,
+        field: usize,
+        error: Option<String>,
+    },
     ThreadPicker {
         selected: usize,
         threads: Vec<ThreadChoice>,
@@ -4166,7 +4172,9 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/pin", "move") => Some("pin move <id> up or down"),
         ("/pane", _) => Some("pane [open <tab>|close|focus]"),
         ("/snooze", _) => Some("snooze [1h|4h|tomorrow|week|off]"),
-        ("/schedule", _) => Some("schedule [list|pause <id>|resume <id>|remove <id>]"),
+        ("/schedule", _) => Some(
+            "schedule [list|add|pause <id>|resume <id>|remove <id>]",
+        ),
         ("/changes", _) => Some("changes [turn]"),
         ("/limits", _) => Some("limits"),
         ("/archive", _) => Some("archive [thread]"),
@@ -4245,6 +4253,12 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
         }
         "/schedule" => {
             push_suggestion(&mut suggestions, command, "list", "open the schedule view");
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "add",
+                "add a schedule for this thread",
+            );
             push_suggestion(&mut suggestions, command, "pause", "pause a schedule by id");
             push_suggestion(
                 &mut suggestions,
@@ -5049,6 +5063,53 @@ fn record_schedule_change(
     )?;
     store.lock().unwrap().append_audit_event(&event)?;
     Ok(())
+}
+
+/// Adds a schedule for the active thread from the TUI form. The row is
+/// inserted, the audit row follows, and a failed audit deletes the row again,
+/// matching the host and CLI rule that no schedule exists unrecorded.
+fn submit_schedule_add(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    cron: &str,
+    prompt: &str,
+) -> std::result::Result<String, String> {
+    let cron = cron.trim();
+    let prompt = prompt.trim();
+    if cron.is_empty() {
+        return Err("enter a cron expression".into());
+    }
+    if prompt.is_empty() {
+        return Err("enter a prompt".into());
+    }
+    let expression = crate::schedule::parse(cron).map_err(|error| error.to_string())?;
+    let next = crate::schedule::next_after(&expression, chrono::Utc::now())
+        .map_err(|error| error.to_string())?;
+    let next_run_at = next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    let row = store
+        .lock()
+        .unwrap()
+        .add_schedule(&state.thread.id, prompt, cron, &next_run_at)
+        .map_err(|error| format!("cannot add schedule: {error}"))?;
+    let audit = record_schedule_change(
+        store,
+        state,
+        crate::audit::AuditAction::ScheduleAdd,
+        &row,
+        serde_json::json!({
+            "thread_id": state.thread.id,
+            "expression": cron,
+            "next_run_at": next_run_at,
+        }),
+    );
+    let short = &row.id[..8.min(row.id.len())];
+    match audit {
+        Ok(()) => Ok(format!("schedule {short} added next {next_run_at}")),
+        Err(error) => {
+            let _ = store.lock().unwrap().remove_schedule(&row.id);
+            Err(format!("cannot audit schedule: {error}; not added"))
+        }
+    }
 }
 
 fn open_schedule_picker(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
@@ -6874,6 +6935,91 @@ fn handle_key(
                         selected,
                         remove_armed,
                         rows,
+                    };
+                }
+            }
+        }
+        Overlay::ScheduleAdd {
+            mut cron,
+            mut prompt,
+            mut field,
+            mut error,
+        } => {
+            let active = if field == 0 { &mut cron } else { &mut prompt };
+            match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Tab | KeyCode::Up | KeyCode::Down => {
+                    field = 1 - field.min(1);
+                    state.overlay = Overlay::ScheduleAdd {
+                        cron,
+                        prompt,
+                        field,
+                        error,
+                    };
+                }
+                KeyCode::Enter => {
+                    if field == 0 {
+                        field = 1;
+                        error = None;
+                        state.overlay = Overlay::ScheduleAdd {
+                            cron,
+                            prompt,
+                            field,
+                            error,
+                        };
+                    } else {
+                        match submit_schedule_add(state, store, &cron, &prompt) {
+                            Ok(notice) => {
+                                state.notice = Some(notice);
+                                refresh_schedule_picker(state, store, 0);
+                            }
+                            Err(message) => {
+                                state.overlay = Overlay::ScheduleAdd {
+                                    cron,
+                                    prompt,
+                                    field,
+                                    error: Some(message),
+                                };
+                            }
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    active.pop();
+                    error = None;
+                    state.overlay = Overlay::ScheduleAdd {
+                        cron,
+                        prompt,
+                        field,
+                        error,
+                    };
+                }
+                KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                    active.clear();
+                    error = None;
+                    state.overlay = Overlay::ScheduleAdd {
+                        cron,
+                        prompt,
+                        field,
+                        error,
+                    };
+                }
+                KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    active.push(character);
+                    error = None;
+                    state.overlay = Overlay::ScheduleAdd {
+                        cron,
+                        prompt,
+                        field,
+                        error,
+                    };
+                }
+                _ => {
+                    state.overlay = Overlay::ScheduleAdd {
+                        cron,
+                        prompt,
+                        field,
+                        error,
                     };
                 }
             }
@@ -12146,6 +12292,17 @@ fn handle_command(
         }
         "/schedule" => match args.first().map(String::as_str) {
             None | Some("list") if args.len() <= 1 => open_schedule_picker(state, store),
+            Some("add") if args.len() == 1 => {
+                state.overlay = Overlay::ScheduleAdd {
+                    cron: String::new(),
+                    prompt: String::new(),
+                    field: 0,
+                    error: None,
+                };
+            }
+            Some("add") => {
+                state.notice = Some("use /schedule add, then type the cron and prompt".into());
+            }
             Some(verb @ ("pause" | "resume" | "remove")) => {
                 if args.len() != 2 {
                     state.notice = Some(format!("use /schedule {verb} <id>"));
@@ -13603,6 +13760,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::EffortPicker { .. } => 10,
             Overlay::SnoozePicker { .. } => 9,
             Overlay::SchedulePicker { rows, .. } => rows.len().min(8) + 6,
+            Overlay::ScheduleAdd { .. } => 8,
             Overlay::OrchestrationPreview { preview } => preview.plan.tasks.len().min(8) * 2 + 8,
             Overlay::HandoffPreview { .. } => 14,
         }
@@ -13854,6 +14012,20 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 remove_armed,
                 rows,
             } => draw_schedule_picker(frame, chunks[2], rows, *selected, *remove_armed),
+            Overlay::ScheduleAdd {
+                cron,
+                prompt,
+                field,
+                error,
+            } => draw_schedule_add(
+                frame,
+                chunks[2],
+                state,
+                cron,
+                prompt,
+                *field,
+                error.as_deref(),
+            ),
             Overlay::OrchestrationPreview { preview } => {
                 draw_orchestration_preview(frame, chunks[2], state, preview)
             }
@@ -15520,6 +15692,49 @@ fn draw_schedule_picker(
                 prompt
             ),
             style,
+        ));
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border));
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_schedule_add(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    state: &TuiState,
+    cron: &str,
+    prompt: &str,
+    field: usize,
+    error: Option<&str>,
+) {
+    let mut lines: Vec<Line> = vec![Line::styled(
+        format!(
+            "add schedule · thread {} · tab switch · enter next or add · esc close",
+            state.thread.title
+        ),
+        Style::default().fg(COLORS.muted),
+    )];
+    for (index, (label, value)) in [("cron", cron), ("prompt", prompt)].iter().enumerate() {
+        let style = if field == index {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        let cursor = if field == index { "❯" } else { " " };
+        lines.push(Line::styled(format!("{cursor} {label:<6} {value}"), style));
+    }
+    lines.push(Line::styled(
+        "cron accepts minute hour day month weekday in UTC",
+        Style::default().fg(COLORS.muted),
+    ));
+    if let Some(error) = error {
+        lines.push(Line::styled(
+            format!("error: {error}"),
+            Style::default().fg(COLORS.error),
         ));
     }
     let block = Block::default()
@@ -26758,6 +26973,138 @@ mod tests {
         );
         let notice = state.notice.clone().unwrap_or_default();
         assert!(notice.contains("no schedule matches abc"), "{notice}");
+    }
+
+    fn type_into_schedule_form(
+        state: &mut TuiState,
+        store: &Arc<Mutex<BatonStore>>,
+        sender: &tokio::sync::mpsc::UnboundedSender<EngineCommand>,
+        text: &str,
+    ) {
+        for character in text.chars() {
+            handle_key(
+                state,
+                store,
+                sender,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            );
+        }
+    }
+
+    #[test]
+    fn schedule_add_form_creates_a_row_and_audits_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/schedule add");
+        assert!(matches!(
+            state.overlay,
+            Overlay::ScheduleAdd { field: 0, .. }
+        ));
+        type_into_schedule_form(&mut state, &store, &engine_command_sender, "0 9 * * 1-5");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(matches!(
+            state.overlay,
+            Overlay::ScheduleAdd { field: 1, .. }
+        ));
+        type_into_schedule_form(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            "check the tests",
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].thread_id, thread_id);
+        assert_eq!(rows[0].expression, "0 9 * * 1-5");
+        assert_eq!(rows[0].prompt, "check the tests");
+        assert!(rows[0].enabled);
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("added next"), "{notice}");
+        assert!(matches!(
+            state.overlay,
+            Overlay::SchedulePicker { selected: 0, .. }
+        ));
+        let audit = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert!(
+            audit.iter().any(|event| {
+                event.action == "schedule.add"
+                    && event.actor == crate::audit::TUI_ACTOR
+                    && event.target.as_deref() == Some(rows[0].id.as_str())
+            }),
+            "{audit:?}"
+        );
+    }
+
+    #[test]
+    fn schedule_add_form_rejects_a_bad_expression_and_an_empty_prompt() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/schedule add");
+        type_into_schedule_form(&mut state, &store, &engine_command_sender, "not a cron");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        type_into_schedule_form(&mut state, &store, &engine_command_sender, "prompt");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(store.lock().unwrap().list_schedules().unwrap().is_empty());
+        let message = match &state.overlay {
+            Overlay::ScheduleAdd { error, .. } => error.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        assert!(message.contains("cron"), "{message}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        );
+        handle_command(&mut state, &store, &engine_command_sender, "/schedule add");
+        type_into_schedule_form(&mut state, &store, &engine_command_sender, "0 9 * * *");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert!(store.lock().unwrap().list_schedules().unwrap().is_empty());
+        let message = match &state.overlay {
+            Overlay::ScheduleAdd { error, .. } => error.clone().unwrap_or_default(),
+            _ => String::new(),
+        };
+        assert!(message.contains("prompt"), "{message}");
     }
 
     #[test]

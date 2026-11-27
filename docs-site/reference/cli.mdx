@@ -136,6 +136,7 @@ baton roles [--json]
 baton diff <id> [turn]
 baton restore <id> <turn> [--force]
 baton import [--dry-run]
+baton mcp [--read-only] [--http <addr> --token-file <path> [--trusted-overlay]]
 baton bench startup [--json] [--repeat N]
 baton completions <shell>
 baton update
@@ -143,7 +144,7 @@ baton update
 
 ## MCP
 
-`baton mcp` serves the local store over MCP stdio, or over HTTP with `--http <addr> --token-file <path>`. The token file must be a regular file with mode 0600 and a 32 to 512 character value. Loopback is the default; a non-loopback bind needs `--trusted-overlay` and is plain HTTP with a static token. `POST /mcp` serves JSON-RPC and `GET /health` returns readiness.
+`baton mcp` serves the local store over MCP stdio, or over HTTP with `--http <addr> --token-file <path>`. The token file must be a regular file with mode 0600 and a 32 to 512 character value. Loopback is the default; a non-loopback bind needs `--trusted-overlay` and is plain HTTP with a static token. `POST /mcp` serves JSON-RPC and `GET /health` returns readiness. Add `--read-only` to hide `baton_fork` and refuse queue clearing; read tools, including `baton_queue` without `clear`, stay available.
 
 ```json
 {

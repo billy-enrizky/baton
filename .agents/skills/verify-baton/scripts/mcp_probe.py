@@ -110,6 +110,34 @@ def run(binary: str, evidence: Path) -> dict:
         exit_code = process.wait(timeout=15)
         stderr = process.stderr.read()
 
+        read_only_process = subprocess.Popen(
+            [binary, "mcp", "--read-only"],
+            cwd=cwd,
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        read_only = Rpc(read_only_process)
+        read_only_init = read_only.call("initialize", {"protocolVersion": "2025-06-18"})
+        read_only_tools = [
+            tool["name"] for tool in read_only.call("tools/list")["result"]["tools"]
+        ]
+        fork_response = read_only.call(
+            "tools/call", {"name": "baton_fork", "arguments": {}}
+        )
+        queue_clear_response = read_only.call(
+            "tools/call",
+            {"name": "baton_queue", "arguments": {"clear": True, "thread": thread_id}},
+        )
+        queue_read_error, queue_read = read_only.tool(
+            "baton_queue", {"thread": thread_id}
+        )
+        read_only_process.stdin.close()
+        read_only_exit = read_only_process.wait(timeout=15)
+        read_only_stderr = read_only_process.stderr.read()
+
         result = {
             "protocol_version": initialized["result"]["protocolVersion"],
             "server": server,
@@ -137,6 +165,16 @@ def run(binary: str, evidence: Path) -> dict:
             "unknown_text": unknown,
             "exit_code": exit_code,
             "stderr": stderr[-300:],
+            "read_only_tool_count": len(read_only_tools),
+            "read_only_fork_hidden": "baton_fork" not in read_only_tools,
+            "read_only_queue_listed": "baton_queue" in read_only_tools,
+            "read_only_instructions": read_only_init["result"]["instructions"],
+            "read_only_fork_error": (fork_response.get("error") or {}).get("code"),
+            "read_only_queue_clear_error": (queue_clear_response.get("error") or {}).get("code"),
+            "read_only_queue_list_error": queue_read_error,
+            "read_only_queue_count": queue_read.get("count"),
+            "read_only_exit_code": read_only_exit,
+            "read_only_stderr": read_only_stderr[-300:],
         }
         passed = (
             result["protocol_version"] == "2025-06-18"
@@ -159,6 +197,16 @@ def run(binary: str, evidence: Path) -> dict:
             and unknown_error
             and "unknown baton tool" in json.dumps(unknown)
             and exit_code == 0
+            and result["read_only_tool_count"] == len(required) - 1
+            and result["read_only_fork_hidden"]
+            and result["read_only_queue_listed"]
+            and "read-only" in result["read_only_instructions"]
+            and result["read_only_fork_error"] == -32003
+            and result["read_only_queue_clear_error"] == -32003
+            and not result["read_only_queue_list_error"]
+            and result["read_only_queue_count"] == 0
+            and read_only_exit == 0
+            and not read_only_stderr
         )
         result["passed"] = passed
         (evidence / "summary.json").write_text(json.dumps(result, indent=2) + "\n")

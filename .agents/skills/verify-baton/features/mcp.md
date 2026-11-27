@@ -7,6 +7,7 @@
 - Read-only tools: status, threads, turns, agents, queue, messages, search, latest diff, doctor, processes, orchestration runs, orchestration report
 - `baton_fork` creates a new thread or attaches a native Codex/OpenCode session
 - `baton_queue` can clear the queue explicitly; everything else is read-only
+- `--read-only` hides `baton_fork` and refuses queue clearing; queue listing and every other read tool stay available
 - Unknown tools return a tool result with `isError: true` and `unknown baton tool <name>`
 
 ## How to get to it
@@ -36,3 +37,5 @@ error, stderr is empty, and the server exits 0.
   the server cwd.
 - The probe seeds an empty thread, so it does not exercise provider turns; those
   are covered by the adapter tests and the slash probe.
+- A read-only server returns JSON-RPC error `-32003` for a mutating tool. It does
+  not write an audit row or change the queue.

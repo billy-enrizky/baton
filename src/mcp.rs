@@ -1,5 +1,6 @@
-//! Minimal MCP stdio server exposing baton's durable thread state to coding
-//! agents. The server is read-only except for explicit queue clear and fork.
+//! Minimal MCP server exposing baton's durable thread state to coding agents.
+//! The default is read-only except for explicit queue clear and fork; `--read-only`
+//! hides fork and refuses queue clear.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -15,15 +16,32 @@ use crate::status::{self, ThreadStatus, TurnStatus};
 use crate::store::{BatonStore, MessageRow, NewAuditEvent, ThreadRow, TurnRow};
 use crate::usage::{format_usage_line, sum_usage};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum McpAccess {
+    ReadWrite,
+    ReadOnly,
+}
+
 pub struct McpServer {
     store: BatonStore,
     home: PathBuf,
     cwd: PathBuf,
+    access: McpAccess,
 }
 
 impl McpServer {
     pub fn new(store: BatonStore, home: PathBuf, cwd: PathBuf) -> Self {
-        Self { store, home, cwd }
+        Self {
+            store,
+            home,
+            cwd,
+            access: McpAccess::ReadWrite,
+        }
+    }
+
+    pub fn read_only(mut self) -> Self {
+        self.access = McpAccess::ReadOnly;
+        self
     }
 
     fn mutation_audit(
@@ -63,11 +81,24 @@ impl McpServer {
                     "version": env!("CARGO_PKG_VERSION"),
                     "title": "Baton thread state"
                 },
-                "instructions": "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_agents, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. baton_fork creates a new thread from an existing conversation; set native=true for a Codex or OpenCode native fork."
+                "instructions": if self.access == McpAccess::ReadOnly {
+                    "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_agents, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. This server is read-only; baton_fork and queue clearing are disabled."
+                } else {
+                    "Use baton_doctor, baton_status, baton_threads, baton_turns, baton_queue, baton_messages, baton_search, baton_processes, baton_latest_diff, baton_agents, baton_orchestration_runs, and baton_orchestration_report to inspect the local baton store, provider readiness, and durable orchestration runs. baton_fork creates a new thread from an existing conversation; set native=true for a Codex or OpenCode native fork."
+                }
             })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tool_descriptors() })),
-            "tools/call" => self.call_tool(&params),
+            "tools/list" => Ok(json!({ "tools": tool_descriptors(self.access) })),
+            "tools/call" => {
+                if let Some(tool) = self.refused_tool(&params) {
+                    return Some(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32003, "message": format!("read-only MCP server refuses {tool}") }
+                    }));
+                }
+                self.call_tool(&params)
+            }
             _ => {
                 return Some(json!({
                     "jsonrpc": "2.0",
@@ -84,6 +115,25 @@ impl McpServer {
                 "error": { "code": -32602, "message": error.to_string() }
             }),
         })
+    }
+
+    fn refused_tool(&self, params: &Value) -> Option<&'static str> {
+        if self.access != McpAccess::ReadOnly {
+            return None;
+        }
+        match params.get("name").and_then(Value::as_str)? {
+            "baton_fork" => Some("baton_fork"),
+            "baton_queue"
+                if params
+                    .get("arguments")
+                    .and_then(|arguments| arguments.get("clear"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false) =>
+            {
+                Some("baton_queue")
+            }
+            _ => None,
+        }
     }
 
     fn call_tool(&self, params: &Value) -> Result<Value> {
@@ -619,8 +669,8 @@ fn thread_schema() -> Value {
     })
 }
 
-fn tool_descriptors() -> Vec<Value> {
-    vec![
+fn tool_descriptors(access: McpAccess) -> Vec<Value> {
+    let mut tools = vec![
         json!({
             "name": "baton_status",
             "description": "Read one thread's provider, model, permission mode, goal, latest turn phase, queue, usage, and stale-turn warning.",
@@ -771,7 +821,20 @@ fn tool_descriptors() -> Vec<Value> {
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": false }
         }),
-    ]
+    ];
+    if access == McpAccess::ReadOnly {
+        tools.retain(|tool| tool["name"] != "baton_fork");
+        if let Some(queue) = tools.iter_mut().find(|tool| tool["name"] == "baton_queue") {
+            queue["description"] = json!(
+                "List a thread's durable queued follow-ups. This server is read-only, so clear is refused."
+            );
+            queue["inputSchema"]["properties"]["clear"] = json!({
+                "type": "boolean",
+                "description": "Refused because this server is read-only."
+            });
+        }
+    }
+    tools
 }
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -1471,6 +1534,57 @@ mod tests {
         assert_eq!(audit[0].actor, "mcp_stdio");
         assert_eq!(audit[0].confirmation, "stdio_spawner");
         assert_eq!(audit[0].thread_id.as_deref(), Some(thread_id.as_str()));
+    }
+
+    #[test]
+    fn read_only_scope_hides_fork_and_refuses_mutations() {
+        let server = server().read_only();
+        let tools = request(&server, 1, "tools/list", json!({}));
+        let names = tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool["name"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!names.contains(&"baton_fork"));
+        assert!(names.contains(&"baton_queue"));
+
+        let init = request(&server, 2, "initialize", json!({}));
+        assert!(init["result"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"));
+
+        let status = tool_json(&server, "baton_status", json!({}));
+        let thread_id = status["thread_id"].as_str().unwrap().to_string();
+        assert_eq!(
+            server.store.list_queued_messages(&thread_id).unwrap().len(),
+            1
+        );
+        let refused = request(
+            &server,
+            3,
+            "tools/call",
+            json!({ "name": "baton_queue", "arguments": { "clear": true } }),
+        );
+        assert_eq!(refused["error"]["code"], -32003);
+        assert_eq!(
+            server.store.list_queued_messages(&thread_id).unwrap().len(),
+            1
+        );
+
+        let fork = request(
+            &server,
+            4,
+            "tools/call",
+            json!({ "name": "baton_fork", "arguments": {} }),
+        );
+        assert_eq!(fork["error"]["code"], -32003);
+        assert_eq!(server.store.list_threads(None).unwrap().len(), 1);
+        assert!(crate::audit::list(&server.store, 10).unwrap().is_empty());
+
+        let queue = tool_json(&server, "baton_queue", json!({}));
+        assert_eq!(queue["count"], 1);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 - The command runs on a background thread with a 60-second timeout. The TUI stays responsive and shows `shell command running` in the composer hint.
 - The transcript area shows `shell · !<command> · exit N` and the output. `/clear` closes it.
 - One command runs at a time; a second `!` line is refused with a notice.
+- A prompt snippet whose body starts with `!` runs through the same shell path after `{{args}}` and `{{cwd}}` expand. The snippet is not submitted to the harness.
 
 ## How to get to it
 Type `!printf 'hello\n'` and press Enter.
@@ -17,6 +18,7 @@ Type `!printf 'hello\n'` and press Enter.
 - `shell::tests::control_sequences_are_sanitized`
 - `tui::tests::shell_command_runs_in_the_background_and_renders`
 - `tui::tests::shell_command_needs_a_command`
+- `tui::tests::a_shell_snippet_runs_the_shell_path`
 - PTY: `.agents/skills/verify-baton/scripts/tui_probe.py --command '!printf shell-probe' --expect 'shell · !printf shell-probe' --expect shell-probe`
 
 ## Gotchas

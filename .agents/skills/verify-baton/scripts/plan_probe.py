@@ -183,6 +183,7 @@ def main() -> int:
             raise RuntimeError("/plan did not open the overlay")
         for value in [
             "enter accept",
+            "r reject",
             "esc revise",
             "turn turn-plan",
             "Two checks",
@@ -211,6 +212,31 @@ def main() -> int:
         )
         # Clear the pre-filled revision text before running the next command.
         os.write(master, b"\x7f" * 40)
+        pump(master, 0.3, transcript)
+        os.write(master, b"/plan\r")
+        if not wait_for_screen(
+            master, "plan · 1/2 done", args.timeout, args.width, args.height, transcript
+        ):
+            raise RuntimeError("/plan did not reopen before reject")
+        os.write(master, b"r")
+        if not wait_for_screen(
+            master,
+            "reject this plan and propose a different approach:",
+            args.timeout,
+            args.width,
+            args.height,
+            transcript,
+        ):
+            raise RuntimeError("r did not prefill the rejection")
+        if not wait_for_screen(
+            master, "plan rejected", args.timeout, args.width, args.height, transcript
+        ):
+            raise RuntimeError("r did not report the rejection")
+        pump(master, 0.3, transcript)
+        screen = Screen(args.width, args.height)
+        screen.feed(bytes(transcript).decode("utf-8", "replace"))
+        (evidence / "reject-screen.txt").write_text("\n".join(screen.lines()) + "\n")
+        os.write(master, b"\x7f" * 64)
         pump(master, 0.3, transcript)
         os.write(master, b"/plan\r")
         if not wait_for_screen(

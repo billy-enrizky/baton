@@ -2047,6 +2047,32 @@ impl BatonStore {
     /// Adds a governed memory. Project memories are scoped to one cwd; global
     /// memories apply everywhere. An identical memory is returned as-is.
     pub fn add_memory(&self, scope: &str, cwd: &str, text: &str) -> Result<i64> {
+        let tx = self.write()?;
+        let id = Self::insert_memory_on(&tx, scope, cwd, text)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    /// Adds one memory and its audit event together, naming the new memory id
+    /// as the target. A rejected event leaves no memory behind.
+    pub fn add_memory_with_audit(
+        &self,
+        scope: &str,
+        cwd: &str,
+        text: &str,
+        event: &NewAuditEvent,
+    ) -> Result<(i64, AuditEventRow)> {
+        let created_at = now_iso();
+        let tx = self.write()?;
+        let id = Self::insert_memory_on(&tx, scope, cwd, text)?;
+        let mut event = event.clone();
+        event.target = Some(id.to_string());
+        let event_id = Self::insert_audit_event_in(&tx, &event, &created_at)?;
+        tx.commit()?;
+        Ok((id, Self::audit_event_row(event_id, created_at, &event)))
+    }
+
+    fn insert_memory_on(tx: &Connection, scope: &str, cwd: &str, text: &str) -> Result<i64> {
         let scope = scope.trim();
         if scope != "global" && scope != "project" {
             anyhow::bail!("memory scope must be global or project");
@@ -2059,7 +2085,7 @@ impl BatonStore {
             anyhow::bail!("memory text is longer than {MEMORY_TEXT_LIMIT} characters");
         }
         let cwd = if scope == "global" { "" } else { cwd };
-        let count: i64 = self.db.query_row(
+        let count: i64 = tx.query_row(
             "SELECT COUNT(*) FROM memories WHERE scope = ? AND cwd = ?",
             params![scope, cwd],
             |row| row.get(0),
@@ -2067,12 +2093,12 @@ impl BatonStore {
         if count >= MEMORY_SCOPE_LIMIT {
             anyhow::bail!("memory limit reached ({MEMORY_SCOPE_LIMIT}); remove one first");
         }
-        self.write_execute(
+        tx.execute(
             "INSERT OR IGNORE INTO memories (scope, cwd, text, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?)",
             params![scope, cwd, text, now_iso(), now_iso()],
         )?;
-        let id = self.db.query_row(
+        let id = tx.query_row(
             "SELECT id FROM memories WHERE scope = ? AND cwd = ? AND text = ?",
             params![scope, cwd, text],
             |row| row.get(0),
@@ -2203,6 +2229,31 @@ impl BatonStore {
         Ok(changed > 0)
     }
 
+    /// Removes one memory and appends its event together. A missing memory
+    /// writes no event and returns `None`.
+    pub fn remove_memory_with_audit(
+        &self,
+        cwd: &str,
+        id: i64,
+        event: &NewAuditEvent,
+    ) -> Result<Option<AuditEventRow>> {
+        let created_at = now_iso();
+        let tx = self.write()?;
+        let changed = tx.execute(
+            "DELETE FROM memories WHERE id = ? AND (scope = 'global' OR cwd = ?)",
+            params![id, cwd],
+        )?;
+        if changed == 0 {
+            tx.commit()?;
+            return Ok(None);
+        }
+        let mut event = event.clone();
+        event.target = Some(id.to_string());
+        let event_id = Self::insert_audit_event_in(&tx, &event, &created_at)?;
+        tx.commit()?;
+        Ok(Some(Self::audit_event_row(event_id, created_at, &event)))
+    }
+
     /// Clears either the project memories for this cwd or every global memory.
     pub fn clear_memories(&self, cwd: &str, global: bool) -> Result<usize> {
         let changed = if global {
@@ -2214,6 +2265,29 @@ impl BatonStore {
             )?
         };
         Ok(changed)
+    }
+
+    /// Clears one memory scope and appends one event together. The caller sets
+    /// the target to `global` or the project key before the count is known.
+    pub fn clear_memories_with_audit(
+        &self,
+        cwd: &str,
+        global: bool,
+        event: &NewAuditEvent,
+    ) -> Result<(usize, AuditEventRow)> {
+        let created_at = now_iso();
+        let tx = self.write()?;
+        let changed = if global {
+            tx.execute("DELETE FROM memories WHERE scope = 'global'", [])?
+        } else {
+            tx.execute(
+                "DELETE FROM memories WHERE scope = 'project' AND cwd = ?",
+                params![cwd],
+            )?
+        };
+        let event_id = Self::insert_audit_event_in(&tx, event, &created_at)?;
+        tx.commit()?;
+        Ok((changed, Self::audit_event_row(event_id, created_at, event)))
     }
 
     /// Project prompt history, oldest first.

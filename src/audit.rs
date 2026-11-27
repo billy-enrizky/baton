@@ -39,6 +39,9 @@ pub enum AuditAction {
     SettingsWrite,
     OrchestrationStart,
     OrchestrationSettle,
+    MemoryAdd,
+    MemoryRemove,
+    MemoryClear,
     QueueClear,
     ThreadFork,
 }
@@ -60,6 +63,9 @@ impl AuditAction {
             AuditAction::SettingsWrite => "settings.write",
             AuditAction::OrchestrationStart => "orchestration.start",
             AuditAction::OrchestrationSettle => "orchestration.settle",
+            AuditAction::MemoryAdd => "memory.add",
+            AuditAction::MemoryRemove => "memory.remove",
+            AuditAction::MemoryClear => "memory.clear",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
         }
@@ -84,6 +90,9 @@ impl AuditAction {
             AuditAction::SettingsWrite => SETTINGS_SCOPE,
             AuditAction::OrchestrationStart => ORCHESTRATE_SCOPE,
             AuditAction::OrchestrationSettle => ADMIN_SCOPE,
+            AuditAction::MemoryAdd | AuditAction::MemoryRemove | AuditAction::MemoryClear => {
+                SETTINGS_SCOPE
+            }
         }
     }
 }
@@ -166,6 +175,9 @@ mod tests {
         assert_eq!(AuditAction::SettingsWrite.scope(), SETTINGS_SCOPE);
         assert_eq!(AuditAction::OrchestrationStart.scope(), ORCHESTRATE_SCOPE);
         assert_eq!(AuditAction::OrchestrationSettle.scope(), ADMIN_SCOPE);
+        assert_eq!(AuditAction::MemoryAdd.scope(), SETTINGS_SCOPE);
+        assert_eq!(AuditAction::MemoryRemove.scope(), SETTINGS_SCOPE);
+        assert_eq!(AuditAction::MemoryClear.scope(), SETTINGS_SCOPE);
     }
 
     #[test]
@@ -219,6 +231,7 @@ mod tests {
             AuditAction::OrchestrationSettle.as_str(),
             "orchestration.settle"
         );
+        assert_eq!(AuditAction::MemoryAdd.as_str(), "memory.add");
         assert_eq!(AuditAction::QueueClear.as_str(), "queue.clear");
         assert_eq!(AuditAction::ThreadFork.as_str(), "thread.fork");
     }

@@ -1974,6 +1974,75 @@ fn memories_are_scoped_deduped_and_removable() {
 }
 
 #[test]
+fn memory_writes_and_their_audit_events_commit_together() {
+    let store = BatonStore::memory().unwrap();
+    let add = baton::audit::event(
+        baton::audit::LOCAL_CLI_ACTOR,
+        "installation",
+        None,
+        None,
+        baton::audit::AuditAction::MemoryAdd,
+        &serde_json::json!({"text_len": 8}),
+    )
+    .unwrap();
+    let mut invalid = add.clone();
+    invalid.payload_digest = "short".into();
+    assert!(store
+        .add_memory_with_audit("project", "/proj-a", "Use tabs", &invalid)
+        .is_err());
+    assert!(store.list_memories("/proj-a").unwrap().is_empty());
+    assert!(store.list_audit_events(10).unwrap().is_empty());
+
+    let (id, wrote) = store
+        .add_memory_with_audit("project", "/proj-a", "Use tabs", &add)
+        .unwrap();
+    assert_eq!(wrote.action, "memory.add");
+    assert_eq!(wrote.target.as_deref(), Some(id.to_string().as_str()));
+    assert_eq!(store.list_memories("/proj-a").unwrap().len(), 1);
+
+    let remove = baton::audit::event(
+        baton::audit::LOCAL_CLI_ACTOR,
+        "installation",
+        None,
+        None,
+        baton::audit::AuditAction::MemoryRemove,
+        &serde_json::json!({"id": id}),
+    )
+    .unwrap();
+    let removed = store
+        .remove_memory_with_audit("/proj-a", id, &remove)
+        .unwrap()
+        .expect("a present memory writes its row");
+    assert_eq!(removed.target.as_deref(), Some(id.to_string().as_str()));
+    assert!(store.list_memories("/proj-a").unwrap().is_empty());
+    assert!(store
+        .remove_memory_with_audit("/proj-a", id, &remove)
+        .unwrap()
+        .is_none());
+
+    store.add_memory("project", "/proj-a", "Keep").unwrap();
+    let clear = baton::audit::event(
+        baton::audit::LOCAL_CLI_ACTOR,
+        "installation",
+        Some("/proj-a"),
+        None,
+        baton::audit::AuditAction::MemoryClear,
+        &serde_json::json!({"global": false}),
+    )
+    .unwrap();
+    let (cleared, wrote) = store
+        .clear_memories_with_audit("/proj-a", false, &clear)
+        .unwrap();
+    assert_eq!(cleared, 1);
+    assert_eq!(wrote.target.as_deref(), Some("/proj-a"));
+    let events = store.list_audit_events(10).unwrap();
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events[0].action, "memory.clear");
+    assert_eq!(events[1].action, "memory.remove");
+    assert_eq!(events[2].action, "memory.add");
+}
+
+#[test]
 fn abandoned_orchestration_is_reconciled_without_losing_completed_tasks() {
     let store = BatonStore::memory().unwrap();
     store

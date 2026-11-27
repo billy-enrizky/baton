@@ -628,7 +628,8 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
 
     writeln!(
         stdin,
-        "pair --scope read --scope operate --ceiling acceptEdits"
+        "pair --scope read --scope operate --ceiling acceptEdits --project {}",
+        root.path().display()
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -651,7 +652,7 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
             Ok(line) => {
                 pairing.push_str(&line);
                 pairing.push('\n');
-                if line.contains("ceiling acceptEdits") {
+                if line.contains("ceiling acceptEdits") && line.contains("projects 1") {
                     break;
                 }
             }
@@ -659,8 +660,8 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
         }
     }
     assert!(
-        pairing.contains("ceiling acceptEdits"),
-        "pair did not report the ceiling: {pairing}"
+        pairing.contains("ceiling acceptEdits") && pairing.contains("projects 1"),
+        "pair did not report the ceiling and project count: {pairing}"
     );
     let fragment = url.trim().strip_prefix("baton://local#").unwrap();
     let mut grant_id = None;

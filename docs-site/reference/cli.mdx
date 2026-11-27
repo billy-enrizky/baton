@@ -144,7 +144,7 @@ baton update
 
 ## MCP
 
-`baton mcp` serves the local store over MCP stdio, or over HTTP with `--http <addr> --token-file <path>`. The token file must be a regular file with mode 0600 and a 32 to 512 character value. Loopback is the default. For HTTPS, add `--tls-cert <pem> --tls-key <pem>`; the key must also be mode 0600. A non-loopback bind needs either TLS or the plain-HTTP `--trusted-overlay`, and the two flags cannot be combined. `POST /mcp` serves JSON-RPC and `GET /health` returns readiness. Add `--read-only` to hide `baton_fork` and refuse queue clearing; read tools, including `baton_queue` without `clear`, stay available. Use repeatable `--allow-tool <name>` instead to expose only the named tools; it cannot be combined with `--read-only`.
+`baton mcp` serves the local store over MCP stdio, or over HTTP with `--http <addr> --token-file <path>`. The token file must be a regular file with mode 0600 and a 32 to 512 character value. Loopback is the default. For HTTPS, add `--tls-cert <pem> --tls-key <pem>`; the key must also be mode 0600. A non-loopback bind needs either TLS or the plain-HTTP `--trusted-overlay`, and the two flags cannot be combined. `POST /mcp` serves JSON-RPC and `GET /health` returns readiness. Add `--read-only` to hide `baton_fork` and refuse queue clearing; read tools, including `baton_queue` without `clear`, stay available. Use repeatable `--allow-tool <name>` instead to expose only the named tools; it cannot be combined with `--read-only`. The token is read at startup. On Unix, replace the file and send SIGHUP to reload it without dropping the listener; an invalid file keeps the current token. On Windows, restart the server.
 
 ```json
 {

@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::config::resolve_config;
@@ -924,6 +924,12 @@ pub fn read_token_file(path: &Path) -> Result<String> {
     Ok(token.to_string())
 }
 
+fn reload_token(current: &RwLock<String>, token_file: &Path) -> Result<()> {
+    let token = read_token_file(token_file)?;
+    *current.write().expect("MCP token lock poisoned") = token;
+    Ok(())
+}
+
 /// Load a PEM certificate chain and a private PKCS#8 key for HTTPS.
 pub fn read_tls_identity(cert_path: &Path, key_path: &Path) -> Result<native_tls::Identity> {
     let cert = read_regular_file(cert_path, "TLS certificate", false)?;
@@ -956,7 +962,7 @@ pub fn run_http(
     trusted_overlay: bool,
     tls: Option<(&Path, &Path)>,
 ) -> Result<()> {
-    let token = read_token_file(token_file)?;
+    let token = Arc::new(RwLock::new(read_token_file(token_file)?));
     let tls_acceptor = tls
         .map(|(cert_path, key_path)| {
             let identity = read_tls_identity(cert_path, key_path)?;
@@ -990,14 +996,40 @@ pub fn run_http(
         let scheme = if encrypted { "https" } else { "http" };
         eprintln!("baton: MCP HTTP listening on {scheme}://{local}");
         let server = Arc::new(Mutex::new(server));
-        let token = Arc::new(token);
+        #[cfg(unix)]
+        let mut reload =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+                .context("listen for SIGHUP")?;
         loop {
+            let reload_signal = async {
+                #[cfg(unix)]
+                {
+                    reload.recv().await;
+                }
+                #[cfg(not(unix))]
+                {
+                    std::future::pending::<()>().await;
+                }
+            };
             tokio::select! {
                 _ = tokio::signal::ctrl_c() => break,
+                _ = reload_signal => {
+                    match reload_token(&token, token_file) {
+                        Ok(()) => eprintln!("baton: reloaded the MCP bearer token"),
+                        Err(error) => eprintln!(
+                            "baton: MCP token reload failed: {error}; keeping the current token"
+                        ),
+                    }
+                }
                 accepted = listener.accept() => {
                     let (stream, _) = accepted.context("accept MCP HTTP connection")?;
                     let server = server.clone();
-                    let token = token.clone();
+                    let token = Arc::new(
+                        token
+                            .read()
+                            .expect("MCP token lock poisoned")
+                            .clone(),
+                    );
                     let tls_acceptor = tls_acceptor.clone();
                     tokio::spawn(async move {
                         let result = match tls_acceptor {
@@ -1526,6 +1558,27 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("\"serverInfo\""), "{response}");
         server_task.await.unwrap();
+    }
+
+    #[test]
+    fn token_reload_keeps_the_old_value_when_the_file_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let token = "a".repeat(64);
+        std::fs::write(&path, &token).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let current = RwLock::new("b".repeat(64));
+        reload_token(&current, &path).unwrap();
+        assert_eq!(*current.read().unwrap(), token);
+
+        std::fs::write(&path, "short").unwrap();
+        let error = reload_token(&current, &path).unwrap_err();
+        assert!(error.to_string().contains("32 to 512"), "{error}");
+        assert_eq!(*current.read().unwrap(), token);
     }
 
     async fn http_request(server: Arc<Mutex<McpServer>>, token: &str, request: &str) -> String {

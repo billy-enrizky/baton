@@ -126,6 +126,24 @@ pub struct AuditEventRow {
     pub retention: String,
 }
 
+/// One completed renewal: the window before the change, the resulting row, and
+/// the audit event written with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewedGrant {
+    pub previous_expires_at: String,
+    pub grant: GrantSummary,
+    pub event: AuditEventRow,
+}
+
+/// The three outcomes of a renewal attempt. A revoked grant is named rather
+/// than folded into "missing", because the operator has to pair again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewGrantOutcome {
+    Renewed(Box<RenewedGrant>),
+    Missing,
+    Revoked,
+}
+
 impl GrantRow {
     pub fn summary(&self) -> GrantSummary {
         GrantSummary {
@@ -3099,6 +3117,47 @@ impl BatonStore {
         Ok(Some(Self::audit_event_row(id, created_at, event)))
     }
 
+    /// Extends one live grant's expiry and commits its audit event together.
+    /// The stored window is never shortened, the secret hash is untouched, and
+    /// a missing or revoked grant writes neither a change nor an event.
+    pub fn renew_grant_row_with_audit(
+        &self,
+        grant_id: &str,
+        requested_expires_at: &str,
+        event: &NewAuditEvent,
+    ) -> Result<RenewGrantOutcome> {
+        let created_at = now_iso();
+        let write = self.write()?;
+        let row = write
+            .query_row(
+                "SELECT grant_id, installation_id, secret_hash, scopes, permission_ceiling, project_allowlist, issued_at, expires_at, revoked_at, label FROM grants WHERE grant_id = ?",
+                params![grant_id],
+                Self::map_grant,
+            )
+            .optional()?;
+        let Some(mut row) = row else {
+            write.commit()?;
+            return Ok(RenewGrantOutcome::Missing);
+        };
+        if row.revoked_at.is_some() {
+            write.commit()?;
+            return Ok(RenewGrantOutcome::Revoked);
+        }
+        let previous_expires_at = row.expires_at.clone();
+        row.expires_at = later_expiry(&previous_expires_at, requested_expires_at);
+        write.execute(
+            "UPDATE grants SET expires_at = ? WHERE grant_id = ?",
+            params![row.expires_at, grant_id],
+        )?;
+        let id = Self::insert_audit_event_in(&write, event, &created_at)?;
+        write.commit()?;
+        Ok(RenewGrantOutcome::Renewed(Box::new(RenewedGrant {
+            previous_expires_at,
+            grant: row.summary(),
+            event: Self::audit_event_row(id, created_at, event),
+        })))
+    }
+
     fn map_audit_event(row: &rusqlite::Row) -> rusqlite::Result<AuditEventRow> {
         Ok(AuditEventRow {
             id: row.get(0)?,
@@ -4325,6 +4384,23 @@ pub struct ImportedMessage {
     pub created_at: String,
 }
 
+/// The later of the stored and requested instants, in the same UTC millisecond
+/// form the grant mint writes. An unparseable stored value preserves nothing,
+/// so the requested instant wins; an unparseable request leaves the row alone.
+fn later_expiry(stored: &str, requested: &str) -> String {
+    let format = |instant: &chrono::DateTime<chrono::Utc>| {
+        instant.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+    match (
+        stored.parse::<chrono::DateTime<chrono::Utc>>(),
+        requested.parse::<chrono::DateTime<chrono::Utc>>(),
+    ) {
+        (Ok(stored), Ok(requested)) => format(&stored.max(requested)),
+        (_, Ok(requested)) => format(&requested),
+        (_, Err(_)) => stored.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5259,6 +5335,65 @@ mod tests {
             .revoked_at
             .is_some());
         assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_renewal_and_its_audit_event_commit_together() {
+        let store = BatonStore::memory().unwrap();
+        let grant = sample_grant("00000000-0000-4000-8000-000000000003");
+        let original = grant.expires_at.clone();
+        store.insert_grant(&grant).unwrap();
+        let later = (chrono::Utc::now() + chrono::Duration::days(60))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+
+        let mut invalid = sample_audit_event("grant.renew");
+        invalid.payload_digest = "short".into();
+        assert!(store
+            .renew_grant_row_with_audit(&grant.grant_id, &later, &invalid)
+            .is_err());
+        let untouched = store.find_grant_row(&grant.grant_id).unwrap().unwrap();
+        assert_eq!(untouched.expires_at, original);
+        assert!(store.list_audit_events(10).unwrap().is_empty());
+
+        let outcome = store
+            .renew_grant_row_with_audit(&grant.grant_id, &later, &sample_audit_event("grant.renew"))
+            .unwrap();
+        let RenewGrantOutcome::Renewed(payload) = outcome else {
+            panic!("a live grant renews: {outcome:?}");
+        };
+        assert_eq!(payload.previous_expires_at, original);
+        assert_eq!(payload.grant.expires_at, later);
+        assert_eq!(payload.event.action, "grant.renew");
+        let stored = store.find_grant_row(&grant.grant_id).unwrap().unwrap();
+        assert_eq!(stored.secret_hash, grant.secret_hash);
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
+
+        let sooner = (chrono::Utc::now() + chrono::Duration::days(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let outcome = store
+            .renew_grant_row_with_audit(&grant.grant_id, &sooner, &sample_audit_event("grant.renew"))
+            .unwrap();
+        let RenewGrantOutcome::Renewed(payload) = outcome else {
+            panic!("a live grant renews: {outcome:?}");
+        };
+        assert_eq!(payload.grant.expires_at, later, "a renewal never shortens");
+
+        store.revoke_grant_row(&grant.grant_id).unwrap();
+        let outcome = store
+            .renew_grant_row_with_audit(&grant.grant_id, &later, &sample_audit_event("grant.renew"))
+            .unwrap();
+        assert_eq!(outcome, RenewGrantOutcome::Revoked);
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 2);
+
+        let outcome = store
+            .renew_grant_row_with_audit(
+                "00000000-0000-4000-8000-000000000004",
+                &later,
+                &sample_audit_event("grant.renew"),
+            )
+            .unwrap();
+        assert_eq!(outcome, RenewGrantOutcome::Missing);
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 2);
     }
 
     #[test]

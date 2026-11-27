@@ -13,6 +13,7 @@ use crate::store::{now_iso, BatonStore, GrantRow, GrantSummary};
 use crate::types::PermissionMode;
 
 pub const DEFAULT_GRANT_DAYS: i64 = 30;
+pub const MAX_GRANT_DAYS: i64 = 365;
 pub const MAX_LABEL_CHARS: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +247,61 @@ pub fn list(store: &BatonStore) -> Result<Vec<GrantSummary>> {
         .collect())
 }
 
+/// One completed renewal, as the caller reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenewedGrant {
+    pub previous_expires_at: String,
+    pub grant: GrantSummary,
+}
+
+/// What one renewal attempt did. A revoked grant is reported separately so the
+/// caller can tell the operator to pair again instead of retrying an id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RenewOutcome {
+    Renewed(Box<RenewedGrant>),
+    Missing,
+    Revoked,
+}
+
+/// Extends a live grant from now. The stored expiry is never moved earlier, so
+/// renewing with fewer days than remain is a no-op, and the client secret keeps
+/// working because the hash and the secret file are untouched.
+pub fn renew(store: &BatonStore, grant_id: &str, days: i64) -> Result<RenewOutcome> {
+    if !valid_grant_id(grant_id) {
+        anyhow::bail!("grant id must be a lowercase UUID: {grant_id}");
+    }
+    if !(1..=MAX_GRANT_DAYS).contains(&days) {
+        anyhow::bail!("renewal days must be between 1 and {MAX_GRANT_DAYS}: {days}");
+    }
+    let Some(grant) = store.find_grant_row(grant_id)? else {
+        return Ok(RenewOutcome::Missing);
+    };
+    let requested_expires_at = expiry_after_days(days);
+    let audit = crate::audit::event(
+        crate::audit::LOCAL_CLI_ACTOR,
+        &grant.installation_id,
+        None,
+        crate::audit::AuditAction::GrantRenew,
+        crate::audit::ADMIN_SCOPE,
+        crate::audit::LOCAL_CLI_CONFIRMATION,
+        &serde_json::json!({
+            "grant_id": grant_id,
+            "previous_expires_at": grant.expires_at,
+            "requested_expires_at": requested_expires_at,
+        }),
+    )?;
+    match store.renew_grant_row_with_audit(grant_id, &requested_expires_at, &audit)? {
+        crate::store::RenewGrantOutcome::Renewed(payload) => {
+            Ok(RenewOutcome::Renewed(Box::new(RenewedGrant {
+                previous_expires_at: payload.previous_expires_at,
+                grant: payload.grant,
+            })))
+        }
+        crate::store::RenewGrantOutcome::Missing => Ok(RenewOutcome::Missing),
+        crate::store::RenewGrantOutcome::Revoked => Ok(RenewOutcome::Revoked),
+    }
+}
+
 pub fn revoke(store: &BatonStore, home: &Path, grant_id: &str) -> Result<bool> {
     let Some(path) = secret_path(home, grant_id) else {
         anyhow::bail!("grant id must be a lowercase UUID: {grant_id}");
@@ -398,6 +454,81 @@ mod tests {
         assert_eq!(
             missing.downcast_ref::<GrantRefusal>(),
             Some(&GrantRefusal::NotFound)
+        );
+    }
+
+    #[test]
+    fn renew_extends_only_forward_and_keeps_the_credential_working() {
+        let home = temp_home();
+        let store = BatonStore::memory().unwrap();
+        let mut request = GrantRequest::new(vec![Scope::Read]);
+        request.expires_at = expiry_after_days(1);
+        let minted = mint(&store, home.path(), &request).unwrap();
+        let original = minted.summary.expires_at.clone();
+        let secret_file = secret_path(home.path(), &minted.summary.grant_id).unwrap();
+
+        let RenewOutcome::Renewed(renewed) = renew(&store, &minted.summary.grant_id, 60).unwrap()
+        else {
+            panic!("a live grant renews");
+        };
+        let RenewedGrant {
+            previous_expires_at,
+            grant,
+        } = *renewed;
+        assert_eq!(previous_expires_at, original);
+        let extended = grant
+            .expires_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        assert!(
+            extended > chrono::Utc::now() + chrono::Duration::days(59),
+            "{extended}"
+        );
+        assert_eq!(
+            fs::read_to_string(&secret_file).unwrap().trim(),
+            minted.secret,
+            "a renewal keeps the client credential"
+        );
+        assert_eq!(
+            verify(&store, &minted.summary.grant_id, &minted.secret)
+                .unwrap()
+                .expires_at,
+            grant.expires_at
+        );
+
+        let RenewOutcome::Renewed(unchanged) = renew(&store, &minted.summary.grant_id, 1).unwrap()
+        else {
+            panic!("a live grant renews");
+        };
+        assert_eq!(unchanged.previous_expires_at, grant.expires_at);
+        assert_eq!(
+            unchanged.grant.expires_at, grant.expires_at,
+            "never shortens"
+        );
+
+        let events = crate::audit::list(&store, 10).unwrap();
+        assert_eq!(events.len(), 3, "{events:?}");
+        assert_eq!(events[0].action, "grant.renew");
+        assert_eq!(events[0].actor, crate::audit::LOCAL_CLI_ACTOR);
+        assert_eq!(events[0].scope, crate::audit::ADMIN_SCOPE);
+        assert_eq!(events[0].confirmation, crate::audit::LOCAL_CLI_CONFIRMATION);
+        assert!(!format!("{events:?}").contains(&minted.secret));
+
+        assert!(revoke(&store, home.path(), &minted.summary.grant_id).unwrap());
+        assert_eq!(
+            renew(&store, &minted.summary.grant_id, 30).unwrap(),
+            RenewOutcome::Revoked
+        );
+        assert_eq!(
+            renew(&store, "00000000-0000-4000-8000-000000000000", 30).unwrap(),
+            RenewOutcome::Missing
+        );
+        let bad_id = renew(&store, "not-a-uuid", 30).unwrap_err();
+        assert!(bad_id.to_string().contains("lowercase UUID"), "{bad_id}");
+        let bad_days = renew(&store, &minted.summary.grant_id, 0).unwrap_err();
+        assert!(
+            bad_days.to_string().contains("between 1 and 365"),
+            "{bad_days}"
         );
     }
 

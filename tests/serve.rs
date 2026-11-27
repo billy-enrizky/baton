@@ -836,6 +836,40 @@ fn serve_stdin_pair_and_attach_use_the_socket() {
     let ping = ask(serde_json::json!({"v":1,"kind":"request","id":2,"command":"ping"}));
     assert_eq!(ping["result"]["pong"], true, "{ping}");
 
+    writeln!(stdin, "renew {grant_id} --days 7").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut renewed = String::new();
+    while Instant::now() < deadline {
+        match err_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line.contains("renewed") => {
+                renewed = line;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(!renewed.is_empty(), "the host renews a grant: {renewed}");
+    assert!(renewed.contains(&grant_id), "{renewed}");
+
+    writeln!(stdin, "renew {grant_id} --days 90").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut extended = String::new();
+    while Instant::now() < deadline {
+        match err_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line.contains("renewed") => {
+                extended = line;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(
+        !extended.is_empty(),
+        "the host extends the window: {extended}"
+    );
+
     unsafe {
         libc::kill(child.0.id() as i32, libc::SIGTERM);
     }
@@ -857,4 +891,17 @@ fn serve_stdin_pair_and_attach_use_the_socket() {
     let grants = baton::grants::list(&store).unwrap();
     assert_eq!(grants.len(), 1, "{grants:?}");
     assert_eq!(grants[0].grant_id, grant_id);
+    let expiry = grants[0]
+        .expires_at
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    assert!(
+        expiry > chrono::Utc::now() + chrono::Duration::days(89),
+        "{expiry}"
+    );
+    let events = store.list_audit_events(10).unwrap();
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert_eq!(events[0].action, "grant.renew");
+    assert_eq!(events[1].action, "grant.renew");
+    assert_eq!(events[2].action, "grant.mint");
 }

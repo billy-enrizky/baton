@@ -468,6 +468,17 @@ pub enum GrantCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Extend a live grant's expiry without rotating its secret
+    Renew {
+        /// Grant id
+        grant_id: String,
+        /// Days from now to extend to; a later stored expiry is kept
+        #[arg(long, default_value_t = crate::grants::DEFAULT_GRANT_DAYS, value_parser = clap::value_parser!(i64).range(1..=crate::grants::MAX_GRANT_DAYS))]
+        days: i64,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
     /// Revoke a grant and delete its client secret
     Revoke {
         /// Grant id
@@ -772,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn grant_list_and_revoke_parse() {
+    fn grant_list_renew_and_revoke_parse() {
         let cli = Cli::try_parse_from(["baton", "grant", "list", "--json"]).unwrap();
         match cli.command {
             Some(Commands::Grant {
@@ -797,6 +808,44 @@ mod tests {
                     },
             }) => assert_eq!(grant_id, "00000000-0000-4000-8000-000000000000"),
             _ => panic!("expected grant revoke"),
+        }
+        let cli = Cli::try_parse_from(["baton", "grant", "renew", "grant-id"]).unwrap();
+        match cli.command {
+            Some(Commands::Grant {
+                command:
+                    GrantCommand::Renew {
+                        grant_id,
+                        days: crate::grants::DEFAULT_GRANT_DAYS,
+                        json: false,
+                    },
+            }) => assert_eq!(grant_id, "grant-id"),
+            _ => panic!("expected grant renew with the default window"),
+        }
+        let cli = Cli::try_parse_from([
+            "baton",
+            "grant",
+            "renew",
+            "00000000-0000-4000-8000-000000000000",
+            "--days",
+            "7",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Grant {
+                command:
+                    GrantCommand::Renew {
+                        grant_id,
+                        days: 7,
+                        json: true,
+                    },
+            }) => assert_eq!(grant_id, "00000000-0000-4000-8000-000000000000"),
+            _ => panic!("expected grant renew"),
+        }
+        for days in ["0", "366"] {
+            let parsed =
+                Cli::try_parse_from(["baton", "grant", "renew", "grant-id", "--days", days]);
+            assert!(parsed.is_err(), "--days {days} must be refused");
         }
     }
 

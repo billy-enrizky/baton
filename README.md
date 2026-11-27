@@ -277,7 +277,7 @@ baton threads
 
 Each thread you open stays in a tab strip above the transcript. The active tab is highlighted and shows its position, from `1:` to `9:`. Press Alt plus a number to jump to that tab, so you can move between an implementation thread, a review thread, and a side chat without going back to the picker.
 
-The strip appears once a second tab is open and shows up to nine tabs, then a `...` marker when more are open. Archiving a thread closes its tab. A tab switch is refused while a turn runs, a request waits for your answer, or a picker or full-screen view is open, so a stream is never torn in the middle. Starting a thread that has not been sent yet keeps it in its tab; send one message to save it.
+The strip appears once a second tab is open and shows up to nine tabs, then a `...` marker when more are open. A running turn keeps running when you switch away; its tab carries a `*` marker and keeps streaming, and the next visit shows everything it produced. Archiving a thread closes its tab. A tab switch is refused while a request waits for your answer or a picker or full-screen view is open, so the current surface is never torn in the middle. Starting a thread that has not been sent yet keeps it in its tab; send one message to save it.
 
 ### 4.6 Your first prompt
 
@@ -382,7 +382,7 @@ Ctrl+K opens the command palette. It filters built-in actions, threads, and rece
 
 #### 6.5.6 Thread tabs
 
-Alt+1 through Alt+9 switch to the tab in that position. Alt+0 does nothing. The strip only appears when more than one thread is open, and every open thread keeps its own transcript, composer draft, goal, and permission mode.
+Alt+1 through Alt+9 switch to the tab in that position. Alt+0 does nothing. The strip only appears when more than one thread is open, and every open thread keeps its own transcript, composer draft, goal, permission mode, and live turn state. A tab whose turn is still running shows a `*` after its title until that turn settles.
 
 ## 7. Slash commands
 

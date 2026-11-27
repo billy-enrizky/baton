@@ -675,6 +675,8 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
             &thread_id,
             "--submit",
             "remote hello",
+            "--idempotency-key",
+            "remote-submit-1",
             "--json",
         ])
         .env("BATON_HOME", home.path())
@@ -684,6 +686,29 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
     let submit: serde_json::Value = serde_json::from_slice(&submit.stdout).unwrap();
     assert_eq!(submit["thread_id"], thread_id);
     assert_eq!(submit["accepted"], true);
+    assert_eq!(submit["replayed"], false);
+
+    let replay = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--thread",
+            &thread_id,
+            "--submit",
+            "remote hello",
+            "--idempotency-key",
+            "remote-submit-1",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(replay.status.success(), "{replay:?}");
+    let replay: serde_json::Value = serde_json::from_slice(&replay.stdout).unwrap();
+    assert_eq!(replay["thread_id"], thread_id);
+    assert_eq!(replay["accepted"], true);
+    assert_eq!(replay["replayed"], true);
 
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut saw_message = false;
@@ -736,6 +761,26 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
     assert!(
         saw_message,
         "the engine did not run the remote turn: {output}\n{tail}\n{state}"
+    );
+    let verified = BatonStore::open_read_only(&home.path().join("baton.sqlite")).unwrap();
+    let messages = verified.list_messages(&thread_id).unwrap();
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|row| row.text == "remote hello")
+            .count(),
+        1,
+        "a replay must not queue a second user message"
+    );
+    assert_eq!(
+        verified
+            .list_audit_events(10)
+            .unwrap()
+            .iter()
+            .filter(|event| event.action == "turn.submit_request")
+            .count(),
+        1,
+        "a replay must not write a second request row"
     );
 
     let audit = Command::new(env!("CARGO_BIN_EXE_baton"))

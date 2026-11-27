@@ -16813,36 +16813,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
 /// recorded; free-text answers are counted, never committed, because the log
 /// stores only a digest and a custom answer can carry a secret.
 fn question_answer_payload(question: &QuestionState) -> serde_json::Value {
-    let answers = question
-        .answers
-        .iter()
-        .map(|answer| {
-            let chosen: Vec<&str> = question
-                .questions
-                .iter()
-                .find(|prompt| prompt.id == answer.id)
-                .map(|prompt| {
-                    answer
-                        .answers
-                        .iter()
-                        .filter(|value| prompt.options.iter().any(|option| &option.label == *value))
-                        .map(String::as_str)
-                        .collect()
-                })
-                .unwrap_or_default();
-            serde_json::json!({
-                "prompt_id": answer.id,
-                "answers": answer.answers.len(),
-                "options": chosen,
-                "custom": answer.answers.len() > chosen.len(),
-            })
-        })
-        .collect::<Vec<_>>();
-    serde_json::json!({
-        "request_id": question.id,
-        "prompts": question.questions.len(),
-        "answers": answers,
-    })
+    crate::audit::question_answer_payload(&question.id, &question.questions, &question.answers)
 }
 
 /// Records the answers before they are sent, so an answer cannot reach the

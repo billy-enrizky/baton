@@ -5,6 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::store::{AuditEventRow, BatonStore, NewAuditEvent};
+use crate::types::{QuestionAnswer, QuestionPrompt};
 
 pub const HOST_TERMINAL_ACTOR: &str = "host_terminal";
 pub const LOCAL_CLI_ACTOR: &str = "local_cli";
@@ -156,6 +157,44 @@ pub fn grant_event(
     Ok(event)
 }
 
+/// The prompt count and option labels an answer touches. Free-text answers are
+/// counted as custom and never written, so a secret typed by the user stays out
+/// of the durable log.
+pub fn question_answer_payload(
+    request_id: &str,
+    questions: &[QuestionPrompt],
+    answers: &[QuestionAnswer],
+) -> Value {
+    let answers = answers
+        .iter()
+        .map(|answer| {
+            let chosen: Vec<&str> = questions
+                .iter()
+                .find(|prompt| prompt.id == answer.id)
+                .map(|prompt| {
+                    answer
+                        .answers
+                        .iter()
+                        .filter(|value| prompt.options.iter().any(|option| &option.label == *value))
+                        .map(String::as_str)
+                        .collect()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "prompt_id": answer.id,
+                "answers": answer.answers.len(),
+                "options": chosen,
+                "custom": answer.answers.len() > chosen.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "request_id": request_id,
+        "prompts": questions.len(),
+        "answers": answers,
+    })
+}
+
 pub fn list(store: &BatonStore, limit: usize) -> Result<Vec<AuditEventRow>> {
     store.list_audit_events(limit)
 }
@@ -174,6 +213,60 @@ mod tests {
         assert!(digest
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+    }
+
+    #[test]
+    fn question_payload_keeps_options_and_counts_custom_text() {
+        let questions = vec![
+            QuestionPrompt {
+                id: "language".into(),
+                header: "Language".into(),
+                question: "Which language?".into(),
+                options: vec![
+                    crate::types::QuestionOption {
+                        label: "Rust".into(),
+                        description: String::new(),
+                    },
+                    crate::types::QuestionOption {
+                        label: "Go".into(),
+                        description: String::new(),
+                    },
+                ],
+                allow_custom: false,
+                multi_select: false,
+                secret: false,
+            },
+            QuestionPrompt {
+                id: "note".into(),
+                header: "Note".into(),
+                question: "Anything else?".into(),
+                options: Vec::new(),
+                allow_custom: true,
+                multi_select: false,
+                secret: true,
+            },
+        ];
+        let answers = vec![
+            QuestionAnswer {
+                id: "language".into(),
+                answers: vec!["Rust".into()],
+            },
+            QuestionAnswer {
+                id: "note".into(),
+                answers: vec!["a secret".into()],
+            },
+        ];
+        let payload = question_answer_payload("req-1", &questions, &answers);
+        assert_eq!(payload["request_id"], "req-1");
+        assert_eq!(payload["prompts"], 2);
+        assert_eq!(payload["answers"][0]["options"][0], "Rust");
+        assert_eq!(payload["answers"][0]["custom"], false);
+        assert_eq!(
+            payload["answers"][1]["options"].as_array().unwrap().len(),
+            0
+        );
+        assert_eq!(payload["answers"][1]["custom"], true);
+        assert!(!payload.to_string().contains("a secret"));
     }
 
     #[test]

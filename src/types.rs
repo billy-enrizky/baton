@@ -350,6 +350,22 @@ pub struct QuestionPrompt {
     pub secret: bool,
 }
 
+impl QuestionPrompt {
+    /// A prompt accepts listed option labels and, when it allows custom text,
+    /// any other string. An empty answer is allowed so a prompt can be skipped.
+    pub fn accepts(&self, answers: &[String]) -> bool {
+        if answers.is_empty() {
+            return true;
+        }
+        if !self.multi_select && answers.len() > 1 {
+            return false;
+        }
+        answers.iter().all(|value| {
+            self.allow_custom || self.options.iter().any(|option| &option.label == value)
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QuestionAnswer {
     pub id: String,
@@ -483,6 +499,44 @@ mod tests {
         assert!(!PermissionMode::Default.within_ceiling(PermissionMode::Plan));
         assert!(PermissionMode::Plan.within_ceiling(PermissionMode::Plan));
         assert!(!PermissionMode::BypassPermissions.within_ceiling(PermissionMode::AcceptEdits));
+    }
+
+    #[test]
+    fn question_prompts_accept_options_custom_text_and_one_choice() {
+        let prompt = QuestionPrompt {
+            id: "language".into(),
+            header: "Language".into(),
+            question: "Which language?".into(),
+            options: vec![
+                QuestionOption {
+                    label: "Rust".into(),
+                    description: String::new(),
+                },
+                QuestionOption {
+                    label: "Go".into(),
+                    description: String::new(),
+                },
+            ],
+            allow_custom: false,
+            multi_select: false,
+            secret: false,
+        };
+        assert!(prompt.accepts(&[]));
+        assert!(prompt.accepts(&["Rust".into()]));
+        assert!(!prompt.accepts(&["Python".into()]));
+        assert!(!prompt.accepts(&["Rust".into(), "Go".into()]));
+
+        let custom = QuestionPrompt {
+            allow_custom: true,
+            ..prompt.clone()
+        };
+        assert!(custom.accepts(&["Python".into()]));
+
+        let multi = QuestionPrompt {
+            multi_select: true,
+            ..prompt
+        };
+        assert!(multi.accepts(&["Rust".into(), "Go".into()]));
     }
 
     #[test]

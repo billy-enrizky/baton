@@ -19,6 +19,8 @@ const MESSAGES_REQUEST_ID: u64 = 2;
 const SUBMIT_REQUEST_ID: u64 = 3;
 const APPROVALS_REQUEST_ID: u64 = 4;
 const RESPOND_REQUEST_ID: u64 = 5;
+const QUESTIONS_REQUEST_ID: u64 = 6;
+const ANSWER_REQUEST_ID: u64 = 7;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingCredential {
@@ -298,6 +300,268 @@ impl AttachAnswer {
             "thread_id": self.thread_id,
             "choice": self.choice,
             "decision": self.decision,
+            "answered": true,
+            "replayed": self.replayed,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteQuestionOption {
+    pub label: String,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteQuestionPrompt {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<RemoteQuestionOption>,
+    pub allow_custom: bool,
+    pub multi_select: bool,
+    pub secret: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteQuestion {
+    pub request_id: String,
+    pub thread_id: String,
+    pub questions: Vec<RemoteQuestionPrompt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachQuestions {
+    pub questions: Vec<RemoteQuestion>,
+}
+
+impl AttachQuestions {
+    pub fn from_response(value: &Value) -> Result<AttachQuestions> {
+        let result = value
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("host response has no result object"))?;
+        let raw = result
+            .get("questions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("host response has no questions array"))?;
+        let mut questions = Vec::with_capacity(raw.len());
+        for request in raw {
+            let object = request
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("host response has a malformed question"))?;
+            let text = |field: &str| {
+                object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("host question has no {field}"))
+            };
+            let prompts = object
+                .get("questions")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("host question has no prompts array"))?
+                .iter()
+                .map(|prompt| {
+                    let prompt = prompt
+                        .as_object()
+                        .ok_or_else(|| anyhow::anyhow!("host question has a malformed prompt"))?;
+                    let field = |name: &str| {
+                        prompt
+                            .get(name)
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("host prompt has no {name}"))
+                    };
+                    let options = prompt
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .ok_or_else(|| anyhow::anyhow!("host prompt has no options array"))?
+                        .iter()
+                        .map(|option| {
+                            let option = option.as_object().ok_or_else(|| {
+                                anyhow::anyhow!("host prompt has a malformed option")
+                            })?;
+                            let field = |name: &str| {
+                                option
+                                    .get(name)
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| anyhow::anyhow!("host option has no {name}"))
+                            };
+                            Ok(RemoteQuestionOption {
+                                label: field("label")?.to_string(),
+                                description: field("description").unwrap_or_default().to_string(),
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(RemoteQuestionPrompt {
+                        id: field("id")?.to_string(),
+                        header: field("header")?.to_string(),
+                        question: field("question")?.to_string(),
+                        options,
+                        allow_custom: prompt
+                            .get("allow_custom")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        multi_select: prompt
+                            .get("multi_select")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        secret: prompt
+                            .get("secret")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            questions.push(RemoteQuestion {
+                request_id: text("request_id")?.to_string(),
+                thread_id: text("thread_id")?.to_string(),
+                questions: prompts,
+            });
+        }
+        Ok(AttachQuestions { questions })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "schema_version": crate::status::SCHEMA_VERSION,
+            "questions": self.questions.iter().map(|request| json!({
+                "request_id": request.request_id,
+                "thread_id": request.thread_id,
+                "questions": request.questions.iter().map(|prompt| json!({
+                    "id": prompt.id,
+                    "header": prompt.header,
+                    "question": prompt.question,
+                    "options": prompt.options.iter().map(|option| json!({
+                        "label": option.label,
+                        "description": option.description,
+                    })).collect::<Vec<_>>(),
+                    "allow_custom": prompt.allow_custom,
+                    "multi_select": prompt.multi_select,
+                    "secret": prompt.secret,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn text(&self) -> String {
+        if self.questions.is_empty() {
+            return "no pending questions
+"
+            .to_string();
+        }
+        let mut out = format!(
+            "{} pending question(s)
+",
+            self.questions.len()
+        );
+        for request in &self.questions {
+            out.push_str(&format!(
+                "  {}  {}
+",
+                crate::sanitize::sanitize_single_line(&request.request_id),
+                crate::sanitize::sanitize_single_line(&request.thread_id),
+            ));
+            for prompt in &request.questions {
+                out.push_str(&format!(
+                    "    [{}] {}: {}
+",
+                    crate::sanitize::sanitize_single_line(&prompt.id),
+                    crate::sanitize::sanitize_single_line(&prompt.header),
+                    crate::sanitize::sanitize_single_line(&prompt.question),
+                ));
+                if !prompt.options.is_empty() {
+                    let options = prompt
+                        .options
+                        .iter()
+                        .map(|option| {
+                            let label = crate::sanitize::sanitize_single_line(&option.label);
+                            let description =
+                                crate::sanitize::sanitize_single_line(&option.description);
+                            if description.is_empty() {
+                                label
+                            } else {
+                                format!("{label} ({description})")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    out.push_str(&format!(
+                        "      options: {options}
+"
+                    ));
+                }
+                let mut flags = Vec::new();
+                if prompt.multi_select {
+                    flags.push("multi-select");
+                }
+                if prompt.allow_custom {
+                    flags.push("custom");
+                }
+                if prompt.secret {
+                    flags.push("secret");
+                }
+                if !flags.is_empty() {
+                    out.push_str(&format!(
+                        "      flags: {}
+",
+                        flags.join(", ")
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachQuestionAnswer {
+    pub request_id: String,
+    pub thread_id: String,
+    pub prompts: u64,
+    pub replayed: bool,
+}
+
+impl AttachQuestionAnswer {
+    pub fn from_response(value: &Value) -> Result<AttachQuestionAnswer> {
+        let result = value
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("host response has no result object"))?;
+        let field = |name: &str| {
+            result
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("host response has no {name}"))
+        };
+        let prompts = result
+            .get("prompts")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("host response has no prompt count"))?;
+        let answered = result
+            .get("answered")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow::anyhow!("host response has no answered flag"))?;
+        if !answered {
+            anyhow::bail!("host did not answer the question");
+        }
+        Ok(AttachQuestionAnswer {
+            request_id: field("request_id")?,
+            thread_id: field("thread_id")?,
+            prompts,
+            replayed: result
+                .get("replayed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "schema_version": crate::status::SCHEMA_VERSION,
+            "request_id": self.request_id,
+            "thread_id": self.thread_id,
+            "prompts": self.prompts,
             "answered": true,
             "replayed": self.replayed,
         })
@@ -604,6 +868,52 @@ pub fn respond(
 }
 
 #[cfg(unix)]
+pub fn query_questions(
+    home: &Path,
+    credential: &PairingCredential,
+    thread: Option<&str>,
+    timeout: Duration,
+) -> Result<AttachQuestions> {
+    let args = match thread {
+        Some(thread) => json!({ "thread": thread }),
+        None => json!({}),
+    };
+    let response = request(
+        home,
+        credential,
+        "questions",
+        args,
+        QUESTIONS_REQUEST_ID,
+        timeout,
+    )?;
+    AttachQuestions::from_response(&response)
+}
+
+#[cfg(unix)]
+pub fn answer_questions(
+    home: &Path,
+    credential: &PairingCredential,
+    request_id: &str,
+    answers: &Value,
+    idempotency_key: &str,
+    timeout: Duration,
+) -> Result<AttachQuestionAnswer> {
+    let response = request(
+        home,
+        credential,
+        "answer",
+        json!({
+            "request": request_id,
+            "answers": answers,
+            "idempotency_key": idempotency_key,
+        }),
+        ANSWER_REQUEST_ID,
+        timeout,
+    )?;
+    AttachQuestionAnswer::from_response(&response)
+}
+
+#[cfg(unix)]
 pub fn query_messages(
     home: &Path,
     credential: &PairingCredential,
@@ -663,6 +973,28 @@ pub fn respond(
     _idempotency_key: &str,
     _timeout: Duration,
 ) -> Result<AttachAnswer> {
+    anyhow::bail!("attach is supported only on Unix")
+}
+
+#[cfg(not(unix))]
+pub fn query_questions(
+    _home: &Path,
+    _credential: &PairingCredential,
+    _thread: Option<&str>,
+    _timeout: Duration,
+) -> Result<AttachQuestions> {
+    anyhow::bail!("attach is supported only on Unix")
+}
+
+#[cfg(not(unix))]
+pub fn answer_questions(
+    _home: &Path,
+    _credential: &PairingCredential,
+    _request_id: &str,
+    _answers: &Value,
+    _idempotency_key: &str,
+    _timeout: Duration,
+) -> Result<AttachQuestionAnswer> {
     anyhow::bail!("attach is supported only on Unix")
 }
 
@@ -777,6 +1109,66 @@ mod tests {
         let mut refused = response.clone();
         refused["result"]["answered"] = json!(false);
         assert!(AttachAnswer::from_response(&refused).is_err());
+    }
+
+    #[test]
+    fn questions_response_is_typed_and_text_is_sanitized() {
+        let response = json!({
+            "v": crate::serve::PROTOCOL_VERSION,
+            "kind": "response",
+            "id": QUESTIONS_REQUEST_ID,
+            "ok": true,
+            "result": {
+                "questions": [{
+                    "request_id": "question-1",
+                    "thread_id": "thread",
+                    "questions": [{
+                        "id": "features",
+                        "header": "Features",
+                        "question": "Which features?\u{1b}[31m",
+                        "options": [
+                            {"label":"CI","description":"Keep it fast"},
+                            {"label":"Installer","description":"Ship it"}
+                        ],
+                        "allow_custom": true,
+                        "multi_select": true,
+                        "secret": false
+                    }]
+                }]
+            }
+        });
+        let questions = AttachQuestions::from_response(&response).unwrap();
+        assert_eq!(questions.questions[0].questions[0].id, "features");
+        assert_eq!(questions.questions[0].questions[0].options[0].label, "CI");
+        let text = questions.text();
+        assert!(text.contains("features"), "{text}");
+        assert!(text.contains("multi-select"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert_eq!(questions.json()["questions"][0]["request_id"], "question-1");
+    }
+
+    #[test]
+    fn question_answer_response_is_typed_and_requires_answered() {
+        let response = json!({
+            "v": crate::serve::PROTOCOL_VERSION,
+            "kind": "response",
+            "id": ANSWER_REQUEST_ID,
+            "ok": true,
+            "result": {
+                "request_id": "question-1",
+                "thread_id": "thread",
+                "prompts": 2,
+                "answered": true,
+                "replayed": false
+            }
+        });
+        let answer = AttachQuestionAnswer::from_response(&response).unwrap();
+        assert_eq!(answer.request_id, "question-1");
+        assert_eq!(answer.prompts, 2);
+        assert!(!answer.replayed);
+        let mut refused = response.clone();
+        refused["result"]["answered"] = json!(false);
+        assert!(AttachQuestionAnswer::from_response(&refused).is_err());
     }
 
     #[test]

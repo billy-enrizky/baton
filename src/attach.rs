@@ -14,7 +14,8 @@ use crate::grants::valid_grant_id;
 
 pub const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
 const PAIRING_PREFIX: &str = "baton://local#";
-const REQUEST_ID: u64 = 1;
+const STATUS_REQUEST_ID: u64 = 1;
+const MESSAGES_REQUEST_ID: u64 = 2;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingCredential {
@@ -77,6 +78,116 @@ impl AttachStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteMessage {
+    pub id: i64,
+    pub turn: i64,
+    pub role: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub text: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachMessages {
+    pub thread_id: String,
+    pub cursor: i64,
+    pub running_turns: u64,
+    pub messages: Vec<RemoteMessage>,
+}
+
+impl AttachMessages {
+    pub fn from_response(value: &Value) -> Result<AttachMessages> {
+        let result = value
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("host response has no result object"))?;
+        let thread_id = result
+            .get("thread_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("host response has no thread id"))?
+            .to_string();
+        let cursor = result
+            .get("cursor")
+            .and_then(Value::as_i64)
+            .filter(|cursor| *cursor >= 0)
+            .ok_or_else(|| anyhow::anyhow!("host response has no message cursor"))?;
+        let running_turns = result
+            .get("running_turns")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| anyhow::anyhow!("host response has no running turn count"))?;
+        let raw = result
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("host response has no messages array"))?;
+        let mut messages = Vec::with_capacity(raw.len());
+        for message in raw {
+            let object = message
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("host response has a malformed message"))?;
+            let id = object
+                .get("id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow::anyhow!("host response message has no id"))?;
+            messages.push(RemoteMessage {
+                id,
+                turn: object.get("turn").and_then(Value::as_i64).unwrap_or(0),
+                role: object
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+                    .to_string(),
+                provider: object
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                model: object
+                    .get("model")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                text: object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                created_at: object
+                    .get("created_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            });
+        }
+        if messages.iter().any(|message| message.id > cursor) {
+            anyhow::bail!("host response cursor is behind its messages");
+        }
+        Ok(AttachMessages {
+            thread_id,
+            cursor,
+            running_turns,
+            messages,
+        })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "schema_version": crate::status::SCHEMA_VERSION,
+            "thread_id": self.thread_id,
+            "cursor": self.cursor,
+            "running_turns": self.running_turns,
+            "messages": self.messages.iter().map(|message| json!({
+                "id": message.id,
+                "turn": message.turn,
+                "role": message.role,
+                "provider": message.provider,
+                "model": message.model,
+                "text": message.text,
+                "created_at": message.created_at,
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
 pub fn parse_pairing_url(value: &str) -> Result<PairingCredential> {
     if value.chars().any(char::is_control) {
         anyhow::bail!("pairing URL contains control characters");
@@ -113,11 +224,14 @@ pub fn parse_pairing_url(value: &str) -> Result<PairingCredential> {
 }
 
 #[cfg(unix)]
-pub fn query_status(
+fn request(
     home: &Path,
     credential: &PairingCredential,
+    command: &str,
+    args: Value,
+    request_id: u64,
     timeout: Duration,
-) -> Result<AttachStatus> {
+) -> Result<Value> {
     let path = crate::serve::socket_path(home);
     let mut stream = UnixStream::connect(&path).with_context(|| {
         format!(
@@ -134,9 +248,9 @@ pub fn query_status(
     let request = json!({
         "v": crate::serve::PROTOCOL_VERSION,
         "kind": "request",
-        "id": REQUEST_ID,
-        "command": "status",
-        "args": null,
+        "id": request_id,
+        "command": command,
+        "args": args,
         "grant_id": credential.grant_id,
         "secret": credential.secret,
     });
@@ -154,8 +268,63 @@ pub fn query_status(
     }
     let response: Value =
         serde_json::from_str(&response_text).context("attach response is not JSON")?;
-    validate_response(&response)?;
+    validate_response(&response, request_id)?;
+    Ok(response)
+}
+
+#[cfg(unix)]
+pub fn query_status(
+    home: &Path,
+    credential: &PairingCredential,
+    timeout: Duration,
+) -> Result<AttachStatus> {
+    let response = request(
+        home,
+        credential,
+        "status",
+        Value::Null,
+        STATUS_REQUEST_ID,
+        timeout,
+    )?;
     AttachStatus::from_response(&response)
+}
+
+#[cfg(unix)]
+pub fn query_thread_status(
+    home: &Path,
+    credential: &PairingCredential,
+    thread: &str,
+    timeout: Duration,
+) -> Result<AttachStatus> {
+    let response = request(
+        home,
+        credential,
+        "status",
+        json!({ "thread": thread }),
+        STATUS_REQUEST_ID,
+        timeout,
+    )?;
+    AttachStatus::from_response(&response)
+}
+
+#[cfg(unix)]
+pub fn query_messages(
+    home: &Path,
+    credential: &PairingCredential,
+    thread: &str,
+    after: i64,
+    limit: usize,
+    timeout: Duration,
+) -> Result<AttachMessages> {
+    let response = request(
+        home,
+        credential,
+        "messages",
+        json!({ "thread": thread, "after": after, "limit": limit }),
+        MESSAGES_REQUEST_ID,
+        timeout,
+    )?;
+    AttachMessages::from_response(&response)
 }
 
 #[cfg(not(unix))]
@@ -167,14 +336,36 @@ pub fn query_status(
     anyhow::bail!("attach is supported only on Unix")
 }
 
-fn validate_response(value: &Value) -> Result<()> {
+#[cfg(not(unix))]
+pub fn query_thread_status(
+    _home: &Path,
+    _credential: &PairingCredential,
+    _thread: &str,
+    _timeout: Duration,
+) -> Result<AttachStatus> {
+    anyhow::bail!("attach is supported only on Unix")
+}
+
+#[cfg(not(unix))]
+pub fn query_messages(
+    _home: &Path,
+    _credential: &PairingCredential,
+    _thread: &str,
+    _after: i64,
+    _limit: usize,
+    _timeout: Duration,
+) -> Result<AttachMessages> {
+    anyhow::bail!("attach is supported only on Unix")
+}
+
+fn validate_response(value: &Value, expected_id: u64) -> Result<()> {
     if value["v"].as_u64() != Some(crate::serve::PROTOCOL_VERSION) {
         anyhow::bail!("host response has an unsupported protocol version");
     }
     if value["kind"].as_str() != Some("response") {
         anyhow::bail!("host response has the wrong message kind");
     }
-    if value["id"].as_u64() != Some(REQUEST_ID) {
+    if value["id"].as_u64() != Some(expected_id) {
         anyhow::bail!("host response does not match the attach request");
     }
     match value["ok"].as_bool() {
@@ -249,11 +440,11 @@ mod tests {
         let response = json!({
             "v": crate::serve::PROTOCOL_VERSION,
             "kind": "response",
-            "id": REQUEST_ID,
+            "id": STATUS_REQUEST_ID,
             "ok": true,
             "result": {"scope": "host", "threads": 2, "running_turns": 0}
         });
-        validate_response(&response).unwrap();
+        validate_response(&response, STATUS_REQUEST_ID).unwrap();
         let status = AttachStatus::from_response(&response).unwrap();
         assert_eq!(
             status,
@@ -267,10 +458,41 @@ mod tests {
         let unknown = json!({
             "v": crate::serve::PROTOCOL_VERSION,
             "kind": "response",
-            "id": REQUEST_ID,
+            "id": STATUS_REQUEST_ID,
             "ok": true,
             "result": {"scope": "elsewhere", "threads": 2, "running_turns": 0}
         });
         assert!(AttachStatus::from_response(&unknown).is_err());
+    }
+
+    #[test]
+    fn message_response_is_typed_and_rejects_a_cursor_behind_its_rows() {
+        let response = json!({
+            "v": crate::serve::PROTOCOL_VERSION,
+            "kind": "response",
+            "id": MESSAGES_REQUEST_ID,
+            "ok": true,
+            "result": {
+                "thread_id": "thread",
+                "cursor": 7,
+                "running_turns": 1,
+                "messages": [
+                    {"id": 6, "turn": 1, "role": "user", "provider": "codex", "model": null, "text": "hello", "created_at": "now"},
+                    {"id": 7, "turn": 1, "role": "assistant", "provider": "codex", "model": "m", "text": "hi", "created_at": "now"}
+                ]
+            }
+        });
+        validate_response(&response, MESSAGES_REQUEST_ID).unwrap();
+        let page = AttachMessages::from_response(&response).unwrap();
+        assert_eq!(page.thread_id, "thread");
+        assert_eq!(page.cursor, 7);
+        assert_eq!(page.running_turns, 1);
+        assert_eq!(page.messages.len(), 2);
+        assert_eq!(page.messages[1].text, "hi");
+        assert_eq!(page.json()["cursor"], 7);
+
+        let mut behind = response.clone();
+        behind["result"]["cursor"] = json!(5);
+        assert!(AttachMessages::from_response(&behind).is_err());
     }
 }

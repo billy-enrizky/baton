@@ -688,6 +688,31 @@ fn serve_stdin_pair_and_attach_use_the_socket() {
     use std::os::unix::net::UnixStream;
 
     let home = tempfile::tempdir().unwrap();
+    let (seeded_thread, first_message, second_message) = {
+        let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+        let thread = store
+            .create_thread(baton::store::NewThread {
+                title: "attach stream".into(),
+                cwd: home.path().to_string_lossy().to_string(),
+                current_provider: baton::types::ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let first = store
+            .add_message(&thread.id, 1, "user", Some("codex"), None, "first message")
+            .unwrap();
+        let second = store
+            .add_message(
+                &thread.id,
+                1,
+                "assistant",
+                Some("codex"),
+                None,
+                "second message",
+            )
+            .unwrap();
+        (thread.id, first, second)
+    };
     let mut child = ChildGuard(
         Command::new(env!("CARGO_BIN_EXE_baton"))
             .arg("serve")
@@ -803,7 +828,7 @@ fn serve_stdin_pair_and_attach_use_the_socket() {
     let attached: serde_json::Value = serde_json::from_slice(&attached.stdout).unwrap();
     assert_eq!(attached["schema_version"], 1);
     assert_eq!(attached["scope"], "host");
-    assert_eq!(attached["threads"], 0);
+    assert_eq!(attached["threads"], 1);
     assert_eq!(attached["running_turns"], 0);
 
     let attached_text = Command::new(env!("CARGO_BIN_EXE_baton"))
@@ -818,8 +843,90 @@ fn serve_stdin_pair_and_attach_use_the_socket() {
         "{attached_text_out}"
     );
     assert!(
-        attached_text_out.contains("threads: 0"),
+        attached_text_out.contains("threads: 1"),
         "{attached_text_out}"
+    );
+
+    let page = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--thread",
+            &seeded_thread,
+            "--messages",
+            "--after",
+            "0",
+            "--limit",
+            "1",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(page.status.success(), "{page:?}");
+    let page: serde_json::Value = serde_json::from_slice(&page.stdout).unwrap();
+    assert_eq!(page["thread_id"], seeded_thread);
+    assert_eq!(page["cursor"], first_message);
+    assert_eq!(page["running_turns"], 0);
+    assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(page["messages"][0]["text"], "first message");
+
+    let page = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--thread",
+            &seeded_thread,
+            "--messages",
+            "--after",
+            &first_message.to_string(),
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(page.status.success(), "{page:?}");
+    let page: serde_json::Value = serde_json::from_slice(&page.stdout).unwrap();
+    assert_eq!(page["cursor"], second_message);
+    assert_eq!(page["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(page["messages"][0]["text"], "second message");
+
+    let thread_status = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--thread",
+            &seeded_thread,
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(thread_status.status.success(), "{thread_status:?}");
+    let thread_status: serde_json::Value = serde_json::from_slice(&thread_status.stdout).unwrap();
+    assert_eq!(thread_status["scope"], "thread");
+    assert_eq!(thread_status["threads"], 1);
+
+    let missing = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--thread",
+            "missing",
+            "--messages",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!missing.status.success(), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("not_found"),
+        "{missing:?}"
     );
 
     let missing_url = Command::new(env!("CARGO_BIN_EXE_baton"))

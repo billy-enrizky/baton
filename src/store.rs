@@ -3609,21 +3609,41 @@ impl BatonStore {
              FROM messages WHERE thread_id = ? ORDER BY id DESC LIMIT ?",
         )?;
         let mut rows = statement
-            .query_map(params![thread_id, limit as i64], |row| {
-                Ok(MessageRow {
-                    id: row.get(0)?,
-                    thread_id: row.get(1)?,
-                    turn: row.get(2)?,
-                    role: row.get(3)?,
-                    provider: row.get(4)?,
-                    model: row.get(5)?,
-                    text: row.get(6)?,
-                    created_at: row.get(7)?,
-                })
-            })?
+            .query_map(params![thread_id, limit as i64], Self::map_message)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         rows.reverse();
         Ok(rows)
+    }
+
+    /// Messages after an id, oldest first. `messages.id` is AUTOINCREMENT, so
+    /// a client can resume from the cursor without missing or repeating rows.
+    pub fn list_messages_after(
+        &self,
+        thread_id: &str,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<MessageRow>> {
+        let mut statement = self.db.prepare(
+            "SELECT id, thread_id, turn, role, provider, model, text, created_at
+             FROM messages WHERE thread_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+        )?;
+        let rows = statement
+            .query_map(params![thread_id, after, limit as i64], Self::map_message)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn map_message(row: &rusqlite::Row) -> rusqlite::Result<MessageRow> {
+        Ok(MessageRow {
+            id: row.get(0)?,
+            thread_id: row.get(1)?,
+            turn: row.get(2)?,
+            role: row.get(3)?,
+            provider: row.get(4)?,
+            model: row.get(5)?,
+            text: row.get(6)?,
+            created_at: row.get(7)?,
+        })
     }
 
     pub fn list_messages(&self, thread_id: &str) -> Result<Vec<MessageRow>> {
@@ -5737,6 +5757,58 @@ CREATE TABLE audit_events (
             .unwrap();
         assert_eq!(outcome, RenewGrantOutcome::Missing);
         assert_eq!(store.list_audit_events(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn messages_after_a_cursor_page_forward_without_repeats() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "stream".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let first = store
+            .add_message(&thread.id, 1, "user", Some("codex"), None, "one")
+            .unwrap();
+        let second = store
+            .add_message(&thread.id, 1, "assistant", Some("codex"), None, "two")
+            .unwrap();
+        let third = store
+            .add_message(&thread.id, 2, "user", Some("codex"), None, "three")
+            .unwrap();
+        let other = store
+            .create_thread(NewThread {
+                title: "other".into(),
+                cwd: "/other".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .add_message(&other.id, 1, "user", None, None, "elsewhere")
+            .unwrap();
+
+        let page = store.list_messages_after(&thread.id, 0, 2).unwrap();
+        assert_eq!(
+            page.iter().map(|message| message.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        let page = store.list_messages_after(&thread.id, second, 5).unwrap();
+        assert_eq!(
+            page.iter().map(|message| message.id).collect::<Vec<_>>(),
+            vec![third]
+        );
+        assert!(store
+            .list_messages_after(&thread.id, third, 5)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.list_messages_after(&thread.id, 0, 10).unwrap().len(),
+            3
+        );
     }
 
     #[test]

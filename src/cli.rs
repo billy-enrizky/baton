@@ -130,6 +130,21 @@ pub enum Commands {
         /// Emit a JSON object instead of lines
         #[arg(long)]
         json: bool,
+        /// Thread id for thread status or message mode
+        #[arg(long, value_name = "ID")]
+        thread: Option<String>,
+        /// Read the thread's stored messages instead of host status
+        #[arg(long, requires = "thread")]
+        messages: bool,
+        /// Resume after this message id
+        #[arg(long, requires = "thread", default_value_t = 0)]
+        after: i64,
+        /// Maximum messages per page (1 to 200)
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Keep polling until the thread is idle
+        #[arg(long, requires = "thread", conflicts_with = "json")]
+        follow: bool,
     },
     /// Inspect or change host ownership of the local store
     Host {
@@ -910,9 +925,59 @@ mod tests {
             Some(Commands::Attach {
                 url: Some(url),
                 json: true,
+                thread: None,
+                messages: false,
+                after: 0,
+                limit: 50,
+                follow: false,
             }) => assert!(url.starts_with("baton://local#")),
             _ => panic!("expected attach"),
         }
+        let cli = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--thread",
+            "thread",
+            "--messages",
+            "--after",
+            "7",
+            "--limit",
+            "1",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Attach {
+                thread: Some(thread),
+                messages: true,
+                after: 7,
+                limit: 1,
+                follow: false,
+                ..
+            }) => assert_eq!(thread, "thread"),
+            _ => panic!("expected a message page"),
+        }
+        let conflict = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--thread",
+            "thread",
+            "--follow",
+            "--json",
+        ]);
+        assert!(conflict.is_err(), "--follow and --json cannot mix");
+        let missing_thread = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--messages",
+        ]);
+        assert!(missing_thread.is_err(), "--messages needs --thread");
     }
 
     #[test]

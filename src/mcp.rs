@@ -10,7 +10,7 @@ use crate::config::resolve_config;
 use crate::orchestrate;
 use crate::process;
 use crate::status::{self, ThreadStatus, TurnStatus};
-use crate::store::{BatonStore, MessageRow, ThreadRow, TurnRow};
+use crate::store::{BatonStore, MessageRow, NewAuditEvent, ThreadRow, TurnRow};
 use crate::usage::{format_usage_line, sum_usage};
 
 pub struct McpServer {
@@ -22,6 +22,24 @@ pub struct McpServer {
 impl McpServer {
     pub fn new(store: BatonStore, home: PathBuf, cwd: PathBuf) -> Self {
         Self { store, home, cwd }
+    }
+
+    fn mutation_audit(
+        &self,
+        thread_id: &str,
+        action: crate::audit::AuditAction,
+        payload: &Value,
+    ) -> Result<NewAuditEvent> {
+        let environment = crate::claim::ensure_installation_id(&self.home)?;
+        crate::audit::event(
+            crate::audit::MCP_STDIO_ACTOR,
+            &environment,
+            Some(thread_id),
+            action,
+            crate::audit::ADMIN_SCOPE,
+            crate::audit::MCP_STDIO_CONFIRMATION,
+            payload,
+        )
     }
 
     pub fn handle(&self, frame: Value) -> Option<Value> {
@@ -171,8 +189,18 @@ impl McpServer {
             }
             "baton_queue" => {
                 let thread = self.resolve_thread(argument_thread(arguments))?;
-                if arguments.get("clear").and_then(Value::as_bool).unwrap_or(false) {
-                    self.store.clear_queued_messages(&thread.id)?;
+                if arguments
+                    .get("clear")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    let audit = self.mutation_audit(
+                        &thread.id,
+                        crate::audit::AuditAction::QueueClear,
+                        &json!({ "thread_id": thread.id, "clear": true }),
+                    )?;
+                    self.store
+                        .clear_queued_messages_with_audit(&thread.id, &audit)?;
                     return Ok(json!({
                         "schema_version": status::SCHEMA_VERSION,
                         "thread_id": thread.id,
@@ -397,6 +425,16 @@ impl McpServer {
                     .get("native")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                let audit = self.mutation_audit(
+                    &thread.id,
+                    crate::audit::AuditAction::ThreadFork,
+                    &json!({
+                        "source_thread_id": thread.id,
+                        "title": title,
+                        "through_turn": turn,
+                        "native": native,
+                    }),
+                )?;
                 let native_session = if native {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -411,9 +449,9 @@ impl McpServer {
                 } else {
                     None
                 };
-                let forked = self
+                let (forked, _) = self
                     .store
-                    .fork_thread_through_turn(&thread.id, &title, turn)?;
+                    .fork_thread_through_turn_with_audit(&thread.id, &title, turn, &audit)?;
                 if let Some((native_provider, native_id, model)) = native_session.as_ref() {
                     self.store.upsert_provider_session(
                         &forked.id,
@@ -936,6 +974,8 @@ mod tests {
     #[test]
     fn messages_queue_and_diff_are_readable() {
         let server = server();
+        let status = tool_json(&server, "baton_status", json!({}));
+        let thread_id = status["thread_id"].as_str().unwrap().to_string();
         let messages = tool_json(&server, "baton_messages", json!({ "limit": 2 }));
         assert_eq!(messages["count"], 2);
         assert_eq!(messages["messages"][0]["role"], "assistant");
@@ -947,6 +987,11 @@ mod tests {
         let cleared = tool_json(&server, "baton_queue", json!({ "clear": true }));
         assert_eq!(cleared["cleared"], true);
         assert_eq!(cleared["count"], 0);
+        let audit = crate::audit::list(&server.store, 10).unwrap();
+        assert_eq!(audit[0].action, "queue.clear");
+        assert_eq!(audit[0].actor, "mcp_stdio");
+        assert_eq!(audit[0].confirmation, "stdio_spawner");
+        assert_eq!(audit[0].thread_id.as_deref(), Some(thread_id.as_str()));
     }
 
     #[test]
@@ -1089,6 +1134,11 @@ mod tests {
         assert_eq!(forked["source_thread_id"], source_id);
         assert_ne!(forked["thread_id"], source_id);
         assert_eq!(forked["title"], "mcp branch");
+        let audit = crate::audit::list(&server.store, 10).unwrap();
+        assert_eq!(audit[0].action, "thread.fork");
+        assert_eq!(audit[0].actor, "mcp_stdio");
+        assert_eq!(audit[0].confirmation, "stdio_spawner");
+        assert_eq!(audit[0].thread_id.as_deref(), forked["thread_id"].as_str());
         let branch = tool_json(
             &server,
             "baton_status",

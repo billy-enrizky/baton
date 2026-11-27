@@ -1390,6 +1390,34 @@ impl BatonStore {
         title: &str,
         through_turn: Option<i64>,
     ) -> Result<ThreadRow> {
+        let (thread, _) =
+            self.fork_thread_through_turn_inner(source_id, title, through_turn, None)?;
+        Ok(thread)
+    }
+
+    /// A fork and its audit event commit together. The event's thread id is
+    /// replaced with the new thread id; the caller supplies a digest over the
+    /// source, title, and cutoff.
+    pub fn fork_thread_through_turn_with_audit(
+        &self,
+        source_id: &str,
+        title: &str,
+        through_turn: Option<i64>,
+        event: &NewAuditEvent,
+    ) -> Result<(ThreadRow, AuditEventRow)> {
+        let (thread, audit) =
+            self.fork_thread_through_turn_inner(source_id, title, through_turn, Some(event))?;
+        let audit = audit.ok_or_else(|| anyhow::anyhow!("fork audit event was not written"))?;
+        Ok((thread, audit))
+    }
+
+    fn fork_thread_through_turn_inner(
+        &self,
+        source_id: &str,
+        title: &str,
+        through_turn: Option<i64>,
+        event: Option<&NewAuditEvent>,
+    ) -> Result<(ThreadRow, Option<AuditEventRow>)> {
         let source = self
             .get_thread(source_id)?
             .ok_or_else(|| anyhow::anyhow!("thread not found: {source_id}"))?;
@@ -1463,9 +1491,20 @@ impl BatonStore {
                 ],
             )?;
         }
+        let audit = if let Some(event) = event {
+            let mut event = event.clone();
+            event.thread_id = Some(id.clone());
+            let created_at = now_iso();
+            let audit_id = Self::insert_audit_event_in(&tx, &event, &created_at)?;
+            Some(Self::audit_event_row(audit_id, created_at, &event))
+        } else {
+            None
+        };
         tx.commit()?;
-        self.get_thread(&id)?
-            .ok_or_else(|| anyhow::anyhow!("forked thread disappeared: {id}"))
+        let thread = self
+            .get_thread(&id)?
+            .ok_or_else(|| anyhow::anyhow!("forked thread disappeared: {id}"))?;
+        Ok((thread, audit))
     }
 
     /// Marks a forked thread as a side chat without changing the source.
@@ -3308,6 +3347,24 @@ impl BatonStore {
             params![thread_id],
         )?;
         Ok(())
+    }
+
+    /// Clearing a queue and its audit event commit together. A clear with no
+    /// queued rows is still recorded as an attempted mutation.
+    pub fn clear_queued_messages_with_audit(
+        &self,
+        thread_id: &str,
+        event: &NewAuditEvent,
+    ) -> Result<AuditEventRow> {
+        let created_at = now_iso();
+        let write = self.write()?;
+        write.execute(
+            "DELETE FROM queued_messages WHERE thread_id = ?",
+            params![thread_id],
+        )?;
+        let id = Self::insert_audit_event_in(&write, event, &created_at)?;
+        write.commit()?;
+        Ok(Self::audit_event_row(id, created_at, event))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5201,6 +5258,82 @@ mod tests {
             .unwrap()
             .revoked_at
             .is_some());
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_queue_clear_and_its_audit_event_commit_together() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "queue".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store.enqueue_message(&thread.id, "one").unwrap();
+        let mut invalid = sample_audit_event("queue.clear");
+        invalid.thread_id = Some(thread.id.clone());
+        invalid.payload_digest = "short".into();
+        assert!(store
+            .clear_queued_messages_with_audit(&thread.id, &invalid)
+            .is_err());
+        assert_eq!(
+            store.list_queued_messages(&thread.id).unwrap(),
+            vec!["one".to_string()]
+        );
+        assert!(store.list_audit_events(10).unwrap().is_empty());
+
+        let mut valid = sample_audit_event("queue.clear");
+        valid.thread_id = Some(thread.id.clone());
+        let event = store
+            .clear_queued_messages_with_audit(&thread.id, &valid)
+            .unwrap();
+        assert_eq!(event.action, "queue.clear");
+        assert_eq!(event.thread_id.as_deref(), Some(thread.id.as_str()));
+        assert!(store.list_queued_messages(&thread.id).unwrap().is_empty());
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_fork_and_its_audit_event_commit_together() {
+        let store = BatonStore::memory().unwrap();
+        let source = store
+            .create_thread(NewThread {
+                title: "source".into(),
+                cwd: "/work".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .submit_turn(&source.id, ProviderId::Codex, None, "hello", false)
+            .unwrap();
+        store
+            .finish_turn_record(&source.id, 1, TurnPhase::Completed, None)
+            .unwrap();
+
+        let mut invalid = sample_audit_event("thread.fork");
+        invalid.payload_digest = "short".into();
+        assert!(store
+            .fork_thread_through_turn_with_audit(&source.id, "fork", Some(1), &invalid)
+            .is_err());
+        assert_eq!(store.list_threads(None).unwrap().len(), 1);
+        assert!(store.list_audit_events(10).unwrap().is_empty());
+
+        let (forked, audit) = store
+            .fork_thread_through_turn_with_audit(
+                &source.id,
+                "fork",
+                Some(1),
+                &sample_audit_event("thread.fork"),
+            )
+            .unwrap();
+        assert_ne!(forked.id, source.id);
+        assert_eq!(audit.action, "thread.fork");
+        assert_eq!(audit.thread_id.as_deref(), Some(forked.id.as_str()));
+        assert_eq!(store.list_threads(None).unwrap().len(), 2);
         assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
     }
 

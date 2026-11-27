@@ -745,6 +745,38 @@ fn serve_stdin_schedule_commands_manage_the_live_host() {
         "{audit:?}"
     );
 
+    writeln!(stdin, "schedule pause {id}").unwrap();
+    await_line(&receiver, &mut child.0, "paused", &mut output);
+    let rows = store.list_schedules().unwrap();
+    assert!(!rows[0].enabled, "{rows:?}");
+    let paused_next = rows[0].next_run_at.clone();
+    writeln!(stdin, "schedule resume {id}").unwrap();
+    await_line(&receiver, &mut child.0, "resumed next", &mut output);
+    let rows = store.list_schedules().unwrap();
+    assert!(rows[0].enabled, "{rows:?}");
+    assert!(
+        rows[0].next_run_at >= paused_next,
+        "{} {paused_next}",
+        rows[0].next_run_at
+    );
+    let audit = store.list_audit_events(10).unwrap();
+    assert!(
+        audit.iter().any(|event| {
+            event.action == "schedule.pause"
+                && event.actor == "host_terminal"
+                && event.target.as_deref() == Some(&full_id)
+        }),
+        "{audit:?}"
+    );
+    assert!(
+        audit.iter().any(|event| {
+            event.action == "schedule.resume"
+                && event.actor == "host_terminal"
+                && event.target.as_deref() == Some(&full_id)
+        }),
+        "{audit:?}"
+    );
+
     writeln!(stdin, "schedule remove {id}").unwrap();
     await_line(&receiver, &mut child.0, "removed", &mut output);
     assert!(store.list_schedules().unwrap().is_empty());

@@ -581,6 +581,20 @@ pub enum ScheduleCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Pause a schedule so its due ticks stop firing
+    Pause {
+        id: String,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume a paused schedule and recompute its next run
+    Resume {
+        id: String,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// The interactive login command for a provider. Antigravity has no CLI

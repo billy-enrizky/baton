@@ -51,6 +51,8 @@ pub enum AuditAction {
     ThreadFork,
     ScheduleAdd,
     ScheduleRemove,
+    SchedulePause,
+    ScheduleResume,
     ScheduleTrigger,
 }
 
@@ -79,6 +81,8 @@ impl AuditAction {
             AuditAction::ThreadFork => "thread.fork",
             AuditAction::ScheduleAdd => "schedule.add",
             AuditAction::ScheduleRemove => "schedule.remove",
+            AuditAction::SchedulePause => "schedule.pause",
+            AuditAction::ScheduleResume => "schedule.resume",
             AuditAction::ScheduleTrigger => "schedule.trigger",
         }
     }
@@ -93,7 +97,9 @@ impl AuditAction {
             | AuditAction::QueueClear
             | AuditAction::ThreadFork
             | AuditAction::ScheduleAdd
-            | AuditAction::ScheduleRemove => ADMIN_SCOPE,
+            | AuditAction::ScheduleRemove
+            | AuditAction::SchedulePause
+            | AuditAction::ScheduleResume => ADMIN_SCOPE,
             AuditAction::TurnSubmit | AuditAction::ScheduleTrigger => OPERATE_SCOPE,
             AuditAction::ApprovalDecide | AuditAction::QuestionAnswer => APPROVE_SCOPE,
             AuditAction::GitCommit

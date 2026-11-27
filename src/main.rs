@@ -2995,40 +2995,121 @@ fn run_schedule(home: &Path, cwd: &Path, command: cli::ScheduleCommand) -> Resul
             }
         }
         cli::ScheduleCommand::Remove { id, json } => {
-            let matches: Vec<store::ScheduleRow> = store
-                .list_schedules()?
-                .into_iter()
-                .filter(|row| row.id.starts_with(&id))
-                .collect();
-            match matches.as_slice() {
-                [] => anyhow::bail!("no schedule matches {id}"),
-                [row] => {
-                    store.remove_schedule(&row.id)?;
+            let row = resolve_schedule(&store, &id)?;
+            store.remove_schedule(&row.id)?;
+            let audit = cli_audit_event(
+                home,
+                audit::AuditAction::ScheduleRemove,
+                Some(&row.id),
+                serde_json::json!({ "thread_id": row.thread_id }),
+            )?;
+            store.append_audit_event(&audit)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "id": row.id,
+                        "removed": true,
+                    }))?
+                );
+            } else {
+                println!("schedule {} removed", &row.id[..8.min(row.id.len())]);
+            }
+        }
+        cli::ScheduleCommand::Pause { id, json } => {
+            let row = resolve_schedule(&store, &id)?;
+            let changed = store.pause_schedule(&row.id)?;
+            if changed {
+                let audit = cli_audit_event(
+                    home,
+                    audit::AuditAction::SchedulePause,
+                    Some(&row.id),
+                    serde_json::json!({
+                        "thread_id": row.thread_id,
+                        "expression": row.expression,
+                    }),
+                )?;
+                store.append_audit_event(&audit)?;
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "id": row.id,
+                        "paused": true,
+                        "changed": changed,
+                    }))?
+                );
+            } else if changed {
+                println!("schedule {} paused", &row.id[..8.min(row.id.len())]);
+            } else {
+                println!(
+                    "schedule {} is already paused",
+                    &row.id[..8.min(row.id.len())]
+                );
+            }
+        }
+        cli::ScheduleCommand::Resume { id, json } => {
+            let row = resolve_schedule(&store, &id)?;
+            let changed = if row.enabled {
+                false
+            } else {
+                let expression = schedule::parse(&row.expression)?;
+                let next = schedule::next_after(&expression, chrono::Utc::now())?;
+                let next_run_at = next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                if store.resume_schedule(&row.id, &next_run_at)? {
                     let audit = cli_audit_event(
                         home,
-                        audit::AuditAction::ScheduleRemove,
+                        audit::AuditAction::ScheduleResume,
                         Some(&row.id),
-                        serde_json::json!({ "thread_id": row.thread_id }),
+                        serde_json::json!({
+                            "thread_id": row.thread_id,
+                            "expression": row.expression,
+                            "next_run_at": next_run_at,
+                        }),
                     )?;
                     store.append_audit_event(&audit)?;
-                    if json {
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&serde_json::json!({
-                                "schema_version": status::SCHEMA_VERSION,
-                                "id": row.id,
-                                "removed": true,
-                            }))?
-                        );
-                    } else {
-                        println!("schedule {} removed", &row.id[..8.min(row.id.len())]);
-                    }
+                    true
+                } else {
+                    false
                 }
-                _ => anyhow::bail!("schedule prefix {id} is ambiguous"),
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "id": row.id,
+                        "paused": false,
+                        "changed": changed,
+                    }))?
+                );
+            } else if changed {
+                println!("schedule {} resumed", &row.id[..8.min(row.id.len())]);
+            } else {
+                println!(
+                    "schedule {} is already running",
+                    &row.id[..8.min(row.id.len())]
+                );
             }
         }
     }
     Ok(())
+}
+
+fn resolve_schedule(store: &BatonStore, id: &str) -> Result<store::ScheduleRow> {
+    let matches: Vec<store::ScheduleRow> = store
+        .list_schedules()?
+        .into_iter()
+        .filter(|row| row.id.starts_with(id))
+        .collect();
+    match matches.as_slice() {
+        [] => anyhow::bail!("no schedule matches {id}"),
+        [row] => Ok(row.clone()),
+        _ => anyhow::bail!("schedule prefix {id} is ambiguous"),
+    }
 }
 
 fn run_runs(command: cli::RunCommand) -> Result<()> {

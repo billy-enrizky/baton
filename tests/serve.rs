@@ -646,6 +646,137 @@ fn serve_fires_a_due_schedule_and_audits_it() {
 
 #[cfg(unix)]
 #[test]
+fn serve_stdin_schedule_commands_manage_the_live_host() {
+    use baton::store::BatonStore;
+
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let thread_id = {
+        let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+        store
+            .create_thread(baton::store::NewThread {
+                title: "host schedule".into(),
+                cwd: root.path().to_string_lossy().to_string(),
+                current_provider: baton::types::ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap()
+            .id
+    };
+
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_baton"))
+            .arg("serve")
+            .current_dir(root.path())
+            .env("BATON_HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    fn await_line(
+        receiver: &mpsc::Receiver<String>,
+        child: &mut std::process::Child,
+        needle: &str,
+        output: &mut String,
+    ) -> String {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline {
+            match receiver.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => {
+                    output.push_str(&line);
+                    output.push('\n');
+                    if line.contains(needle) {
+                        return line;
+                    }
+                }
+                Err(_) if child.try_wait().unwrap().is_some() => break,
+                Err(_) => {}
+            }
+        }
+        panic!("serve did not print {needle}: {output}");
+    }
+    let mut output = String::new();
+    await_line(&receiver, &mut child.0, "host ready", &mut output);
+
+    writeln!(
+        stdin,
+        "schedule add --thread {thread_id} --cron \"0 9 * * 1-5\" --prompt \"check the tests\""
+    )
+    .unwrap();
+    let added = await_line(&receiver, &mut child.0, "baton: schedule ", &mut output);
+    assert!(added.contains("next"), "{added}");
+    let id = added
+        .split_whitespace()
+        .nth(2)
+        .expect("schedule id in the add line")
+        .to_string();
+
+    writeln!(stdin, "schedule list").unwrap();
+    let listed = await_line(&receiver, &mut child.0, "check the tests", &mut output);
+    assert!(listed.contains("0 9 * * 1-5"), "{listed}");
+    assert!(listed.contains(&thread_id[..8]), "{listed}");
+
+    let store = BatonStore::open_read_only(&home.path().join("baton.sqlite")).unwrap();
+    let rows = store.list_schedules().unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].id.starts_with(&id), "{} {id}", rows[0].id);
+    let full_id = rows[0].id.clone();
+    assert_eq!(rows[0].prompt, "check the tests");
+    assert_eq!(rows[0].thread_id, thread_id);
+    let audit = store.list_audit_events(10).unwrap();
+    assert!(
+        audit.iter().any(|event| {
+            event.action == "schedule.add"
+                && event.actor == "host_terminal"
+                && event.target.as_deref() == Some(&full_id)
+        }),
+        "{audit:?}"
+    );
+
+    writeln!(stdin, "schedule remove {id}").unwrap();
+    await_line(&receiver, &mut child.0, "removed", &mut output);
+    assert!(store.list_schedules().unwrap().is_empty());
+    let audit = store.list_audit_events(10).unwrap();
+    assert!(
+        audit.iter().any(|event| {
+            event.action == "schedule.remove"
+                && event.actor == "host_terminal"
+                && event.target.as_deref() == Some(&full_id)
+        }),
+        "{audit:?}"
+    );
+
+    unsafe {
+        libc::kill(child.0.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            assert!(status.success(), "{status:?}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.0.kill();
+            panic!("serve did not stop after SIGTERM: {output}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
     use baton::store::BatonStore;
     use std::os::unix::fs::PermissionsExt;

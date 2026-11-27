@@ -2411,7 +2411,7 @@ pub fn fire_due_schedules(
                 let _ = store
                     .lock()
                     .unwrap()
-                    .claim_schedule(&row.id, &row.next_run_at, &retry);
+                    .defer_schedule(&row.id, &row.next_run_at, &retry);
                 eprintln!("baton: schedule {short} has an invalid expression: {error}");
                 continue;
             }
@@ -2424,7 +2424,7 @@ pub fn fire_due_schedules(
                 let _ = store
                     .lock()
                     .unwrap()
-                    .claim_schedule(&row.id, &row.next_run_at, &retry);
+                    .defer_schedule(&row.id, &row.next_run_at, &retry);
                 eprintln!("baton: schedule {short} cannot compute its next run: {error}");
                 continue;
             }
@@ -2562,6 +2562,75 @@ mod tests {
                 && event.target.as_deref() == Some(&row.id)));
         fire_due_schedules(&store, home.path(), &pool).unwrap();
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn fire_due_schedules_coalesces_a_long_outage_to_one_run() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = scheduled_thread(&store.lock().unwrap(), work.path());
+        let now = chrono::Utc::now();
+        let due =
+            (now - chrono::Duration::hours(3)).to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        store
+            .lock()
+            .unwrap()
+            .add_schedule(&thread.id, "run it", "0 * * * *", &due)
+            .unwrap();
+        let (pool, mut receiver) = fake_pool(home.path(), work.path());
+        fire_due_schedules(&store, home.path(), &pool).unwrap();
+        assert!(receiver.try_recv().is_ok(), "the missed run fires once");
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert_eq!(rows[0].last_run_at.as_deref(), Some(due.as_str()));
+        let next = rows[0]
+            .next_run_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        assert!(next > now, "{next} {now}");
+        assert!(next <= now + chrono::Duration::hours(1), "{next} {now}");
+        fire_due_schedules(&store, home.path(), &pool).unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "the skipped occurrences are not replayed"
+        );
+    }
+
+    #[test]
+    fn fire_due_schedules_defers_an_invalid_expression_without_recording_a_run() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = scheduled_thread(&store.lock().unwrap(), work.path());
+        let due = due_expression();
+        store
+            .lock()
+            .unwrap()
+            .add_schedule(&thread.id, "run it", "not a cron", &due)
+            .unwrap();
+        let (pool, mut receiver) = fake_pool(home.path(), work.path());
+        fire_due_schedules(&store, home.path(), &pool).unwrap();
+        assert!(receiver.try_recv().is_err());
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert!(
+            rows[0].last_run_at.is_none(),
+            "no run happened: {:?}",
+            rows[0]
+        );
+        let next = rows[0]
+            .next_run_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let now = chrono::Utc::now();
+        assert!(next > now + chrono::Duration::minutes(55), "{next} {now}");
+        assert!(next < now + chrono::Duration::minutes(65), "{next} {now}");
+        let audit = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert!(!audit.iter().any(|event| event.action == "schedule.trigger"));
+        fire_due_schedules(&store, home.path(), &pool).unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "the hour deferral stops the row from spinning"
+        );
     }
 
     #[test]

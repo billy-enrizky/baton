@@ -34,6 +34,8 @@ Non-goals:
 - `/schedule` opens a TUI view of every row with its on or off state, id, next run, thread, expression, and prompt. `p` pauses or resumes the selected row, `d` removes it after a second press, and Enter opens its thread. `/schedule pause <id>`, `/schedule resume <id>`, and `/schedule remove <id>` act directly. Each real change writes an audit row as `tui`.
 - `/schedule add` opens a three-field form: an optional thread id prefix, the cron, and the prompt. A blank thread uses the active one. Tab cycles fields, Enter advances and then submits, and Esc cancels. An invalid expression, an empty prompt, or an unknown or ambiguous thread prefix shows an error in the form and changes nothing. A successful add inserts the row, writes `schedule.add` as `tui`, and opens the refreshed view; a failed audit deletes the row.
 - A claimed run writes `schedule.trigger` with actor `scheduler`, confirmation `host_schedule`, the schedule id as the target, and the thread id. A failed audit write skips the run instead of starting an unaudited turn.
+- Each fire computes the next occurrence from the current time, so an outage that passed several occurrences produces one run when the host returns and then moves to the next future occurrence. Missed ticks are not replayed.
+- An invalid stored expression, or one whose next occurrence cannot be computed, moves the row forward one hour with `defer_schedule` instead of `claim_schedule`. The tick is consumed so the row cannot spin, but `last_run_at` stays empty because no run happened.
 - The host posts the prompt into the thread through its project engine pool, using the thread's permission mode and prepending its active goal.
 - An archived thread or a stored expression that no longer parses is skipped and logged. The claim has already advanced, so neither path hot-loops.
 
@@ -103,6 +105,8 @@ The live integration test starts a host against a real SQLite store and a fake h
 - `store::tests::a_schedule_claim_requires_the_expected_due_time`
 - `serve::tests::fire_due_schedules_submits_and_advances`
 - `serve::tests::fire_due_schedules_skips_an_archived_thread`
+- `serve::tests::fire_due_schedules_coalesces_a_long_outage_to_one_run`
+- `serve::tests::fire_due_schedules_defers_an_invalid_expression_without_recording_a_run`
 - `tests/schedule_cli.rs::schedule_add_list_remove_and_audit`
 - `tests/schedule_cli.rs::schedule_add_refuses_an_invalid_expression`
 - `tests/schedule_cli.rs::schedule_pause_and_resume_skip_due_runs`

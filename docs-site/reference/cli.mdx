@@ -147,7 +147,7 @@ baton update
 
 ## Schedules
 
-`baton serve` owns scheduled runs. A schedule stores a five-field cron expression in UTC, a prompt, and a thread. Each field accepts `*`, a number, a list, a range, and a step; weekdays are 0 for Sunday through 6 for Saturday, and day-of-month and day-of-week use the traditional OR rule when both are restricted. The host checks due schedules every second, claims the tick with a compare-and-set, writes a `schedule.trigger` audit row, and posts the prompt into the thread with that thread's goal and permission mode. A due schedule is skipped while its thread is archived or its expression is invalid.
+`baton serve` owns scheduled runs. A schedule stores a five-field cron expression in UTC, a prompt, and a thread. Each field accepts `*`, a number, a list, a range, and a step; weekdays are 0 for Sunday through 6 for Saturday, and day-of-month and day-of-week use the traditional OR rule when both are restricted. The host checks due schedules every second, claims the tick with a compare-and-set, writes a `schedule.trigger` audit row, and posts the prompt into the thread with that thread's goal and permission mode. A due schedule is skipped while its thread is archived. If the host was down past several occurrences, one run fires when it returns and the row moves to the next future occurrence, so missed runs are not replayed. An invalid stored expression is retried in an hour and is not recorded as a run.
 
 Manage schedules from the CLI while no host or TUI owns the store, or at the running host's terminal:
 

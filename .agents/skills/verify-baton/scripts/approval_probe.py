@@ -252,6 +252,7 @@ def main() -> int:
     question_selected = None
     multi_answers = None
     approval_events = None
+    question_events = None
     try:
         if not wait_for_screen(
             master, "Ask anything", args.timeout, args.width, args.height, transcript
@@ -396,6 +397,21 @@ def main() -> int:
                 "approval.decide row must carry the installation id, got "
                 f"{approval_event['environment']!r}"
             )
+        question_events = [
+            event for event in events if event["action"] == "question.answer"
+        ]
+        if len(question_events) != 2:
+            raise RuntimeError(
+                f"expected two question.answer rows, found {len(question_events)}"
+            )
+        for event in question_events:
+            if event["actor"] != "tui" or event["scope"] != "approve":
+                raise RuntimeError(
+                    "question.answer row has the wrong actor or scope: "
+                    f"{event['actor']}/{event['scope']}"
+                )
+            if not event["thread_id"]:
+                raise RuntimeError("question.answer row is missing its thread id")
 
         if state_path.is_file():
             for line in state_path.read_text().splitlines():
@@ -434,6 +450,8 @@ def main() -> int:
             not missing
             and approval_events is not None
             and len(approval_events) == 1
+            and question_events is not None
+            and len(question_events) == 2
             and selected == "opt-reject"
             and question_selected == "opt-sqlite"
             and multi_answers == ["CI", "Installer"]
@@ -476,6 +494,7 @@ def main() -> int:
             "question_selected": question_selected,
             "multi_answers": multi_answers,
             "approval_events": len(approval_events or []),
+            "question_events": len(question_events or []),
             "error": error,
             "exit_code": exit_code,
             "evidence": str(evidence),

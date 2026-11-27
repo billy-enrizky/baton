@@ -653,3 +653,146 @@ fn serve_socket_refuses_a_regular_file_at_the_path() {
     let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
     assert!(store.get_host_claim().unwrap().is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn serve_stdin_pair_mints_a_usable_grant() {
+    use baton::store::BatonStore;
+    use std::os::unix::net::UnixStream;
+
+    let home = tempfile::tempdir().unwrap();
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_baton"))
+            .arg("serve")
+            .env("BATON_HOME", home.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    let stdout = child.0.stdout.take().unwrap();
+    let stderr = child.0.stderr.take().unwrap();
+    let (out_sender, out_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if out_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let (err_sender, err_receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if err_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut output = String::new();
+    let mut ready = false;
+    while Instant::now() < deadline {
+        match err_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                output.push_str(&line);
+                output.push('\n');
+                if line.contains("host ready") {
+                    ready = true;
+                    break;
+                }
+            }
+            Err(_) if child.0.try_wait().unwrap().is_some() => break,
+            Err(_) => {}
+        }
+    }
+    assert!(ready, "serve did not report readiness: {output}");
+
+    writeln!(stdin, "pair --label test-socket --scope read").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut url = String::new();
+    while Instant::now() < deadline {
+        match out_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line.starts_with("baton://local#") => {
+                url = line;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(!url.is_empty(), "pair did not print a URL: {output}");
+    let fragment = url.trim().strip_prefix("baton://local#").unwrap();
+    let mut grant_id = None;
+    let mut secret = None;
+    for field in fragment.split('&') {
+        let (key, value) = field.split_once('=').expect("key=value");
+        match key {
+            "grant" => grant_id = Some(value.to_string()),
+            "secret" => secret = Some(value.to_string()),
+            _ => {}
+        }
+    }
+    let grant_id = grant_id.expect("grant id in the pairing URL");
+    let secret = secret.expect("secret in the pairing URL");
+
+    let socket = home.path().join("serve.sock");
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut ask = |value: serde_json::Value| -> serde_json::Value {
+        writeln!(stream, "{}", value).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+    let status = ask(serde_json::json!({
+        "v":1,
+        "kind":"request",
+        "id":1,
+        "command":"status",
+        "grant_id": grant_id.clone(),
+        "secret": secret.clone(),
+    }));
+    assert_eq!(status["ok"], true, "{status}");
+
+    writeln!(stdin, "pair --scope nope").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut error = String::new();
+    while Instant::now() < deadline {
+        match err_receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) if line.contains("unknown scope") => {
+                error = line;
+                break;
+            }
+            Ok(_) => {}
+            Err(_) => {}
+        }
+    }
+    assert!(!error.is_empty(), "a bad pair line reports the error");
+    let ping = ask(serde_json::json!({"v":1,"kind":"request","id":2,"command":"ping"}));
+    assert_eq!(ping["result"]["pong"], true, "{ping}");
+
+    unsafe {
+        libc::kill(child.0.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.0.kill();
+            panic!("serve did not stop after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(!socket.exists(), "shutdown removes the socket");
+    let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+    assert!(store.get_host_claim().unwrap().is_none());
+    let grants = baton::grants::list(&store).unwrap();
+    assert_eq!(grants.len(), 1, "{grants:?}");
+    assert_eq!(grants[0].grant_id, grant_id);
+}

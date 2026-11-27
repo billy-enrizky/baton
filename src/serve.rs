@@ -153,15 +153,35 @@ pub fn bind_socket(_path: &Path) -> Result<()> {
 pub async fn socket_loop(
     listener: StdUnixListener,
     store: Arc<Mutex<BatonStore>>,
+    home: &Path,
     path: &Path,
 ) -> Result<()> {
     let listener = TokioUnixListener::from_std(listener).context("register the host socket")?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // The host terminal is the pairing surface. A daemonized host sees EOF
+    // immediately and keeps serving with no host commands.
+    let (host_sender, mut host_receiver) = tokio::sync::mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if host_sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut stdin_open = true;
     let mut clients = Vec::new();
     let result = loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break Ok(()),
             _ = terminate.recv() => break Ok(()),
+            line = host_receiver.recv(), if stdin_open => {
+                match line {
+                    Some(line) => handle_host_command(&store, home, &line),
+                    None => stdin_open = false,
+                }
+            }
             accepted = listener.accept() => {
                 match accepted {
                     Ok((stream, _address)) => {
@@ -196,9 +216,110 @@ pub async fn socket_loop(
 pub async fn socket_loop(
     _listener: (),
     _store: Arc<Mutex<BatonStore>>,
+    _home: &Path,
     _path: &Path,
 ) -> Result<()> {
     anyhow::bail!("the host socket is Unix-only")
+}
+
+#[cfg(unix)]
+fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    let mut tokens = trimmed.split_whitespace();
+    let command = tokens.next().unwrap_or_default();
+    match command {
+        "help" => eprintln!(
+            "baton: host commands: pair [--label <name>] [--scope <s>]... [--expires-days N]; help"
+        ),
+        "pair" => match parse_pair(tokens.collect()) {
+            Ok(request) => {
+                let minted = {
+                    let store = store.lock().unwrap();
+                    crate::grants::mint(&store, home, &request)
+                };
+                match minted {
+                    Ok(minted) => {
+                        println!("{}", pair_url(&minted));
+                        eprintln!(
+                            "baton: paired {} with {} scopes, expires {}",
+                            minted.summary.grant_id,
+                            minted.summary.scopes.join(","),
+                            minted.summary.expires_at
+                        );
+                    }
+                    Err(error) => eprintln!("baton: pair failed: {error}"),
+                }
+            }
+            Err(error) => eprintln!("baton: {error}"),
+        },
+        other => eprintln!("baton: unknown host command {other}; type help"),
+    }
+}
+
+#[cfg(unix)]
+fn parse_pair(args: Vec<&str>) -> Result<crate::grants::GrantRequest> {
+    use crate::grants::{expiry_after_days, GrantRequest, Scope, DEFAULT_GRANT_DAYS};
+
+    let mut scopes = vec![Scope::Read, Scope::Operate];
+    let mut scopes_set = false;
+    let mut label = None;
+    let mut expires_days = DEFAULT_GRANT_DAYS;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--label" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--label needs a name"))?;
+                label = Some((*value).to_string());
+            }
+            "--scope" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--scope needs a scope"))?;
+                let scope =
+                    Scope::parse(value).ok_or_else(|| anyhow::anyhow!("unknown scope {value}"))?;
+                if !scopes_set {
+                    scopes.clear();
+                    scopes_set = true;
+                }
+                if !scopes.contains(&scope) {
+                    scopes.push(scope);
+                }
+            }
+            "--expires-days" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--expires-days needs a number"))?;
+                expires_days = value
+                    .parse::<i64>()
+                    .map_err(|_| anyhow::anyhow!("--expires-days needs a number"))?;
+                if expires_days <= 0 {
+                    anyhow::bail!("--expires-days must be positive");
+                }
+            }
+            other => anyhow::bail!("unknown pair option {other}"),
+        }
+        index += 1;
+    }
+    let mut request = GrantRequest::new(scopes);
+    request.label = label;
+    request.expires_at = expiry_after_days(expires_days);
+    Ok(request)
+}
+
+#[cfg(unix)]
+fn pair_url(minted: &crate::grants::MintedGrant) -> String {
+    format!(
+        "baton://local#grant={}&secret={}",
+        minted.summary.grant_id, minted.secret
+    )
 }
 
 #[cfg(unix)]
@@ -595,6 +716,43 @@ mod tests {
         .unwrap();
         assert_eq!(unknown["id"], 11);
         assert_eq!(unknown["error"]["code"], "not_implemented");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pair_parses_labels_scopes_and_expiry() {
+        use crate::grants::Scope;
+
+        let request = parse_pair(Vec::new()).unwrap();
+        assert_eq!(request.scopes, vec![Scope::Read, Scope::Operate]);
+        assert!(request.label.is_none());
+
+        let request = parse_pair(vec![
+            "--label",
+            "laptop",
+            "--scope",
+            "read",
+            "--scope",
+            "git",
+            "--expires-days",
+            "7",
+        ])
+        .unwrap();
+        assert_eq!(request.scopes, vec![Scope::Read, Scope::Git]);
+        assert_eq!(request.label.as_deref(), Some("laptop"));
+        let expiry = request
+            .expires_at
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .unwrap();
+        let expected = chrono::Utc::now() + chrono::Duration::days(7);
+        assert!((expiry - expected).num_seconds().abs() < 60);
+
+        let error = parse_pair(vec!["--scope", "nope"]).unwrap_err();
+        assert!(error.to_string().contains("unknown scope"), "{error}");
+        let error = parse_pair(vec!["--expires-days", "0"]).unwrap_err();
+        assert!(error.to_string().contains("positive"), "{error}");
+        let error = parse_pair(vec!["--bogus"]).unwrap_err();
+        assert!(error.to_string().contains("unknown pair option"), "{error}");
     }
 
     #[cfg(unix)]

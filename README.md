@@ -614,7 +614,7 @@ Install and update copy the whole skill directory through a staging directory. S
 }
 ```
 
-`baton serve` claims the local store for one host process, runs provider and turn recovery, and listens on `BATON_HOME/serve.sock` with mode 0600 until SIGINT or SIGTERM. `--stdio` serves the spawner pipe instead, and `--socket <path>` overrides the path. Every socket request except `ping` must carry a live grant id and secret with the `read` scope, and the peer uid must match the host. `baton grant list` shows grants without their secrets, and `baton grant revoke <id>` deletes the client secret and refuses every later request. On shutdown it stops recorded provider children with a verified command and start identity, cancels the turns, tasks, and runs it owns with the `host shut down` reason, reports the worktrees it leaves in place, settles turns and runs whose owner process stopped, then releases the claim. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and the `baton host takeover --pid <pid>` hint. The TUI opens read-only, shows the same ownership line, and refuses to send a prompt or change the store.
+`baton serve` claims the local store for one host process, runs provider and turn recovery, and listens on `BATON_HOME/serve.sock` with mode 0600 until SIGINT or SIGTERM. `--stdio` serves the spawner pipe instead, and `--socket <path>` overrides the path. Every socket request except `ping` must carry a live grant id and secret with the `read` scope, and the peer uid must match the host. `baton grant list` shows grants without their secrets, and `baton grant revoke <id>` deletes the client secret and refuses every later request. At the terminal that started the host, type `pair [--label <name>] [--scope <s>]... [--expires-days N]`. It mints a grant with the `read` and `operate` scopes by default, replaces those defaults when you pass any `--scope`, and expires after 30 days unless you pass another number. It prints a `baton://local#grant=<id>&secret=<secret>` URL on stdout and the grant id, scopes, and expiry on stderr. The fragment carries the secret, so treat the whole URL as a credential. A host whose stdin is closed keeps serving without host commands. On shutdown it stops recorded provider children with a verified command and start identity, cancels the turns, tasks, and runs it owns with the `host shut down` reason, reports the worktrees it leaves in place, settles turns and runs whose owner process stopped, then releases the claim. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and the `baton host takeover --pid <pid>` hint. The TUI opens read-only, shows the same ownership line, and refuses to send a prompt or change the store.
 
 With `--stdio`, the host accepts one newline-delimited JSON request per line. Responses carry the same `id`, and stdout carries no diagnostics:
 
@@ -679,6 +679,7 @@ baton search <query> [--all] [--json]
 baton doctor [--json]
 baton ps [--json]
 baton serve [--stdio | --socket <path>]  # claim the store and serve the pipe or socket
+# in the host terminal: pair [--label <name>] [--scope <s>]... [--expires-days N]
 baton host takeover --pid <pid>    # replace a live host after confirmation
 ```
 

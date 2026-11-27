@@ -5842,6 +5842,27 @@ fn handle_key(
                         state.notice = Some("plan returned for revision".into());
                     }
                 }
+                KeyCode::Char('r') => {
+                    if state.permission_mode == PermissionMode::Plan
+                        && current_plan(state).is_some()
+                    {
+                        if state.input.trim().is_empty() {
+                            state.input =
+                                "reject this plan and propose a different approach: ".into();
+                            state.input_cursor = state.input.chars().count();
+                        }
+                        state.overlay = Overlay::None;
+                        state.notice = Some(
+                            "plan rejected · permission mode: plan · send a revised prompt".into(),
+                        );
+                    } else {
+                        state.overlay = Overlay::PlanView { scroll };
+                        state.notice = Some(format!(
+                            "plan is read-only; permission mode is {}",
+                            state.permission_mode.as_str()
+                        ));
+                    }
+                }
                 KeyCode::Char('q') => {}
                 KeyCode::Up | KeyCode::Char('k') => {
                     scroll = scroll.saturating_sub(1);
@@ -15960,7 +15981,7 @@ fn draw_plan_view(frame: &mut ratatui::Frame, area: Rect, state: &TuiState, scro
         header.push_str(&format!(" · turn {}", truncate_chars(turn_id, 12)));
     }
     if state.permission_mode == PermissionMode::Plan {
-        header.push_str(" · ↑↓ scroll · enter accept · esc revise");
+        header.push_str(" · ↑↓ scroll · enter accept · r reject · esc revise");
     } else {
         header.push_str(" · ↑↓ scroll · esc close");
     }
@@ -33600,6 +33621,73 @@ exit 1
         assert!(matches!(state.overlay, Overlay::None));
         assert_eq!(state.input, "keep this draft");
         assert_eq!(state.input_cursor, state.input.chars().count());
+    }
+
+    #[test]
+    fn plan_reject_prefills_a_different_approach() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.apply_permission_mode(&store, PermissionMode::Plan);
+        let provider = state.thread.current_provider;
+        apply_turn_event(&mut state, sample_plan_event(provider));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("r reject"), "{text}");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('r')),
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+        assert_eq!(
+            state.input,
+            "reject this plan and propose a different approach: "
+        );
+        assert_eq!(state.input_cursor, state.input.chars().count());
+        assert_eq!(state.permission_mode, PermissionMode::Plan);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("plan rejected"),
+            "{:?}",
+            state.notice
+        );
+        let persisted = store
+            .lock()
+            .unwrap()
+            .get_thread(&state.thread.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.permission_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn plan_reject_is_read_only_outside_plan_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let provider = state.thread.current_provider;
+        apply_turn_event(&mut state, sample_plan_event(provider));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &engine_command_sender, "/plan");
+        handle_key(
+            &mut state,
+            &store,
+            &engine_command_sender,
+            key(KeyCode::Char('r')),
+        );
+        assert!(matches!(state.overlay, Overlay::PlanView { .. }));
+        assert!(state.input.is_empty());
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("read-only"),
+            "{:?}",
+            state.notice
+        );
     }
 
     #[test]

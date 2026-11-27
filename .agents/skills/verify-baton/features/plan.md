@@ -12,7 +12,7 @@ Goals:
 - Let `/plan` open a sanitized overlay for the plan reported by the current thread and harness.
 - Show completed, in-progress, and pending steps plus any explanation or priority.
 - Render ACP markdown plans and show the URI of an ACP file plan.
-- Let Enter accept a plan and leave plan mode, and Esc return the plan to the composer for revision.
+- Let Enter accept a plan and leave plan mode, Esc return the plan to the composer for revision, and `r` reject it into a different-approach draft.
 - Expose the same event in `exec --stream-json`.
 
 Non-goals:
@@ -38,9 +38,9 @@ Non-goals:
 - The last plan for each thread and harness is stored in SQLite and rehydrated when the TUI starts or the thread is opened, so `/plan` survives a restart.
 - A new submit, `/multi`, orchestration preview, orchestration start, transcript rewind, or native rewind clears the thread's stored plans as well as the in-memory ones.
 - An orchestration worker's final plan reaches the parent TUI, the worker thread's snapshot, and the `plans` table after the worker settles.
-- In plan mode the header offers `enter accept` and `esc revise`; outside plan mode it offers `esc close`.
+- In plan mode the header offers `enter accept`, `r reject`, and `esc revise`; outside plan mode it offers `esc close`.
 - Enter in plan mode switches the thread to the `default` permission mode, closes the overlay, and says `plan accepted`. Enter outside plan mode keeps the overlay open and states that the plan is read-only.
-- Esc in plan mode closes the overlay and pre-fills an empty composer with `revise the plan: `; an existing draft is left untouched. `q` always closes without touching the composer.
+- Esc in plan mode closes the overlay and pre-fills an empty composer with `revise the plan: `; an existing draft is left untouched. `r` in plan mode closes the overlay and pre-fills `reject this plan and propose a different approach: ` without changing the permission mode. Outside plan mode `r` keeps the overlay open and reports that it is read-only. `q` always closes without touching the composer.
 
 ## Approach
 
@@ -50,7 +50,7 @@ The TUI keeps an in-memory snapshot per thread and provider. `/plan` reads only 
 
 The retention path covers events handled by the TUI process, including the in-process multi-provider children. Each accepted plan is written to the `plans` table keyed by thread and harness; `hydrate_plans` loads that thread's rows when the TUI starts and when `load_thread_state` opens a thread, and the whole-thread clear paths delete both the memory and the row. Orchestration workers run as `baton exec --json` subprocesses. The exec stream keeps the last plan, including clearing it on a matching `plan_removed`, and adds a `plan` object to the final `--json` result; the parent parses that object (and still accepts JSONL rows from an older worker), emits `WorkerPlanReported`, stores the plan under the worker thread, and the TUI inserts it into that thread's snapshot and the `plans` table.
 
-The overlay never edits the plan and never sends a provider message. Accept is one permission-mode transition: in plan mode Enter calls the same `apply_permission_mode` path `/mode default` uses, persists the thread, and closes the overlay, so the next turn runs with the accepted mode. Esc returns control to the composer with a `revise the plan: ` draft when the composer is empty, which lets the user describe the change and send it as the next turn. Rejecting without feedback stays out of scope.
+The overlay never edits the plan and never sends a provider message. Accept is one permission-mode transition: in plan mode Enter calls the same `apply_permission_mode` path `/mode default` uses, persists the thread, and closes the overlay, so the next turn runs with the accepted mode. Esc returns control to the composer with a `revise the plan: ` draft when the composer is empty, which lets the user describe the change and send it as the next turn. `r` prepares a different-approach draft and leaves the thread in plan mode; rejecting without feedback stays out of scope.
 
 ## Alternatives considered
 
@@ -62,7 +62,7 @@ The overlay never edits the plan and never sends a provider message. Accept is o
 | Map ACP `plan_update` items, markdown, and files in the same slice | Accepted | The v2 item list has the same step shape as the legacy frame. The snapshot keeps `planId`, so a removal clears only the matching plan. Markdown and file plans use the same `PlanEntry` stream with an optional `kind` and `uri`, and item plans keep their original wire shape. |
 | Keep one global snapshot slot | Rejected | A background worker's plan would be dropped, and parallel supervision is a core terminal workflow. A small per-thread/provider map keeps the plan that was actually reported. |
 | Send an implementation prompt on accept | Rejected | The plan text is already in the transcript, and an automatic turn would start spend without a user message. Accept changes the permission mode and states the next step; the user sends the prompt. |
-| Treat Esc as reject | Rejected | The plan stays in the transcript and `/plan`; Esc prepares a revision draft instead of pretending the plan is gone. A separate reject action has no provider command yet. |
+| Treat Esc as reject | Rejected | The plan stays in the transcript and `/plan`; Esc prepares a revision draft instead of pretending the plan is gone. `r` is the explicit reject action and prepares a different-approach draft without changing permission mode. |
 | Allow Enter to accept outside plan mode | Rejected | Outside plan mode the plan is progress information, not an approval gate. Enter reports that the view is read-only instead of silently changing permission mode. |
 
 ## Risks and mitigations
@@ -144,7 +144,7 @@ uv run --no-project python .agents/skills/verify-baton/scripts/acp_plan_probe.py
 - `plan_events_keep_the_entries_and_explanation`
 - `plan_statuses_use_one_vocabulary`
 - `plan_removal_keeps_the_plan_id`
-- `.agents/skills/verify-baton/scripts/plan_probe.py` proves the populated item overlay in a PTY, including `/mode plan`, the `enter accept` and `esc revise` hints, the Esc revision draft, and the Enter acceptance notice.
+- `.agents/skills/verify-baton/scripts/plan_probe.py` proves the populated item overlay in a PTY, including `/mode plan`, the `enter accept`, `r reject`, and `esc revise` hints, the Esc revision draft, the reject draft and notice, and the Enter acceptance notice.
 - `.agents/skills/verify-baton/scripts/acp_plan_probe.py` proves markdown and file plans through a fake ACP agent and the real TUI overlay.
 - `.agents/skills/verify-baton/scripts/slash_sweep.py` runs `/plan` and requires the empty-state notice.
 

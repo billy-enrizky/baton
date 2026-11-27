@@ -1214,7 +1214,7 @@ pub fn run_tui(
         orchestrate::reconcile_abandoned_runs(&store.lock().unwrap()).unwrap_or_default()
     };
 
-    let custom_commands = discover_custom_commands(&thread.cwd);
+    let custom_commands = discover_custom_commands(&home, &thread.cwd);
     let (orchestration_sender, orchestration_receiver) = std::sync::mpsc::channel();
     let (native_rewind_sender, native_rewind_receiver) = std::sync::mpsc::channel();
     let (files_picker_sender, files_picker_receiver) = std::sync::mpsc::channel();
@@ -4249,7 +4249,9 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/skills", _) => {
             Some("skills (enter insert · i install · u update · d remove)")
         }
-        ("/snippets", _) => Some("snippets [list|add <name> <template>|remove <name>]"),
+        ("/snippets", _) => Some(
+            "snippets [list|add [--global] <name> <template>|remove [--global] <name>]",
+        ),
         ("/clear", _) => Some("clear (no arguments)"),
         ("/quit", _) => Some("quit (no arguments)"),
         ("/exit", _) => Some("exit (no arguments)"),
@@ -4271,19 +4273,34 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 &mut suggestions,
                 command,
                 "add",
-                "write a command under .baton/commands",
+                "write a project command under .baton/commands",
             );
-            let dir = std::path::PathBuf::from(&state.thread.cwd)
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "add --global",
+                "write a user command under ~/.baton/commands",
+            );
+            let project = std::path::PathBuf::from(&state.thread.cwd)
                 .join(".baton")
                 .join("commands");
+            let global = state.home.join(".baton").join("commands");
             for (name, _) in &state.custom_commands {
                 let short = name.trim_start_matches('/');
-                if dir.join(format!("{short}.md")).exists() {
+                let file = format!("{short}.md");
+                if project.join(&file).exists() {
                     push_suggestion(
                         &mut suggestions,
                         command,
                         &format!("remove {short}"),
-                        format!("delete the {name} command file"),
+                        format!("delete the project {name} command file"),
+                    );
+                } else if global.join(&file).exists() {
+                    push_suggestion(
+                        &mut suggestions,
+                        command,
+                        &format!("remove --global {short}"),
+                        format!("delete the global {name} command file"),
                     );
                 }
             }
@@ -5212,10 +5229,12 @@ fn snippet_name_ok(name: &str) -> bool {
 
 fn snippets_notice(state: &TuiState) -> String {
     if state.custom_commands.is_empty() {
-        return "no snippets · add one with /snippets add <name> <template>".into();
+        return "no snippets · add one with /snippets add [--global] <name> <template>".into();
     }
     let mut lines = vec![format!("snippets · {}", state.custom_commands.len())];
     for (name, template) in &state.custom_commands {
+        let short = name.trim_start_matches('/');
+        let scope = snippet_source(state, short).unwrap_or("unknown");
         let first: String = template
             .lines()
             .next()
@@ -5223,7 +5242,7 @@ fn snippets_notice(state: &TuiState) -> String {
             .chars()
             .take(60)
             .collect();
-        lines.push(format!("{name:<16} {first}"));
+        lines.push(format!("{name:<16} {scope:<14} {first}"));
     }
     lines.join("\n")
 }
@@ -5247,21 +5266,39 @@ fn record_snippet(
     Ok(())
 }
 
+fn snippet_dir(state: &TuiState, global: bool) -> std::path::PathBuf {
+    if global {
+        state.home.join(".baton").join("commands")
+    } else {
+        std::path::PathBuf::from(&state.thread.cwd)
+            .join(".baton")
+            .join("commands")
+    }
+}
+
+fn snippet_scope_label(global: bool) -> &'static str {
+    if global {
+        "global"
+    } else {
+        "project"
+    }
+}
+
 fn write_snippet(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
     name: &str,
     template: &str,
+    global: bool,
 ) -> String {
     if !snippet_name_ok(name) {
         return format!("snippet name {name:?} must use letters, digits, dash, or underscore");
     }
-    let dir = std::path::PathBuf::from(&state.thread.cwd)
-        .join(".baton")
-        .join("commands");
+    let scope = snippet_scope_label(global);
+    let dir = snippet_dir(state, global);
     let path = dir.join(format!("{name}.md"));
     if path.exists() {
-        return format!("snippet /{name} already exists; remove it first");
+        return format!("{scope} snippet /{name} already exists; remove it first");
     }
     if let Err(error) = std::fs::create_dir_all(&dir) {
         return format!("cannot create {}: {error}", dir.display());
@@ -5278,26 +5315,30 @@ fn write_snippet(
         serde_json::json!({
             "name": name,
             "path": path.display().to_string(),
+            "scope": scope,
             "bytes": body.trim().len(),
         }),
     );
-    state.custom_commands = discover_custom_commands(&state.thread.cwd);
+    state.custom_commands = discover_custom_commands(&state.home, &state.thread.cwd);
     match audit {
-        Ok(()) => format!("snippet /{name} written; use /{name} <args>"),
-        Err(error) => format!("snippet /{name} written but audit failed: {error}"),
+        Ok(()) => format!("{scope} snippet /{name} written; use /{name} <args>"),
+        Err(error) => format!("{scope} snippet /{name} written but audit failed: {error}"),
     }
 }
 
-fn remove_snippet(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, name: &str) -> String {
+fn remove_snippet(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    name: &str,
+    global: bool,
+) -> String {
     if !snippet_name_ok(name) {
         return format!("snippet name {name:?} must use letters, digits, dash, or underscore");
     }
-    let path = std::path::PathBuf::from(&state.thread.cwd)
-        .join(".baton")
-        .join("commands")
-        .join(format!("{name}.md"));
+    let scope = snippet_scope_label(global);
+    let path = snippet_dir(state, global).join(format!("{name}.md"));
     if !path.exists() {
-        return format!("no snippet /{name} under .baton/commands");
+        return format!("no {scope} snippet /{name} under .baton/commands");
     }
     if let Err(error) = std::fs::remove_file(&path) {
         return format!("cannot remove {}: {error}", path.display());
@@ -5307,12 +5348,16 @@ fn remove_snippet(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, name: &s
         state,
         crate::audit::AuditAction::SnippetRemove,
         name,
-        serde_json::json!({ "name": name, "path": path.display().to_string() }),
+        serde_json::json!({
+            "name": name,
+            "path": path.display().to_string(),
+            "scope": scope,
+        }),
     );
-    state.custom_commands = discover_custom_commands(&state.thread.cwd);
+    state.custom_commands = discover_custom_commands(&state.home, &state.thread.cwd);
     match audit {
-        Ok(()) => format!("snippet /{name} removed"),
-        Err(error) => format!("snippet /{name} removed but audit failed: {error}"),
+        Ok(()) => format!("{scope} snippet /{name} removed"),
+        Err(error) => format!("{scope} snippet /{name} removed but audit failed: {error}"),
     }
 }
 
@@ -11758,27 +11803,42 @@ fn handle_command(
                 state.overlay = Overlay::McpPicker { selected: 0 };
             }
         }
-        "/snippets" => match (args.first().map(String::as_str), args.len()) {
-            (None, _) | (Some("list"), 1) => {
+        "/snippets" => match args.first().map(String::as_str) {
+            None | Some("list") if args.len() <= 1 => {
                 state.notice = Some(snippets_notice(state));
             }
-            (Some("add"), count) if count >= 3 => {
-                let name = args[1].clone();
-                let template = args[2..].join(" ");
-                state.notice = Some(write_snippet(state, store, &name, &template));
+            Some("add") => {
+                let mut rest = &args[1..];
+                let global = rest.first().map(String::as_str) == Some("--global");
+                if global {
+                    rest = &rest[1..];
+                }
+                if rest.len() < 2 {
+                    state.notice = Some("use /snippets add [--global] <name> <template>".into());
+                } else {
+                    let name = rest[0].clone();
+                    let template = rest[1..].join(" ");
+                    state.notice = Some(write_snippet(state, store, &name, &template, global));
+                }
             }
-            (Some("add"), _) => {
-                state.notice = Some("use /snippets add <name> <template>".into());
-            }
-            (Some("remove"), 2) => {
-                let name = args[1].clone();
-                state.notice = Some(remove_snippet(state, store, &name));
-            }
-            (Some("remove"), _) => {
-                state.notice = Some("use /snippets remove <name>".into());
+            Some("remove") => {
+                let mut rest = &args[1..];
+                let global = rest.first().map(String::as_str) == Some("--global");
+                if global {
+                    rest = &rest[1..];
+                }
+                if rest.len() != 1 {
+                    state.notice = Some("use /snippets remove [--global] <name>".into());
+                } else {
+                    let name = rest[0].clone();
+                    state.notice = Some(remove_snippet(state, store, &name, global));
+                }
             }
             _ => {
-                state.notice = Some("snippets [list|add <name> <template>|remove <name>]".into());
+                state.notice = Some(
+                    "snippets [list|add [--global] <name> <template>|remove [--global] <name>]"
+                        .into(),
+                );
             }
         },
         "/skills" => {
@@ -14331,18 +14391,23 @@ fn refresh_cwd_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, cwd: 
         .list_prompt_history(cwd)
         .unwrap_or_default();
     state.prompt_history_index = None;
-    state.custom_commands = discover_custom_commands(cwd);
+    state.custom_commands = discover_custom_commands(&state.home, cwd);
     state.banner_cache.borrow_mut().take();
 }
 
-fn discover_custom_commands(cwd: &str) -> Vec<(String, String)> {
-    let mut commands = Vec::new();
+/// Loads user and project commands into one sorted list. Later directories win
+/// a name collision, so project files shadow user files and a `.baton` file
+/// shadows a `.claude` file in the same scope.
+fn discover_custom_commands(home: &std::path::Path, cwd: &str) -> Vec<(String, String)> {
+    let mut commands = std::collections::BTreeMap::new();
     let dirs = [
-        std::path::PathBuf::from(cwd)
-            .join(".baton")
-            .join("commands"),
+        home.join(".claude").join("commands"),
+        home.join(".baton").join("commands"),
         std::path::PathBuf::from(cwd)
             .join(".claude")
+            .join("commands"),
+        std::path::PathBuf::from(cwd)
+            .join(".baton")
             .join("commands"),
     ];
     for dir in dirs {
@@ -14354,13 +14419,55 @@ fn discover_custom_commands(cwd: &str) -> Vec<(String, String)> {
                         path.file_stem().and_then(|name| name.to_str()),
                         std::fs::read_to_string(&path),
                     ) {
-                        commands.push((format!("/{name}"), contents.trim().to_string()));
+                        commands.insert(format!("/{name}"), contents.trim().to_string());
                     }
                 }
             }
         }
     }
-    commands
+    commands.into_iter().collect()
+}
+
+/// The file a command was loaded from, in the same precedence order as
+/// `discover_custom_commands`.
+fn snippet_source(state: &TuiState, short: &str) -> Option<&'static str> {
+    let project = std::path::PathBuf::from(&state.thread.cwd);
+    let candidates = [
+        (
+            project
+                .join(".baton")
+                .join("commands")
+                .join(format!("{short}.md")),
+            "project",
+        ),
+        (
+            project
+                .join(".claude")
+                .join("commands")
+                .join(format!("{short}.md")),
+            "project claude",
+        ),
+        (
+            state
+                .home
+                .join(".baton")
+                .join("commands")
+                .join(format!("{short}.md")),
+            "global",
+        ),
+        (
+            state
+                .home
+                .join(".claude")
+                .join("commands")
+                .join(format!("{short}.md")),
+            "global claude",
+        ),
+    ];
+    candidates
+        .into_iter()
+        .find(|(path, _)| path.exists())
+        .map(|(_, scope)| scope)
 }
 
 fn handle_mcp_command(state: &mut TuiState, action: &str, args: &[String]) {
@@ -27541,7 +27648,7 @@ mod tests {
         std::fs::write(claude.join("deploy.md"), "from claude").unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        state.custom_commands = discover_custom_commands(&state.thread.cwd);
+        state.custom_commands = discover_custom_commands(&state.home, &state.thread.cwd);
         assert!(state
             .custom_commands
             .iter()
@@ -27550,10 +27657,107 @@ mod tests {
         handle_command(&mut state, &store, &sender, "/snippets remove deploy");
         let notice = state.notice.clone().unwrap_or_default();
         assert!(
-            notice.contains("no snippet /deploy under .baton/commands"),
+            notice.contains("no project snippet /deploy under .baton/commands"),
             "{notice}"
         );
         assert!(claude.join("deploy.md").exists());
+    }
+
+    #[test]
+    fn global_snippets_are_shadowed_by_project_snippets() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        state.custom_commands = discover_custom_commands(&state.home, &state.thread.cwd);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(
+            &mut state,
+            &store,
+            &sender,
+            "/snippets add --global deploy global body",
+        );
+        let global_path = home.path().join(".baton/commands/deploy.md");
+        assert_eq!(
+            std::fs::read_to_string(&global_path).unwrap(),
+            "global body\n"
+        );
+        handle_command(&mut state, &store, &sender, "/snippets list");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("(global)") || notice.contains("global"),
+            "{notice}"
+        );
+
+        handle_command(
+            &mut state,
+            &store,
+            &sender,
+            "/snippets add deploy project body",
+        );
+        let project_path = project.path().join(".baton/commands/deploy.md");
+        assert_eq!(
+            std::fs::read_to_string(&project_path).unwrap(),
+            "project body\n"
+        );
+        assert_eq!(
+            state.custom_commands.len(),
+            1,
+            "{:?}",
+            state.custom_commands
+        );
+        assert_eq!(state.custom_commands[0].1, "project body");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("project"), "{notice}");
+
+        handle_command(
+            &mut state,
+            &store,
+            &sender,
+            "/snippets remove --global deploy",
+        );
+        assert!(!global_path.exists());
+        assert_eq!(
+            std::fs::read_to_string(&project_path).unwrap(),
+            "project body\n"
+        );
+        assert_eq!(state.custom_commands[0].1, "project body");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("global snippet /deploy removed"),
+            "{notice}"
+        );
+
+        handle_command(&mut state, &store, &sender, "/snippets remove deploy");
+        assert!(state.custom_commands.is_empty());
+    }
+
+    #[test]
+    fn discovery_reads_global_claude_commands_and_keeps_one_name() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let global = home.path().join(".claude/commands");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::write(global.join("solo.md"), "global claude").unwrap();
+        let global_baton = home.path().join(".baton/commands");
+        std::fs::create_dir_all(&global_baton).unwrap();
+        std::fs::write(global_baton.join("shared.md"), "global baton").unwrap();
+        let project_baton = project.path().join(".baton/commands");
+        std::fs::create_dir_all(&project_baton).unwrap();
+        std::fs::write(project_baton.join("shared.md"), "project baton").unwrap();
+
+        let commands = discover_custom_commands(home.path(), &project.path().to_string_lossy());
+        assert_eq!(commands.len(), 2, "{commands:?}");
+        assert_eq!(
+            commands[0],
+            ("/shared".to_string(), "project baton".to_string())
+        );
+        assert_eq!(
+            commands[1],
+            ("/solo".to_string(), "global claude".to_string())
+        );
     }
 
     #[test]

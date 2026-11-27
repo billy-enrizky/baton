@@ -43,8 +43,9 @@ Site: https://baton.openbrowser.me · Docs: https://baton.openbrowser.me/docs
   - 4.2 [Single-harness mode](#42-single-harness-mode)
   - 4.3 [Orchestrate mode](#43-orchestrate-mode)
   - 4.4 [Open an existing thread](#44-open-an-existing-thread)
-  - 4.5 [Your first prompt](#45-your-first-prompt)
-  - 4.6 [Help inside the app](#46-help-inside-the-app)
+  - 4.5 [Keep several threads open](#45-keep-several-threads-open)
+  - 4.6 [Your first prompt](#46-your-first-prompt)
+  - 4.7 [Help inside the app](#47-help-inside-the-app)
 - 5\. [Core concepts](#5-core-concepts)
   - 5.1 [Harness](#51-harness)
   - 5.2 [Thread](#52-thread)
@@ -66,6 +67,7 @@ Site: https://baton.openbrowser.me · Docs: https://baton.openbrowser.me/docs
     - 6.5.3 [Select and copy](#653-select-and-copy)
     - 6.5.4 [Steering and queueing](#654-steering-and-queueing)
     - 6.5.5 [Palette](#655-palette)
+    - 6.5.6 [Thread tabs](#656-thread-tabs)
 - 7\. [Slash commands](#7-slash-commands)
   - 7.1 [How commands behave](#71-how-commands-behave)
   - 7.2 [Session and model](#72-session-and-model)
@@ -271,7 +273,13 @@ baton threads
 
 `baton threads` lists each thread's short id, title, harness, model, mode, phase, turn count, and queue count. `--json` also includes the goal. `baton -t` opens one and keeps its saved session mode.
 
-### 4.5 Your first prompt
+### 4.5 Keep several threads open
+
+Each thread you open stays in a tab strip above the transcript. The active tab is highlighted and shows its position, from `1:` to `9:`. Press Alt plus a number to jump to that tab, so you can move between an implementation thread, a review thread, and a side chat without going back to the picker.
+
+The strip appears once a second tab is open and shows up to nine tabs, then a `...` marker when more are open. Archiving a thread closes its tab. A tab switch is refused while a turn runs, a request waits for your answer, or a picker or full-screen view is open, so a stream is never torn in the middle. Starting a thread that has not been sent yet keeps it in its tab; send one message to save it.
+
+### 4.6 Your first prompt
 
 Type what you want in plain language. Examples:
 
@@ -281,7 +289,7 @@ Type what you want in plain language. Examples:
 
 In orchestrate mode the planner runs first and the run report shows the task split as workers start. Use `/orchestrate --plan-only <goal>` to review a plan before anything runs; Enter starts it, and Esc returns the goal to the composer.
 
-### 4.6 Help inside the app
+### 4.7 Help inside the app
 
 - `/help` shows the common paths.
 - `/help all` opens a scrollable list of every command and its description; type a command and a space for its syntax.
@@ -371,6 +379,10 @@ While a turn is running, a new composer message is sent as a steer on Codex, Cla
 #### 6.5.5 Palette
 
 Ctrl+K opens the command palette. It filters built-in actions, threads, and recent files as you type. Enter runs an action, opens a thread, or inserts a file path; Esc closes it. Ctrl+K is ignored while a picker is open, so it cannot replace work in progress.
+
+#### 6.5.6 Thread tabs
+
+Alt+1 through Alt+9 switch to the tab in that position. Alt+0 does nothing. The strip only appears when more than one thread is open, and every open thread keeps its own transcript, composer draft, goal, and permission mode.
 
 ## 7. Slash commands
 

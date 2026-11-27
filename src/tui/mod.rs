@@ -260,7 +260,7 @@ fn help_all_text() -> String {
         .collect::<Vec<_>>()
         .join("\n");
     help.push_str(
-        "\n\nshift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · esc: clear · drag transcript to copy",
+        "\n\nalt+1..alt+9: switch open thread tabs · shift+enter or alt+enter: newline · left/right/home/end: edit · up/down: history or scroll · esc: clear · drag transcript to copy",
     );
     help.push_str(
         "\npaste a multi-line prompt: it stays in the composer · typing during a turn steers it · enter on an empty composer sends the next queued message",
@@ -1002,6 +1002,23 @@ const PROVIDERS: [ProviderId; 6] = [
     ProviderId::Antigravity,
 ];
 
+/// A thread kept open in the tab strip. The row is stored so an unsaved
+/// draft survives switching away before its first message persists it.
+#[derive(Clone, Debug)]
+struct OpenThreadTab {
+    thread: ThreadRow,
+}
+
+impl OpenThreadTab {
+    fn id(&self) -> &str {
+        &self.thread.id
+    }
+
+    fn title(&self) -> &str {
+        &self.thread.title
+    }
+}
+
 pub struct TuiState {
     /// Terminal bell on turn end, opt-in through config.json.
     bell_enabled: bool,
@@ -1020,10 +1037,12 @@ pub struct TuiState {
     home: std::path::PathBuf,
     memory_environment: crate::memory_files::MemoryEnvironment,
     thread: ThreadRow,
+    open_tabs: Vec<OpenThreadTab>,
     side_chat_of: Option<String>,
     adapter_lifecycles: std::collections::HashMap<ProviderId, AdapterLifecycle>,
     history: Vec<MessageRow>,
     input: String,
+    thread_drafts: std::collections::HashMap<String, String>,
     input_cursor: usize,
     input_layout: std::cell::RefCell<Vec<InputRow>>,
     suggestion_cache: std::cell::RefCell<Option<(SuggestionCacheKey, Vec<CommandSuggestion>)>>,
@@ -1172,6 +1191,9 @@ pub fn run_tui(
         .ok()
         .flatten()
         .map(|source| source.title);
+    let open_tabs = vec![OpenThreadTab {
+        thread: thread.clone(),
+    }];
     let mut state = TuiState {
         bell_enabled,
         monochrome: capability::color_mode_requested() == capability::ColorMode::Monochrome,
@@ -1187,10 +1209,12 @@ pub fn run_tui(
         home,
         memory_environment: crate::memory_files::MemoryEnvironment::from_env(),
         thread,
+        open_tabs,
         side_chat_of,
         adapter_lifecycles,
         history,
         input: String::new(),
+        thread_drafts: std::collections::HashMap::new(),
         input_cursor: 0,
         input_layout: std::cell::RefCell::new(Vec::new()),
         suggestion_cache: std::cell::RefCell::new(None),
@@ -1930,6 +1954,7 @@ fn apply_engine_event(
                 let guard = store.lock().unwrap();
                 state.history = guard.list_messages(&state.thread.id).unwrap_or_default();
                 if let Some(fresh) = guard.get_thread(&state.thread.id).unwrap_or(None) {
+                    remember_open_thread(state, &fresh);
                     state.thread = fresh;
                 }
             }
@@ -2957,6 +2982,8 @@ fn start_orchestration(
             .lock()
             .unwrap()
             .set_thread_title(&state.thread.id, &title);
+        let thread = state.thread.clone();
+        remember_open_thread(state, &thread);
     }
     state.prompt_history.push(effective_goal.clone());
     state.prompt_history_index = None;
@@ -3301,7 +3328,40 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
     }
 }
 
+fn remember_open_thread(state: &mut TuiState, thread: &ThreadRow) {
+    if let Some(tab) = state.open_tabs.iter_mut().find(|tab| tab.id() == thread.id) {
+        tab.thread = thread.clone();
+        return;
+    }
+    state.open_tabs.push(OpenThreadTab {
+        thread: thread.clone(),
+    });
+}
+
+fn forget_open_tab(state: &mut TuiState, thread_id: &str) {
+    state.open_tabs.retain(|tab| tab.id() != thread_id);
+    state.thread_drafts.remove(thread_id);
+}
+
+fn switch_open_tab(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, index: usize) {
+    let Some(tab) = state.open_tabs.get(index).cloned() else {
+        state.notice = Some(format!("no tab {}", index + 1));
+        return;
+    };
+    if tab.id() == state.thread.id {
+        return;
+    }
+    let stored = store.lock().unwrap().get_thread(tab.id()).ok().flatten();
+    if stored.is_some() {
+        open_thread_by_id(state, store, tab.id());
+    } else {
+        load_thread_state(state, store, tab.thread);
+    }
+}
+
 fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread: ThreadRow) {
+    state.stash_composer();
+    remember_open_thread(state, &thread);
     state.permission_mode = thread.permission_mode;
     state.goal = thread.goal.clone();
     state.goal_paused = thread.goal_paused;
@@ -3318,8 +3378,9 @@ fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.diff_output = None;
     state.shell_output = None;
     state.scroll_offset = 0;
-    state.notice = Some(format!("opened {}", thread.title));
     drop(guard);
+    state.restore_composer();
+    state.notice = Some(format!("opened {}", thread.title));
     hydrate_plans(state, &thread.id);
 }
 
@@ -4489,6 +4550,7 @@ fn apply_archive_command(
     };
     match outcome {
         ArchiveOutcome::Archived => {
+            forget_open_tab(state, &target.id);
             if target.id == current_id {
                 handle_command(state, store, engine_command_sender, "/new");
             }
@@ -5387,6 +5449,8 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
         state.notice = Some(format!("no thread matches \"{thread_id}\""));
         return;
     };
+    state.stash_composer();
+    remember_open_thread(state, &thread);
     state.permission_mode = thread.permission_mode;
     state.goal = thread.goal.clone();
     state.goal_paused = thread.goal_paused;
@@ -5417,6 +5481,7 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
         format!("opened {}", thread.title)
     });
     state.overlay = Overlay::None;
+    state.restore_composer();
 }
 
 fn open_command_palette(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
@@ -5541,6 +5606,34 @@ fn handle_key(
         state.exit_armed = Some(now);
         state.notice = Some("press ctrl+c again to exit".into());
         return;
+    }
+
+    if key.modifiers.contains(KeyModifiers::ALT) {
+        if let KeyCode::Char(character) = key.code {
+            if let Some(digit) = character.to_digit(10) {
+                if digit == 0 {
+                    return;
+                }
+                if !state.approvals.is_empty() || !state.questions.is_empty() {
+                    state.notice = Some("answer the pending request before switching tabs".into());
+                    return;
+                }
+                if state.running
+                    || state.orchestration_pending
+                    || state.multi.is_some()
+                    || state.review.is_some()
+                    || state.orchestration_report.is_some()
+                    || state.activity.is_some()
+                    || !matches!(state.overlay, Overlay::None)
+                {
+                    state.notice =
+                        Some("close or finish the current view before switching tabs".into());
+                    return;
+                }
+                switch_open_tab(state, store, digit as usize - 1);
+                return;
+            }
+        }
     }
 
     if !state.approvals.is_empty() {
@@ -8190,6 +8283,7 @@ fn begin_issue_task(
         }
     };
     let title = format!("#{} {}", plan.issue.number, plan.issue.title);
+    state.stash_composer();
     state.thread = {
         let guard = store.lock().unwrap();
         guard.draft_thread(NewThread {
@@ -8214,7 +8308,10 @@ fn begin_issue_task(
     state.scroll_offset = 0;
     state.overlay = Overlay::None;
     state.banner_cache.borrow_mut().take();
+    state.restore_composer();
     state.set_input(plan.issue.prompt());
+    let thread = state.thread.clone();
+    remember_open_thread(state, &thread);
     state.notice = Some(format!(
         "task #{} ready in {} · review the prompt, then press enter",
         plan.issue.number,
@@ -10828,6 +10925,7 @@ fn handle_command(
             } else {
                 args.join(" ")
             };
+            state.stash_composer();
             state.thread = {
                 let guard = store.lock().unwrap();
                 guard.draft_thread(NewThread {
@@ -10850,6 +10948,9 @@ fn handle_command(
             state.diff_output = None;
             state.shell_output = None;
             state.scroll_offset = 0;
+            state.restore_composer();
+            let thread = state.thread.clone();
+            remember_open_thread(state, &thread);
             state.notice = Some("new thread, unsaved until you send a message".into());
         }
         "/fork" => {
@@ -11393,29 +11494,7 @@ fn handle_command(
         },
         "/open" => {
             if let Some(prefix) = args.first() {
-                let found = {
-                    let guard = store.lock().unwrap();
-                    guard
-                        .list_threads(None)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .find(|thread| thread.id.starts_with(prefix.as_str()))
-                };
-                match found {
-                    Some(thread) => {
-                        state.thread = thread.clone();
-                        let guard = store.lock().unwrap();
-                        state.history = guard.list_messages(&thread.id).unwrap_or_default();
-                        state.queued_messages =
-                            guard.list_queued_messages(&thread.id).unwrap_or_default();
-                        state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
-                        state.diff_output = None;
-                        state.shell_output = None;
-                        state.scroll_offset = 0;
-                        state.notice = Some(format!("opened {}", thread.title));
-                    }
-                    None => state.notice = Some(format!("no thread matches \"{prefix}\"")),
-                }
+                open_thread_by_id(state, store, prefix.as_str());
             } else {
                 let threads = all_thread_choices(store);
                 if threads.is_empty() {
@@ -12839,7 +12918,9 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::HandoffPreview { .. } => 14,
         }
     };
+    let tab_rows = u16::from(state.open_tabs.len() > 1);
     let chunks = Layout::vertical([
+        Constraint::Length(tab_rows),
         Constraint::Min(3),
         Constraint::Length(overlay_rows as u16),
         Constraint::Length(notice_rows as u16),
@@ -12848,22 +12929,23 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     ])
     .split(area);
 
-    draw_transcript(frame, state, chunks[0], spinner_frame);
+    draw_tabs(frame, chunks[0], state);
+    draw_transcript(frame, state, chunks[1], spinner_frame);
     if let Some(approval) = state.approvals.last() {
-        draw_approval(frame, chunks[1], state, approval);
+        draw_approval(frame, chunks[2], state, approval);
     } else if let Some(question) = state.questions.last() {
-        draw_question(frame, chunks[1], state, question);
+        draw_question(frame, chunks[2], state, question);
     } else {
         match &state.overlay {
             Overlay::RewindPicker { selected, native } => {
-                draw_rewind_picker(frame, chunks[1], state, *selected, *native)
+                draw_rewind_picker(frame, chunks[2], state, *selected, *native)
             }
             Overlay::RetryPicker { selected, choices } => {
-                draw_retry_picker(frame, chunks[1], state, choices, *selected)
+                draw_retry_picker(frame, chunks[2], state, choices, *selected)
             }
-            Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[1], *turn),
+            Overlay::CodeConfirm { turn, .. } => draw_code_confirm(frame, chunks[2], *turn),
             Overlay::SwitchPicker { selected } => {
-                draw_switch_picker(frame, chunks[1], state, *selected)
+                draw_switch_picker(frame, chunks[2], state, *selected)
             }
             Overlay::ModelPicker {
                 provider,
@@ -12872,7 +12954,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 filter,
                 ..
             } => draw_model_picker(
-                frame, chunks[1], state, *provider, models, *selected, filter,
+                frame, chunks[2], state, *provider, models, *selected, filter,
             ),
             Overlay::SettingsPicker {
                 provider,
@@ -12881,97 +12963,97 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 value_index,
             } => draw_settings_picker(
                 frame,
-                chunks[1],
+                chunks[2],
                 *provider,
                 categories,
                 *category_index,
                 *value_index,
             ),
-            Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[1], *selected),
+            Overlay::McpPicker { selected } => draw_mcp_picker(frame, chunks[2], *selected),
             Overlay::RolesPicker { selected, roles } => {
-                draw_roles_picker(frame, chunks[1], roles, *selected)
+                draw_roles_picker(frame, chunks[2], roles, *selected)
             }
             Overlay::CopyPicker { selected, replies } => {
-                draw_copy_picker(frame, chunks[1], replies, *selected)
+                draw_copy_picker(frame, chunks[2], replies, *selected)
             }
             Overlay::RunPicker { selected, runs } => {
-                draw_run_picker(frame, chunks[1], runs, *selected)
+                draw_run_picker(frame, chunks[2], runs, *selected)
             }
             Overlay::SkillsPicker { selected, skills } => {
-                draw_skills_picker(frame, chunks[1], skills, *selected)
+                draw_skills_picker(frame, chunks[2], skills, *selected)
             }
             Overlay::SkillRemoveConfirm { selected, skills } => {
-                draw_skill_remove_confirm(frame, chunks[1], skills.get(*selected))
+                draw_skill_remove_confirm(frame, chunks[2], skills.get(*selected))
             }
             Overlay::MemoryPicker { selected, listing } => {
-                draw_memory_picker(frame, chunks[1], listing, *selected)
+                draw_memory_picker(frame, chunks[2], listing, *selected)
             }
             Overlay::GitPicker {
                 selected,
                 status,
                 blocked,
-            } => draw_git_picker(frame, chunks[1], status, *selected, blocked.as_deref()),
+            } => draw_git_picker(frame, chunks[2], status, *selected, blocked.as_deref()),
             Overlay::GitStatus { status, scroll } => {
-                draw_git_status(frame, chunks[1], status, *scroll)
+                draw_git_status(frame, chunks[2], status, *scroll)
             }
             Overlay::GitConfirm { plan, scroll } => {
-                draw_git_confirm(frame, chunks[1], plan, *scroll)
+                draw_git_confirm(frame, chunks[2], plan, *scroll)
             }
             Overlay::GitPushPicker { selected, targets } => {
-                draw_git_push_picker(frame, chunks[1], targets, *selected)
+                draw_git_push_picker(frame, chunks[2], targets, *selected)
             }
-            Overlay::GitPushConfirm { plan } => draw_git_push_confirm(frame, chunks[1], plan),
+            Overlay::GitPushConfirm { plan } => draw_git_push_confirm(frame, chunks[2], plan),
             Overlay::GitChecks { report, scroll } => {
-                draw_git_checks(frame, chunks[1], report, *scroll)
+                draw_git_checks(frame, chunks[2], report, *scroll)
             }
             Overlay::GitPrConfirm { plan, scroll } => {
-                draw_git_pr_confirm(frame, chunks[1], state, plan, *scroll)
+                draw_git_pr_confirm(frame, chunks[2], state, plan, *scroll)
             }
             Overlay::GitReviewPicker { selected } => {
-                draw_git_review_picker(frame, chunks[1], *selected)
+                draw_git_review_picker(frame, chunks[2], *selected)
             }
             Overlay::GitReviewConfirm { plan, scroll } => {
-                draw_git_review_confirm(frame, chunks[1], state, plan, *scroll)
+                draw_git_review_confirm(frame, chunks[2], state, plan, *scroll)
             }
             Overlay::GitMergePicker { selected } => {
-                draw_git_merge_picker(frame, chunks[1], *selected)
+                draw_git_merge_picker(frame, chunks[2], *selected)
             }
-            Overlay::GitMergeConfirm { plan } => draw_git_merge_confirm(frame, chunks[1], plan),
+            Overlay::GitMergeConfirm { plan } => draw_git_merge_confirm(frame, chunks[2], plan),
             Overlay::ModePicker { selected } => {
-                draw_mode_picker(frame, chunks[1], state, *selected)
+                draw_mode_picker(frame, chunks[2], state, *selected)
             }
             Overlay::AuthPicker { selected } => {
-                draw_auth_picker(frame, chunks[1], state, *selected)
+                draw_auth_picker(frame, chunks[2], state, *selected)
             }
             Overlay::AuthProviderPicker { provider, selected } => {
-                draw_auth_provider_picker(frame, chunks[1], state, *provider, *selected)
+                draw_auth_provider_picker(frame, chunks[2], state, *provider, *selected)
             }
-            Overlay::LoginPicker { selected } => draw_login_picker(frame, chunks[1], *selected),
+            Overlay::LoginPicker { selected } => draw_login_picker(frame, chunks[2], *selected),
             Overlay::OrchestratePicker { selected } => {
-                draw_orchestrate_picker(frame, chunks[1], state, *selected)
+                draw_orchestrate_picker(frame, chunks[2], state, *selected)
             }
             Overlay::GoalPicker { selected } => {
-                draw_goal_picker(frame, chunks[1], state, *selected)
+                draw_goal_picker(frame, chunks[2], state, *selected)
             }
             Overlay::QueuePicker {
                 selected,
                 clear_armed,
-            } => draw_queue_picker(frame, chunks[1], state, *selected, *clear_armed),
+            } => draw_queue_picker(frame, chunks[2], state, *selected, *clear_armed),
             Overlay::ThreadPicker {
                 selected,
                 threads,
                 action,
-            } => draw_thread_picker(frame, chunks[1], threads, *selected, *action),
+            } => draw_thread_picker(frame, chunks[2], threads, *selected, *action),
             Overlay::InboxPicker { selected, items } => {
-                draw_inbox_picker(frame, chunks[1], items, *selected)
+                draw_inbox_picker(frame, chunks[2], items, *selected)
             }
             Overlay::CommandPalette {
                 selected,
                 query,
                 items,
-            } => draw_command_palette(frame, chunks[1], query, items, *selected),
+            } => draw_command_palette(frame, chunks[2], query, items, *selected),
             Overlay::QuestionInboxPicker { selected, items } => {
-                draw_question_inbox(frame, chunks[1], items, *selected)
+                draw_question_inbox(frame, chunks[2], items, *selected)
             }
             Overlay::GrepPicker {
                 selected,
@@ -12987,7 +13069,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 ..
             } => draw_grep_picker(
                 frame,
-                chunks[1],
+                chunks[2],
                 GrepPickerView {
                     matches,
                     filtered,
@@ -13014,7 +13096,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 ..
             } => draw_files_picker(
                 frame,
-                chunks[1],
+                chunks[2],
                 FilesPickerView {
                     entries,
                     filtered,
@@ -13037,7 +13119,7 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
                 ..
             } => draw_issue_picker(
                 frame,
-                chunks[1],
+                chunks[2],
                 *selected,
                 issues,
                 repo,
@@ -13047,36 +13129,36 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
             Overlay::CheckpointPicker {
                 selected,
                 checkpoints,
-            } => draw_checkpoint_picker(frame, chunks[1], checkpoints, *selected),
-            Overlay::DirtyConfirm { .. } => draw_dirty_confirm(frame, chunks[1]),
+            } => draw_checkpoint_picker(frame, chunks[2], checkpoints, *selected),
+            Overlay::DirtyConfirm { .. } => draw_dirty_confirm(frame, chunks[2]),
             Overlay::CommandList {
                 selected,
                 expanded,
                 turn,
-            } => draw_command_list(frame, chunks[1], state, *selected, *expanded, *turn),
+            } => draw_command_list(frame, chunks[2], state, *selected, *expanded, *turn),
             Overlay::AgentsPicker { selected, entries } => {
-                draw_agents_picker(frame, chunks[1], entries, *selected)
+                draw_agents_picker(frame, chunks[2], entries, *selected)
             }
             Overlay::EffortPicker { selected } => {
-                draw_effort_picker(frame, chunks[1], state, *selected)
+                draw_effort_picker(frame, chunks[2], state, *selected)
             }
             Overlay::SnoozePicker { selected } => {
-                draw_snooze_picker(frame, chunks[1], state, *selected)
+                draw_snooze_picker(frame, chunks[2], state, *selected)
             }
             Overlay::OrchestrationPreview { preview } => {
-                draw_orchestration_preview(frame, chunks[1], state, preview)
+                draw_orchestration_preview(frame, chunks[2], state, preview)
             }
-            Overlay::HandoffPreview { pending } => draw_handoff_preview(frame, chunks[1], pending),
-            Overlay::Help { scroll } => draw_help(frame, chunks[1], *scroll),
-            Overlay::UsagePicker { selected } => draw_usage_picker(frame, chunks[1], *selected),
+            Overlay::HandoffPreview { pending } => draw_handoff_preview(frame, chunks[2], pending),
+            Overlay::Help { scroll } => draw_help(frame, chunks[2], *scroll),
+            Overlay::UsagePicker { selected } => draw_usage_picker(frame, chunks[2], *selected),
             Overlay::UsageReport {
                 title,
                 lines,
                 scroll,
-            } => draw_usage_report(frame, chunks[1], title, lines, *scroll),
-            Overlay::PlanView { scroll } => draw_plan_view(frame, chunks[1], state, *scroll),
+            } => draw_usage_report(frame, chunks[2], title, lines, *scroll),
+            Overlay::PlanView { scroll } => draw_plan_view(frame, chunks[2], state, *scroll),
             Overlay::ChangesView { scroll, turn } => {
-                draw_changes_view(frame, chunks[1], state, *scroll, *turn)
+                draw_changes_view(frame, chunks[2], state, *scroll, *turn)
             }
             Overlay::None => {}
         }
@@ -13085,10 +13167,10 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
         let paragraph = Paragraph::new(notice.clone())
             .style(Style::default().fg(COLORS.warning))
             .wrap(Wrap { trim: false });
-        frame.render_widget(paragraph, chunks[2]);
+        frame.render_widget(paragraph, chunks[3]);
     }
-    draw_composer(frame, state, chunks[3], &suggestions);
-    draw_status(frame, state, chunks[4]);
+    draw_composer(frame, state, chunks[4], &suggestions);
+    draw_status(frame, state, chunks[5]);
 }
 
 fn discover_custom_commands(cwd: &str) -> Vec<(String, String)> {
@@ -17839,6 +17921,43 @@ fn draw_composer(
     frame.render_widget(Paragraph::new(rows).block(block), composer_area);
 }
 
+fn draw_tabs(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
+    if area.height == 0 {
+        return;
+    }
+    let mut spans = Vec::new();
+    let mut used = 0usize;
+    let width = area.width as usize;
+    for (index, tab) in state.open_tabs.iter().take(9).enumerate() {
+        let title = crate::sanitize::sanitize_terminal_text(tab.title());
+        let label = format!(" {}:{} ", index + 1, truncate_chars(&title, 18));
+        let length = label.chars().count();
+        if !spans.is_empty() && used + length + 1 > width {
+            break;
+        }
+        let active = tab.id() == state.thread.id;
+        let style = if active && state.monochrome {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else if active {
+            Style::default()
+                .fg(COLORS.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(COLORS.muted)
+        };
+        if !spans.is_empty() {
+            spans.push(Span::raw(" "));
+            used += 1;
+        }
+        spans.push(Span::styled(label, style));
+        used += length;
+    }
+    if state.open_tabs.len() > 9 && used + 4 <= width {
+        spans.push(Span::styled(" ...", Style::default().fg(COLORS.muted)));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     let left = if state.esc_primed {
         Line::styled(
@@ -17933,6 +18052,14 @@ impl TuiState {
         self.permission_mode = mode;
         self.thread.permission_mode = mode;
         self.persist_thread_state(store);
+        self.sync_active_tab();
+    }
+
+    /// Keeps an unsaved draft's tab row current; stored threads reload from
+    /// the database when a tab is switched back to.
+    fn sync_active_tab(&mut self) {
+        let thread = self.thread.clone();
+        remember_open_thread(self, &thread);
     }
 
     fn banner_lines(&self) -> Vec<Line<'static>> {
@@ -18084,6 +18211,8 @@ impl TuiState {
         self.thread.session_mode = mode;
         let guard = store.lock().unwrap();
         let _ = guard.set_thread_session_mode(&self.thread.id, mode);
+        drop(guard);
+        self.sync_active_tab();
     }
 
     fn set_goal_state(
@@ -18097,6 +18226,26 @@ impl TuiState {
         self.thread.goal = self.goal.clone();
         self.thread.goal_paused = paused;
         self.persist_thread_state(store);
+        self.sync_active_tab();
+    }
+
+    /// Keeps composer text with the thread it was typed in, so a tab switch
+    /// never sends one thread's draft to another.
+    fn stash_composer(&mut self) {
+        if self.input.is_empty() {
+            self.thread_drafts.remove(&self.thread.id);
+        } else {
+            self.thread_drafts
+                .insert(self.thread.id.clone(), self.input.clone());
+        }
+    }
+
+    fn restore_composer(&mut self) {
+        let text = self
+            .thread_drafts
+            .remove(&self.thread.id)
+            .unwrap_or_default();
+        self.set_input(text);
     }
 
     fn set_input(&mut self, text: String) {
@@ -18358,6 +18507,9 @@ mod tests {
         let (issue_picker_sender, issue_picker_receiver) = std::sync::mpsc::channel();
         let (grep_picker_sender, grep_picker_receiver) = std::sync::mpsc::channel();
         let (shell_sender, shell_receiver) = std::sync::mpsc::channel();
+        let open_tabs = vec![OpenThreadTab {
+            thread: thread.clone(),
+        }];
         TuiState {
             bell_enabled: crate::config::notifications(home).bell,
             monochrome: false,
@@ -18377,10 +18529,12 @@ mod tests {
                 home.to_path_buf(),
             ),
             thread,
+            open_tabs,
             side_chat_of: None,
             adapter_lifecycles: std::collections::HashMap::new(),
             history,
             input: String::new(),
+            thread_drafts: std::collections::HashMap::new(),
             input_cursor: 0,
             input_layout: std::cell::RefCell::new(Vec::new()),
             suggestion_cache: std::cell::RefCell::new(None),
@@ -33688,6 +33842,209 @@ exit 1
             "{:?}",
             state.notice
         );
+    }
+
+    #[test]
+    fn opening_threads_adds_tabs_and_alt_number_switches() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let first = state.thread.clone();
+        let second = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "second".into(),
+                cwd: first.cwd.clone(),
+                current_provider: first.current_provider,
+                current_model: None,
+            })
+            .unwrap();
+        open_thread_by_id(&mut state, &store, &second.id);
+        assert_eq!(state.open_tabs.len(), 2);
+        assert_eq!(state.thread.id, second.id);
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("1:test"), "{text}");
+        assert!(text.contains("2:second"), "{text}");
+
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('1'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, first.id);
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, second.id);
+    }
+
+    #[test]
+    fn opening_the_same_thread_keeps_one_tab() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let first = state.thread.id.clone();
+        open_thread_by_id(&mut state, &store, &first);
+        open_thread_by_id(&mut state, &store, &first);
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.open_tabs[0].id(), first);
+    }
+
+    #[test]
+    fn archiving_a_thread_removes_its_tab() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let first = state.thread.id.clone();
+        let second = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "second".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: state.thread.current_provider,
+                current_model: None,
+            })
+            .unwrap();
+        open_thread_by_id(&mut state, &store, &second.id);
+        open_thread_by_id(&mut state, &store, &first);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_archive_command(&mut state, &store, &sender, true, Some(&second.id));
+        assert_eq!(state.open_tabs.len(), 1);
+        assert_eq!(state.open_tabs[0].id(), first);
+        assert_eq!(state.thread.id, first);
+    }
+
+    #[test]
+    fn alt_number_without_a_tab_reports_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let first = state.thread.id.clone();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('9'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, first);
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("no tab 9"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn alt_number_restores_an_unsaved_draft_tab() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let first = state.thread.id.clone();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/new draft");
+        let draft = state.thread.id.clone();
+        assert_ne!(draft, first);
+        assert_eq!(state.open_tabs.len(), 2);
+        assert!(
+            store.lock().unwrap().get_thread(&draft).unwrap().is_none(),
+            "a fresh draft must still be unsaved"
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('1'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, first);
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, draft);
+        assert_eq!(state.thread.title, "draft");
+    }
+
+    #[test]
+    fn tab_switches_keep_a_draft_per_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let first = state.thread.id.clone();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        state.set_input("draft one".into());
+        handle_command(&mut state, &store, &sender, "/new second");
+        let second = state.thread.id.clone();
+        assert_eq!(state.input, "");
+        state.set_input("draft two".into());
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('1'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, first);
+        assert_eq!(state.input, "draft one");
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, second);
+        assert_eq!(state.input, "draft two");
+    }
+
+    #[test]
+    fn alt_number_is_blocked_while_a_turn_runs() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let first = state.thread.id.clone();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/new second");
+        let second = state.thread.id.clone();
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('1'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, first);
+        state.running = true;
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, first);
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("before switching tabs"),
+            "{:?}",
+            state.notice
+        );
+        state.running = false;
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, second);
     }
 
     #[test]

@@ -90,5 +90,5 @@
       }
     ]
   },
-  "favicon": "https://baton.openbrowser.me/assets/favicon.png"
+  "favicon": "/assets/favicon.png"
 }

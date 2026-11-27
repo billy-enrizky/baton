@@ -516,3 +516,140 @@ fn serve_shutdown_settles_work_from_stopped_owners() {
     assert_eq!(host_tasks[0].error.as_deref(), Some("host shut down"));
     assert!(store.get_host_claim().unwrap().is_none());
 }
+
+#[cfg(unix)]
+#[test]
+fn serve_socket_answers_ping_and_requires_a_read_grant() {
+    use baton::grants::{mint, GrantRequest, Scope};
+    use baton::store::BatonStore;
+    use std::os::unix::net::UnixStream;
+
+    let home = tempfile::tempdir().unwrap();
+    let db = home.path().join("baton.sqlite");
+    let grant = {
+        let store = BatonStore::open(&db).unwrap();
+        mint(&store, home.path(), &GrantRequest::new(vec![Scope::Read])).unwrap()
+    };
+    let mut child = ChildGuard(
+        Command::new(env!("CARGO_BIN_EXE_baton"))
+            .arg("serve")
+            .env("BATON_HOME", home.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stderr = child.0.stderr.take().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready = false;
+    let mut output = String::new();
+    while Instant::now() < deadline {
+        match receiver.recv_timeout(Duration::from_millis(100)) {
+            Ok(line) => {
+                output.push_str(&line);
+                output.push('\n');
+                if line.contains("host ready") {
+                    ready = true;
+                    break;
+                }
+            }
+            Err(_) if child.0.try_wait().unwrap().is_some() => break,
+            Err(_) => {}
+        }
+    }
+    assert!(ready, "serve did not report readiness: {output}");
+    assert!(output.contains("serve.sock"), "{output}");
+
+    let socket = home.path().join("serve.sock");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    let mut stream = UnixStream::connect(&socket).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut ask = |value: serde_json::Value| -> serde_json::Value {
+        writeln!(stream, "{}", value).unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    };
+
+    let ping = ask(serde_json::json!({"v":1,"kind":"request","id":1,"command":"ping"}));
+    assert_eq!(ping["result"]["pong"], true, "{ping}");
+
+    let bare = ask(serde_json::json!({"v":1,"kind":"request","id":2,"command":"status"}));
+    assert_eq!(bare["error"]["code"], "unauthenticated", "{bare}");
+
+    let authenticated = ask(serde_json::json!({
+        "v":1,
+        "kind":"request",
+        "id":3,
+        "command":"status",
+        "grant_id": grant.summary.grant_id,
+        "secret": grant.secret,
+    }));
+    assert_eq!(authenticated["ok"], true, "{authenticated}");
+    assert_eq!(authenticated["result"]["scope"], "host");
+
+    let wrong = ask(serde_json::json!({
+        "v":1,
+        "kind":"request",
+        "id":4,
+        "command":"status",
+        "grant_id": grant.summary.grant_id,
+        "secret":"wrong",
+    }));
+    assert_eq!(wrong["error"]["code"], "bad_secret", "{wrong}");
+
+    unsafe {
+        libc::kill(child.0.id() as i32, libc::SIGTERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.0.kill();
+            panic!("serve did not stop after SIGTERM");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert!(status.success(), "{status:?}");
+    assert!(!socket.exists(), "shutdown removes the socket");
+    let store = BatonStore::open(&db).unwrap();
+    assert!(store.get_host_claim().unwrap().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_socket_refuses_a_regular_file_at_the_path() {
+    use baton::store::BatonStore;
+
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("serve.sock");
+    std::fs::write(&socket, "keep").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .arg("serve")
+        .env("BATON_HOME", home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("not a socket"), "{stderr}");
+    assert_eq!(std::fs::read_to_string(&socket).unwrap(), "keep");
+    let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
+    assert!(store.get_host_claim().unwrap().is_none());
+}

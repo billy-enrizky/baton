@@ -3,9 +3,15 @@
 //! Stdout carries protocol responses only. Diagnostics stay on stderr. P2 is
 //! request/response only: no events, resume cursor, or idempotency key.
 
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
+#[cfg(unix)]
+use std::os::unix::net::UnixListener as StdUnixListener;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener as TokioUnixListener, UnixStream};
 
 use crate::store::{BatonStore, HostClaimRow};
 
@@ -93,6 +99,220 @@ pub fn finish_host(store: &BatonStore, host_id: &str, loop_result: Result<()>) -
         anyhow::bail!("host claim disappeared before shutdown");
     }
     loop_result
+}
+
+#[cfg(unix)]
+pub fn socket_path(home: &Path) -> PathBuf {
+    home.join("serve.sock")
+}
+
+/// Binds the host socket. A stale socket is replaced; any other kind of file
+/// at the path is refused, so the host never deletes something it did not
+/// create.
+#[cfg(unix)]
+pub fn bind_socket(path: &Path) -> Result<StdUnixListener> {
+    if let Ok(metadata) = std::fs::symlink_metadata(path) {
+        use std::os::unix::fs::FileTypeExt;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+            anyhow::bail!(
+                "refusing to replace {}: the path is not a socket",
+                path.display()
+            );
+        }
+        std::fs::remove_file(path)
+            .with_context(|| format!("remove stale socket {}", path.display()))?;
+    }
+    if let Some(parent) = path.parent() {
+        crate::claim::create_private_dir(parent)?;
+    }
+    let listener =
+        StdUnixListener::bind(path).with_context(|| format!("bind {}", path.display()))?;
+    listener.set_nonblocking(true)?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("set mode on {}", path.display()))?;
+    }
+    Ok(listener)
+}
+
+#[cfg(not(unix))]
+pub fn socket_path(home: &Path) -> PathBuf {
+    home.join("serve.sock")
+}
+
+#[cfg(not(unix))]
+pub fn bind_socket(_path: &Path) -> Result<()> {
+    anyhow::bail!("the host socket is Unix-only")
+}
+
+/// Accepts same-user clients until a signal arrives. Every client task is
+/// aborted before the socket file is removed, so the store lock can be
+/// released and shutdown cannot race a request.
+#[cfg(unix)]
+pub async fn socket_loop(
+    listener: StdUnixListener,
+    store: Arc<Mutex<BatonStore>>,
+    path: &Path,
+) -> Result<()> {
+    let listener = TokioUnixListener::from_std(listener).context("register the host socket")?;
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut clients = Vec::new();
+    let result = loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => break Ok(()),
+            _ = terminate.recv() => break Ok(()),
+            accepted = listener.accept() => {
+                match accepted {
+                    Ok((stream, _address)) => {
+                        let store = store.clone();
+                        clients.push(tokio::spawn(async move {
+                            if let Err(error) = serve_socket_client(store, stream).await {
+                                eprintln!("baton: socket client ended: {error}");
+                            }
+                        }));
+                    }
+                    Err(error) => break Err(error).context("accept on the host socket"),
+                }
+            }
+        }
+    };
+    for client in &clients {
+        client.abort();
+    }
+    for client in clients {
+        let _ = client.await;
+    }
+    drop(listener);
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => eprintln!("baton: socket cleanup: {error}"),
+    }
+    result
+}
+
+#[cfg(not(unix))]
+pub async fn socket_loop(
+    _listener: (),
+    _store: Arc<Mutex<BatonStore>>,
+    _path: &Path,
+) -> Result<()> {
+    anyhow::bail!("the host socket is Unix-only")
+}
+
+#[cfg(unix)]
+async fn serve_socket_client(store: Arc<Mutex<BatonStore>>, stream: UnixStream) -> Result<()> {
+    let peer = socket_peer_uid(&stream)?;
+    let host = unsafe { libc::getuid() };
+    if !same_user(peer, host) {
+        let response = error_response(
+            Value::Null,
+            "peer_uid",
+            "the client does not run as the host user",
+        );
+        let mut stream = stream;
+        let mut text = serde_json::to_string(&response)?;
+        text.push('\n');
+        let _ = stream.write_all(text.as_bytes()).await;
+        return Ok(());
+    }
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    while let Some(line) = lines.next_line().await? {
+        let response = {
+            let store = store.lock().unwrap();
+            handle_socket_line(&store, &line)
+        };
+        let mut text = serde_json::to_string(&response)?;
+        text.push('\n');
+        write.write_all(text.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+/// Socket requests carry a grant id and secret. `ping` is the only request
+/// answered without one, so a readiness probe needs no credential.
+fn handle_socket_line(store: &BatonStore, line: &str) -> Value {
+    let Ok(value) = serde_json::from_str::<Value>(line) else {
+        return error_response(Value::Null, "malformed_line", "line is not JSON");
+    };
+    if value["v"].as_u64() != Some(PROTOCOL_VERSION) {
+        return error_response(Value::Null, "bad_version", "unsupported protocol version");
+    }
+    let id = value["id"].clone();
+    let command = value["command"].as_str().unwrap_or_default();
+    if command != "ping" {
+        let (Some(grant_id), Some(secret)) = (value["grant_id"].as_str(), value["secret"].as_str())
+        else {
+            return error_response(id, "unauthenticated", "grant_id and secret are required");
+        };
+        match crate::grants::verify(store, grant_id, secret) {
+            Ok(grant) => {
+                if !grant.scopes.iter().any(|scope| scope == "read") {
+                    return error_response(id, "not_permitted", "the grant lacks the read scope");
+                }
+            }
+            Err(error) => {
+                if let Some(refusal) = error.downcast_ref::<crate::grants::GrantRefusal>() {
+                    return error_response(id, refusal.code(), refusal.to_string());
+                }
+                return error_response(id, "internal", error.to_string());
+            }
+        }
+    }
+    handle_line(store, line).unwrap_or_else(|| {
+        error_response(
+            id,
+            "not_implemented",
+            format!("command {command} is not implemented"),
+        )
+    })
+}
+
+#[cfg(unix)]
+fn same_user(peer_uid: u32, host_uid: u32) -> bool {
+    peer_uid == host_uid
+}
+
+#[cfg(target_os = "linux")]
+fn socket_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            &mut credentials as *mut libc::ucred as *mut libc::c_void,
+            &mut length,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(credentials.uid)
+}
+
+#[cfg(target_os = "macos")]
+fn socket_peer_uid(stream: &UnixStream) -> std::io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    let result = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(uid)
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+fn socket_peer_uid(_stream: &UnixStream) -> std::io::Result<u32> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "peer credentials are unavailable on this platform",
+    ))
 }
 
 fn response(id: Value, result: Value) -> Value {
@@ -377,6 +597,74 @@ mod tests {
         assert_eq!(unknown["error"]["code"], "not_implemented");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn socket_lines_require_a_live_read_grant() {
+        use crate::grants::{mint, revoke, GrantRequest, Scope};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = BatonStore::memory().unwrap();
+        let read = mint(&store, dir.path(), &GrantRequest::new(vec![Scope::Read])).unwrap();
+        let operate = mint(&store, dir.path(), &GrantRequest::new(vec![Scope::Operate])).unwrap();
+
+        let ping = handle_socket_line(
+            &store,
+            r#"{"v":1,"kind":"request","id":1,"command":"ping"}"#,
+        );
+        assert_eq!(ping["result"]["pong"], true);
+
+        let bare = handle_socket_line(
+            &store,
+            r#"{"v":1,"kind":"request","id":2,"command":"status"}"#,
+        );
+        assert_eq!(bare["error"]["code"], "unauthenticated");
+
+        let with = handle_socket_line(
+            &store,
+            &format!(
+                r#"{{"v":1,"kind":"request","id":3,"command":"status","grant_id":"{}","secret":"{}"}}"#,
+                read.summary.grant_id, read.secret
+            ),
+        );
+        assert_eq!(with["ok"], true, "{with}");
+        assert_eq!(with["result"]["scope"], "host");
+
+        let wrong = handle_socket_line(
+            &store,
+            &format!(
+                r#"{{"v":1,"kind":"request","id":4,"command":"status","grant_id":"{}","secret":"wrong"}}"#,
+                read.summary.grant_id
+            ),
+        );
+        assert_eq!(wrong["error"]["code"], "bad_secret");
+
+        let narrow = handle_socket_line(
+            &store,
+            &format!(
+                r#"{{"v":1,"kind":"request","id":5,"command":"status","grant_id":"{}","secret":"{}"}}"#,
+                operate.summary.grant_id, operate.secret
+            ),
+        );
+        assert_eq!(narrow["error"]["code"], "not_permitted");
+
+        revoke(&store, dir.path(), &read.summary.grant_id).unwrap();
+        let revoked = handle_socket_line(
+            &store,
+            &format!(
+                r#"{{"v":1,"kind":"request","id":6,"command":"status","grant_id":"{}","secret":"{}"}}"#,
+                read.summary.grant_id, read.secret
+            ),
+        );
+        assert_eq!(revoked["error"]["code"], "revoked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn peer_credentials_accept_only_the_host_user() {
+        let host = unsafe { libc::getuid() };
+        assert!(same_user(host, host));
+        assert!(!same_user(host.wrapping_add(1), host));
+    }
     #[cfg(unix)]
     #[test]
     fn finish_host_settles_dead_owner_work_before_release() {

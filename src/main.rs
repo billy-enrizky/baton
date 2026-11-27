@@ -707,7 +707,7 @@ fn main_result(started: Instant) -> Result<()> {
             cli_prompt,
             requested_effort,
         ),
-        cli::Commands::Serve { stdio } => run_serve(&home, stdio),
+        cli::Commands::Serve { stdio, socket } => run_serve(&home, stdio, socket.as_deref()),
         cli::Commands::Host { command } => run_host(&home, command),
         cli::Commands::Runs { command } => run_runs(command),
         cli::Commands::Mcp => {
@@ -2979,7 +2979,7 @@ fn reap_startup_processes() {
     }
 }
 
-fn run_serve(home: &Path, stdio: bool) -> Result<()> {
+fn run_serve(home: &Path, stdio: bool, socket: Option<&str>) -> Result<()> {
     let host_id = uuid::Uuid::new_v4().to_string();
     let store = BatonStore::open_hosted(&paths::baton_db_path(), &host_id)?;
     let claimed = match claim::acquire(&store, home, &host_id, &claim::SystemProbe)? {
@@ -2998,9 +2998,34 @@ fn run_serve(home: &Path, stdio: bool) -> Result<()> {
     }
     let turns = store.reconcile_running_turns(None)?;
     let runs = orchestrate::reconcile_abandoned_runs(&store)?;
+    let socket_target = if stdio {
+        None
+    } else {
+        Some(
+            socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| serve::socket_path(home)),
+        )
+    };
+    let listener = match socket_target.as_deref() {
+        Some(path) => match serve::bind_socket(path) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                let loop_result = Err(anyhow::anyhow!("bind {}: {error}", path.display()));
+                return serve::finish_host(&store, &host_id, loop_result);
+            }
+        },
+        None => None,
+    };
     eprintln!(
-        "baton: host ready pid {} host {} installation {}",
-        claimed.pid, claimed.host_id, claimed.installation_id
+        "baton: host ready pid {} host {} installation {}{}",
+        claimed.pid,
+        claimed.host_id,
+        claimed.installation_id,
+        socket_target
+            .as_ref()
+            .map(|path| format!(" socket {}", path.display()))
+            .unwrap_or_default()
     );
     if !turns.is_empty() {
         eprintln!("baton: settled {} unfinished turn(s)", turns.len());
@@ -3014,12 +3039,20 @@ fn run_serve(home: &Path, stdio: bool) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let loop_result = if stdio {
-        runtime.block_on(serve::stdio_loop(&store))
-    } else {
-        runtime.block_on(wait_for_host_stop())
-    };
-    serve::finish_host(&store, &host_id, loop_result)?;
+    match (listener, socket_target.as_deref()) {
+        (Some(listener), Some(path)) => {
+            let shared = Arc::new(Mutex::new(store));
+            let result = runtime.block_on(serve::socket_loop(listener, shared.clone(), path));
+            let store = shared.lock().unwrap();
+            let finished = serve::finish_host(&store, &host_id, result);
+            drop(store);
+            finished?;
+        }
+        _ => {
+            let loop_result = runtime.block_on(serve::stdio_loop(&store));
+            serve::finish_host(&store, &host_id, loop_result)?;
+        }
+    }
     eprintln!("baton: host stopped");
     Ok(())
 }

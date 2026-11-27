@@ -626,7 +626,11 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
     }
     assert!(ready, "serve did not report readiness: {output}");
 
-    writeln!(stdin, "pair --scope read --scope operate").unwrap();
+    writeln!(
+        stdin,
+        "pair --scope read --scope operate --ceiling acceptEdits"
+    )
+    .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut url = String::new();
     while Instant::now() < deadline {
@@ -640,6 +644,24 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
         }
     }
     assert!(!url.is_empty(), "pair did not print a URL: {output}");
+    let mut pairing = String::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match err_receiver.recv_timeout(Duration::from_millis(50)) {
+            Ok(line) => {
+                pairing.push_str(&line);
+                pairing.push('\n');
+                if line.contains("ceiling acceptEdits") {
+                    break;
+                }
+            }
+            Err(_) => {}
+        }
+    }
+    assert!(
+        pairing.contains("ceiling acceptEdits"),
+        "pair did not report the ceiling: {pairing}"
+    );
     let fragment = url.trim().strip_prefix("baton://local#").unwrap();
     let mut grant_id = None;
     let mut secret = None;

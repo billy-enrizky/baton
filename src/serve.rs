@@ -351,7 +351,7 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
     let command = tokens.next().unwrap_or_default();
     match command {
         "help" => eprintln!(
-            "baton: host commands: pair [--label <name>] [--scope <s>]... [--expires-days N]; renew <id> [--days N]; help"
+            "baton: host commands: pair [--label <name>] [--scope <s>]... [--ceiling <mode>] [--expires-days N]; renew <id> [--days N]; help"
         ),
         "pair" => match parse_pair(tokens.collect()) {
             Ok(request) => {
@@ -363,9 +363,10 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
                     Ok(minted) => {
                         println!("{}", pair_url(&minted));
                         eprintln!(
-                            "baton: paired {} with {} scopes, expires {}",
+                            "baton: paired {} with {} scopes, ceiling {}, expires {}",
                             minted.summary.grant_id,
                             minted.summary.scopes.join(","),
+                            minted.summary.permission_ceiling,
                             minted.summary.expires_at
                         );
                     }
@@ -434,10 +435,12 @@ fn parse_renew(args: Vec<&str>) -> Result<(String, i64)> {
 #[cfg(unix)]
 fn parse_pair(args: Vec<&str>) -> Result<crate::grants::GrantRequest> {
     use crate::grants::{expiry_after_days, GrantRequest, Scope, DEFAULT_GRANT_DAYS};
+    use crate::types::PermissionMode;
 
     let mut scopes = vec![Scope::Read, Scope::Operate];
     let mut scopes_set = false;
     let mut label = None;
+    let mut ceiling = PermissionMode::Default;
     let mut expires_days = DEFAULT_GRANT_DAYS;
     let mut index = 0;
     while index < args.len() {
@@ -464,6 +467,17 @@ fn parse_pair(args: Vec<&str>) -> Result<crate::grants::GrantRequest> {
                     scopes.push(scope);
                 }
             }
+            "--ceiling" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--ceiling needs a mode"))?;
+                if *value == "bypassPermissions" {
+                    anyhow::bail!("ceiling: bypassPermissions is not grantable");
+                }
+                ceiling = PermissionMode::parse(value)
+                    .ok_or_else(|| anyhow::anyhow!("unknown ceiling {value}"))?;
+            }
             "--expires-days" => {
                 index += 1;
                 let value = args
@@ -482,6 +496,7 @@ fn parse_pair(args: Vec<&str>) -> Result<crate::grants::GrantRequest> {
     }
     let mut request = GrantRequest::new(scopes);
     request.label = label;
+    request.permission_ceiling = ceiling;
     request.expires_at = expiry_after_days(expires_days);
     Ok(request)
 }
@@ -683,6 +698,26 @@ fn submit_request(
             id,
             "ceiling",
             "the thread runs with bypassPermissions; set a safe mode before submitting remotely",
+        );
+    }
+    let ceiling = match crate::types::PermissionMode::parse(&grant.permission_ceiling) {
+        Some(ceiling) => ceiling,
+        None => {
+            return error_response(
+                id,
+                "ceiling",
+                "the grant carries an unknown permission ceiling",
+            )
+        }
+    };
+    if !thread.permission_mode.within_ceiling(ceiling) {
+        return error_response(
+            id,
+            "ceiling",
+            format!(
+                "thread {thread_id} runs with {} above the grant ceiling {ceiling}",
+                thread.permission_mode
+            ),
         );
     }
     let body = json!({ "thread_id": thread_id, "accepted": true });
@@ -1159,10 +1194,12 @@ mod tests {
     #[test]
     fn pair_parses_labels_scopes_and_expiry() {
         use crate::grants::Scope;
+        use crate::types::PermissionMode;
 
         let request = parse_pair(Vec::new()).unwrap();
         assert_eq!(request.scopes, vec![Scope::Read, Scope::Operate]);
         assert!(request.label.is_none());
+        assert_eq!(request.permission_ceiling, PermissionMode::Default);
 
         let request = parse_pair(vec![
             "--label",
@@ -1171,12 +1208,15 @@ mod tests {
             "read",
             "--scope",
             "git",
+            "--ceiling",
+            "acceptEdits",
             "--expires-days",
             "7",
         ])
         .unwrap();
         assert_eq!(request.scopes, vec![Scope::Read, Scope::Git]);
         assert_eq!(request.label.as_deref(), Some("laptop"));
+        assert_eq!(request.permission_ceiling, PermissionMode::AcceptEdits);
         let expiry = request
             .expires_at
             .parse::<chrono::DateTime<chrono::Utc>>()
@@ -1188,6 +1228,10 @@ mod tests {
         assert!(error.to_string().contains("unknown scope"), "{error}");
         let error = parse_pair(vec!["--expires-days", "0"]).unwrap_err();
         assert!(error.to_string().contains("positive"), "{error}");
+        let error = parse_pair(vec!["--ceiling", "bypassPermissions"]).unwrap_err();
+        assert!(error.to_string().contains("not grantable"), "{error}");
+        let error = parse_pair(vec!["--ceiling", "nope"]).unwrap_err();
+        assert!(error.to_string().contains("unknown ceiling"), "{error}");
         let error = parse_pair(vec!["--bogus"]).unwrap_err();
         assert!(error.to_string().contains("unknown pair option"), "{error}");
     }
@@ -1384,6 +1428,81 @@ mod tests {
             .unwrap()
             .iter()
             .any(|event| event.action == "turn.submit_request"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn submit_refuses_a_thread_above_the_grant_ceiling() {
+        use crate::grants::{mint, GrantRequest, Scope};
+        use crate::types::PermissionMode;
+
+        let (_dir, store) = claimed_store();
+        let home = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let accepted_thread = store
+            .create_thread(NewThread {
+                title: "accept edits".into(),
+                cwd: root.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        store
+            .set_thread_permission_mode(&accepted_thread.id, PermissionMode::AcceptEdits)
+            .unwrap();
+        let default_thread = store
+            .create_thread(NewThread {
+                title: "default".into(),
+                cwd: root.path().to_string_lossy().to_string(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let mut default_request = GrantRequest::new(vec![Scope::Read, Scope::Operate]);
+        default_request.permission_ceiling = PermissionMode::Default;
+        let default_grant = mint(&store, home.path(), &default_request).unwrap();
+        let mut accept_request = GrantRequest::new(vec![Scope::Read, Scope::Operate]);
+        accept_request.permission_ceiling = PermissionMode::AcceptEdits;
+        let accept_grant = mint(&store, home.path(), &accept_request).unwrap();
+        let mut plan_request = GrantRequest::new(vec![Scope::Read, Scope::Operate]);
+        plan_request.permission_ceiling = PermissionMode::Plan;
+        let plan_grant = mint(&store, home.path(), &plan_request).unwrap();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let engine = EngineLink {
+            sender,
+            home: home.path().to_path_buf(),
+            root: root.path().to_path_buf(),
+        };
+        let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64| {
+            format!(
+                r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{thread}","text":"remote hello","idempotency_key":"k-{id}"}}}}"#,
+                grant.summary.grant_id, grant.secret
+            )
+        };
+
+        let above = handle_socket_line(
+            &store,
+            &request(&default_grant, &accepted_thread.id, 1),
+            Some(&engine),
+        );
+        assert_eq!(above["error"]["code"], "ceiling");
+        assert!(receiver.try_recv().is_err());
+
+        let below = handle_socket_line(
+            &store,
+            &request(&plan_grant, &default_thread.id, 2),
+            Some(&engine),
+        );
+        assert_eq!(below["error"]["code"], "ceiling");
+        assert!(receiver.try_recv().is_err());
+
+        let accepted = handle_socket_line(
+            &store,
+            &request(&accept_grant, &accepted_thread.id, 3),
+            Some(&engine),
+        );
+        assert_eq!(accepted["ok"], true, "{accepted}");
+        assert!(receiver.try_recv().is_ok());
     }
 
     #[cfg(unix)]

@@ -758,11 +758,21 @@ fn main_result(started: Instant) -> Result<()> {
             token_file,
             trusted_overlay,
             read_only,
+            allow_tool,
         } => {
             let store = open_store(None)?;
             let mut server = mcp::McpServer::new(store, home.clone(), cwd.clone());
             if read_only {
                 server = server.read_only();
+            }
+            if !allow_tool.is_empty() {
+                let known = mcp::known_tool_names();
+                for tool in &allow_tool {
+                    if !known.iter().any(|name| name == tool) {
+                        anyhow::bail!("unknown MCP tool {tool}; known tools: {}", known.join(", "));
+                    }
+                }
+                server = server.with_allowed_tools(allow_tool);
             }
             match http {
                 Some(addr) => {

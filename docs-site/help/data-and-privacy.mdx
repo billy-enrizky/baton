@@ -38,7 +38,7 @@ Baton does not write keys into the transcript. A harness message or a command ou
 
 ## MCP
 
-`baton mcp` serves the local store over stdio to the process that starts it. It does not open a network port. The server is read-only except for clearing the queue and creating a fork. Pass `--read-only` to hide `baton_fork` and refuse queue clearing. The HTTP form adds a bearer token and the same `--read-only` option.
+`baton mcp` serves the local store over stdio to the process that starts it. It does not open a network port. The server is read-only except for clearing the queue and creating a fork. Pass `--read-only` to hide `baton_fork` and refuse queue clearing. Use repeatable `--allow-tool` to expose only named tools instead. The HTTP form adds a bearer token and the same tool restrictions.
 
 `baton serve` claims the store for one host process, runs recovery, and idles until stopped. It does not open a network port. With `--stdio`, only the process holding its pipe can send the `ping`, `claim-info`, and `status` requests.
 

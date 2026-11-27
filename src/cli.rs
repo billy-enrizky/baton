@@ -237,6 +237,9 @@ pub enum Commands {
         /// Hide fork and refuse queue clearing
         #[arg(long)]
         read_only: bool,
+        /// Allow only these MCP tools; repeat for several (default: all)
+        #[arg(long = "allow-tool", value_name = "NAME", conflicts_with = "read_only", action = clap::ArgAction::Append)]
+        allow_tool: Vec<String>,
     },
     /// Inspect every turn's tool calls, diff, and usage
     Activity {
@@ -972,9 +975,11 @@ mod tests {
                 token_file: Some(path),
                 trusted_overlay: false,
                 read_only: false,
+                allow_tool,
             }) => {
                 assert_eq!(addr, "127.0.0.1:8787");
                 assert_eq!(path, PathBuf::from("/tmp/baton-mcp-token"));
+                assert!(allow_tool.is_empty());
             }
             _ => panic!("expected MCP HTTP"),
         }
@@ -992,9 +997,38 @@ mod tests {
                 token_file: None,
                 trusted_overlay: false,
                 read_only: true,
+                ..
             }) => {}
             _ => panic!("expected read-only MCP stdio"),
         }
+        let allow = Cli::try_parse_from([
+            "baton",
+            "mcp",
+            "--allow-tool",
+            "baton_status",
+            "--allow-tool",
+            "baton_turns",
+        ])
+        .unwrap();
+        match allow.command {
+            Some(Commands::Mcp {
+                allow_tool,
+                read_only: false,
+                ..
+            }) => assert_eq!(allow_tool, vec!["baton_status", "baton_turns"]),
+            _ => panic!("expected an MCP tool allowlist"),
+        }
+        let conflict = Cli::try_parse_from([
+            "baton",
+            "mcp",
+            "--read-only",
+            "--allow-tool",
+            "baton_status",
+        ]);
+        assert!(
+            conflict.is_err(),
+            "--read-only and --allow-tool must not be combined"
+        );
     }
 
     #[test]

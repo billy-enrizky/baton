@@ -1,6 +1,7 @@
 pub mod activity;
 pub mod adapters;
 pub mod attach;
+pub mod audit;
 pub mod checkpoints;
 pub mod claim;
 pub mod cli;

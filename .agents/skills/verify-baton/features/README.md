@@ -48,6 +48,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | MCP stdio | CLI | `baton mcp` handshakes, lists 15 tools including agents, and answers status, turns, threads, agents, and doctor |
 | Host pairing | CLI | at the host terminal, `pair` mints a grant with read and operate defaults, prints a `baton://local#grant=...&secret=...` URL, and the grant answers `status` over the local socket |
 | Host attach | CLI | `baton attach --url <url> [--json]` validates the pairing URL, sends one read-only `status` request over the local socket, and prints the host scope, thread count, and running turn count without starting a second engine |
+| Audit log | CLI | `baton audit list [--limit N] [--json]` shows append-only grant events with actor, environment, action, scope, confirmation, payload digest, result, and retention; the table rejects updates and deletes, and grant mint/revoke commit with their audit row |
 | Antigravity | CLI | `agy acp` completes one turn with the ICA key and custom base URL |
 | Harness matrix | CLI | Codex, Claude, Cursor, Grok, OpenCode, and Antigravity are checked for a live ICA turn or an explicit external account block |
 | Output sanitization | CLI and TUI | Control sequences are replaced before `exec` stdout and the transcript; unit proof only |

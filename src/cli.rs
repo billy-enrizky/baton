@@ -141,6 +141,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: GrantCommand,
     },
+    /// Inspect append-only audit events
+    Audit {
+        #[command(subcommand)]
+        command: AuditCommand,
+    },
     /// Serve the local thread store over MCP stdio for coding agents
     Mcp,
     /// Inspect every turn's tool calls, diff, and usage
@@ -474,6 +479,19 @@ pub enum GrantCommand {
 }
 
 #[derive(Subcommand, Clone)]
+pub enum AuditCommand {
+    /// List audit events, newest first
+    List {
+        /// Maximum rows to print
+        #[arg(long, default_value_t = 50, value_name = "N")]
+        limit: usize,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 pub enum RunCommand {
     /// Settle a running orchestration with an explicit final status
     Settle {
@@ -779,6 +797,22 @@ mod tests {
                     },
             }) => assert_eq!(grant_id, "00000000-0000-4000-8000-000000000000"),
             _ => panic!("expected grant revoke"),
+        }
+    }
+
+    #[test]
+    fn audit_list_parses_a_limit_and_json() {
+        let cli =
+            Cli::try_parse_from(["baton", "audit", "list", "--limit", "25", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Audit {
+                command:
+                    AuditCommand::List {
+                        limit: 25,
+                        json: true,
+                    },
+            }) => {}
+            _ => panic!("expected audit list"),
         }
     }
 

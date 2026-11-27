@@ -69,7 +69,7 @@ A malformed line or unsupported version answers with `id: null` and code `malfor
 
 The pipe's authority is its spawner, so `--stdio` requests need no grant. Over the local socket, every request except `ping` also carries `grant_id` and `secret`. The host accepts only the same uid, verifies the grant, and requires the `read` scope for `claim-info` and `status`. A missing grant answers `unauthenticated`, a refused grant answers `not_found`, `bad_secret`, `revoked`, or `expired`, and a granted command without the scope answers `not_permitted`. A different uid is closed with `peer_uid`. The socket is removed on shutdown.
 
-`baton grant list` shows each grant's scopes, ceiling, expiry, state, and label, never its secret or hash. `baton grant revoke <id>` deletes the client secret file and refuses every later request with `revoked`. At the host terminal, `pair [--label <name>] [--scope <s>]... [--expires-days N]` mints a grant with `read` and `operate` by default and prints a `baton://local#...` URL whose fragment carries the secret. The URL is a credential, so keep it out of public logs. `baton attach --url <url> [--json]` sends one read-only `status` request over the socket and prints the host scope, thread count, and running turn count. It does not start a second engine or run recovery. The local socket and attach are available on macOS and Linux; Windows uses `baton serve --stdio`.
+`baton grant list` shows each grant's scopes, ceiling, expiry, state, and label, never its secret or hash. `baton grant revoke <id>` deletes the client secret file and refuses every later request with `revoked`. `baton audit list [--limit N] [--json]` shows the append-only audit log. Each event records the actor, environment, action, scope, confirmation, payload digest, result, timestamp, and retention. The table rejects updates and deletes, and a grant mint or revoke commits with its audit row in one transaction. At the host terminal, `pair [--label <name>] [--scope <s>]... [--expires-days N]` mints a grant with `read` and `operate` by default and prints a `baton://local#...` URL whose fragment carries the secret. The URL is a credential, so keep it out of public logs. `baton attach --url <url> [--json]` sends one read-only `status` request over the socket and prints the host scope, thread count, and running turn count. It does not start a second engine or run recovery. The local socket and attach are available on macOS and Linux; Windows uses `baton serve --stdio`.
 
 `baton host takeover --pid <pid>` prints the live claim's pid and process start and asks for a `y` or `yes` answer. Confirmation replaces the claim, fences the old host out, stops provider children recorded under the old host generation, settles all open turns and running orchestration, and releases the store for a new host. A wrong pid, changed claim, dead owner, held write lock, or declined prompt leaves the claim untouched. The old host process is not signalled.
 
@@ -114,6 +114,7 @@ baton grep <query> [--case-sensitive] [--word] [--regex] [--json]
 baton memories [add|remove|clear] [-C path] [--json]
 baton grant list [--json]
 baton grant revoke <id> [--json]
+baton audit list [--limit N] [--json]
 baton checkpoints <thread-id>
 baton queue [-t id] [--clear] [--json]
 baton auth [provider] [subscription|api]

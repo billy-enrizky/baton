@@ -232,7 +232,7 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
     let command = tokens.next().unwrap_or_default();
     match command {
         "help" => eprintln!(
-            "baton: host commands: pair [--label <name>] [--scope <s>]... [--expires-days N]; help"
+            "baton: host commands: pair [--label <name>] [--scope <s>]... [--expires-days N]; renew <id> [--days N]; help"
         ),
         "pair" => match parse_pair(tokens.collect()) {
             Ok(request) => {
@@ -255,8 +255,61 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
             }
             Err(error) => eprintln!("baton: {error}"),
         },
+        "renew" => match parse_renew(tokens.collect()) {
+            Ok((grant_id, days)) => {
+                let renewed = {
+                    let store = store.lock().unwrap();
+                    crate::grants::renew(&store, &grant_id, days)
+                };
+                match renewed {
+                    Ok(crate::grants::RenewOutcome::Renewed(payload)) => eprintln!(
+                        "baton: renewed {} until {} (was {})",
+                        payload.grant.grant_id, payload.grant.expires_at, payload.previous_expires_at
+                    ),
+                    Ok(crate::grants::RenewOutcome::Missing) => {
+                        eprintln!("baton: no grant matches {grant_id}")
+                    }
+                    Ok(crate::grants::RenewOutcome::Revoked) => {
+                        eprintln!("baton: {grant_id} is revoked; pair the client again")
+                    }
+                    Err(error) => eprintln!("baton: renew failed: {error}"),
+                }
+            }
+            Err(error) => eprintln!("baton: {error}"),
+        },
         other => eprintln!("baton: unknown host command {other}; type help"),
     }
+}
+
+#[cfg(unix)]
+fn parse_renew(args: Vec<&str>) -> Result<(String, i64)> {
+    let mut grant_id = None;
+    let mut days = crate::grants::DEFAULT_GRANT_DAYS;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "--days" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| anyhow::anyhow!("--days needs a number"))?;
+                days = value
+                    .parse::<i64>()
+                    .map_err(|_| anyhow::anyhow!("--days needs a number"))?;
+            }
+            other if other.starts_with("--") => {
+                anyhow::bail!("unknown renew option {other}")
+            }
+            other => {
+                if grant_id.replace(other.to_string()).is_some() {
+                    anyhow::bail!("renew takes exactly one grant id");
+                }
+            }
+        }
+        index += 1;
+    }
+    let grant_id = grant_id.ok_or_else(|| anyhow::anyhow!("renew needs a grant id"))?;
+    Ok((grant_id, days))
 }
 
 #[cfg(unix)]
@@ -753,6 +806,36 @@ mod tests {
         assert!(error.to_string().contains("positive"), "{error}");
         let error = parse_pair(vec!["--bogus"]).unwrap_err();
         assert!(error.to_string().contains("unknown pair option"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renew_parses_a_grant_id_and_days() {
+        let (grant_id, days) = parse_renew(vec!["00000000-0000-4000-8000-000000000000"]).unwrap();
+        assert_eq!(grant_id, "00000000-0000-4000-8000-000000000000");
+        assert_eq!(days, crate::grants::DEFAULT_GRANT_DAYS);
+
+        let (grant_id, days) = parse_renew(vec!["grant", "--days", "7"]).unwrap();
+        assert_eq!(grant_id, "grant");
+        assert_eq!(days, 7);
+
+        let error = parse_renew(Vec::new()).unwrap_err();
+        assert!(error.to_string().contains("needs a grant id"), "{error}");
+        let error = parse_renew(vec!["a", "b"]).unwrap_err();
+        assert!(
+            error.to_string().contains("exactly one grant id"),
+            "{error}"
+        );
+        let error = parse_renew(vec!["a", "--days"]).unwrap_err();
+        assert!(
+            error.to_string().contains("--days needs a number"),
+            "{error}"
+        );
+        let error = parse_renew(vec!["a", "--bogus"]).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown renew option"),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]

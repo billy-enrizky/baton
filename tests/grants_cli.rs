@@ -52,6 +52,114 @@ fn grant_list_reports_grants_without_secrets() {
 }
 
 #[test]
+fn grant_renew_extends_the_window_and_reports_refusals() {
+    let home = tempfile::tempdir().unwrap();
+    let db = home.path().join("baton.sqlite");
+    let minted = {
+        let store = BatonStore::open(&db).unwrap();
+        let mut request = GrantRequest::new(vec![Scope::Read]);
+        request.expires_at = baton::grants::expiry_after_days(2);
+        baton::grants::mint(&store, home.path(), &request).unwrap()
+    };
+    let original = minted.summary.expires_at.clone();
+
+    let output = run(
+        home.path(),
+        &["grant", "renew", &minted.summary.grant_id, "--days", "45"],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("renewed"), "{text}");
+    assert!(!text.contains(&minted.secret), "{text}");
+    assert!(
+        text.contains(&original),
+        "the text form shows both dates: {text}"
+    );
+
+    let store = BatonStore::open_read_only(&db).unwrap();
+    let row = store
+        .find_grant_row(&minted.summary.grant_id)
+        .unwrap()
+        .unwrap();
+    let extended = row
+        .expires_at
+        .parse::<chrono::DateTime<chrono::Utc>>()
+        .unwrap();
+    assert!(
+        extended > chrono::Utc::now() + chrono::Duration::days(44),
+        "{extended}"
+    );
+    assert!(
+        baton::grants::verify(&store, &minted.summary.grant_id, &minted.secret).is_ok(),
+        "the client secret still works"
+    );
+    drop(store);
+
+    let output = run(
+        home.path(),
+        &[
+            "grant",
+            "renew",
+            &minted.summary.grant_id,
+            "--days",
+            "10",
+            "--json",
+        ],
+    );
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["grant_id"], minted.summary.grant_id);
+    assert_eq!(value["previous_expires_at"], row.expires_at);
+    let unchanged = value["expires_at"].as_str().unwrap();
+    assert_eq!(
+        unchanged, row.expires_at,
+        "a shorter request keeps the window"
+    );
+
+    let output = run(
+        home.path(),
+        &["grant", "renew", "00000000-0000-4000-8000-000000000000"],
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no grant matches"),
+        "{output:?}"
+    );
+
+    let output = run(home.path(), &["grant", "renew", "not-a-uuid"]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("lowercase UUID"),
+        "{output:?}"
+    );
+
+    {
+        let store = BatonStore::open(&db).unwrap();
+        assert!(baton::grants::revoke(&store, home.path(), &minted.summary.grant_id).unwrap());
+    }
+    let output = run(home.path(), &["grant", "renew", &minted.summary.grant_id]);
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("revoked"),
+        "{output:?}"
+    );
+
+    let output = run(home.path(), &["audit", "list", "--json"]);
+    assert!(output.status.success(), "{output:?}");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let actions: Vec<&str> = value["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["action"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        actions,
+        vec!["grant.revoke", "grant.renew", "grant.renew", "grant.mint"]
+    );
+}
+
+#[test]
 fn grant_revoke_removes_the_secret_and_refuses_unknown_ids() {
     let home = tempfile::tempdir().unwrap();
     let db = home.path().join("baton.sqlite");

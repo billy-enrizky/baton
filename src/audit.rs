@@ -18,6 +18,7 @@ pub const DURABLE_RETENTION: &str = "durable";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuditAction {
     GrantMint,
+    GrantRenew,
     GrantRevoke,
     QueueClear,
     ThreadFork,
@@ -27,6 +28,7 @@ impl AuditAction {
     pub fn as_str(self) -> &'static str {
         match self {
             AuditAction::GrantMint => "grant.mint",
+            AuditAction::GrantRenew => "grant.renew",
             AuditAction::GrantRevoke => "grant.revoke",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
@@ -103,6 +105,7 @@ mod tests {
         assert_eq!(event.result, "ok");
         assert_eq!(event.retention, DURABLE_RETENTION);
         assert_eq!(event.payload_digest.len(), 64);
+        assert_eq!(AuditAction::GrantRenew.as_str(), "grant.renew");
         assert_eq!(AuditAction::QueueClear.as_str(), "queue.clear");
         assert_eq!(AuditAction::ThreadFork.as_str(), "thread.fork");
     }

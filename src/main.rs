@@ -2936,6 +2936,11 @@ fn audit_event_json(event: &store::AuditEventRow) -> serde_json::Value {
 fn run_grant(home: &Path, command: cli::GrantCommand) -> Result<()> {
     match command {
         cli::GrantCommand::List { json } => list_grants(json),
+        cli::GrantCommand::Renew {
+            grant_id,
+            days,
+            json,
+        } => renew_grant(&grant_id, days, json),
         cli::GrantCommand::Revoke { grant_id, json } => revoke_grant(home, &grant_id, json),
     }
 }
@@ -2995,6 +3000,38 @@ fn list_grants(json: bool) -> Result<()> {
             grant.expires_at,
             label
         );
+    }
+    Ok(())
+}
+
+fn renew_grant(grant_id: &str, days: i64, json: bool) -> Result<()> {
+    let store = open_store(None)?;
+    match grants::renew(&store, grant_id, days)? {
+        grants::RenewOutcome::Missing => anyhow::bail!("no grant matches {grant_id}"),
+        grants::RenewOutcome::Revoked => {
+            anyhow::bail!("{grant_id} is revoked; pair the client again")
+        }
+        grants::RenewOutcome::Renewed(payload) => {
+            let previous_expires_at = payload.previous_expires_at;
+            let grant = payload.grant;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema_version": status::SCHEMA_VERSION,
+                        "grant_id": grant.grant_id,
+                        "previous_expires_at": previous_expires_at,
+                        "expires_at": grant.expires_at,
+                    }))?
+                );
+            } else {
+                let short = &grant.grant_id[..8.min(grant.grant_id.len())];
+                println!(
+                    "renewed {short} until {} (was {})",
+                    grant.expires_at, previous_expires_at
+                );
+            }
+        }
     }
     Ok(())
 }

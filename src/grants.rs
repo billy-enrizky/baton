@@ -157,17 +157,6 @@ pub fn mint(store: &BatonStore, home: &Path, request: &GrantRequest) -> Result<M
     let secret_hash = hash_secret(&secret);
     let issued_at = now_iso();
 
-    crate::claim::create_private_dir(home)?;
-    let dir = grants_dir(home);
-    crate::claim::create_private_dir(&dir)?;
-    let path = secret_path(home, &grant_id).expect("generated grant ids are UUIDs");
-    {
-        let mut file = crate::claim::open_private_new(&path)
-            .with_context(|| format!("create {}", path.display()))?;
-        file.write_all(secret.as_bytes())?;
-        file.write_all(b"\n")?;
-    }
-
     let row = GrantRow {
         grant_id: grant_id.clone(),
         installation_id,
@@ -184,7 +173,36 @@ pub fn mint(store: &BatonStore, home: &Path, request: &GrantRequest) -> Result<M
         revoked_at: None,
         label: request.label.clone(),
     };
-    if let Err(error) = store.insert_grant(&row) {
+    let audit = crate::audit::event(
+        crate::audit::HOST_TERMINAL_ACTOR,
+        &row.installation_id,
+        None,
+        crate::audit::AuditAction::GrantMint,
+        crate::audit::ADMIN_SCOPE,
+        crate::audit::HOST_TERMINAL_CONFIRMATION,
+        &serde_json::json!({
+            "grant_id": row.grant_id,
+            "installation_id": row.installation_id,
+            "scopes": row.scopes,
+            "permission_ceiling": row.permission_ceiling,
+            "project_allowlist": row.project_allowlist,
+            "expires_at": row.expires_at,
+            "label": row.label,
+        }),
+    )?;
+
+    crate::claim::create_private_dir(home)?;
+    let dir = grants_dir(home);
+    crate::claim::create_private_dir(&dir)?;
+    let path = secret_path(home, &grant_id).expect("generated grant ids are UUIDs");
+    {
+        let mut file = crate::claim::open_private_new(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        file.write_all(secret.as_bytes())?;
+        file.write_all(b"\n")?;
+    }
+
+    if let Err(error) = store.insert_grant_with_audit(&row, &audit) {
         let _ = fs::remove_file(&path);
         return Err(error);
     }
@@ -232,13 +250,32 @@ pub fn revoke(store: &BatonStore, home: &Path, grant_id: &str) -> Result<bool> {
     let Some(path) = secret_path(home, grant_id) else {
         anyhow::bail!("grant id must be a lowercase UUID: {grant_id}");
     };
-    let existed = store.revoke_grant_row(grant_id)?;
-    match fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).with_context(|| format!("remove {}", path.display())),
-    }
+    let Some(grant) = store.find_grant_row(grant_id)? else {
+        remove_secret_file(&path)?;
+        return Ok(false);
+    };
+    let audit = crate::audit::event(
+        crate::audit::LOCAL_CLI_ACTOR,
+        &grant.installation_id,
+        None,
+        crate::audit::AuditAction::GrantRevoke,
+        crate::audit::ADMIN_SCOPE,
+        crate::audit::LOCAL_CLI_CONFIRMATION,
+        &serde_json::json!({ "grant_id": grant_id }),
+    )?;
+    let existed = store
+        .revoke_grant_row_with_audit(grant_id, &audit)?
+        .is_some();
+    remove_secret_file(&path)?;
     Ok(existed)
+}
+
+fn remove_secret_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
 }
 
 fn validate(request: &GrantRequest) -> Result<()> {
@@ -388,6 +425,44 @@ mod tests {
             refused.downcast_ref::<GrantRefusal>(),
             Some(&GrantRefusal::Revoked)
         );
+    }
+
+    #[test]
+    fn mint_records_a_host_terminal_audit_event() {
+        let home = temp_home();
+        let store = BatonStore::memory().unwrap();
+        let minted = mint(&store, home.path(), &GrantRequest::new(vec![Scope::Read])).unwrap();
+        let row = store
+            .find_grant_row(&minted.summary.grant_id)
+            .unwrap()
+            .unwrap();
+        let events = crate::audit::list(&store, 10).unwrap();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.actor, crate::audit::HOST_TERMINAL_ACTOR);
+        assert_eq!(event.environment, row.installation_id);
+        assert_eq!(event.action, "grant.mint");
+        assert_eq!(event.scope, "admin");
+        assert_eq!(event.confirmation, "host_terminal");
+        assert_eq!(event.result, "ok");
+        assert_eq!(event.retention, "durable");
+        assert_eq!(event.payload_digest.len(), 64);
+        assert!(!format!("{event:?}").contains(&minted.secret));
+    }
+
+    #[test]
+    fn revoke_records_a_local_cli_audit_event() {
+        let home = temp_home();
+        let store = BatonStore::memory().unwrap();
+        let minted = mint(&store, home.path(), &GrantRequest::new(vec![Scope::Read])).unwrap();
+        assert!(revoke(&store, home.path(), &minted.summary.grant_id).unwrap());
+        let events = crate::audit::list(&store, 10).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].action, "grant.revoke");
+        assert_eq!(events[0].actor, crate::audit::LOCAL_CLI_ACTOR);
+        assert_eq!(events[0].confirmation, "local_cli");
+        assert_eq!(events[0].scope, "admin");
+        assert_eq!(events[1].action, "grant.mint");
     }
 
     #[test]

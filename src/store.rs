@@ -98,6 +98,34 @@ pub struct GrantSummary {
     pub label: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAuditEvent {
+    pub actor: String,
+    pub environment: String,
+    pub thread_id: Option<String>,
+    pub action: String,
+    pub scope: String,
+    pub confirmation: String,
+    pub payload_digest: String,
+    pub result: String,
+    pub retention: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditEventRow {
+    pub id: i64,
+    pub actor: String,
+    pub environment: String,
+    pub thread_id: Option<String>,
+    pub action: String,
+    pub scope: String,
+    pub confirmation: String,
+    pub payload_digest: String,
+    pub result: String,
+    pub created_at: String,
+    pub retention: String,
+}
+
 impl GrantRow {
     pub fn summary(&self) -> GrantSummary {
         GrantSummary {
@@ -483,7 +511,7 @@ fn store_home(path: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 /// The first schema with the `host_claim` table. A client can check ownership
 /// only from this version on, before it runs any migration DDL.
 const HOST_CLAIM_SCHEMA_VERSION: i64 = 2;
@@ -735,6 +763,29 @@ CREATE TABLE IF NOT EXISTS grants (
   revoked_at TEXT,
   label TEXT
 );
+CREATE TABLE IF NOT EXISTS audit_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor TEXT NOT NULL CHECK (length(actor) > 0),
+  environment TEXT NOT NULL CHECK (length(environment) > 0),
+  thread_id TEXT,
+  action TEXT NOT NULL CHECK (length(action) > 0),
+  scope TEXT NOT NULL CHECK (length(scope) > 0),
+  confirmation TEXT NOT NULL CHECK (length(confirmation) > 0),
+  payload_digest TEXT NOT NULL CHECK (length(payload_digest) = 64),
+  result TEXT NOT NULL CHECK (length(result) > 0),
+  created_at TEXT NOT NULL CHECK (length(created_at) > 0),
+  retention TEXT NOT NULL CHECK (length(retention) > 0)
+);
+CREATE TRIGGER IF NOT EXISTS audit_events_no_update
+BEFORE UPDATE ON audit_events
+BEGIN
+  SELECT RAISE(ABORT, 'audit_events_append_only');
+END;
+CREATE TRIGGER IF NOT EXISTS audit_events_no_delete
+BEFORE DELETE ON audit_events
+BEGIN
+  SELECT RAISE(ABORT, 'audit_events_append_only');
+END;
 CREATE TABLE IF NOT EXISTS host_claim (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
   host_id TEXT NOT NULL,
@@ -2859,8 +2910,66 @@ impl BatonStore {
         Ok(changed == 1)
     }
 
-    pub fn insert_grant(&self, grant: &GrantRow) -> Result<()> {
-        self.write_execute(
+    fn insert_audit_event_in(
+        db: &Connection,
+        event: &NewAuditEvent,
+        created_at: &str,
+    ) -> Result<i64> {
+        db.execute(
+            "INSERT INTO audit_events (actor, environment, thread_id, action, scope, confirmation, payload_digest, result, created_at, retention) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![
+                event.actor,
+                event.environment,
+                event.thread_id,
+                event.action,
+                event.scope,
+                event.confirmation,
+                event.payload_digest,
+                event.result,
+                created_at,
+                event.retention,
+            ],
+        )?;
+        Ok(db.last_insert_rowid())
+    }
+
+    fn audit_event_row(id: i64, created_at: String, event: &NewAuditEvent) -> AuditEventRow {
+        AuditEventRow {
+            id,
+            actor: event.actor.clone(),
+            environment: event.environment.clone(),
+            thread_id: event.thread_id.clone(),
+            action: event.action.clone(),
+            scope: event.scope.clone(),
+            confirmation: event.confirmation.clone(),
+            payload_digest: event.payload_digest.clone(),
+            result: event.result.clone(),
+            created_at,
+            retention: event.retention.clone(),
+        }
+    }
+
+    pub fn append_audit_event(&self, event: &NewAuditEvent) -> Result<AuditEventRow> {
+        let created_at = now_iso();
+        let write = self.write()?;
+        let id = Self::insert_audit_event_in(&write, event, &created_at)?;
+        write.commit()?;
+        Ok(Self::audit_event_row(id, created_at, event))
+    }
+
+    pub fn list_audit_events(&self, limit: usize) -> Result<Vec<AuditEventRow>> {
+        let limit = limit.min(i64::MAX as usize) as i64;
+        let mut statement = self.db.prepare(
+            "SELECT id, actor, environment, thread_id, action, scope, confirmation, payload_digest, result, created_at, retention FROM audit_events ORDER BY id DESC LIMIT ?",
+        )?;
+        let rows = statement
+            .query_map(params![limit], Self::map_audit_event)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    fn insert_grant_in(db: &Connection, grant: &GrantRow) -> Result<()> {
+        db.execute(
             "INSERT INTO grants (grant_id, installation_id, secret_hash, scopes, permission_ceiling, project_allowlist, issued_at, expires_at, revoked_at, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 grant.grant_id,
@@ -2876,6 +2985,28 @@ impl BatonStore {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn insert_grant(&self, grant: &GrantRow) -> Result<()> {
+        let write = self.write()?;
+        Self::insert_grant_in(&write, grant)?;
+        write.commit()?;
+        Ok(())
+    }
+
+    /// A grant row and its audit event commit together. If the audit event is
+    /// rejected, the grant does not exist.
+    pub fn insert_grant_with_audit(
+        &self,
+        grant: &GrantRow,
+        event: &NewAuditEvent,
+    ) -> Result<AuditEventRow> {
+        let created_at = now_iso();
+        let write = self.write()?;
+        Self::insert_grant_in(&write, grant)?;
+        let id = Self::insert_audit_event_in(&write, event, &created_at)?;
+        write.commit()?;
+        Ok(Self::audit_event_row(id, created_at, event))
     }
 
     pub fn list_grant_rows(&self) -> Result<Vec<GrantRow>> {
@@ -2905,6 +3036,44 @@ impl BatonStore {
             params![now_iso(), grant_id],
         )?;
         Ok(changed == 1)
+    }
+
+    /// Revoking a present grant and its audit event commit together. A missing
+    /// grant writes no event and returns `None`.
+    pub fn revoke_grant_row_with_audit(
+        &self,
+        grant_id: &str,
+        event: &NewAuditEvent,
+    ) -> Result<Option<AuditEventRow>> {
+        let created_at = now_iso();
+        let write = self.write()?;
+        let changed = write.execute(
+            "UPDATE grants SET revoked_at = COALESCE(revoked_at, ?) WHERE grant_id = ?",
+            params![created_at, grant_id],
+        )?;
+        if changed == 0 {
+            write.commit()?;
+            return Ok(None);
+        }
+        let id = Self::insert_audit_event_in(&write, event, &created_at)?;
+        write.commit()?;
+        Ok(Some(Self::audit_event_row(id, created_at, event)))
+    }
+
+    fn map_audit_event(row: &rusqlite::Row) -> rusqlite::Result<AuditEventRow> {
+        Ok(AuditEventRow {
+            id: row.get(0)?,
+            actor: row.get(1)?,
+            environment: row.get(2)?,
+            thread_id: row.get(3)?,
+            action: row.get(4)?,
+            scope: row.get(5)?,
+            confirmation: row.get(6)?,
+            payload_digest: row.get(7)?,
+            result: row.get(8)?,
+            created_at: row.get(9)?,
+            retention: row.get(10)?,
+        })
     }
 
     fn map_grant(row: &rusqlite::Row) -> rusqlite::Result<GrantRow> {
@@ -4103,6 +4272,35 @@ pub struct ImportedMessage {
 mod tests {
     use super::*;
 
+    fn sample_audit_event(action: &str) -> NewAuditEvent {
+        NewAuditEvent {
+            actor: "host_terminal".into(),
+            environment: "installation".into(),
+            thread_id: None,
+            action: action.into(),
+            scope: "admin".into(),
+            confirmation: "host_terminal".into(),
+            payload_digest: "a".repeat(64),
+            result: "ok".into(),
+            retention: "durable".into(),
+        }
+    }
+
+    fn sample_grant(grant_id: &str) -> GrantRow {
+        GrantRow {
+            grant_id: grant_id.into(),
+            installation_id: "installation".into(),
+            secret_hash: "hash".into(),
+            scopes: vec!["read".into()],
+            permission_ceiling: "default".into(),
+            project_allowlist: Vec::new(),
+            issued_at: now_iso(),
+            expires_at: now_iso(),
+            revoked_at: None,
+            label: None,
+        }
+    }
+
     #[test]
     fn open_sets_wal_and_schema_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -4894,6 +5092,116 @@ mod tests {
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn a_version_five_store_gains_append_only_audit_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.sqlite");
+        let db = Connection::open(&path).unwrap();
+        db.pragma_update(None, "user_version", 5).unwrap();
+        drop(db);
+
+        let store = BatonStore::open(&path).unwrap();
+        drop(store);
+        let db = Connection::open(&path).unwrap();
+        let table: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'audit_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table, 1, "the migration creates the audit table");
+        let triggers: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name LIKE 'audit_events_no_%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            triggers, 2,
+            "the migration creates both append-only triggers"
+        );
+        let version: i64 = db
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn audit_events_are_newest_first_and_append_only() {
+        let store = BatonStore::memory().unwrap();
+        let first = store
+            .append_audit_event(&sample_audit_event("grant.mint"))
+            .unwrap();
+        let second = store
+            .append_audit_event(&sample_audit_event("grant.revoke"))
+            .unwrap();
+        assert!(second.id > first.id);
+        let listed = store.list_audit_events(10).unwrap();
+        assert_eq!(listed[0].id, second.id);
+        assert_eq!(listed[1].id, first.id);
+        let limited = store.list_audit_events(1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, second.id);
+
+        let update = store
+            .write_execute("UPDATE audit_events SET action = 'changed'", [])
+            .unwrap_err();
+        assert!(update.to_string().contains("audit_events_append_only"));
+        let delete = store
+            .write_execute("DELETE FROM audit_events", [])
+            .unwrap_err();
+        assert!(delete.to_string().contains("audit_events_append_only"));
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_grant_and_its_audit_event_commit_together() {
+        let store = BatonStore::memory().unwrap();
+        let grant = sample_grant("00000000-0000-4000-8000-000000000001");
+        let mut invalid = sample_audit_event("grant.mint");
+        invalid.payload_digest = "short".into();
+        assert!(store.insert_grant_with_audit(&grant, &invalid).is_err());
+        assert!(store.find_grant_row(&grant.grant_id).unwrap().is_none());
+        assert!(store.list_audit_events(10).unwrap().is_empty());
+
+        let event = store
+            .insert_grant_with_audit(&grant, &sample_audit_event("grant.mint"))
+            .unwrap();
+        assert_eq!(event.action, "grant.mint");
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
+        assert!(store.find_grant_row(&grant.grant_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_revoke_and_its_audit_event_commit_together() {
+        let store = BatonStore::memory().unwrap();
+        let grant = sample_grant("00000000-0000-4000-8000-000000000002");
+        store.insert_grant(&grant).unwrap();
+        let mut invalid = sample_audit_event("grant.revoke");
+        invalid.payload_digest = "short".into();
+        assert!(store
+            .revoke_grant_row_with_audit(&grant.grant_id, &invalid)
+            .is_err());
+        let untouched = store.find_grant_row(&grant.grant_id).unwrap().unwrap();
+        assert!(untouched.revoked_at.is_none());
+        assert!(store.list_audit_events(10).unwrap().is_empty());
+
+        let revocation = store
+            .revoke_grant_row_with_audit(&grant.grant_id, &sample_audit_event("grant.revoke"))
+            .unwrap()
+            .expect("a present grant writes an audit event");
+        assert_eq!(revocation.action, "grant.revoke");
+        assert!(store
+            .find_grant_row(&grant.grant_id)
+            .unwrap()
+            .unwrap()
+            .revoked_at
+            .is_some());
+        assert_eq!(store.list_audit_events(10).unwrap().len(), 1);
     }
 
     #[cfg(unix)]

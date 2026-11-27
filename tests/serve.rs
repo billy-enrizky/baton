@@ -757,6 +757,16 @@ fn serve_stdin_pair_and_attach_use_the_socket() {
     }));
     assert_eq!(status["ok"], true, "{status}");
 
+    let audit = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["audit", "list", "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(audit.status.success(), "{audit:?}");
+    let audit: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(audit["events"].as_array().unwrap().len(), 1);
+    assert_eq!(audit["events"][0]["action"], "grant.mint");
+
     let attached = Command::new(env!("CARGO_BIN_EXE_baton"))
         .args(["attach", "--url", &url, "--json"])
         .env("BATON_HOME", home.path())

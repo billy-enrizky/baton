@@ -1,4 +1,4 @@
-use baton::{activity, adapters, attach, checkpoints, claim, cli, config, doctor, exec_events, files, grants, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, serve, status, store, tasks, tui, types, usage, worktree};
+use baton::{activity, adapters, attach, audit, checkpoints, claim, cli, config, doctor, exec_events, files, grants, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, serve, status, store, tasks, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -56,7 +56,10 @@ fn main_result(started: Instant) -> Result<()> {
     }
 
     let serving = matches!(&command, cli::Commands::Serve { .. });
-    let read_only_client = matches!(&command, cli::Commands::Attach { .. });
+    let read_only_client = matches!(
+        &command,
+        cli::Commands::Attach { .. } | cli::Commands::Audit { .. }
+    );
     let hosted_child = cli.host_id.is_some();
     if !serving && !hosted_child && !read_only_client {
         reap_startup_processes();
@@ -713,6 +716,7 @@ fn main_result(started: Instant) -> Result<()> {
         cli::Commands::Attach { url, json } => run_attach(&home, url, json),
         cli::Commands::Host { command } => run_host(&home, command),
         cli::Commands::Grant { command } => run_grant(&home, command),
+        cli::Commands::Audit { command } => run_audit(command),
         cli::Commands::Runs { command } => run_runs(command),
         cli::Commands::Mcp => {
             let store = open_store(None)?;
@@ -2856,6 +2860,77 @@ fn run_attach(home: &Path, url: Option<String>, json: bool) -> Result<()> {
         println!("running turns: {}", status.running_turns);
     }
     Ok(())
+}
+
+fn run_audit(command: cli::AuditCommand) -> Result<()> {
+    match command {
+        cli::AuditCommand::List { limit, json } => list_audit(limit, json),
+    }
+}
+
+fn list_audit(limit: usize, json: bool) -> Result<()> {
+    if limit == 0 || limit > 1000 {
+        anyhow::bail!("--limit must be between 1 and 1000");
+    }
+    let path = paths::baton_db_path();
+    let events = if path.exists() {
+        let store = BatonStore::open_read_only(&path)?;
+        audit::list(&store, limit)?
+    } else {
+        Vec::new()
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": status::SCHEMA_VERSION,
+                "events": events.iter().map(audit_event_json).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+    if events.is_empty() {
+        println!("no audit events yet");
+        return Ok(());
+    }
+    println!("audit events, newest first:");
+    for event in &events {
+        let action = sanitize::sanitize_single_line(&event.action);
+        let result = sanitize::sanitize_single_line(&event.result);
+        let scope = sanitize::sanitize_single_line(&event.scope);
+        let confirmation = sanitize::sanitize_single_line(&event.confirmation);
+        let actor = sanitize::sanitize_single_line(&event.actor);
+        let environment = sanitize::sanitize_single_line(&event.environment);
+        let retention = sanitize::sanitize_single_line(&event.retention);
+        let created_at = sanitize::sanitize_single_line(&event.created_at);
+        let digest = sanitize::sanitize_single_line(&event.payload_digest);
+        println!(
+            "#{} {} {} {} scope={} confirmation={}",
+            event.id, created_at, action, result, scope, confirmation
+        );
+        println!("   actor={actor} environment={environment} retention={retention}");
+        if let Some(thread) = &event.thread_id {
+            println!("   thread={}", sanitize::sanitize_single_line(thread));
+        }
+        println!("   digest={digest}");
+    }
+    Ok(())
+}
+
+fn audit_event_json(event: &store::AuditEventRow) -> serde_json::Value {
+    serde_json::json!({
+        "id": event.id,
+        "actor": event.actor,
+        "environment": event.environment,
+        "thread_id": event.thread_id,
+        "action": event.action,
+        "scope": event.scope,
+        "confirmation": event.confirmation,
+        "payload_digest": event.payload_digest,
+        "result": event.result,
+        "created_at": event.created_at,
+        "retention": event.retention,
+    })
 }
 
 fn run_grant(home: &Path, command: cli::GrantCommand) -> Result<()> {

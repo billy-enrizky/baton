@@ -555,6 +555,7 @@ struct ApprovalState {
 
 struct QuestionState {
     thread_id: String,
+    id: String,
     questions: Vec<QuestionPrompt>,
     index: usize,
     selected: usize,
@@ -3263,7 +3264,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
             state.ring_attention();
         }
         TurnEvent::QuestionRequest {
-            id: _,
+            id,
             questions,
             respond,
         } => {
@@ -3272,6 +3273,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
             } else {
                 state.questions.push(QuestionState {
                     thread_id,
+                    id,
                     questions,
                     index: 0,
                     selected: 0,
@@ -5552,7 +5554,7 @@ fn handle_key(
             question_key(question, key)
         };
         if let QuestionKey::Answer(answer) = outcome {
-            finish_question_answers(state, answer);
+            finish_question_answers(state, store, answer);
         }
         return;
     }
@@ -16694,6 +16696,62 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
     frame.render_widget(Paragraph::new(render_lines), area);
 }
 
+/// The audit payload for one answered request. Provider option labels are
+/// recorded; free-text answers are counted, never committed, because the log
+/// stores only a digest and a custom answer can carry a secret.
+fn question_answer_payload(question: &QuestionState) -> serde_json::Value {
+    let answers = question
+        .answers
+        .iter()
+        .map(|answer| {
+            let chosen: Vec<&str> = question
+                .questions
+                .iter()
+                .find(|prompt| prompt.id == answer.id)
+                .map(|prompt| {
+                    answer
+                        .answers
+                        .iter()
+                        .filter(|value| prompt.options.iter().any(|option| &option.label == *value))
+                        .map(String::as_str)
+                        .collect()
+                })
+                .unwrap_or_default();
+            serde_json::json!({
+                "prompt_id": answer.id,
+                "answers": answer.answers.len(),
+                "options": chosen,
+                "custom": answer.answers.len() > chosen.len(),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "request_id": question.id,
+        "prompts": question.questions.len(),
+        "answers": answers,
+    })
+}
+
+/// Records the answers before they are sent, so an answer cannot reach the
+/// provider with no row that names the request.
+fn record_question_answers(
+    store: &Arc<Mutex<BatonStore>>,
+    home: &std::path::Path,
+    question: &QuestionState,
+) -> anyhow::Result<()> {
+    let event = crate::audit::event(
+        crate::audit::TUI_ACTOR,
+        &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+        Some(&question.thread_id),
+        crate::audit::AuditAction::QuestionAnswer,
+        crate::audit::APPROVE_SCOPE,
+        crate::audit::HOST_SESSION_CONFIRMATION,
+        &question_answer_payload(question),
+    )?;
+    store.lock().unwrap().append_audit_event(&event)?;
+    Ok(())
+}
+
 fn approval_decision_name(decision: &ApprovalDecision) -> String {
     match decision {
         ApprovalDecision::Accept => "accept".to_string(),
@@ -16852,7 +16910,11 @@ fn question_selected_labels(question: &QuestionState) -> Vec<String> {
         .collect()
 }
 
-fn finish_question_answers(state: &mut TuiState, answers: Vec<String>) {
+fn finish_question_answers(
+    state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
+    answers: Vec<String>,
+) {
     let Some(question) = state.questions.last_mut() else {
         return;
     };
@@ -16870,15 +16932,31 @@ fn finish_question_answers(state: &mut TuiState, answers: Vec<String>) {
     }
     let question = state.questions.pop().expect("question checked above");
     let count = question.answers.len();
-    if question.respond.send(question.answers).is_err() {
-        state.notice = Some("question request expired".into());
-    } else if state.questions.is_empty() {
-        state.notice = Some(format!("answered {count} question(s)"));
-    } else {
-        state.notice = Some(format!(
-            "answered {count} question(s) · {} request(s) still waiting",
-            state.questions.len()
-        ));
+    match record_question_answers(store, &state.home, &question) {
+        Ok(()) => {
+            if question.respond.send(question.answers).is_err() {
+                state.notice = Some("question request expired".into());
+            } else if state.questions.is_empty() {
+                state.notice = Some(format!("answered {count} question(s)"));
+            } else {
+                state.notice = Some(format!(
+                    "answered {count} question(s) · {} request(s) still waiting",
+                    state.questions.len()
+                ));
+            }
+        }
+        Err(error) => {
+            let empty = question
+                .answers
+                .iter()
+                .map(|answer| QuestionAnswer {
+                    id: answer.id.clone(),
+                    answers: Vec::new(),
+                })
+                .collect();
+            let _ = question.respond.send(empty);
+            state.notice = Some(format!("question not recorded, answered empty: {error}"));
+        }
     }
 }
 
@@ -20632,6 +20710,121 @@ mod tests {
         assert_eq!(answers[1].answers, vec!["B".to_string()]);
         assert!(state.questions.is_empty());
         assert!(state.notice.as_deref().unwrap_or("").contains("answered 2"));
+
+        let events = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].action, "question.answer");
+        assert_eq!(events[0].actor, crate::audit::TUI_ACTOR);
+        assert_eq!(events[0].scope, crate::audit::APPROVE_SCOPE);
+        assert_eq!(
+            events[0].thread_id.as_deref(),
+            Some(state.thread.id.as_str())
+        );
+        assert_eq!(events[0].payload_digest.len(), 64);
+    }
+
+    #[test]
+    fn question_payload_records_labels_and_never_custom_text() {
+        let (respond, _receiver) = tokio::sync::oneshot::channel();
+        let question = QuestionState {
+            thread_id: "thread".into(),
+            id: "request".into(),
+            questions: vec![QuestionPrompt {
+                id: "db".into(),
+                header: "Database".into(),
+                question: "Which database?".into(),
+                options: vec![QuestionOption {
+                    label: "SQLite".into(),
+                    description: String::new(),
+                }],
+                allow_custom: true,
+                multi_select: false,
+                secret: true,
+            }],
+            index: 0,
+            selected: 0,
+            toggled: Vec::new(),
+            custom: None,
+            answers: vec![
+                QuestionAnswer {
+                    id: "db".into(),
+                    answers: vec!["SQLite".into()],
+                },
+                QuestionAnswer {
+                    id: "free".into(),
+                    answers: vec!["hunter2".into()],
+                },
+            ],
+            respond,
+        };
+        let payload = question_answer_payload(&question);
+        assert_eq!(payload["request_id"], "request");
+        assert_eq!(payload["prompts"], 1);
+        assert_eq!(
+            payload["answers"][0]["options"],
+            serde_json::json!(["SQLite"])
+        );
+        assert_eq!(payload["answers"][0]["custom"], false);
+        assert_eq!(payload["answers"][1]["options"], serde_json::json!([]));
+        assert_eq!(payload["answers"][1]["custom"], true);
+        assert!(
+            !serde_json::to_string(&payload).unwrap().contains("hunter2"),
+            "a typed answer is counted, never committed"
+        );
+    }
+
+    #[test]
+    fn a_question_that_cannot_be_recorded_sends_no_answers() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("baton.sqlite");
+        let writable = Arc::new(Mutex::new(BatonStore::open(&db).unwrap()));
+        let mut state = test_state(home.path(), &writable, Vec::new());
+        let read_only = Arc::new(Mutex::new(BatonStore::open_read_only(&db).unwrap()));
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::QuestionRequest {
+                id: "unrecorded-question".into(),
+                questions: vec![QuestionPrompt {
+                    id: "db".into(),
+                    header: "Database".into(),
+                    question: "Which database?".into(),
+                    options: vec![QuestionOption {
+                        label: "SQLite".into(),
+                        description: String::new(),
+                    }],
+                    allow_custom: true,
+                    multi_select: false,
+                    secret: true,
+                }],
+                respond: sender,
+            },
+        );
+
+        finish_question_answers(&mut state, &read_only, vec!["hunter2".into()]);
+        let answers = receiver.try_recv().unwrap();
+        assert_eq!(answers.len(), 1);
+        assert!(
+            answers[0].answers.is_empty(),
+            "an unrecorded answer never reaches the provider"
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("not recorded"),
+            "{:?}",
+            state.notice
+        );
+        assert!(writable
+            .lock()
+            .unwrap()
+            .list_audit_events(10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

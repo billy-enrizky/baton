@@ -27,6 +27,7 @@ pub enum AuditAction {
     GrantRevoke,
     TurnSubmit,
     ApprovalDecide,
+    QuestionAnswer,
     QueueClear,
     ThreadFork,
 }
@@ -39,6 +40,7 @@ impl AuditAction {
             AuditAction::GrantRevoke => "grant.revoke",
             AuditAction::TurnSubmit => "turn.submit",
             AuditAction::ApprovalDecide => "approval.decide",
+            AuditAction::QuestionAnswer => "question.answer",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
         }
@@ -117,6 +119,7 @@ mod tests {
         assert_eq!(AuditAction::GrantRenew.as_str(), "grant.renew");
         assert_eq!(AuditAction::TurnSubmit.as_str(), "turn.submit");
         assert_eq!(AuditAction::ApprovalDecide.as_str(), "approval.decide");
+        assert_eq!(AuditAction::QuestionAnswer.as_str(), "question.answer");
         assert_eq!(AuditAction::QueueClear.as_str(), "queue.clear");
         assert_eq!(AuditAction::ThreadFork.as_str(), "thread.fork");
     }

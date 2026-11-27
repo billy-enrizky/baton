@@ -6,6 +6,7 @@ Each event carries:
 
 - actor: `host_terminal` for the pairing command, `local_cli` for `grant renew` and `grant revoke`, `host_engine` for accepted turns, `tui` for approval answers, question answers, and git actions, `mcp_stdio` for MCP fork and queue clear
 - environment: the installation id
+- target: what changed, such as a grant id, thread id, provider request id, commit sha, or pull request number
 - optional thread id
 - action: `grant.mint`, `grant.renew`, `grant.revoke`, `turn.submit`, `approval.decide`, `question.answer`, `git.commit`, `git.push`, `git.pr`, `git.review`, `git.merge`, `queue.clear`, or `thread.fork`
 - scope: `admin` for grants, MCP fork, and queue clear; `operate` for turn submission; `approve` for approval and question answers; `git` for repository actions
@@ -20,7 +21,7 @@ The `audit_events` table rejects UPDATE and DELETE with the `audit_events_append
 ## Proof
 
 - `src/audit.rs` `payload_digest_ignores_object_key_order`, `event_carries_the_action_scope_and_retention`
-- `src/store.rs` `a_version_five_store_gains_append_only_audit_events`, `audit_events_are_newest_first_and_append_only`, `a_grant_and_its_audit_event_commit_together`, `a_renewal_and_its_audit_event_commit_together`, `a_revoke_and_its_audit_event_commit_together`
+- `src/store.rs` `a_version_five_store_gains_append_only_audit_events`, `a_version_six_store_gains_the_audit_target`, `audit_events_are_newest_first_and_append_only`, `a_grant_and_its_audit_event_commit_together`, `a_renewal_and_its_audit_event_commit_together`, `a_revoke_and_its_audit_event_commit_together`
 - `src/grants.rs` `mint_records_a_host_terminal_audit_event`, `renew_extends_only_forward_and_keeps_the_credential_working`, `revoke_records_a_local_cli_audit_event`
 - `src/runtime.rs` `runtime::tests::a_completed_turn_is_recorded` asserts one `turn.submit` row per accepted engine turn
 - `src/tui/mod.rs` `approvals_stack_over_pickers_without_losing_them` asserts one row per answer with distinct digests, `an_approval_that_cannot_be_recorded_is_denied` proves the denial fallback, and `approval_decision_names_cover_every_choice` fixes the decision names

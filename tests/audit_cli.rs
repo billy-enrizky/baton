@@ -27,6 +27,7 @@ fn audit_list_reports_grant_events_and_respects_the_limit() {
     let events = value["events"].as_array().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["action"], "grant.mint");
+    assert_eq!(events[0]["target"], minted.summary.grant_id);
     assert_eq!(events[0]["actor"], "host_terminal");
     assert_eq!(events[0]["confirmation"], "host_terminal");
     assert_eq!(events[0]["result"], "ok");
@@ -43,6 +44,7 @@ fn audit_list_reports_grant_events_and_respects_the_limit() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(output.status.success(), "{stdout}");
     assert!(stdout.contains("grant.mint"), "{stdout}");
+    assert!(stdout.contains("target="), "{stdout}");
     assert!(stdout.contains("actor=host_terminal"), "{stdout}");
     assert!(!stdout.contains(&minted.secret));
 
@@ -58,6 +60,7 @@ fn audit_list_reports_grant_events_and_respects_the_limit() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["events"].as_array().unwrap().len(), 1);
     assert_eq!(value["events"][0]["action"], "grant.revoke");
+    assert_eq!(value["events"][0]["target"], minted.summary.grant_id);
     assert_eq!(value["events"][0]["actor"], "local_cli");
 
     let empty = tempfile::tempdir().unwrap();

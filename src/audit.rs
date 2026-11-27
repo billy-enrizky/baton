@@ -56,6 +56,37 @@ impl AuditAction {
             AuditAction::ThreadFork => "thread.fork",
         }
     }
+
+    /// The scope is a property of the action, so a row cannot claim one scope
+    /// while recording an action that belongs to another.
+    pub fn scope(self) -> &'static str {
+        match self {
+            AuditAction::GrantMint
+            | AuditAction::GrantRenew
+            | AuditAction::GrantRevoke
+            | AuditAction::QueueClear
+            | AuditAction::ThreadFork => ADMIN_SCOPE,
+            AuditAction::TurnSubmit => OPERATE_SCOPE,
+            AuditAction::ApprovalDecide | AuditAction::QuestionAnswer => APPROVE_SCOPE,
+            AuditAction::GitCommit
+            | AuditAction::GitPush
+            | AuditAction::GitPr
+            | AuditAction::GitReview
+            | AuditAction::GitMerge => GIT_SCOPE,
+        }
+    }
+}
+
+/// The confirmation follows the actor: the local human typed it at the host,
+/// the engine or TUI acted inside the host session, and MCP acted through its
+/// spawner.
+pub fn confirmation_for(actor: &str) -> &'static str {
+    match actor {
+        HOST_TERMINAL_ACTOR => HOST_TERMINAL_CONFIRMATION,
+        LOCAL_CLI_ACTOR => LOCAL_CLI_CONFIRMATION,
+        MCP_STDIO_ACTOR => MCP_STDIO_CONFIRMATION,
+        _ => HOST_SESSION_CONFIRMATION,
+    }
 }
 
 pub fn payload_digest(value: &Value) -> Result<String> {
@@ -67,19 +98,19 @@ pub fn payload_digest(value: &Value) -> Result<String> {
 pub fn event(
     actor: &str,
     environment: &str,
+    target: Option<&str>,
     thread_id: Option<&str>,
     action: AuditAction,
-    scope: &str,
-    confirmation: &str,
     payload: &Value,
 ) -> Result<NewAuditEvent> {
     Ok(NewAuditEvent {
         actor: actor.to_string(),
         environment: environment.to_string(),
+        target: target.map(str::to_string),
         thread_id: thread_id.map(str::to_string),
         action: action.as_str().to_string(),
-        scope: scope.to_string(),
-        confirmation: confirmation.to_string(),
+        scope: action.scope().to_string(),
+        confirmation: confirmation_for(actor).to_string(),
         payload_digest: payload_digest(payload)?,
         result: "ok".to_string(),
         retention: DURABLE_RETENTION.to_string(),
@@ -107,19 +138,51 @@ mod tests {
     }
 
     #[test]
+    fn every_action_maps_to_its_scope() {
+        assert_eq!(AuditAction::GrantMint.scope(), ADMIN_SCOPE);
+        assert_eq!(AuditAction::GrantRenew.scope(), ADMIN_SCOPE);
+        assert_eq!(AuditAction::GrantRevoke.scope(), ADMIN_SCOPE);
+        assert_eq!(AuditAction::QueueClear.scope(), ADMIN_SCOPE);
+        assert_eq!(AuditAction::ThreadFork.scope(), ADMIN_SCOPE);
+        assert_eq!(AuditAction::TurnSubmit.scope(), OPERATE_SCOPE);
+        assert_eq!(AuditAction::ApprovalDecide.scope(), APPROVE_SCOPE);
+        assert_eq!(AuditAction::QuestionAnswer.scope(), APPROVE_SCOPE);
+        assert_eq!(AuditAction::GitCommit.scope(), GIT_SCOPE);
+        assert_eq!(AuditAction::GitPush.scope(), GIT_SCOPE);
+        assert_eq!(AuditAction::GitPr.scope(), GIT_SCOPE);
+        assert_eq!(AuditAction::GitReview.scope(), GIT_SCOPE);
+        assert_eq!(AuditAction::GitMerge.scope(), GIT_SCOPE);
+    }
+
+    #[test]
+    fn every_actor_maps_to_its_confirmation() {
+        assert_eq!(
+            confirmation_for(HOST_TERMINAL_ACTOR),
+            HOST_TERMINAL_CONFIRMATION
+        );
+        assert_eq!(confirmation_for(LOCAL_CLI_ACTOR), LOCAL_CLI_CONFIRMATION);
+        assert_eq!(confirmation_for(MCP_STDIO_ACTOR), MCP_STDIO_CONFIRMATION);
+        assert_eq!(
+            confirmation_for(HOST_ENGINE_ACTOR),
+            HOST_SESSION_CONFIRMATION
+        );
+        assert_eq!(confirmation_for(TUI_ACTOR), HOST_SESSION_CONFIRMATION);
+    }
+
+    #[test]
     fn event_carries_the_action_scope_and_retention() {
         let event = event(
             HOST_TERMINAL_ACTOR,
             "installation",
+            Some("grant"),
             Some("thread"),
             AuditAction::GrantMint,
-            ADMIN_SCOPE,
-            HOST_TERMINAL_CONFIRMATION,
             &serde_json::json!({"grant_id": "grant"}),
         )
         .unwrap();
         assert_eq!(event.actor, HOST_TERMINAL_ACTOR);
         assert_eq!(event.environment, "installation");
+        assert_eq!(event.target.as_deref(), Some("grant"));
         assert_eq!(event.thread_id.as_deref(), Some("thread"));
         assert_eq!(event.action, "grant.mint");
         assert_eq!(event.scope, "admin");

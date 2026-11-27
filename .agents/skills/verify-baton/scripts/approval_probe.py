@@ -392,6 +392,8 @@ def main() -> int:
             )
         if not approval_event["thread_id"]:
             raise RuntimeError("approval.decide row is missing its thread id")
+        if not approval_event["target"]:
+            raise RuntimeError("approval.decide row is missing its target")
         if len(approval_event["environment"]) != 36:
             raise RuntimeError(
                 "approval.decide row must carry the installation id, got "
@@ -412,6 +414,8 @@ def main() -> int:
                 )
             if not event["thread_id"]:
                 raise RuntimeError("question.answer row is missing its thread id")
+            if not event["target"]:
+                raise RuntimeError("question.answer row is missing its target")
 
         if state_path.is_file():
             for line in state_path.read_text().splitlines():

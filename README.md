@@ -279,6 +279,8 @@ Each thread you open stays in a tab strip above the transcript. The active tab i
 
 The strip appears once a second tab is open and shows up to nine tabs, then a `...` marker when more are open. A running turn keeps running when you switch away; its tab carries a `*` marker and keeps streaming, and the next visit shows everything it produced. A queued follow-up starts automatically when its background turn finishes, unless the thread's harness changed and a handoff preview needs your review; that one stays queued for the next visit. Archiving a thread closes its tab. A tab switch is refused while a request waits for your answer or a picker or full-screen view is open, so the current surface is never torn in the middle. Starting a thread that has not been sent yet keeps it in its tab; send one message to save it.
 
+`/pane` shows another open tab beside the active one, with its own transcript, running marker, and live tool or stream tail. Alt+W swaps focus between the panes, so the composer follows the thread you are reading. `/pane close` hides the second pane. A narrow terminal stacks the panes instead of placing them side by side.
+
 ### 4.6 Your first prompt
 
 Type what you want in plain language. Examples:
@@ -383,6 +385,8 @@ Ctrl+K opens the command palette. It filters built-in actions, threads, and rece
 #### 6.5.6 Thread tabs
 
 Alt+1 through Alt+9 switch to the tab in that position. Alt+0 does nothing. The strip only appears when more than one thread is open, and every open thread keeps its own transcript, composer draft, prompt history, goal, permission mode, and live turn state. A tab in another working directory also reloads that directory's custom commands. A tab whose turn is still running shows a `*` after its title until that turn settles.
+
+`/pane` opens a picker for the second pane. Alt+W swaps the active and secondary threads, and `/pane close` closes the second pane. The second pane is read-only; its header names the tab, and its body shows the transcript tail plus any live tool or stream rows for that thread.
 
 ## 7. Slash commands
 

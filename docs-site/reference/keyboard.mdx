@@ -31,6 +31,16 @@ A pasted multi-line prompt stays in the composer.
 
 The tab strip appears above the transcript once a second thread is open. A running turn keeps running when you switch away, and its tab carries a `*` marker until it settles. A queued follow-up starts on its own when that background turn finishes, unless a handoff preview is needed. A switch is refused while a request waits for an answer or a picker or full-screen view is open.
 
+## Secondary pane
+
+| Key | Action |
+|---|---|
+| Alt+W | Swap focus between the active pane and the secondary pane |
+| `/pane` | Pick an open tab for the secondary pane |
+| `/pane close` | Close the secondary pane |
+
+The secondary pane is read-only. It shows the other thread's transcript tail and any live tool or stream rows. Alt+W makes it the active pane so you can type into it. A wide terminal places the panes side by side; a narrow one stacks them.
+
 ## Steer and queue
 
 While a turn runs, a new message is sent as a steer on Codex, Claude, and OpenCode 2 or newer. Other harnesses queue it durably. A bare `/queue` opens the queue: Enter sends, `e` edits, `d` deletes, `c` twice clears, and Ctrl+Up and Ctrl+Down reorder.

@@ -8,6 +8,7 @@ import json
 import os
 import pty
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -250,6 +251,7 @@ def main() -> int:
     selected = None
     question_selected = None
     multi_answers = None
+    approval_events = None
     try:
         if not wait_for_screen(
             master, "Ask anything", args.timeout, args.width, args.height, transcript
@@ -363,6 +365,38 @@ def main() -> int:
             multi_after_text + "\n"
         )
 
+        audit = subprocess.run(
+            [str(binary), "audit", "list", "--json"],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        (evidence / "audit.json").write_text(audit.stdout)
+        if audit.returncode != 0:
+            raise RuntimeError(f"audit list failed: {audit.stderr.strip()}")
+        events = json.loads(audit.stdout)["events"]
+        approval_events = [
+            event for event in events if event["action"] == "approval.decide"
+        ]
+        if len(approval_events) != 1:
+            raise RuntimeError(
+                f"expected one approval.decide row, found {len(approval_events)}"
+            )
+        approval_event = approval_events[0]
+        if approval_event["actor"] != "tui" or approval_event["scope"] != "approve":
+            raise RuntimeError(
+                "approval.decide row has the wrong actor or scope: "
+                f"{approval_event['actor']}/{approval_event['scope']}"
+            )
+        if not approval_event["thread_id"]:
+            raise RuntimeError("approval.decide row is missing its thread id")
+        if len(approval_event["environment"]) != 36:
+            raise RuntimeError(
+                "approval.decide row must carry the installation id, got "
+                f"{approval_event['environment']!r}"
+            )
+
         if state_path.is_file():
             for line in state_path.read_text().splitlines():
                 try:
@@ -398,6 +432,8 @@ def main() -> int:
             missing.append("Which release features?")
         passed = (
             not missing
+            and approval_events is not None
+            and len(approval_events) == 1
             and selected == "opt-reject"
             and question_selected == "opt-sqlite"
             and multi_answers == ["CI", "Installer"]
@@ -439,6 +475,7 @@ def main() -> int:
             "selected": selected,
             "question_selected": question_selected,
             "multi_answers": multi_answers,
+            "approval_events": len(approval_events or []),
             "error": error,
             "exit_code": exit_code,
             "evidence": str(evidence),

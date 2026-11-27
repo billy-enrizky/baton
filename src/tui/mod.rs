@@ -545,6 +545,8 @@ struct ActivityView {
 
 struct ApprovalState {
     thread_id: String,
+    id: String,
+    kind: String,
     summary: String,
     choices: Vec<ApprovalChoice>,
     selected: usize,
@@ -3238,10 +3240,11 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
             }
         }
         TurnEvent::ApprovalRequest {
+            id,
+            kind,
             summary,
             choices,
             respond,
-            ..
         } => {
             let choices = if choices.is_empty() {
                 standard_approval_choices()
@@ -3250,6 +3253,8 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
             };
             state.approvals.push(ApprovalState {
                 thread_id,
+                id,
+                kind,
                 summary,
                 choices,
                 selected: 0,
@@ -5519,15 +5524,23 @@ fn handle_key(
         };
         if let Some((decision, label)) = decision {
             let approval = state.approvals.pop().expect("approval checked above");
-            if approval.respond.send(decision).is_err() {
-                state.notice = Some("approval request expired".into());
-            } else if state.approvals.is_empty() {
-                state.notice = Some(format!("approval {label}"));
-            } else {
-                state.notice = Some(format!(
-                    "approval {label} · {} request(s) still waiting",
-                    state.approvals.len()
-                ));
+            match record_approval(store, &state.home, &approval, &decision, &label) {
+                Ok(()) => {
+                    if approval.respond.send(decision).is_err() {
+                        state.notice = Some("approval request expired".into());
+                    } else if state.approvals.is_empty() {
+                        state.notice = Some(format!("approval {label}"));
+                    } else {
+                        state.notice = Some(format!(
+                            "approval {label} · {} request(s) still waiting",
+                            state.approvals.len()
+                        ));
+                    }
+                }
+                Err(error) => {
+                    let _ = approval.respond.send(ApprovalDecision::Deny);
+                    state.notice = Some(format!("approval not recorded, denied: {error}"));
+                }
             }
         }
         return;
@@ -16681,6 +16694,42 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
     frame.render_widget(Paragraph::new(render_lines), area);
 }
 
+fn approval_decision_name(decision: &ApprovalDecision) -> String {
+    match decision {
+        ApprovalDecision::Accept => "accept".to_string(),
+        ApprovalDecision::AcceptAlways => "accept_always".to_string(),
+        ApprovalDecision::Deny => "deny".to_string(),
+        ApprovalDecision::Choose(option) => format!("choose:{option}"),
+    }
+}
+
+/// Records one answer before it is sent. A failed write returns the error so
+/// the caller can deny instead of authorizing a decision nothing recorded.
+fn record_approval(
+    store: &Arc<Mutex<BatonStore>>,
+    home: &std::path::Path,
+    approval: &ApprovalState,
+    decision: &ApprovalDecision,
+    label: &str,
+) -> anyhow::Result<()> {
+    let event = crate::audit::event(
+        crate::audit::TUI_ACTOR,
+        &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+        Some(&approval.thread_id),
+        crate::audit::AuditAction::ApprovalDecide,
+        crate::audit::APPROVE_SCOPE,
+        crate::audit::HOST_SESSION_CONFIRMATION,
+        &serde_json::json!({
+            "request_id": approval.id,
+            "kind": approval.kind,
+            "decision": approval_decision_name(decision),
+            "label": label,
+        }),
+    )?;
+    store.lock().unwrap().append_audit_event(&event)?;
+    Ok(())
+}
+
 fn decision_for_choice(choice: &ApprovalChoice) -> ApprovalDecision {
     match choice.id.as_str() {
         "accept" => ApprovalDecision::Accept,
@@ -20289,6 +20338,96 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("accepted once"));
+
+        let events = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|event| event.action == "approval.decide"));
+        assert!(events
+            .iter()
+            .all(|event| event.actor == crate::audit::TUI_ACTOR));
+        assert!(events
+            .iter()
+            .all(|event| event.scope == crate::audit::APPROVE_SCOPE));
+        assert_eq!(
+            events[0].thread_id.as_deref(),
+            Some(state.thread.id.as_str())
+        );
+        assert_eq!(events[0].payload_digest.len(), 64);
+        assert_ne!(
+            events[0].payload_digest, events[1].payload_digest,
+            "the digest covers the decision"
+        );
+    }
+
+    #[test]
+    fn an_approval_that_cannot_be_recorded_is_denied() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("baton.sqlite");
+        let writable = Arc::new(Mutex::new(BatonStore::open(&db).unwrap()));
+        let mut state = test_state(home.path(), &writable, Vec::new());
+        let read_only = Arc::new(Mutex::new(BatonStore::open_read_only(&db).unwrap()));
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (sender, mut receiver) = tokio::sync::oneshot::channel();
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::ApprovalRequest {
+                id: "unrecorded".into(),
+                kind: "command".into(),
+                summary: "run a command".into(),
+                choices: Vec::new(),
+                respond: sender,
+            },
+        );
+        let key = |code| KeyEvent {
+            code,
+            modifiers: KeyModifiers::empty(),
+            kind: KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::empty(),
+        };
+
+        handle_key(
+            &mut state,
+            &read_only,
+            &engine_command_sender,
+            key(KeyCode::Char('y')),
+        );
+        assert_eq!(
+            receiver.try_recv().unwrap(),
+            ApprovalDecision::Deny,
+            "an unrecorded approval never reaches the provider as an accept"
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("not recorded"),
+            "{:?}",
+            state.notice
+        );
+        assert!(state.approvals.is_empty());
+        assert!(writable
+            .lock()
+            .unwrap()
+            .list_audit_events(10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn approval_decision_names_cover_every_choice() {
+        assert_eq!(approval_decision_name(&ApprovalDecision::Accept), "accept");
+        assert_eq!(
+            approval_decision_name(&ApprovalDecision::AcceptAlways),
+            "accept_always"
+        );
+        assert_eq!(approval_decision_name(&ApprovalDecision::Deny), "deny");
+        assert_eq!(
+            approval_decision_name(&ApprovalDecision::Choose("opt-reject".into())),
+            "choose:opt-reject"
+        );
     }
 
     #[test]

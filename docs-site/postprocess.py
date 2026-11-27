@@ -62,8 +62,17 @@ def main() -> int:
         print(f"no pages in {docs_root}", file=sys.stderr)
         return 1
 
-    canonicals: set[str] = set()
     errors: list[str] = []
+    generated_favicon = docs_root / "favicons" / "favicon-32x32.png"
+    if not generated_favicon.is_file():
+        errors.append(f"missing {generated_favicon}")
+    generated_ico = docs_root / "favicons" / "favicon.ico"
+    if not generated_ico.is_file():
+        errors.append(f"missing {generated_ico}")
+    elif not generated_ico.read_bytes().startswith(b"\x00\x00\x01\x00"):
+        errors.append(f"{generated_ico} is not an ICO file")
+
+    canonicals: set[str] = set()
     for page in pages:
         path = page.resolve()
         text = replace_origin(path.read_text(encoding="utf-8"), site_url)
@@ -94,13 +103,20 @@ def main() -> int:
         elif og_url.group(1) != canonical_url:
             errors.append(f"{label}: og:url does not match canonical")
         favicon = FAVICON.search(text)
+        expected_favicon = f"{base_path}/favicons/favicon-32x32.png"
         if favicon is None:
             errors.append(f"{label}: no PNG favicon")
-        elif not favicon.group(1).startswith(site_url + "/assets/favicon.png"):
-            errors.append(f"{label}: favicon is not on the production origin")
+        elif favicon.group(1) != expected_favicon:
+            errors.append(f"{label}: favicon is {favicon.group(1)}")
 
     urls = sorted(canonicals)
     write_sitemap(docs_root, urls)
+
+    ico = site_root / "favicon.ico"
+    if not ico.is_file():
+        errors.append(f"missing {ico}")
+    elif not ico.read_bytes().startswith(b"\x00\x00\x01\x00"):
+        errors.append(f"{ico} is not an ICO file")
 
     robots = site_root / "robots.txt"
     expected_sitemap = f"Sitemap: {site_url}{base_path}/sitemap.xml"

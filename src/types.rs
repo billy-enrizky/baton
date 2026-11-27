@@ -167,6 +167,23 @@ impl PermissionMode {
             _ => None,
         }
     }
+
+    /// Privilege order used by a grant ceiling. Plan is read-only, Default
+    /// asks before changes, AcceptEdits auto-approves edits, and
+    /// BypassPermissions skips checks.
+    pub fn privilege(self) -> u8 {
+        match self {
+            PermissionMode::Plan => 0,
+            PermissionMode::Default => 1,
+            PermissionMode::AcceptEdits => 2,
+            PermissionMode::BypassPermissions => 3,
+        }
+    }
+
+    /// True when a thread may run under a grant minted with this ceiling.
+    pub fn within_ceiling(self, ceiling: PermissionMode) -> bool {
+        self.privilege() <= ceiling.privilege()
+    }
 }
 
 impl fmt::Display for PermissionMode {
@@ -431,6 +448,17 @@ pub struct NativeSessionRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_modes_order_under_a_ceiling() {
+        assert!(PermissionMode::Plan.within_ceiling(PermissionMode::Default));
+        assert!(PermissionMode::Default.within_ceiling(PermissionMode::Default));
+        assert!(!PermissionMode::AcceptEdits.within_ceiling(PermissionMode::Default));
+        assert!(PermissionMode::AcceptEdits.within_ceiling(PermissionMode::AcceptEdits));
+        assert!(!PermissionMode::Default.within_ceiling(PermissionMode::Plan));
+        assert!(PermissionMode::Plan.within_ceiling(PermissionMode::Plan));
+        assert!(!PermissionMode::BypassPermissions.within_ceiling(PermissionMode::AcceptEdits));
+    }
 
     #[test]
     fn provider_key_keeps_an_unknown_name_verbatim() {

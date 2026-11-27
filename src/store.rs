@@ -1689,6 +1689,30 @@ impl BatonStore {
         Ok(changed == 1)
     }
 
+    /// Pauses one schedule. Returns false when it was already paused, so a
+    /// repeated command can say so instead of writing an audit row.
+    pub fn pause_schedule(&self, id: &str) -> Result<bool> {
+        let tx = self.write()?;
+        let changed = tx.execute(
+            "UPDATE schedules SET enabled = 0 WHERE id = ?1 AND enabled = 1",
+            params![id],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
+    /// Resumes one schedule and moves its next run to a caller-computed time, so
+    /// a long pause does not replay a missed tick on the next host scan.
+    pub fn resume_schedule(&self, id: &str, next_run_at: &str) -> Result<bool> {
+        let tx = self.write()?;
+        let changed = tx.execute(
+            "UPDATE schedules SET enabled = 1, next_run_at = ?1 WHERE id = ?2 AND enabled = 0",
+            params![next_run_at, id],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
     pub fn remove_schedule(&self, id: &str) -> Result<bool> {
         let tx = self.write()?;
         let changed = tx.execute("DELETE FROM schedules WHERE id = ?", params![id])?;
@@ -4906,6 +4930,49 @@ mod tests {
         );
         assert!(store.remove_schedule(&row.id).unwrap());
         assert!(store.list_schedules().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_paused_schedule_leaves_the_due_query_until_it_resumes() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "scheduled".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        let due = "2026-11-27T10:15:00.000Z";
+        let row = store
+            .add_schedule(&thread.id, "run it", "*/15 * * * *", due)
+            .unwrap();
+        assert!(store.pause_schedule(&row.id).unwrap());
+        assert!(!store.pause_schedule(&row.id).unwrap());
+        assert!(store.due_schedules_at(due).unwrap().is_empty());
+        assert!(!store
+            .claim_schedule(&row.id, due, "2026-11-27T10:30:00.000Z")
+            .unwrap());
+        let paused = &store.list_schedules().unwrap()[0];
+        assert!(!paused.enabled);
+        assert_eq!(paused.next_run_at, due);
+        assert!(store
+            .resume_schedule(&row.id, "2026-11-27T12:00:00.000Z")
+            .unwrap());
+        assert!(!store
+            .resume_schedule(&row.id, "2026-11-27T12:15:00.000Z")
+            .unwrap());
+        let resumed = &store.list_schedules().unwrap()[0];
+        assert!(resumed.enabled);
+        assert_eq!(resumed.next_run_at, "2026-11-27T12:00:00.000Z");
+        assert!(store.due_schedules_at(due).unwrap().is_empty());
+        assert_eq!(
+            store
+                .due_schedules_at("2026-11-27T12:00:00.000Z")
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

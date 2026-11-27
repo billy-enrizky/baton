@@ -896,7 +896,7 @@ fn handle_host_command(store: &Arc<Mutex<BatonStore>>, home: &Path, line: &str) 
     let command = tokens.first().map(String::as_str).unwrap_or_default();
     match command {
         "help" => eprintln!(
-            "baton: host commands: pair [--label <name>] [--scope <s>]... [--ceiling <mode>] [--project <path>]... [--expires-days N]; renew <id> [--days N]; schedule add --thread <id> --cron \"<expr>\" --prompt \"<text>\"; schedule list; schedule remove <id>; help"
+            "baton: host commands: pair [--label <name>] [--scope <s>]... [--ceiling <mode>] [--project <path>]... [--expires-days N]; renew <id> [--days N]; schedule add --thread <id> --cron \"<expr>\" --prompt \"<text>\"; schedule list; schedule pause <id>; schedule resume <id>; schedule remove <id>; help"
         ),
         "pair" => match parse_pair(tokens.iter().skip(1).map(String::as_str).collect()) {
             Ok(request) => {
@@ -1106,26 +1106,110 @@ fn handle_host_schedule(store: &Arc<Mutex<BatonStore>>, home: &Path, args: &[Str
                 }
             }
         }
+        "pause" => {
+            let Some(prefix) = args.get(1) else {
+                eprintln!("baton: schedule pause needs an id");
+                return;
+            };
+            let Some(row) = resolve_host_schedule(store, prefix) else {
+                return;
+            };
+            let paused = store.lock().unwrap().pause_schedule(&row.id);
+            match paused {
+                Ok(true) => {
+                    let audit = crate::audit::event(
+                        crate::audit::HOST_TERMINAL_ACTOR,
+                        &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+                        Some(&row.id),
+                        Some(&row.thread_id),
+                        crate::audit::AuditAction::SchedulePause,
+                        &serde_json::json!({
+                            "thread_id": row.thread_id,
+                            "expression": row.expression,
+                        }),
+                    );
+                    match audit.and_then(|audit| store.lock().unwrap().append_audit_event(&audit)) {
+                        Ok(_) => {
+                            eprintln!("baton: schedule {} paused", &row.id[..8.min(row.id.len())])
+                        }
+                        Err(error) => eprintln!("baton: schedule paused but audit failed: {error}"),
+                    }
+                }
+                Ok(false) => eprintln!(
+                    "baton: schedule {} is already paused",
+                    &row.id[..8.min(row.id.len())]
+                ),
+                Err(error) => eprintln!("baton: cannot pause schedule: {error}"),
+            }
+        }
+        "resume" => {
+            let Some(prefix) = args.get(1) else {
+                eprintln!("baton: schedule resume needs an id");
+                return;
+            };
+            let Some(row) = resolve_host_schedule(store, prefix) else {
+                return;
+            };
+            if row.enabled {
+                eprintln!(
+                    "baton: schedule {} is already running",
+                    &row.id[..8.min(row.id.len())]
+                );
+                return;
+            }
+            let expression = match crate::schedule::parse(&row.expression) {
+                Ok(expression) => expression,
+                Err(error) => {
+                    eprintln!("baton: {error}");
+                    return;
+                }
+            };
+            let next = match crate::schedule::next_after(&expression, chrono::Utc::now()) {
+                Ok(next) => next.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                Err(error) => {
+                    eprintln!("baton: {error}");
+                    return;
+                }
+            };
+            let resumed = store.lock().unwrap().resume_schedule(&row.id, &next);
+            match resumed {
+                Ok(true) => {
+                    let audit = crate::audit::event(
+                        crate::audit::HOST_TERMINAL_ACTOR,
+                        &crate::claim::installation_id(home).unwrap_or_else(|| "unclaimed".into()),
+                        Some(&row.id),
+                        Some(&row.thread_id),
+                        crate::audit::AuditAction::ScheduleResume,
+                        &serde_json::json!({
+                            "thread_id": row.thread_id,
+                            "expression": row.expression,
+                            "next_run_at": next,
+                        }),
+                    );
+                    match audit.and_then(|audit| store.lock().unwrap().append_audit_event(&audit)) {
+                        Ok(_) => eprintln!(
+                            "baton: schedule {} resumed next {next}",
+                            &row.id[..8.min(row.id.len())]
+                        ),
+                        Err(error) => {
+                            eprintln!("baton: schedule resumed but audit failed: {error}")
+                        }
+                    }
+                }
+                Ok(false) => eprintln!(
+                    "baton: schedule {} is already running",
+                    &row.id[..8.min(row.id.len())]
+                ),
+                Err(error) => eprintln!("baton: cannot resume schedule: {error}"),
+            }
+        }
         "remove" => {
             let Some(prefix) = args.get(1) else {
                 eprintln!("baton: schedule remove needs an id");
                 return;
             };
-            let schedules = store.lock().unwrap().list_schedules().unwrap_or_default();
-            let matches: Vec<_> = schedules
-                .into_iter()
-                .filter(|row| row.id.starts_with(prefix))
-                .collect();
-            let row = match matches.as_slice() {
-                [] => {
-                    eprintln!("baton: no schedule matches {prefix}");
-                    return;
-                }
-                [row] => row.clone(),
-                _ => {
-                    eprintln!("baton: schedule prefix {prefix} is ambiguous");
-                    return;
-                }
+            let Some(row) = resolve_host_schedule(store, prefix) else {
+                return;
             };
             if let Err(error) = store.lock().unwrap().remove_schedule(&row.id) {
                 eprintln!("baton: cannot remove schedule: {error}");
@@ -1144,7 +1228,32 @@ fn handle_host_schedule(store: &Arc<Mutex<BatonStore>>, home: &Path, args: &[Str
                 Err(error) => eprintln!("baton: schedule removed but audit failed: {error}"),
             }
         }
-        other => eprintln!("baton: unknown schedule action {other}; use add, list, or remove"),
+        other => eprintln!(
+            "baton: unknown schedule action {other}; use add, list, pause, resume, or remove"
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn resolve_host_schedule(
+    store: &Arc<Mutex<BatonStore>>,
+    prefix: &str,
+) -> Option<crate::store::ScheduleRow> {
+    let schedules = store.lock().unwrap().list_schedules().unwrap_or_default();
+    let matches: Vec<_> = schedules
+        .into_iter()
+        .filter(|row| row.id.starts_with(prefix))
+        .collect();
+    match matches.as_slice() {
+        [] => {
+            eprintln!("baton: no schedule matches {prefix}");
+            None
+        }
+        [row] => Some(row.clone()),
+        _ => {
+            eprintln!("baton: schedule prefix {prefix} is ambiguous");
+            None
+        }
     }
 }
 
@@ -2533,6 +2642,47 @@ mod tests {
         }));
         assert!(audit.iter().any(|event| {
             event.action == "schedule.remove"
+                && event.actor == crate::audit::HOST_TERMINAL_ACTOR
+                && event.target.as_deref() == Some(&id)
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn host_schedule_pause_and_resume() {
+        let home = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let thread = scheduled_thread(&store.lock().unwrap(), work.path());
+        handle_host_command(
+            &store,
+            home.path(),
+            &format!(
+                "schedule add --thread {} --cron \"*/5 * * * *\" --prompt \"check the tests\"",
+                thread.id
+            ),
+        );
+        let id = store.lock().unwrap().list_schedules().unwrap()[0]
+            .id
+            .clone();
+        handle_host_command(&store, home.path(), &format!("schedule pause {}", &id[..8]));
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert!(!rows[0].enabled, "{rows:?}");
+        handle_host_command(
+            &store,
+            home.path(),
+            &format!("schedule resume {}", &id[..8]),
+        );
+        let rows = store.lock().unwrap().list_schedules().unwrap();
+        assert!(rows[0].enabled, "{rows:?}");
+        let audit = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert!(audit.iter().any(|event| {
+            event.action == "schedule.pause"
+                && event.actor == crate::audit::HOST_TERMINAL_ACTOR
+                && event.target.as_deref() == Some(&id)
+        }));
+        assert!(audit.iter().any(|event| {
+            event.action == "schedule.resume"
                 && event.actor == crate::audit::HOST_TERMINAL_ACTOR
                 && event.target.as_deref() == Some(&id)
         }));

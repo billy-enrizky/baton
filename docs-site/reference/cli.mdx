@@ -154,10 +154,12 @@ Manage schedules from the CLI while no host or TUI owns the store, or at the run
 ```text
 schedule add --thread <id> --cron "<minute hour day month weekday>" --prompt "<text>"
 schedule list
+schedule pause <id>
+schedule resume <id>
 schedule remove <id>
 ```
 
-Quoted prompts may contain spaces. A host with stdin closed cannot use the terminal commands.
+The CLI takes the same verbs with the `baton schedule` prefix. Quoted prompts may contain spaces. A paused row never fires. Resuming recomputes the next run from the current time, so a long pause does not replay a missed tick. A host with stdin closed cannot use the terminal commands.
 
 ## MCP
 

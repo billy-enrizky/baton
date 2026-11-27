@@ -26,7 +26,9 @@ Non-goals:
 - `baton schedule add --thread <id> --cron "<minute hour day month weekday>" --prompt "<text>"` validates the expression, computes the next UTC occurrence, stores the row, and writes a `schedule.add` audit row.
 - `baton schedule list [--json]` shows the id, next run, thread, expression, prompt preview, and enabled state.
 - `baton schedule remove <id> [--json]` accepts a unique id prefix, deletes the row, and writes a `schedule.remove` audit row.
-- At the `baton serve` host terminal, `schedule add --thread <id> --cron "<expr>" --prompt "<text>"`, `schedule list`, and `schedule remove <id>` manage the live host's rows. A quoted prompt or cron may contain spaces. The host writes `schedule.add` or `schedule.remove` with actor `host_terminal`.
+- `baton schedule pause <id> [--json]` accepts a unique id prefix, clears the enabled flag, and writes a `schedule.pause` audit row. A paused row never appears in the due query and cannot win a claim.
+- `baton schedule resume <id> [--json]` parses the stored expression, recomputes the next UTC occurrence from the current time, sets the enabled flag, and writes a `schedule.resume` audit row. A long pause therefore does not replay a missed tick.
+- At the `baton serve` host terminal, `schedule add --thread <id> --cron "<expr>" --prompt "<text>"`, `schedule list`, `schedule pause <id>`, `schedule resume <id>`, and `schedule remove <id>` manage the live host's rows. A quoted prompt or cron may contain spaces. The host writes `schedule.add`, `schedule.pause`, `schedule.resume`, or `schedule.remove` with actor `host_terminal`.
 - The expression supports `*`, a number, a list, a range, and a step in each of the five fields. Weekdays are 0 for Sunday through 6 for Saturday. Day-of-month and day-of-week use the traditional OR rule when both are restricted.
 - `baton serve` checks due schedules every second. A due row is claimed with a compare-and-set on its `next_run_at`; only the winner fires.
 - A claimed run writes `schedule.trigger` with actor `scheduler`, confirmation `host_schedule`, the schedule id as the target, and the thread id. A failed audit write skips the run instead of starting an unaudited turn.
@@ -71,10 +73,14 @@ Add a schedule before starting a host, or manage a running host from its termina
 ```sh
 baton schedule add --thread <id> --cron "0 9 * * 1-5" --prompt "Check the failing tests"
 baton schedule list --json
+baton schedule pause <id>
+baton schedule resume <id>
 baton serve
 # At the host terminal:
 schedule add --thread <id> --cron "0 9 * * 1-5" --prompt "Check the failing tests"
 schedule list
+schedule pause <id>
+schedule resume <id>
 schedule remove <id>
 baton audit list --json
 ```
@@ -97,6 +103,9 @@ The live integration test starts a host against a real SQLite store and a fake h
 - `serve::tests::fire_due_schedules_skips_an_archived_thread`
 - `tests/schedule_cli.rs::schedule_add_list_remove_and_audit`
 - `tests/schedule_cli.rs::schedule_add_refuses_an_invalid_expression`
+- `tests/schedule_cli.rs::schedule_pause_and_resume_skip_due_runs`
+- `store::tests::a_paused_schedule_leaves_the_due_query_until_it_resumes`
+- `serve::tests::host_schedule_pause_and_resume`
 - `tests/serve.rs::serve_stdin_schedule_commands_manage_the_live_host`
 - `tests/serve.rs::serve_fires_a_due_schedule_and_audits_it`
 - `serve::tests::host_tokens_keep_quoted_spaces`
@@ -106,5 +115,5 @@ The live integration test starts a host against a real SQLite store and a fake h
 ## Limits
 
 - A host with stdin closed cannot use the host terminal commands. The socket and TUI management paths remain.
-- The TUI does not fire or display schedules yet.
-- Cron is UTC only; there is no pause/resume, local timezone, missed-run catch-up, notification, or retry.
+- The TUI does not display schedules yet.
+- Cron is UTC only; there is no local timezone, missed-run catch-up, notification, or retry.

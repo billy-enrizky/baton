@@ -115,9 +115,12 @@ pub enum Commands {
     Chat,
     /// Claim the local store as the host and idle until stopped
     Serve {
-        /// Exit when stdin reaches EOF
-        #[arg(long)]
+        /// Serve the spawner pipe instead of the local socket
+        #[arg(long, conflicts_with = "socket")]
         stdio: bool,
+        /// Override the local socket path (default: BATON_HOME/serve.sock)
+        #[arg(long, value_name = "PATH")]
+        socket: Option<String>,
     },
     /// Inspect or change host ownership of the local store
     Host {
@@ -716,6 +719,37 @@ mod tests {
             }
             _ => panic!("expected the exec command"),
         }
+    }
+
+    #[test]
+    fn serve_selects_one_transport() {
+        let cli = Cli::try_parse_from(["baton", "serve", "--stdio"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                stdio: true,
+                socket: None,
+            }) => {}
+            _ => panic!("expected stdio serve"),
+        }
+        let cli = Cli::try_parse_from(["baton", "serve", "--socket", "/tmp/host.sock"]).unwrap();
+        match cli.command {
+            Some(Commands::Serve {
+                stdio: false,
+                socket: Some(path),
+            }) => assert_eq!(path, "/tmp/host.sock"),
+            _ => panic!("expected socket serve"),
+        }
+        let error = match Cli::try_parse_from([
+            "baton",
+            "serve",
+            "--stdio",
+            "--socket",
+            "/tmp/host.sock",
+        ]) {
+            Ok(_) => panic!("the two transports cannot mix"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

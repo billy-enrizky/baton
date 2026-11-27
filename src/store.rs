@@ -1713,6 +1713,24 @@ impl BatonStore {
         Ok(changed == 1)
     }
 
+    /// Moves a due row forward without recording a run. The invalid-expression
+    /// path uses this: the tick was consumed so the row cannot spin, but no
+    /// turn ran and `last_run_at` must stay empty.
+    pub fn defer_schedule(
+        &self,
+        id: &str,
+        expected_next_run_at: &str,
+        next_run_at: &str,
+    ) -> Result<bool> {
+        let tx = self.write()?;
+        let changed = tx.execute(
+            "UPDATE schedules SET next_run_at = ?1 WHERE id = ?2 AND next_run_at = ?3 AND enabled = 1",
+            params![next_run_at, id, expected_next_run_at],
+        )?;
+        tx.commit()?;
+        Ok(changed == 1)
+    }
+
     pub fn remove_schedule(&self, id: &str) -> Result<bool> {
         let tx = self.write()?;
         let changed = tx.execute("DELETE FROM schedules WHERE id = ?", params![id])?;

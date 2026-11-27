@@ -553,6 +553,7 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
 
     let home = tempfile::tempdir().unwrap();
     let root = tempfile::tempdir().unwrap();
+    let other_root = tempfile::tempdir().unwrap();
     let bin = root.path().join("fake-bin");
     std::fs::create_dir_all(&bin).unwrap();
     let harness = bin.join("codex");
@@ -563,7 +564,7 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let thread_id = {
+    let (thread_id, other_thread_id) = {
         let store = BatonStore::open(&home.path().join("baton.sqlite")).unwrap();
         let thread = store
             .create_thread(baton::store::NewThread {
@@ -573,7 +574,15 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
                 current_model: None,
             })
             .unwrap();
-        thread.id
+        let other = store
+            .create_thread(baton::store::NewThread {
+                title: "remote submit other project".into(),
+                cwd: other_root.path().to_string_lossy().to_string(),
+                current_provider: baton::types::ProviderId::Codex,
+                current_model: None,
+            })
+            .unwrap();
+        (thread.id, other.id)
     };
 
     let mut child = ChildGuard(
@@ -628,8 +637,9 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
 
     writeln!(
         stdin,
-        "pair --scope read --scope operate --ceiling acceptEdits --project {}",
-        root.path().display()
+        "pair --scope read --scope operate --ceiling acceptEdits --project {} --project {}",
+        root.path().display(),
+        other_root.path().display()
     )
     .unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -652,7 +662,7 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
             Ok(line) => {
                 pairing.push_str(&line);
                 pairing.push('\n');
-                if line.contains("ceiling acceptEdits") && line.contains("projects 1") {
+                if line.contains("ceiling acceptEdits") && line.contains("projects 2") {
                     break;
                 }
             }
@@ -660,7 +670,7 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
         }
     }
     assert!(
-        pairing.contains("ceiling acceptEdits") && pairing.contains("projects 1"),
+        pairing.contains("ceiling acceptEdits") && pairing.contains("projects 2"),
         "pair did not report the ceiling and project count: {pairing}"
     );
     let fragment = url.trim().strip_prefix("baton://local#").unwrap();
@@ -733,31 +743,60 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
     assert_eq!(replay["accepted"], true);
     assert_eq!(replay["replayed"], true);
 
+    let other = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args([
+            "attach",
+            "--url",
+            &url,
+            "--thread",
+            &other_thread_id,
+            "--submit",
+            "other hello",
+            "--idempotency-key",
+            "remote-submit-2",
+            "--json",
+        ])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(other.status.success(), "{other:?}");
+    let other: serde_json::Value = serde_json::from_slice(&other.stdout).unwrap();
+    assert_eq!(other["thread_id"], other_thread_id);
+    assert_eq!(other["accepted"], true);
+
     let deadline = Instant::now() + Duration::from_secs(20);
     let mut saw_message = false;
-    while Instant::now() < deadline {
-        let page = ask(serde_json::json!({
-            "v":1,
-            "kind":"request",
-            "id": next_id,
-            "command":"messages",
-            "grant_id": grant_id,
-            "secret": secret,
-            "args": {"thread": thread_id, "after": 0, "limit": 50},
-        }));
-        next_id += 1;
-        let messages = page["result"]["messages"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        if messages
-            .iter()
-            .any(|message| message["text"] == "remote hello")
-        {
-            saw_message = true;
-            break;
+    let mut saw_other_message = false;
+    while Instant::now() < deadline && (!saw_message || !saw_other_message) {
+        for (thread, text) in [
+            (&thread_id, "remote hello"),
+            (&other_thread_id, "other hello"),
+        ] {
+            let page = ask(serde_json::json!({
+                "v":1,
+                "kind":"request",
+                "id": next_id,
+                "command":"messages",
+                "grant_id": grant_id,
+                "secret": secret,
+                "args": {"thread": thread, "after": 0, "limit": 50},
+            }));
+            next_id += 1;
+            let messages = page["result"]["messages"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            if messages.iter().any(|message| message["text"] == text) {
+                if text == "remote hello" {
+                    saw_message = true;
+                } else {
+                    saw_other_message = true;
+                }
+            }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        if !saw_message || !saw_other_message {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
     let mut tail = String::new();
     while let Ok(line) = err_receiver.try_recv() {
@@ -768,9 +807,14 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
         .map(|store| {
             format!(
                 "messages={:?} turn={:?} events={:?}",
-                store
-                    .list_messages(&thread_id)
-                    .map(|rows| rows.iter().map(|row| row.text.clone()).collect::<Vec<_>>()),
+                (
+                    store
+                        .list_messages(&thread_id)
+                        .map(|rows| rows.iter().map(|row| row.text.clone()).collect::<Vec<_>>()),
+                    store
+                        .list_messages(&other_thread_id)
+                        .map(|rows| rows.iter().map(|row| row.text.clone()).collect::<Vec<_>>()),
+                ),
                 store
                     .get_turn_record(&thread_id, 1)
                     .map(|row| row.map(|row| row.phase)),
@@ -782,8 +826,8 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
         })
         .unwrap_or_else(|error| format!("store read failed: {error}"));
     assert!(
-        saw_message,
-        "the engine did not run the remote turn: {output}\n{tail}\n{state}"
+        saw_message && saw_other_message,
+        "an engine did not run a remote turn: {output}\n{tail}\n{state}"
     );
     let verified = BatonStore::open_read_only(&home.path().join("baton.sqlite")).unwrap();
     let messages = verified.list_messages(&thread_id).unwrap();
@@ -795,19 +839,28 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
         1,
         "a replay must not queue a second user message"
     );
+    let other_messages = verified.list_messages(&other_thread_id).unwrap();
+    assert_eq!(
+        other_messages
+            .iter()
+            .filter(|row| row.text == "other hello")
+            .count(),
+        1,
+        "the other project runs exactly one turn"
+    );
     assert_eq!(
         verified
-            .list_audit_events(10)
+            .list_audit_events(20)
             .unwrap()
             .iter()
             .filter(|event| event.action == "turn.submit_request")
             .count(),
-        1,
-        "a replay must not write a second request row"
+        2,
+        "each project writes one request row and the replay writes none"
     );
 
     let audit = Command::new(env!("CARGO_BIN_EXE_baton"))
-        .args(["audit", "list", "--json", "--limit", "10"])
+        .args(["audit", "list", "--json", "--limit", "20"])
         .env("BATON_HOME", home.path())
         .output()
         .unwrap();
@@ -824,14 +877,16 @@ fn serve_socket_submit_runs_a_turn_through_the_host_engine() {
         }),
         "{events:?}"
     );
-    assert!(
-        events.iter().any(|event| {
-            event["action"] == "turn.submit"
-                && event["actor"] == "host_engine"
-                && event["target"] == thread_id
-        }),
-        "{events:?}"
-    );
+    for target in [&thread_id, &other_thread_id] {
+        assert!(
+            events.iter().any(|event| {
+                event["action"] == "turn.submit"
+                    && event["actor"] == "host_engine"
+                    && event["target"] == *target
+            }),
+            "{events:?}"
+        );
+    }
 
     unsafe {
         libc::kill(child.0.id() as i32, libc::SIGTERM);

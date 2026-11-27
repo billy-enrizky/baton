@@ -494,126 +494,316 @@ impl EngineLink {
     }
 }
 
-/// The host's provider engine. A socket host owns one engine for the project
-/// directory it started in.
-pub struct ServeEngine {
+/// One provider engine per canonical project root. Engines start lazily when a
+/// thread in that project is first used; the initial serve directory starts
+/// eagerly so readiness includes a working engine.
+#[derive(Clone)]
+pub struct EnginePool {
+    inner: Arc<Mutex<PoolState>>,
+}
+
+struct PoolState {
+    store: Option<Arc<Mutex<BatonStore>>>,
+    home: PathBuf,
+    engines: BTreeMap<PathBuf, PooledEngine>,
+}
+
+struct PooledEngine {
     link: EngineLink,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-impl ServeEngine {
-    pub fn start(store: Arc<Mutex<BatonStore>>, home: &Path, root: &Path) -> Result<ServeEngine> {
-        let adapters = crate::runtime::build_adapters(&store, home, root);
-        let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
-        let (engine_event_sender, engine_event_receiver) = std::sync::mpsc::channel();
-        let (turn_event_sender, turn_event_receiver) = std::sync::mpsc::channel();
-        let approvals = Arc::new(Mutex::new(RemoteApprovals::default()));
-        let questions = Arc::new(Mutex::new(RemoteQuestions::default()));
-        // The host has no UI to consume engine events. Turn events are read to
-        // keep remote interactions alive and to drop them when their turn ends.
-        std::thread::spawn(move || for _ in engine_event_receiver {});
-        let approval_sink = approvals.clone();
-        let question_sink = questions.clone();
-        std::thread::spawn(move || {
-            for (thread_id, event) in turn_event_receiver {
-                match event {
-                    crate::adapters::TurnEvent::ApprovalRequest {
-                        id,
-                        kind,
-                        summary,
-                        choices,
-                        respond,
-                    } => {
-                        if let Ok(mut approvals) = approval_sink.lock() {
-                            approvals.insert(thread_id, id, kind, summary, choices, respond);
-                        }
-                    }
-                    crate::adapters::TurnEvent::QuestionRequest {
-                        id,
-                        questions,
-                        respond,
-                    } => {
-                        if questions.is_empty() {
-                            let _ = respond.send(Vec::new());
-                        } else if let Ok(mut pending) = question_sink.lock() {
-                            pending.insert(thread_id, id, questions, respond);
-                        }
-                    }
-                    crate::adapters::TurnEvent::TurnCompleted { .. }
-                    | crate::adapters::TurnEvent::TurnFailed { .. }
-                    | crate::adapters::TurnEvent::TurnInterrupted { .. } => {
-                        if let Ok(mut approvals) = approval_sink.lock() {
-                            approvals.clear_thread(&thread_id);
-                        }
-                        if let Ok(mut questions) = question_sink.lock() {
-                            questions.clear_thread(&thread_id);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        });
-        let engine_store = store.clone();
-        let engine_home = home.to_path_buf();
-        let thread = std::thread::spawn(move || {
-            let runtime = match tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(error) => {
-                    eprintln!("baton: engine runtime: {error}");
-                    return;
-                }
-            };
-            let interrupts = runtime.block_on(async {
-                let mut handles = Vec::new();
-                for adapter in &adapters {
-                    let adapter = adapter.lock().await;
-                    handles.push((adapter.id(), adapter.interrupt_handle()));
-                }
-                handles
-            });
-            if let Err(error) = runtime.block_on(crate::runtime::run_engine(
-                engine_store,
-                engine_home,
-                adapters,
-                interrupts,
-                Vec::new(),
-                command_receiver,
-                engine_event_sender,
-                turn_event_sender,
-            )) {
-                eprintln!("baton: engine stopped: {error}");
-            }
-        });
-        Ok(ServeEngine {
-            link: EngineLink::new(
-                command_sender,
-                home.to_path_buf(),
-                root.to_path_buf(),
-                approvals,
-                questions,
-            ),
-            thread: Some(thread),
-        })
+impl EnginePool {
+    fn new(store: Arc<Mutex<BatonStore>>, home: &Path) -> EnginePool {
+        EnginePool {
+            inner: Arc::new(Mutex::new(PoolState {
+                store: Some(store),
+                home: home.to_path_buf(),
+                engines: BTreeMap::new(),
+            })),
+        }
     }
 
-    pub fn link(&self) -> EngineLink {
-        self.link.clone()
+    #[cfg(test)]
+    fn from_link(link: EngineLink) -> EnginePool {
+        EnginePool::from_links(vec![link])
+    }
+
+    #[cfg(test)]
+    fn from_links(links: Vec<EngineLink>) -> EnginePool {
+        let home = links
+            .first()
+            .map(|link| link.home.clone())
+            .unwrap_or_default();
+        let mut engines = BTreeMap::new();
+        for link in links {
+            let root = link
+                .root
+                .canonicalize()
+                .unwrap_or_else(|_| link.root.clone());
+            engines.insert(root, PooledEngine { link, thread: None });
+        }
+        EnginePool {
+            inner: Arc::new(Mutex::new(PoolState {
+                store: None,
+                home,
+                engines,
+            })),
+        }
+    }
+
+    fn engine_for(&self, project: &Path) -> Result<EngineLink> {
+        let project = project
+            .canonicalize()
+            .with_context(|| format!("resolve project {}", project.display()))?;
+        if !project.is_dir() {
+            anyhow::bail!("project {} is not a directory", project.display());
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("engine pool lock poisoned"))?;
+        if let Some(engine) = state.engines.get(&project) {
+            return Ok(engine.link.clone());
+        }
+        let Some(store) = state.store.clone() else {
+            anyhow::bail!("no engine is registered for {}", project.display());
+        };
+        let home = state.home.clone();
+        let (link, thread) = start_engine(store, &home, &project);
+        state.engines.insert(
+            project,
+            PooledEngine {
+                link: link.clone(),
+                thread: Some(thread),
+            },
+        );
+        Ok(link)
+    }
+
+    fn has_allowed_engine(&self, allowlist: &[String]) -> bool {
+        let Ok(state) = self.inner.lock() else {
+            return false;
+        };
+        state
+            .engines
+            .keys()
+            .any(|root| crate::grants::allows_project(allowlist, root))
+    }
+
+    fn list_approvals(&self, allowlist: &[String], thread: Option<&str>) -> Vec<Value> {
+        let Ok(state) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for (root, engine) in &state.engines {
+            if crate::grants::allows_project(allowlist, root) {
+                rows.extend(engine.link.list_approvals(thread));
+            }
+        }
+        rows
+    }
+
+    fn take_approval(
+        &self,
+        allowlist: &[String],
+        request: &str,
+        choice: &str,
+    ) -> Option<(EngineLink, TakenApproval)> {
+        let state = self.inner.lock().ok()?;
+        for (root, engine) in &state.engines {
+            if !crate::grants::allows_project(allowlist, root) {
+                continue;
+            }
+            if let Some(taken) = engine.link.take_approval(request, choice) {
+                return Some((engine.link.clone(), taken));
+            }
+        }
+        None
+    }
+
+    fn list_questions(&self, allowlist: &[String], thread: Option<&str>) -> Vec<Value> {
+        let Ok(state) = self.inner.lock() else {
+            return Vec::new();
+        };
+        let mut rows = Vec::new();
+        for (root, engine) in &state.engines {
+            if crate::grants::allows_project(allowlist, root) {
+                rows.extend(engine.link.list_questions(thread));
+            }
+        }
+        rows
+    }
+
+    fn take_question(
+        &self,
+        allowlist: &[String],
+        request: &str,
+        answers: &[crate::types::QuestionAnswer],
+    ) -> std::result::Result<(EngineLink, TakenQuestion), QuestionTakeError> {
+        let state = self.inner.lock().map_err(|_| QuestionTakeError::NotFound)?;
+        for (root, engine) in &state.engines {
+            if !crate::grants::allows_project(allowlist, root) {
+                continue;
+            }
+            match engine.link.take_question(request, answers) {
+                Ok(taken) => return Ok((engine.link.clone(), taken)),
+                Err(QuestionTakeError::NotFound) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(QuestionTakeError::NotFound)
+    }
+
+    fn quit_all(&self) {
+        if let Ok(state) = self.inner.lock() {
+            for engine in state.engines.values() {
+                let _ = engine.link.sender.send(crate::runtime::EngineCommand::Quit);
+            }
+        }
+    }
+
+    fn stop_all(&self) {
+        let engines = {
+            let Ok(mut state) = self.inner.lock() else {
+                return;
+            };
+            std::mem::take(&mut state.engines)
+        };
+        for (_, engine) in engines {
+            let _ = engine.link.sender.send(crate::runtime::EngineCommand::Quit);
+            if let Some(thread) = engine.thread {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+fn start_engine(
+    store: Arc<Mutex<BatonStore>>,
+    home: &Path,
+    root: &Path,
+) -> (EngineLink, std::thread::JoinHandle<()>) {
+    let adapters = crate::runtime::build_adapters(&store, home, root);
+    let (command_sender, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (engine_event_sender, engine_event_receiver) = std::sync::mpsc::channel();
+    let (turn_event_sender, turn_event_receiver) = std::sync::mpsc::channel();
+    let approvals = Arc::new(Mutex::new(RemoteApprovals::default()));
+    let questions = Arc::new(Mutex::new(RemoteQuestions::default()));
+    // The host has no UI to consume engine events. Turn events are read to
+    // keep remote interactions alive and to drop them when their turn ends.
+    std::thread::spawn(move || for _ in engine_event_receiver {});
+    let approval_sink = approvals.clone();
+    let question_sink = questions.clone();
+    std::thread::spawn(move || {
+        for (thread_id, event) in turn_event_receiver {
+            match event {
+                crate::adapters::TurnEvent::ApprovalRequest {
+                    id,
+                    kind,
+                    summary,
+                    choices,
+                    respond,
+                } => {
+                    if let Ok(mut approvals) = approval_sink.lock() {
+                        approvals.insert(thread_id, id, kind, summary, choices, respond);
+                    }
+                }
+                crate::adapters::TurnEvent::QuestionRequest {
+                    id,
+                    questions,
+                    respond,
+                } => {
+                    if questions.is_empty() {
+                        let _ = respond.send(Vec::new());
+                    } else if let Ok(mut pending) = question_sink.lock() {
+                        pending.insert(thread_id, id, questions, respond);
+                    }
+                }
+                crate::adapters::TurnEvent::TurnCompleted { .. }
+                | crate::adapters::TurnEvent::TurnFailed { .. }
+                | crate::adapters::TurnEvent::TurnInterrupted { .. } => {
+                    if let Ok(mut approvals) = approval_sink.lock() {
+                        approvals.clear_thread(&thread_id);
+                    }
+                    if let Ok(mut questions) = question_sink.lock() {
+                        questions.clear_thread(&thread_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    let engine_store = store.clone();
+    let engine_home = home.to_path_buf();
+    let thread = std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("baton: engine runtime: {error}");
+                return;
+            }
+        };
+        let interrupts = runtime.block_on(async {
+            let mut handles = Vec::new();
+            for adapter in &adapters {
+                let adapter = adapter.lock().await;
+                handles.push((adapter.id(), adapter.interrupt_handle()));
+            }
+            handles
+        });
+        if let Err(error) = runtime.block_on(crate::runtime::run_engine(
+            engine_store,
+            engine_home,
+            adapters,
+            interrupts,
+            Vec::new(),
+            command_receiver,
+            engine_event_sender,
+            turn_event_sender,
+        )) {
+            eprintln!("baton: engine stopped: {error}");
+        }
+    });
+    (
+        EngineLink::new(
+            command_sender,
+            home.to_path_buf(),
+            root.to_path_buf(),
+            approvals,
+            questions,
+        ),
+        thread,
+    )
+}
+
+/// The host's provider engines, one per project.
+pub struct ServeEngine {
+    pool: EnginePool,
+}
+
+impl ServeEngine {
+    pub fn start(store: Arc<Mutex<BatonStore>>, home: &Path, root: &Path) -> Result<ServeEngine> {
+        let pool = EnginePool::new(store, home);
+        pool.engine_for(root)?;
+        Ok(ServeEngine { pool })
+    }
+
+    pub fn pool(&self) -> EnginePool {
+        self.pool.clone()
     }
 
     pub fn stop(&mut self) {
-        let _ = self.link.sender.send(crate::runtime::EngineCommand::Quit);
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
+        self.pool.stop_all();
     }
 }
 
 impl Drop for ServeEngine {
     fn drop(&mut self) {
-        let _ = self.link.sender.send(crate::runtime::EngineCommand::Quit);
+        self.pool.quit_all();
     }
 }
 
@@ -626,7 +816,7 @@ pub async fn socket_loop(
     store: Arc<Mutex<BatonStore>>,
     home: &Path,
     path: &Path,
-    engine: Option<EngineLink>,
+    engine: Option<EnginePool>,
 ) -> Result<()> {
     let listener = TokioUnixListener::from_std(listener).context("register the host socket")?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -691,7 +881,7 @@ pub async fn socket_loop(
     _store: Arc<Mutex<BatonStore>>,
     _home: &Path,
     _path: &Path,
-    _engine: Option<EngineLink>,
+    _engine: Option<EnginePool>,
 ) -> Result<()> {
     anyhow::bail!("the host socket is Unix-only")
 }
@@ -888,7 +1078,7 @@ fn pair_url(minted: &crate::grants::MintedGrant) -> String {
 async fn serve_socket_client(
     store: Arc<Mutex<BatonStore>>,
     stream: UnixStream,
-    engine: Option<EngineLink>,
+    engine: Option<EnginePool>,
 ) -> Result<()> {
     let peer = socket_peer_uid(&stream)?;
     let host = unsafe { libc::getuid() };
@@ -920,7 +1110,7 @@ async fn serve_socket_client(
 
 /// Socket requests carry a grant id and secret. `ping` is the only request
 /// answered without one, so a readiness probe needs no credential.
-fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EngineLink>) -> Value {
+fn handle_socket_line(store: &BatonStore, line: &str, engine: Option<&EnginePool>) -> Value {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return error_response(Value::Null, "malformed_line", "line is not JSON");
     };
@@ -1078,7 +1268,7 @@ fn replay_response(id: Value, stored: &str) -> Value {
 
 fn submit_request(
     store: &BatonStore,
-    engine: Option<&EngineLink>,
+    engine: Option<&EnginePool>,
     grant: &crate::store::GrantSummary,
     id: Value,
     value: &Value,
@@ -1130,18 +1320,7 @@ fn submit_request(
         }
         Err(error) => return error_response(id, "internal", error.to_string()),
     };
-    let root = std::fs::canonicalize(engine.root()).unwrap_or_else(|_| engine.root().to_path_buf());
     let cwd = std::fs::canonicalize(&thread.cwd).unwrap_or_else(|_| thread.cwd.clone().into());
-    if !cwd.starts_with(&root) {
-        return error_response(
-            id,
-            "wrong_project",
-            format!(
-                "thread {thread_id} is outside the served project {}",
-                root.display()
-            ),
-        );
-    }
     if !crate::grants::allows_project(&grant.project_allowlist, &cwd) {
         return error_response(
             id,
@@ -1176,6 +1355,16 @@ fn submit_request(
             ),
         );
     }
+    let engine = match engine.engine_for(&cwd) {
+        Ok(engine) => engine,
+        Err(error) => {
+            return error_response(
+                id,
+                "wrong_project",
+                format!("cannot use project {}: {error}", cwd.display()),
+            )
+        }
+    };
     let body = json!({ "thread_id": thread_id, "accepted": true });
     match store.claim_idempotent_request(key, SUBMIT_OPERATION, thread_id, &body.to_string()) {
         Ok(Some(stored)) => return replay_response(id, &stored),
@@ -1211,7 +1400,7 @@ fn submit_request(
 }
 
 fn approvals_request(
-    engine: Option<&EngineLink>,
+    engine: Option<&EnginePool>,
     grant: &crate::store::GrantSummary,
     id: Value,
     value: &Value,
@@ -1223,14 +1412,11 @@ fn approvals_request(
             "this host has no engine; start baton serve without --stdio",
         );
     };
-    if !crate::grants::allows_project(&grant.project_allowlist, engine.root()) {
+    if !engine.has_allowed_engine(&grant.project_allowlist) {
         return error_response(
             id,
             "not_permitted",
-            format!(
-                "the grant does not allow project {}",
-                engine.root().display()
-            ),
+            "the grant does not allow any served project",
         );
     }
     let thread = match value.get("args") {
@@ -1248,12 +1434,15 @@ fn approvals_request(
         },
         _ => return error_response(id, "malformed_line", "approvals args must be an object"),
     };
-    response(id, json!({ "approvals": engine.list_approvals(thread) }))
+    response(
+        id,
+        json!({ "approvals": engine.list_approvals(&grant.project_allowlist, thread) }),
+    )
 }
 
 fn respond_request(
     store: &BatonStore,
-    engine: Option<&EngineLink>,
+    engine: Option<&EnginePool>,
     grant: &crate::store::GrantSummary,
     id: Value,
     value: &Value,
@@ -1265,14 +1454,11 @@ fn respond_request(
             "this host has no engine; start baton serve without --stdio",
         );
     };
-    if !crate::grants::allows_project(&grant.project_allowlist, engine.root()) {
+    if !engine.has_allowed_engine(&grant.project_allowlist) {
         return error_response(
             id,
             "not_permitted",
-            format!(
-                "the grant does not allow project {}",
-                engine.root().display()
-            ),
+            "the grant does not allow any served project",
         );
     }
     let args = match value.get("args") {
@@ -1320,7 +1506,9 @@ fn respond_request(
         Ok(None) => {}
         Err(error) => return error_response(id, "idempotency_conflict", error.to_string()),
     }
-    let Some(taken) = engine.take_approval(request_id, choice_id) else {
+    let Some((engine, taken)) =
+        engine.take_approval(&grant.project_allowlist, request_id, choice_id)
+    else {
         return match store.replay_idempotent_request(key, RESPOND_OPERATION) {
             Ok(Some(stored)) => replay_response(id, &stored),
             Ok(None) => error_response(
@@ -1385,7 +1573,7 @@ fn respond_request(
 }
 
 fn questions_request(
-    engine: Option<&EngineLink>,
+    engine: Option<&EnginePool>,
     grant: &crate::store::GrantSummary,
     id: Value,
     value: &Value,
@@ -1397,14 +1585,11 @@ fn questions_request(
             "this host has no engine; start baton serve without --stdio",
         );
     };
-    if !crate::grants::allows_project(&grant.project_allowlist, engine.root()) {
+    if !engine.has_allowed_engine(&grant.project_allowlist) {
         return error_response(
             id,
             "not_permitted",
-            format!(
-                "the grant does not allow project {}",
-                engine.root().display()
-            ),
+            "the grant does not allow any served project",
         );
     }
     let thread = match value.get("args") {
@@ -1422,12 +1607,15 @@ fn questions_request(
         },
         _ => return error_response(id, "malformed_line", "questions args must be an object"),
     };
-    response(id, json!({ "questions": engine.list_questions(thread) }))
+    response(
+        id,
+        json!({ "questions": engine.list_questions(&grant.project_allowlist, thread) }),
+    )
 }
 
 fn answer_request(
     store: &BatonStore,
-    engine: Option<&EngineLink>,
+    engine: Option<&EnginePool>,
     grant: &crate::store::GrantSummary,
     id: Value,
     value: &Value,
@@ -1439,14 +1627,11 @@ fn answer_request(
             "this host has no engine; start baton serve without --stdio",
         );
     };
-    if !crate::grants::allows_project(&grant.project_allowlist, engine.root()) {
+    if !engine.has_allowed_engine(&grant.project_allowlist) {
         return error_response(
             id,
             "not_permitted",
-            format!(
-                "the grant does not allow project {}",
-                engine.root().display()
-            ),
+            "the grant does not allow any served project",
         );
     }
     let args = match value.get("args") {
@@ -1482,7 +1667,8 @@ fn answer_request(
         Ok(None) => {}
         Err(error) => return error_response(id, "idempotency_conflict", error.to_string()),
     }
-    let taken = match engine.take_question(request_id, &answers) {
+    let (engine, taken) = match engine.take_question(&grant.project_allowlist, request_id, &answers)
+    {
         Ok(taken) => taken,
         Err(QuestionTakeError::NotFound) => {
             return match store.replay_idempotent_request(key, ANSWER_OPERATION) {
@@ -2079,13 +2265,14 @@ mod tests {
             })
             .unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let engine = EngineLink::new(
+        let link = EngineLink::new(
             sender,
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
             Arc::new(Mutex::new(RemoteQuestions::default())),
         );
+        let engine = EnginePool::from_link(link.clone());
         let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64, key: &str| {
             format!(
                 r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{thread}","text":"remote hello","idempotency_key":"{key}"}}}}"#,
@@ -2221,13 +2408,14 @@ mod tests {
             .set_thread_permission_mode(&thread.id, crate::types::PermissionMode::BypassPermissions)
             .unwrap();
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let engine = EngineLink::new(
+        let link = EngineLink::new(
             sender,
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
             Arc::new(Mutex::new(RemoteQuestions::default())),
         );
+        let engine = EnginePool::from_link(link.clone());
         let refused = handle_socket_line(
             &store,
             &format!(
@@ -2282,13 +2470,14 @@ mod tests {
         plan_request.permission_ceiling = PermissionMode::Plan;
         let plan_grant = mint(&store, home.path(), &plan_request).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let engine = EngineLink::new(
+        let link = EngineLink::new(
             sender,
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
             Arc::new(Mutex::new(RemoteQuestions::default())),
         );
+        let engine = EnginePool::from_link(link.clone());
         let request = |grant: &crate::grants::MintedGrant, thread: &str, id: u64| {
             format!(
                 r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{thread}","text":"remote hello","idempotency_key":"k-{id}"}}}}"#,
@@ -2375,15 +2564,16 @@ mod tests {
         let wrong = mint(&store, home.path(), &wrong_request).unwrap();
         let thread = store.list_threads(None).unwrap().remove(0);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let engine = EngineLink::new(
+        let link = EngineLink::new(
             sender,
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
             Arc::new(Mutex::new(RemoteQuestions::default())),
         );
+        let engine = EnginePool::from_link(link.clone());
         let (respond, mut decision_receiver) = tokio::sync::oneshot::channel();
-        engine.approvals.lock().unwrap().insert(
+        link.approvals.lock().unwrap().insert(
             thread.id.clone(),
             "req-1".into(),
             "command".into(),
@@ -2448,7 +2638,7 @@ mod tests {
             Some(&engine),
         );
         assert_eq!(wrong["error"]["code"], "not_found");
-        assert!(engine.list_approvals(None).len() == 1);
+        assert!(engine.list_approvals(&[], None).len() == 1);
 
         let accepted = handle_socket_line(
             &store,
@@ -2467,7 +2657,7 @@ mod tests {
             decision_receiver.try_recv().unwrap(),
             crate::types::ApprovalDecision::Accept
         );
-        assert!(engine.list_approvals(None).is_empty());
+        assert!(engine.list_approvals(&[], None).is_empty());
 
         let replay = handle_socket_line(
             &store,
@@ -2551,13 +2741,14 @@ mod tests {
         let wrong = mint(&store, home.path(), &wrong_request).unwrap();
         let thread = store.list_threads(None).unwrap().remove(0);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        let engine = EngineLink::new(
+        let link = EngineLink::new(
             sender,
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
             Arc::new(Mutex::new(RemoteQuestions::default())),
         );
+        let engine = EnginePool::from_link(link.clone());
         let (respond, mut answer_receiver) = tokio::sync::oneshot::channel();
         let prompts = vec![
             QuestionPrompt {
@@ -2588,7 +2779,7 @@ mod tests {
                 secret: true,
             },
         ];
-        engine.questions.lock().unwrap().insert(
+        link.questions.lock().unwrap().insert(
             thread.id.clone(),
             "q-1".into(),
             prompts.clone(),
@@ -2691,7 +2882,7 @@ mod tests {
                 }
             ]
         );
-        assert!(engine.list_questions(None).is_empty());
+        assert!(engine.list_questions(&[], None).is_empty());
 
         let replay = handle_socket_line(
             &store,
@@ -2788,13 +2979,14 @@ mod tests {
             .to_string()];
         let right = mint(&store, home.path(), &right_request).unwrap();
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-        let engine = EngineLink::new(
+        let link = EngineLink::new(
             sender,
             home.path().to_path_buf(),
             root.path().to_path_buf(),
             Arc::new(Mutex::new(RemoteApprovals::default())),
             Arc::new(Mutex::new(RemoteQuestions::default())),
         );
+        let engine = EnginePool::from_link(link.clone());
         let request = |grant: &crate::grants::MintedGrant, id: u64| {
             format!(
                 r#"{{"v":1,"kind":"request","id":{id},"command":"submit","grant_id":"{}","secret":"{}","args":{{"thread":"{}","text":"remote hello","idempotency_key":"k-{id}"}}}}"#,
@@ -2809,6 +3001,91 @@ mod tests {
         let accepted = handle_socket_line(&store, &request(&right, 2), Some(&engine));
         assert_eq!(accepted["ok"], true, "{accepted}");
         assert!(receiver.try_recv().is_ok());
+    }
+
+    #[test]
+    fn pool_interactions_follow_the_project_allowlist() {
+        let home = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let (first_sender, _first_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (second_sender, _second_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let first_link = EngineLink::new(
+            first_sender,
+            home.path().to_path_buf(),
+            first.path().to_path_buf(),
+            Arc::new(Mutex::new(RemoteApprovals::default())),
+            Arc::new(Mutex::new(RemoteQuestions::default())),
+        );
+        let second_link = EngineLink::new(
+            second_sender,
+            home.path().to_path_buf(),
+            second.path().to_path_buf(),
+            Arc::new(Mutex::new(RemoteApprovals::default())),
+            Arc::new(Mutex::new(RemoteQuestions::default())),
+        );
+        let (first_approval, _first_decision) = tokio::sync::oneshot::channel();
+        first_link.approvals.lock().unwrap().insert(
+            "thread-a".into(),
+            "approval-a".into(),
+            "command".into(),
+            "first".into(),
+            Vec::new(),
+            first_approval,
+        );
+        let (second_approval, _second_decision) = tokio::sync::oneshot::channel();
+        second_link.approvals.lock().unwrap().insert(
+            "thread-b".into(),
+            "approval-b".into(),
+            "command".into(),
+            "second".into(),
+            Vec::new(),
+            second_approval,
+        );
+        let (second_question, _second_answers) = tokio::sync::oneshot::channel();
+        second_link.questions.lock().unwrap().insert(
+            "thread-b".into(),
+            "question-b".into(),
+            Vec::new(),
+            second_question,
+        );
+        let pool = EnginePool::from_links(vec![first_link, second_link]);
+        let first_root = first
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let second_root = second
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let missing = first.path().join("missing").to_string_lossy().to_string();
+
+        let allowed_first = std::slice::from_ref(&first_root);
+        let allowed_second = std::slice::from_ref(&second_root);
+        assert!(pool.has_allowed_engine(allowed_first));
+        assert!(!pool.has_allowed_engine(&[missing]));
+        let listed = pool.list_approvals(allowed_first, None);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["request_id"], "approval-a");
+        assert_eq!(pool.list_questions(allowed_first, None).len(), 0);
+        assert_eq!(
+            pool.list_questions(allowed_second, None)[0]["request_id"],
+            "question-b"
+        );
+        assert!(
+            pool.take_approval(allowed_first, "approval-b", "accept")
+                .is_none(),
+            "a request from an excluded project is not visible"
+        );
+        assert!(
+            pool.take_approval(allowed_second, "approval-b", "accept")
+                .is_some(),
+            "the allowed project can answer its own request"
+        );
     }
 
     #[cfg(unix)]

@@ -3619,9 +3619,9 @@ fn run_serve(home: &Path, stdio: bool, socket: Option<&str>) -> Result<()> {
             let shared = Arc::new(Mutex::new(store));
             let root = std::env::current_dir()?;
             let mut engine = Some(serve::ServeEngine::start(shared.clone(), home, &root)?);
-            let link = engine.as_ref().map(serve::ServeEngine::link);
+            let pool = engine.as_ref().map(serve::ServeEngine::pool);
             let result =
-                runtime.block_on(serve::socket_loop(listener, shared.clone(), home, path, link));
+                runtime.block_on(serve::socket_loop(listener, shared.clone(), home, path, pool));
             if let Some(engine) = engine.as_mut() {
                 engine.stop();
             }

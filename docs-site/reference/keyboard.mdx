@@ -22,6 +22,15 @@ A pasted multi-line prompt stays in the composer.
 | Ctrl+C twice while idle | Exit Baton |
 | Esc | Close a picker or preview |
 
+## Thread tabs
+
+| Key | Action |
+|---|---|
+| Alt+1 through Alt+9 | Switch to the open thread in that position |
+| Alt+0 | Nothing; reserved for terminal shortcuts |
+
+The tab strip appears above the transcript once a second thread is open. A switch is refused while a turn runs, a request waits for an answer, or a picker or full-screen view is open.
+
 ## Steer and queue
 
 While a turn runs, a new message is sent as a steer on Codex, Claude, and OpenCode 2 or newer. Other harnesses queue it durably. A bare `/queue` opens the queue: Enter sends, `e` edits, `d` deletes, `c` twice clears, and Ctrl+Up and Ctrl+Down reorder.

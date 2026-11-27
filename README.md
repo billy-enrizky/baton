@@ -417,7 +417,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 |---|---|
 | `/threads`, `/open`, `/pin`, `/inbox` | List, open, pin, or triage threads; `/threads all` includes archived threads |
 | `/snooze` | Hide this thread from `/inbox` for an hour, four hours, a day, a week, or clear the snooze with `off`; a new failure or question after the snooze wakes it early |
-| `/snippets` | List, add, or remove prompt commands under `.baton/commands` or `--global` under `~/.baton/commands`; a template expands `{{args}}` and `{{cwd}}`, and a project command shadows a user command with the same name |
+| `/snippets` | List, add, or remove prompt commands under `.baton/commands` or `--global` under `~/.baton/commands`; a template expands `{{args}}` and `{{cwd}}`, a project command shadows a user command with the same name, and a template that starts with `!` runs as a shell command |
 | `/schedule` | Open the schedule view; `p` pauses or resumes the selected row, `d` removes it after a second press, and Enter opens its thread. `/schedule add` starts a thread, cron, and prompt form; a blank thread uses the current one |
 | `/archive`, `/unarchive` | Hide a thread from the default lists and `/inbox`, or restore it; a running turn blocks the archive |
 | `/new`, `/fork`, `/worktree`, `/task` | Start a thread, fork one, or start from a git worktree or GitHub issue; `/task` without a number loads open issues and falls back to a clear notice when none can be read |
@@ -800,7 +800,7 @@ Machine output stays on stdout and progress stays on stderr, so a pipeline can p
 - `~/.baton/worktrees/`: managed orchestration and thread worktrees.
 - `~/.baton/model-cache/`: the last full model list for each harness.
 - Baton reads Claude and Codex settings plus OpenCode's model setting from their global and project-level files.
-- `~/.baton/commands/<name>.md` and `.baton/commands/<name>.md`: reusable slash commands whose body expands `{{args}}` and `{{cwd}}`. `~/.claude/commands` and `.claude/commands` are also read, and a project file shadows a user file with the same name. `/snippets` lists, adds, and removes the `.baton` files, with `--global` selecting the user file.
+- `~/.baton/commands/<name>.md` and `.baton/commands/<name>.md`: reusable slash commands whose body expands `{{args}}` and `{{cwd}}`. A body that starts with `!` runs through the shell path instead of the harness. `~/.claude/commands` and `.claude/commands` are also read, and a project file shadows a user file with the same name. `/snippets` lists, adds, and removes the `.baton` files, with `--global` selecting the user file.
 - `baton.json` in a repository root: optional shared worktree directories.
 
 ### 13.2 BATON_HOME

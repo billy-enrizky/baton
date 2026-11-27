@@ -13055,7 +13055,11 @@ fn handle_command(
                 let expanded = template
                     .replace("{{args}}", &args.join(" "))
                     .replace("{{cwd}}", &state.thread.cwd);
-                submit(state, store, engine_command_sender, expanded);
+                if let Some(command) = expanded.strip_prefix('!') {
+                    run_shell_command(state, command.trim().to_string());
+                } else {
+                    submit(state, store, engine_command_sender, expanded);
+                }
             } else {
                 state.notice = Some(format!("unknown command {other}. Try /help."));
             }
@@ -27757,6 +27761,28 @@ mod tests {
         assert_eq!(
             commands[1],
             ("/solo".to_string(), "global claude".to_string())
+        );
+    }
+
+    #[test]
+    fn a_shell_snippet_runs_the_shell_path() {
+        let home = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = project.path().to_string_lossy().to_string();
+        let dir = project.path().join(".baton/commands");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tests.md"), "!printf snippet-shell").unwrap();
+        state.custom_commands = discover_custom_commands(&state.home, &state.thread.cwd);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/tests");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("running !printf snippet-shell"), "{notice}");
+        assert!(state.shell_running);
+        assert!(
+            receiver.try_recv().is_err(),
+            "a shell snippet is not submitted to the engine"
         );
     }
 

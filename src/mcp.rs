@@ -1,10 +1,12 @@
 //! Minimal MCP stdio server exposing baton's durable thread state to coding
 //! agents. The server is read-only except for explicit queue clear and fork.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::config::resolve_config;
 use crate::orchestrate;
@@ -106,7 +108,10 @@ impl McpServer {
                 Ok(status::to_json(&self.status_for(&thread)?))
             }
             "baton_threads" => {
-                let all = arguments.get("all").and_then(Value::as_bool).unwrap_or(false);
+                let all = arguments
+                    .get("all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let threads = if all {
                     self.store.list_threads(None)?
                 } else {
@@ -163,7 +168,10 @@ impl McpServer {
                 Ok(crate::activity::to_json(&thread.id, &rows))
             }
             "baton_memories" => {
-                let all = arguments.get("all").and_then(Value::as_bool).unwrap_or(false);
+                let all = arguments
+                    .get("all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let cwd = arguments
                     .get("cwd")
                     .and_then(Value::as_str)
@@ -242,7 +250,10 @@ impl McpServer {
                     .map(str::trim)
                     .filter(|query| !query.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("query is required"))?;
-                let all = arguments.get("all").and_then(Value::as_bool).unwrap_or(false);
+                let all = arguments
+                    .get("all")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
                 let limit = arguments
                     .get("limit")
                     .and_then(Value::as_u64)
@@ -763,6 +774,350 @@ fn tool_descriptors() -> Vec<Value> {
     ]
 }
 
+const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
+const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+
+/// Load the bearer token from a private regular file. The token is a static
+/// credential; revocation is replacing the file and restarting the server.
+pub fn read_token_file(path: &Path) -> Result<String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("read token file {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("token file cannot be a symlink");
+    }
+    if !metadata.is_file() {
+        anyhow::bail!("token file must be a regular file");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("token file must be mode 0600");
+        }
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("read token file {}", path.display()))?;
+    let token = text.trim();
+    if !(32..=512).contains(&token.len()) {
+        anyhow::bail!("token must be 32 to 512 characters");
+    }
+    if token
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        anyhow::bail!("token cannot contain whitespace or control characters");
+    }
+    Ok(token.to_string())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+pub fn run_http(
+    server: McpServer,
+    addr: &str,
+    token_file: &Path,
+    trusted_overlay: bool,
+) -> Result<()> {
+    let token = read_token_file(token_file)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build the MCP HTTP runtime")?;
+    runtime.block_on(async move {
+        let mut addresses = tokio::net::lookup_host(addr)
+            .await
+            .with_context(|| format!("--http needs a resolvable host:port, got {addr}"))?;
+        let addr = addresses
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("--http resolved to no address"))?;
+        if !addr.ip().is_loopback() && !trusted_overlay {
+            anyhow::bail!("--http outside loopback needs --trusted-overlay");
+        }
+        if !addr.ip().is_loopback() {
+            eprintln!(
+                "baton: MCP HTTP on {addr} uses a static bearer token without TLS; use it only on a trusted overlay"
+            );
+        }
+        let listener = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("bind MCP HTTP on {addr}"))?;
+        let local = listener.local_addr()?;
+        eprintln!("baton: MCP HTTP listening on http://{local}");
+        let server = Arc::new(Mutex::new(server));
+        let token = Arc::new(token);
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.context("accept MCP HTTP connection")?;
+                    let server = server.clone();
+                    let token = token.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = serve_http_connection(stream, server, token).await {
+                            eprintln!("baton: MCP HTTP connection: {error}");
+                        }
+                    });
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+async fn serve_http_connection<S>(
+    stream: S,
+    server: Arc<Mutex<McpServer>>,
+    token: Arc<String>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (read, mut write) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read);
+    let mut request_line = String::new();
+    let read = reader
+        .read_line(&mut request_line)
+        .await
+        .context("read MCP HTTP request line")?;
+    if read == 0 {
+        return Ok(());
+    }
+    if request_line.len() > 8192 {
+        return write_http_response(
+            &mut write,
+            "431 Request Header Fields Too Large",
+            "application/json",
+            json!({"error": "request line too large"})
+                .to_string()
+                .as_bytes(),
+        )
+        .await;
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+    if parts.next().is_none() {
+        return write_http_response(
+            &mut write,
+            "400 Bad Request",
+            "application/json",
+            json!({"error": "malformed request line"})
+                .to_string()
+                .as_bytes(),
+        )
+        .await;
+    }
+
+    let mut content_length = None;
+    let mut authorization = None;
+    let mut expect_continue = false;
+    let mut header_bytes = 0usize;
+    loop {
+        let mut line = String::new();
+        let read = reader
+            .read_line(&mut line)
+            .await
+            .context("read MCP HTTP header")?;
+        if read == 0 {
+            return write_http_response(
+                &mut write,
+                "400 Bad Request",
+                "application/json",
+                json!({"error": "request ended in headers"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await;
+        }
+        header_bytes += read;
+        if header_bytes > MAX_HTTP_HEADER_BYTES {
+            return write_http_response(
+                &mut write,
+                "431 Request Header Fields Too Large",
+                "application/json",
+                json!({"error": "headers too large"}).to_string().as_bytes(),
+            )
+            .await;
+        }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            return write_http_response(
+                &mut write,
+                "400 Bad Request",
+                "application/json",
+                json!({"error": "malformed header"}).to_string().as_bytes(),
+            )
+            .await;
+        };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "content-length" => {
+                let Ok(length) = value.trim().parse::<usize>() else {
+                    return write_http_response(
+                        &mut write,
+                        "400 Bad Request",
+                        "application/json",
+                        json!({"error": "content-length must be a number"})
+                            .to_string()
+                            .as_bytes(),
+                    )
+                    .await;
+                };
+                content_length = Some(length);
+            }
+            "authorization" => authorization = Some(value.trim().to_string()),
+            "expect" => expect_continue = value.trim().eq_ignore_ascii_case("100-continue"),
+            _ => {}
+        }
+    }
+
+    if method == "GET" && path == "/health" {
+        return write_http_response(
+            &mut write,
+            "200 OK",
+            "application/json",
+            json!({"ok": true, "server": "baton", "version": env!("CARGO_PKG_VERSION")})
+                .to_string()
+                .as_bytes(),
+        )
+        .await;
+    }
+    if path != "/mcp" {
+        return write_http_response(
+            &mut write,
+            "404 Not Found",
+            "application/json",
+            json!({"error": "not found"}).to_string().as_bytes(),
+        )
+        .await;
+    }
+    if method != "POST" {
+        return write_http_response(
+            &mut write,
+            "405 Method Not Allowed",
+            "application/json",
+            json!({"error": "use POST /mcp"}).to_string().as_bytes(),
+        )
+        .await;
+    }
+
+    let provided = authorization
+        .as_deref()
+        .and_then(|header| header.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .map(|(_, value)| value.trim())
+        .unwrap_or_default();
+    if !constant_time_eq(provided.as_bytes(), token.as_bytes()) {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": null,
+            "error": { "code": -32001, "message": "unauthorized" }
+        })
+        .to_string();
+        let header = format!(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {}\r\nWWW-Authenticate: Bearer\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        write.write_all(header.as_bytes()).await?;
+        write.write_all(body.as_bytes()).await?;
+        write.flush().await?;
+        return Ok(());
+    }
+
+    let Some(content_length) = content_length else {
+        return write_http_response(
+            &mut write,
+            "411 Length Required",
+            "application/json",
+            json!({"error": "content-length is required"})
+                .to_string()
+                .as_bytes(),
+        )
+        .await;
+    };
+    if content_length > MAX_HTTP_BODY_BYTES {
+        return write_http_response(
+            &mut write,
+            "413 Payload Too Large",
+            "application/json",
+            json!({"error": "body too large"}).to_string().as_bytes(),
+        )
+        .await;
+    }
+    if expect_continue {
+        write.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+        write.flush().await?;
+    }
+    let mut body = vec![0u8; content_length];
+    reader
+        .read_exact(&mut body)
+        .await
+        .context("read MCP HTTP body")?;
+    let frame: Value = match serde_json::from_slice(&body) {
+        Ok(frame) => frame,
+        Err(error) => {
+            return write_http_response(
+                &mut write,
+                "400 Bad Request",
+                "application/json",
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": null,
+                    "error": { "code": -32700, "message": format!("parse error: {error}") }
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .await
+        }
+    };
+    let response = server
+        .lock()
+        .map_err(|_| anyhow::anyhow!("MCP server lock poisoned"))?
+        .handle(frame);
+    match response {
+        Some(response) => {
+            write_http_response(
+                &mut write,
+                "200 OK",
+                "application/json",
+                serde_json::to_string(&response)?.as_bytes(),
+            )
+            .await
+        }
+        None => write_http_response(&mut write, "202 Accepted", "application/json", b"").await,
+    }
+}
+
+async fn write_http_response<W>(
+    write: &mut W,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    write.write_all(header.as_bytes()).await?;
+    write.write_all(body).await?;
+    write.flush().await?;
+    Ok(())
+}
+
 pub fn run_stdio(server: McpServer) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
@@ -810,13 +1165,31 @@ mod tests {
             .set_thread_permission_mode(&thread.id, PermissionMode::Plan)
             .unwrap();
         store
-            .add_message(&thread.id, 1, "user", Some("codex"), Some("model-1"), "hello")
+            .add_message(
+                &thread.id,
+                1,
+                "user",
+                Some("codex"),
+                Some("model-1"),
+                "hello",
+            )
             .unwrap();
         store
-            .add_message(&thread.id, 1, "assistant", Some("codex"), Some("model-1"), "world")
+            .add_message(
+                &thread.id,
+                1,
+                "assistant",
+                Some("codex"),
+                Some("model-1"),
+                "world",
+            )
             .unwrap();
-        store.start_turn_record(&thread.id, 1, ProviderId::Codex, Some("model-1")).unwrap();
-        store.finish_turn_record(&thread.id, 1, crate::types::TurnPhase::Completed, None).unwrap();
+        store
+            .start_turn_record(&thread.id, 1, ProviderId::Codex, Some("model-1"))
+            .unwrap();
+        store
+            .finish_turn_record(&thread.id, 1, crate::types::TurnPhase::Completed, None)
+            .unwrap();
         store
             .add_message(&thread.id, 1, "diff", None, None, "diff --git a/a b/a")
             .unwrap();
@@ -839,6 +1212,113 @@ mod tests {
         );
         let text = response["result"]["content"][0]["text"].as_str().unwrap();
         serde_json::from_str(text).unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_requires_a_private_regular_file() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        let token = "a".repeat(64);
+        std::fs::write(&path, format!("{token}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_token_file(&path).unwrap(), token);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = read_token_file(&path).unwrap_err();
+        assert!(error.to_string().contains("0600"), "{error}");
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.path().join("token-link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        let error = read_token_file(&link).unwrap_err();
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    async fn http_request(server: Arc<Mutex<McpServer>>, token: &str, request: &str) -> String {
+        let (mut client, server_side) = tokio::io::duplex(16 * 1024);
+        let token = Arc::new(token.to_string());
+        let handle = tokio::spawn(serve_http_connection(server_side, server, token));
+        client.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        client.read_to_end(&mut response).await.unwrap();
+        handle.await.unwrap().unwrap();
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    fn http_post(auth: Option<&str>, body: &str) -> String {
+        let auth = auth
+            .map(|value| format!("Authorization: {value}\r\n"))
+            .unwrap_or_default();
+        format!(
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    #[tokio::test]
+    async fn http_requires_a_bearer_and_answers_initialize() {
+        let server = Arc::new(Mutex::new(server()));
+        let token = "a".repeat(64);
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}
+        })
+        .to_string();
+
+        let unauthorized = http_request(
+            server.clone(),
+            &token,
+            &http_post(Some("Bearer wrong"), &initialize),
+        )
+        .await;
+        assert!(unauthorized.starts_with("HTTP/1.1 401"), "{unauthorized}");
+
+        let accepted = http_request(
+            server.clone(),
+            &token,
+            &http_post(Some(&format!("Bearer {token}")), &initialize),
+        )
+        .await;
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+        assert!(accepted.contains("\"serverInfo\""), "{accepted}");
+        assert!(accepted.contains("2025-06-18"), "{accepted}");
+
+        let notification = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        })
+        .to_string();
+        let accepted = http_request(
+            server.clone(),
+            &token,
+            &http_post(Some(&format!("Bearer {token}")), &notification),
+        )
+        .await;
+        assert!(accepted.starts_with("HTTP/1.1 202"), "{accepted}");
+
+        let health = http_request(
+            server.clone(),
+            &token,
+            "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        assert!(health.starts_with("HTTP/1.1 200"), "{health}");
+        assert!(health.contains("\"ok\":true"), "{health}");
+
+        let malformed = http_request(
+            server,
+            &token,
+            &http_post(Some(&format!("Bearer {token}")), "{"),
+        )
+        .await;
+        assert!(malformed.starts_with("HTTP/1.1 400"), "{malformed}");
+        assert!(malformed.contains("-32700"), "{malformed}");
     }
 
     #[test]

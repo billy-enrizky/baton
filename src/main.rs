@@ -753,9 +753,21 @@ fn main_result(started: Instant) -> Result<()> {
         cli::Commands::Grant { command } => run_grant(&home, command),
         cli::Commands::Audit { command } => run_audit(command),
         cli::Commands::Runs { command } => run_runs(command),
-        cli::Commands::Mcp => {
+        cli::Commands::Mcp {
+            http,
+            token_file,
+            trusted_overlay,
+        } => {
             let store = open_store(None)?;
-            mcp::run_stdio(mcp::McpServer::new(store, home.clone(), cwd.clone()))
+            let server = mcp::McpServer::new(store, home.clone(), cwd.clone());
+            match http {
+                Some(addr) => {
+                    let token_file =
+                        token_file.ok_or_else(|| anyhow::anyhow!("--http needs --token-file"))?;
+                    mcp::run_http(server, &addr, &token_file, trusted_overlay)
+                }
+                None => mcp::run_stdio(server),
+            }
         }
         cli::Commands::Threads { json, all } => {
             let store = open_store(None)?;

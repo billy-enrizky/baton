@@ -234,6 +234,12 @@ pub enum Commands {
         /// Allow a non-loopback HTTP bind on a trusted overlay
         #[arg(long, requires = "http")]
         trusted_overlay: bool,
+        /// PEM certificate chain for HTTPS; requires --tls-key
+        #[arg(long, value_name = "PATH", requires_all = ["http", "tls_key"], conflicts_with = "trusted_overlay")]
+        tls_cert: Option<PathBuf>,
+        /// PEM private key for HTTPS; requires --tls-cert
+        #[arg(long, value_name = "PATH", requires_all = ["http", "tls_cert"], conflicts_with = "trusted_overlay")]
+        tls_key: Option<PathBuf>,
         /// Hide fork and refuse queue clearing
         #[arg(long)]
         read_only: bool,
@@ -976,6 +982,7 @@ mod tests {
                 trusted_overlay: false,
                 read_only: false,
                 allow_tool,
+                ..
             }) => {
                 assert_eq!(addr, "127.0.0.1:8787");
                 assert_eq!(path, PathBuf::from("/tmp/baton-mcp-token"));
@@ -1028,6 +1035,58 @@ mod tests {
         assert!(
             conflict.is_err(),
             "--read-only and --allow-tool must not be combined"
+        );
+        let tls = Cli::try_parse_from([
+            "baton",
+            "mcp",
+            "--http",
+            "127.0.0.1:8787",
+            "--token-file",
+            "/tmp/baton-mcp-token",
+            "--tls-cert",
+            "/tmp/baton-cert.pem",
+            "--tls-key",
+            "/tmp/baton-key.pem",
+        ])
+        .unwrap();
+        match tls.command {
+            Some(Commands::Mcp {
+                tls_cert: Some(cert),
+                tls_key: Some(key),
+                ..
+            }) => {
+                assert_eq!(cert, PathBuf::from("/tmp/baton-cert.pem"));
+                assert_eq!(key, PathBuf::from("/tmp/baton-key.pem"));
+            }
+            _ => panic!("expected HTTPS MCP"),
+        }
+        let missing_key = Cli::try_parse_from([
+            "baton",
+            "mcp",
+            "--http",
+            "127.0.0.1:8787",
+            "--token-file",
+            "/tmp/baton-mcp-token",
+            "--tls-cert",
+            "/tmp/baton-cert.pem",
+        ]);
+        assert!(missing_key.is_err(), "--tls-cert needs --tls-key");
+        let overlay_conflict = Cli::try_parse_from([
+            "baton",
+            "mcp",
+            "--http",
+            "0.0.0.0:8787",
+            "--token-file",
+            "/tmp/baton-mcp-token",
+            "--trusted-overlay",
+            "--tls-cert",
+            "/tmp/baton-cert.pem",
+            "--tls-key",
+            "/tmp/baton-key.pem",
+        ]);
+        assert!(
+            overlay_conflict.is_err(),
+            "--trusted-overlay and TLS must not be combined"
         );
     }
 

@@ -882,26 +882,35 @@ fn tool_descriptors(access: McpAccess) -> Vec<Value> {
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 
+const MAX_SECRET_FILE_BYTES: u64 = 1024 * 1024;
+
+fn read_regular_file(path: &Path, label: &str, private: bool) -> Result<Vec<u8>> {
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("read {label} file {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        anyhow::bail!("{label} file cannot be a symlink");
+    }
+    if !metadata.is_file() {
+        anyhow::bail!("{label} file must be a regular file");
+    }
+    if metadata.len() > MAX_SECRET_FILE_BYTES {
+        anyhow::bail!("{label} file is larger than 1 MiB");
+    }
+    #[cfg(unix)]
+    if private {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            anyhow::bail!("{label} file must be mode 0600");
+        }
+    }
+    std::fs::read(path).with_context(|| format!("read {label} file {}", path.display()))
+}
+
 /// Load the bearer token from a private regular file. The token is a static
 /// credential; revocation is replacing the file and restarting the server.
 pub fn read_token_file(path: &Path) -> Result<String> {
-    let metadata = std::fs::symlink_metadata(path)
-        .with_context(|| format!("read token file {}", path.display()))?;
-    if metadata.file_type().is_symlink() {
-        anyhow::bail!("token file cannot be a symlink");
-    }
-    if !metadata.is_file() {
-        anyhow::bail!("token file must be a regular file");
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
-            anyhow::bail!("token file must be mode 0600");
-        }
-    }
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("read token file {}", path.display()))?;
+    let text = String::from_utf8(read_regular_file(path, "token", true)?)
+        .with_context(|| format!("token file {} is not UTF-8", path.display()))?;
     let token = text.trim();
     if !(32..=512).contains(&token.len()) {
         anyhow::bail!("token must be 32 to 512 characters");
@@ -915,6 +924,13 @@ pub fn read_token_file(path: &Path) -> Result<String> {
     Ok(token.to_string())
 }
 
+/// Load a PEM certificate chain and a private PKCS#8 key for HTTPS.
+pub fn read_tls_identity(cert_path: &Path, key_path: &Path) -> Result<native_tls::Identity> {
+    let cert = read_regular_file(cert_path, "TLS certificate", false)?;
+    let key = read_regular_file(key_path, "TLS key", true)?;
+    native_tls::Identity::from_pkcs8(&cert, &key).context("load the TLS certificate and key")
+}
+
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     if left.len() != right.len() {
         return false;
@@ -926,13 +942,30 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+fn check_http_bind(addr: std::net::IpAddr, trusted_overlay: bool, encrypted: bool) -> Result<()> {
+    if !addr.is_loopback() && !trusted_overlay && !encrypted {
+        anyhow::bail!("--http outside loopback needs --tls-cert or --trusted-overlay");
+    }
+    Ok(())
+}
+
 pub fn run_http(
     server: McpServer,
     addr: &str,
     token_file: &Path,
     trusted_overlay: bool,
+    tls: Option<(&Path, &Path)>,
 ) -> Result<()> {
     let token = read_token_file(token_file)?;
+    let tls_acceptor = tls
+        .map(|(cert_path, key_path)| {
+            let identity = read_tls_identity(cert_path, key_path)?;
+            native_tls::TlsAcceptor::new(identity)
+                .context("build the TLS acceptor")
+                .map(tokio_native_tls::TlsAcceptor::from)
+        })
+        .transpose()?;
+    let encrypted = tls_acceptor.is_some();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -944,10 +977,8 @@ pub fn run_http(
         let addr = addresses
             .next()
             .ok_or_else(|| anyhow::anyhow!("--http resolved to no address"))?;
-        if !addr.ip().is_loopback() && !trusted_overlay {
-            anyhow::bail!("--http outside loopback needs --trusted-overlay");
-        }
-        if !addr.ip().is_loopback() {
+        check_http_bind(addr.ip(), trusted_overlay, encrypted)?;
+        if !addr.ip().is_loopback() && !encrypted {
             eprintln!(
                 "baton: MCP HTTP on {addr} uses a static bearer token without TLS; use it only on a trusted overlay"
             );
@@ -956,7 +987,8 @@ pub fn run_http(
             .await
             .with_context(|| format!("bind MCP HTTP on {addr}"))?;
         let local = listener.local_addr()?;
-        eprintln!("baton: MCP HTTP listening on http://{local}");
+        let scheme = if encrypted { "https" } else { "http" };
+        eprintln!("baton: MCP HTTP listening on {scheme}://{local}");
         let server = Arc::new(Mutex::new(server));
         let token = Arc::new(token);
         loop {
@@ -966,8 +998,17 @@ pub fn run_http(
                     let (stream, _) = accepted.context("accept MCP HTTP connection")?;
                     let server = server.clone();
                     let token = token.clone();
+                    let tls_acceptor = tls_acceptor.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = serve_http_connection(stream, server, token).await {
+                        let result = match tls_acceptor {
+                            Some(acceptor) => match acceptor.accept(stream).await {
+                                Ok(stream) => serve_http_connection(stream, server, token).await,
+                                Err(error) => Err(anyhow::Error::new(error)
+                                    .context("MCP TLS handshake")),
+                            },
+                            None => serve_http_connection(stream, server, token).await,
+                        };
+                        if let Err(error) = result {
                             eprintln!("baton: MCP HTTP connection: {error}");
                         }
                     });
@@ -1340,6 +1381,151 @@ mod tests {
         std::os::unix::fs::symlink(&path, &link).unwrap();
         let error = read_token_file(&link).unwrap_err();
         assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    #[cfg(unix)]
+    fn tls_fixture(dir: &tempfile::TempDir) -> (PathBuf, PathBuf, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        let status = std::process::Command::new("openssl")
+            .args(["req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout"])
+            .arg(&key_path)
+            .arg("-out")
+            .arg(&cert_path)
+            .args([
+                "-days",
+                "1",
+                "-subj",
+                "/CN=localhost",
+                "-addext",
+                "subjectAltName=DNS:localhost,IP:127.0.0.1",
+                "-addext",
+                "extendedKeyUsage=serverAuth",
+                "-addext",
+                "keyUsage=digitalSignature,keyEncipherment",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("openssl is required for the TLS tests");
+        assert!(status.success(), "openssl could not create the TLS fixture");
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let cert_pem = std::fs::read_to_string(&cert_path).unwrap();
+        (cert_path, key_path, cert_pem)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tls_identity_requires_a_private_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, _) = tls_fixture(&dir);
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let error = match read_tls_identity(&cert_path, &key_path) {
+            Ok(_) => panic!("a public TLS key must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("TLS key"), "{error}");
+        assert!(error.to_string().contains("0600"), "{error}");
+
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if let Err(error) = read_tls_identity(&cert_path, &key_path) {
+            panic!("valid TLS identity was refused: {error:#}");
+        }
+
+        let link = dir.path().join("key-link");
+        std::os::unix::fs::symlink(&key_path, &link).unwrap();
+        let error = match read_tls_identity(&cert_path, &link) {
+            Ok(_) => panic!("a symlinked TLS key must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("symlink"), "{error}");
+    }
+
+    #[test]
+    fn tls_identity_rejects_invalid_pem() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        std::fs::write(&cert_path, "not a certificate").unwrap();
+        std::fs::write(&key_path, "not a key").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let error = match read_tls_identity(&cert_path, &key_path) {
+            Ok(_) => panic!("invalid PEM must be refused"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("TLS"), "{error}");
+    }
+
+    #[test]
+    fn tls_bind_policy_requires_encryption_or_an_overlay() {
+        use std::net::{IpAddr, Ipv4Addr};
+
+        assert!(check_http_bind(IpAddr::V4(Ipv4Addr::LOCALHOST), false, false).is_ok());
+        assert!(
+            check_http_bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), false, false).is_err(),
+            "a plain non-loopback bind needs an overlay"
+        );
+        assert!(check_http_bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), true, false).is_ok());
+        assert!(check_http_bind(IpAddr::V4(Ipv4Addr::UNSPECIFIED), false, true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tls_serves_initialize_after_a_handshake() {
+        let dir = tempfile::tempdir().unwrap();
+        let (cert_path, key_path, cert_pem) = tls_fixture(&dir);
+        let identity = read_tls_identity(&cert_path, &key_path).unwrap();
+        let acceptor =
+            tokio_native_tls::TlsAcceptor::from(native_tls::TlsAcceptor::new(identity).unwrap());
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = Arc::new(Mutex::new(server()));
+        let token = "a".repeat(64);
+        let auth = format!("Bearer {token}");
+        let expected_token = token.clone();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let stream = acceptor.accept(stream).await.unwrap();
+            serve_http_connection(stream, server, Arc::new(expected_token))
+                .await
+                .unwrap();
+        });
+
+        let root = native_tls::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
+        let connector = native_tls::TlsConnector::builder()
+            .add_root_certificate(root)
+            .build()
+            .unwrap();
+        let connector = tokio_native_tls::TlsConnector::from(connector);
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = connector.connect("localhost", stream).await.unwrap();
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18" }
+        })
+        .to_string();
+        stream
+            .write_all(http_post(Some(&auth), &initialize).as_bytes())
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("\"serverInfo\""), "{response}");
+        server_task.await.unwrap();
     }
 
     async fn http_request(server: Arc<Mutex<McpServer>>, token: &str, request: &str) -> String {

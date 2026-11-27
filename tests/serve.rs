@@ -656,7 +656,7 @@ fn serve_socket_refuses_a_regular_file_at_the_path() {
 
 #[cfg(unix)]
 #[test]
-fn serve_stdin_pair_mints_a_usable_grant() {
+fn serve_stdin_pair_and_attach_use_the_socket() {
     use baton::store::BatonStore;
     use std::os::unix::net::UnixStream;
 
@@ -756,6 +756,58 @@ fn serve_stdin_pair_mints_a_usable_grant() {
         "secret": secret.clone(),
     }));
     assert_eq!(status["ok"], true, "{status}");
+
+    let attached = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["attach", "--url", &url, "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(attached.status.success(), "{attached:?}");
+    let attached: serde_json::Value = serde_json::from_slice(&attached.stdout).unwrap();
+    assert_eq!(attached["schema_version"], 1);
+    assert_eq!(attached["scope"], "host");
+    assert_eq!(attached["threads"], 0);
+    assert_eq!(attached["running_turns"], 0);
+
+    let attached_text = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["attach", "--url", &url])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    let attached_text_out = String::from_utf8_lossy(&attached_text.stdout);
+    assert!(attached_text.status.success(), "{attached_text:?}");
+    assert!(
+        attached_text_out.contains("scope: host"),
+        "{attached_text_out}"
+    );
+    assert!(
+        attached_text_out.contains("threads: 0"),
+        "{attached_text_out}"
+    );
+
+    let missing_url = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .arg("attach")
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(!missing_url.status.success(), "{missing_url:?}");
+    assert!(
+        String::from_utf8_lossy(&missing_url.stderr).contains("needs --url"),
+        "{missing_url:?}"
+    );
+
+    let mut bad_url = url.clone();
+    let last = bad_url.pop().unwrap();
+    bad_url.push(if last == '0' { '1' } else { '0' });
+    let refused = Command::new(env!("CARGO_BIN_EXE_baton"))
+        .args(["attach", "--url", &bad_url, "--json"])
+        .env("BATON_HOME", home.path())
+        .output()
+        .unwrap();
+    let refused_err = String::from_utf8_lossy(&refused.stderr);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(refused_err.contains("bad_secret"), "{refused_err}");
+    assert!(!refused_err.contains(&secret), "{refused_err}");
 
     writeln!(stdin, "pair --scope nope").unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);

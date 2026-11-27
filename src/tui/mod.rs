@@ -935,6 +935,17 @@ enum SettingsAction {
     ReadOnly,
 }
 
+impl SettingsAction {
+    /// The config key this action writes, used as the audit target.
+    fn key(self) -> &'static str {
+        match self {
+            SettingsAction::DefaultMode => "default_mode",
+            SettingsAction::Bell => "bell",
+            SettingsAction::ReadOnly => "read_only",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SettingsCategory {
     label: String,
@@ -6298,7 +6309,7 @@ fn handle_key(
                                     category.label
                                 ));
                             }
-                            action => match write_global_setting(state, action, &value) {
+                            action => match write_global_setting(state, store, action, &value) {
                                 Ok(notice) => {
                                     category.current = value_index;
                                     state.notice = Some(notice);
@@ -9793,6 +9804,7 @@ fn settings_categories(state: &TuiState) -> Vec<SettingsCategory> {
 
 fn write_global_setting(
     state: &mut TuiState,
+    store: &Arc<Mutex<BatonStore>>,
     action: SettingsAction,
     value: &str,
 ) -> std::result::Result<String, String> {
@@ -9817,7 +9829,11 @@ fn write_global_setting(
     if action == SettingsAction::Bell {
         state.bell_enabled = value == "on";
     }
-    Ok(notice)
+    let note = match record_settings_write(store, state, action, value) {
+        Ok(()) => String::new(),
+        Err(error) => format!(" · not recorded: {error}"),
+    };
+    Ok(format!("{notice}{note}"))
 }
 
 fn handle_command(
@@ -16813,6 +16829,27 @@ fn record_question_answers(
     Ok(())
 }
 
+/// Records one global settings write after the config file landed. The file
+/// is the mutation and cannot join a store transaction, so a failed append is
+/// reported, never allowed to pretend the write did not happen.
+fn record_settings_write(
+    store: &Arc<Mutex<BatonStore>>,
+    state: &TuiState,
+    action: SettingsAction,
+    value: &str,
+) -> anyhow::Result<()> {
+    let event = crate::audit::event(
+        crate::audit::TUI_ACTOR,
+        &crate::claim::installation_id(&state.home).unwrap_or_else(|| "unclaimed".into()),
+        Some(action.key()),
+        None,
+        crate::audit::AuditAction::SettingsWrite,
+        &serde_json::json!({ "key": action.key(), "value": value }),
+    )?;
+    store.lock().unwrap().append_audit_event(&event)?;
+    Ok(())
+}
+
 /// Appends a git action row after the command succeeded. The action already
 /// happened, so a failed append can only be reported, never undone.
 fn record_git_action(
@@ -20186,6 +20223,51 @@ mod tests {
 
         handle_command(&mut state, &store, &engine_command_sender, "/new");
         assert_eq!(state.thread.session_mode, SessionMode::Single);
+
+        let events = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(events.iter().all(|event| event.action == "settings.write"));
+        assert!(events
+            .iter()
+            .all(|event| event.scope == crate::audit::SETTINGS_SCOPE));
+        assert!(events
+            .iter()
+            .all(|event| event.actor == crate::audit::TUI_ACTOR));
+        assert!(events.iter().all(|event| event.thread_id.is_none()));
+        assert_eq!(events[0].target.as_deref(), Some("bell"));
+        assert_eq!(events[1].target.as_deref(), Some("default_mode"));
+    }
+
+    #[test]
+    fn a_setting_that_cannot_be_recorded_still_saves_and_says_so() {
+        let home = tempfile::tempdir().unwrap();
+        let db = home.path().join("baton.sqlite");
+        let writable = Arc::new(Mutex::new(BatonStore::open(&db).unwrap()));
+        let mut state = test_state(home.path(), &writable, Vec::new());
+        let read_only = Arc::new(Mutex::new(BatonStore::open_read_only(&db).unwrap()));
+
+        let notice = write_global_setting(
+            &mut state,
+            &read_only,
+            SettingsAction::DefaultMode,
+            "single",
+        )
+        .unwrap();
+        assert!(
+            notice.contains("default session mode set to single"),
+            "{notice}"
+        );
+        assert!(notice.contains("not recorded"), "{notice}");
+        assert_eq!(
+            crate::config::get_default_session_mode(home.path()),
+            SessionMode::Single
+        );
+        assert!(writable
+            .lock()
+            .unwrap()
+            .list_audit_events(10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

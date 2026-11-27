@@ -19,6 +19,7 @@ pub const ADMIN_SCOPE: &str = "admin";
 pub const OPERATE_SCOPE: &str = "operate";
 pub const APPROVE_SCOPE: &str = "approve";
 pub const GIT_SCOPE: &str = "git";
+pub const SETTINGS_SCOPE: &str = "settings";
 pub const DURABLE_RETENTION: &str = "durable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +35,7 @@ pub enum AuditAction {
     GitPr,
     GitReview,
     GitMerge,
+    SettingsWrite,
     QueueClear,
     ThreadFork,
 }
@@ -52,6 +54,7 @@ impl AuditAction {
             AuditAction::GitPr => "git.pr",
             AuditAction::GitReview => "git.review",
             AuditAction::GitMerge => "git.merge",
+            AuditAction::SettingsWrite => "settings.write",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
         }
@@ -73,6 +76,7 @@ impl AuditAction {
             | AuditAction::GitPr
             | AuditAction::GitReview
             | AuditAction::GitMerge => GIT_SCOPE,
+            AuditAction::SettingsWrite => SETTINGS_SCOPE,
         }
     }
 }
@@ -152,6 +156,7 @@ mod tests {
         assert_eq!(AuditAction::GitPr.scope(), GIT_SCOPE);
         assert_eq!(AuditAction::GitReview.scope(), GIT_SCOPE);
         assert_eq!(AuditAction::GitMerge.scope(), GIT_SCOPE);
+        assert_eq!(AuditAction::SettingsWrite.scope(), SETTINGS_SCOPE);
     }
 
     #[test]
@@ -196,6 +201,7 @@ mod tests {
         assert_eq!(AuditAction::QuestionAnswer.as_str(), "question.answer");
         assert_eq!(AuditAction::GitCommit.as_str(), "git.commit");
         assert_eq!(AuditAction::GitMerge.as_str(), "git.merge");
+        assert_eq!(AuditAction::SettingsWrite.as_str(), "settings.write");
         assert_eq!(AuditAction::QueueClear.as_str(), "queue.clear");
         assert_eq!(AuditAction::ThreadFork.as_str(), "thread.fork");
     }

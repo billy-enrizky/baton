@@ -1019,6 +1019,17 @@ impl OpenThreadTab {
     }
 }
 
+/// Live turn buffers for a tab that is not active. A tab switch moves these
+/// aside so the background turn keeps streaming and can be restored intact.
+#[derive(Default)]
+struct ThreadRunState {
+    running: bool,
+    queued_provider: Option<ProviderId>,
+    streaming_text: String,
+    tool_lines: Vec<ToolLine>,
+    live_subagents: Vec<AgentEntry>,
+}
+
 pub struct TuiState {
     /// Terminal bell on turn end, opt-in through config.json.
     bell_enabled: bool,
@@ -1038,6 +1049,7 @@ pub struct TuiState {
     memory_environment: crate::memory_files::MemoryEnvironment,
     thread: ThreadRow,
     open_tabs: Vec<OpenThreadTab>,
+    background_runs: std::collections::HashMap<String, ThreadRunState>,
     side_chat_of: Option<String>,
     adapter_lifecycles: std::collections::HashMap<ProviderId, AdapterLifecycle>,
     history: Vec<MessageRow>,
@@ -1210,6 +1222,7 @@ pub fn run_tui(
         memory_environment: crate::memory_files::MemoryEnvironment::from_env(),
         thread,
         open_tabs,
+        background_runs: std::collections::HashMap::new(),
         side_chat_of,
         adapter_lifecycles,
         history,
@@ -1861,6 +1874,13 @@ fn apply_engine_event(
                 child.error = None;
             }
             if thread_id != state.thread.id {
+                if state.open_tabs.iter().any(|tab| tab.id() == thread_id) {
+                    let run = state.background_runs.entry(thread_id).or_default();
+                    run.running = true;
+                    run.queued_provider = Some(provider);
+                    run.streaming_text.clear();
+                    run.tool_lines.clear();
+                }
                 return;
             }
             state.running = true;
@@ -1888,6 +1908,13 @@ fn apply_engine_event(
                 child.error = None;
             }
             if thread_id != state.thread.id {
+                if state.open_tabs.iter().any(|tab| tab.id() == thread_id) {
+                    let run = state.background_runs.entry(thread_id).or_default();
+                    run.running = true;
+                    run.queued_provider = None;
+                    run.streaming_text.clear();
+                    run.tool_lines.clear();
+                }
                 return;
             }
             state.running = true;
@@ -1942,6 +1969,23 @@ fn apply_engine_event(
                 }
             }
             if thread_id != state.thread.id {
+                let title = state
+                    .open_tabs
+                    .iter()
+                    .find(|tab| tab.id() == thread_id)
+                    .map(|tab| tab.title().to_string());
+                if let Some(title) = title {
+                    let run = state.background_runs.entry(thread_id).or_default();
+                    run.running = false;
+                    run.queued_provider = None;
+                    run.streaming_text.clear();
+                    run.tool_lines.clear();
+                    run.live_subagents.clear();
+                    if !ok {
+                        let detail = error.unwrap_or_else(|| "unknown error".into());
+                        state.notice = Some(format!("background turn in {title} failed: {detail}"));
+                    }
+                }
                 return;
             }
             state.suggestion_cache.borrow_mut().take();
@@ -3037,6 +3081,135 @@ fn start_orchestration(
     });
 }
 
+fn push_text_delta(streaming_text: &mut String, text: &str) {
+    streaming_text.push_str(&crate::sanitize::sanitize_terminal_text(text));
+}
+
+fn track_tool_started(
+    lines: &mut Vec<ToolLine>,
+    id: Option<String>,
+    tool: String,
+    detail: Option<String>,
+) {
+    let label = match detail {
+        Some(detail) => format!("{tool} {detail}"),
+        None => tool,
+    };
+    if let Some(id) = id.as_deref() {
+        if let Some(line) = lines
+            .iter_mut()
+            .rev()
+            .find(|line| line.status == ToolStatus::Running && line.id.as_deref() == Some(id))
+        {
+            line.label = label;
+            return;
+        }
+    }
+    lines.push(ToolLine {
+        id,
+        label,
+        status: ToolStatus::Running,
+    });
+}
+
+fn track_tool_completed(
+    lines: &mut Vec<ToolLine>,
+    id: Option<String>,
+    tool: String,
+    detail: Option<String>,
+    exit_code: Option<i64>,
+) {
+    let label = match detail {
+        Some(detail) => format!("{tool} {detail}"),
+        None => tool,
+    };
+    let status = if exit_code.unwrap_or(0) != 0 {
+        ToolStatus::Failed
+    } else {
+        ToolStatus::Done
+    };
+    let matched = match id.as_deref() {
+        Some(id) => lines
+            .iter_mut()
+            .rev()
+            .find(|line| line.status == ToolStatus::Running && line.id.as_deref() == Some(id)),
+        None => lines
+            .iter_mut()
+            .rev()
+            .find(|line| line.status == ToolStatus::Running),
+    };
+    if let Some(line) = matched {
+        line.status = status;
+    } else {
+        lines.push(ToolLine { id, label, status });
+    }
+}
+
+fn track_subagent_started(
+    entries: &mut Vec<AgentEntry>,
+    id: Option<String>,
+    name: String,
+    detail: Option<String>,
+) {
+    let label = match detail {
+        Some(detail) if !detail.is_empty() => format!("{name} · {detail}"),
+        _ => name,
+    };
+    if let Some(id) = id.as_deref() {
+        if let Some(entry) = entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.status == "running" && entry.id.as_deref() == Some(id))
+        {
+            entry.label = label;
+            return;
+        }
+    }
+    entries.push(AgentEntry {
+        id,
+        label,
+        status: "running".to_string(),
+        turn: 0,
+        live: true,
+    });
+}
+
+fn track_subagent_finished(
+    entries: &mut Vec<AgentEntry>,
+    id: Option<String>,
+    name: String,
+    status: String,
+    detail: Option<String>,
+) {
+    let label = match detail {
+        Some(detail) if !detail.is_empty() => format!("{name} · {detail}"),
+        _ => name.clone(),
+    };
+    let matched = match id.as_deref() {
+        Some(id) => entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.status == "running" && entry.id.as_deref() == Some(id)),
+        None => entries
+            .iter_mut()
+            .rev()
+            .find(|entry| entry.status == "running" && entry.label.starts_with(&name)),
+    };
+    match matched {
+        Some(entry) => {
+            entry.status = status;
+            entry.label = label;
+        }
+        None => entries.push(AgentEntry {
+            id,
+            label,
+            status,
+            turn: 0,
+            live: true,
+        }),
+    }
+}
+
 fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
     match event {
         TurnEvent::PlanUpdated {
@@ -3078,122 +3251,26 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
                     .remove_plan(&state.thread.id, provider);
             }
         }
-        TurnEvent::TextDelta { text } => {
-            state
-                .streaming_text
-                .push_str(&crate::sanitize::sanitize_terminal_text(&text));
-        }
+        TurnEvent::TextDelta { text } => push_text_delta(&mut state.streaming_text, &text),
         TurnEvent::AssistantText { .. } => {}
         TurnEvent::ToolStarted { id, tool, detail } => {
-            let label = match detail {
-                Some(detail) => format!("{tool} {detail}"),
-                None => tool,
-            };
-            if let Some(id) = id.as_deref() {
-                if let Some(line) = state.tool_lines.iter_mut().rev().find(|line| {
-                    line.status == ToolStatus::Running && line.id.as_deref() == Some(id)
-                }) {
-                    line.label = label;
-                    return;
-                }
-            }
-            state.tool_lines.push(ToolLine {
-                id,
-                label,
-                status: ToolStatus::Running,
-            });
+            track_tool_started(&mut state.tool_lines, id, tool, detail)
         }
         TurnEvent::ToolCompleted {
             id,
             tool,
             detail,
             exit_code,
-        } => {
-            let label = match detail {
-                Some(detail) => format!("{tool} {detail}"),
-                None => tool,
-            };
-            let status = if exit_code.unwrap_or(0) != 0 {
-                ToolStatus::Failed
-            } else {
-                ToolStatus::Done
-            };
-            let matched = match id.as_deref() {
-                Some(id) => state.tool_lines.iter_mut().rev().find(|line| {
-                    line.status == ToolStatus::Running && line.id.as_deref() == Some(id)
-                }),
-                None => state
-                    .tool_lines
-                    .iter_mut()
-                    .rev()
-                    .find(|line| line.status == ToolStatus::Running),
-            };
-            if let Some(line) = matched {
-                line.status = status;
-            } else {
-                state.tool_lines.push(ToolLine { id, label, status });
-            }
-        }
+        } => track_tool_completed(&mut state.tool_lines, id, tool, detail, exit_code),
         TurnEvent::SubagentStarted { id, name, detail } => {
-            let label = match detail {
-                Some(detail) if !detail.is_empty() => format!("{name} · {detail}"),
-                _ => name,
-            };
-            if let Some(id) = id.as_deref() {
-                if let Some(entry) = state
-                    .live_subagents
-                    .iter_mut()
-                    .rev()
-                    .find(|entry| entry.status == "running" && entry.id.as_deref() == Some(id))
-                {
-                    entry.label = label;
-                    return;
-                }
-            }
-            state.live_subagents.push(AgentEntry {
-                id,
-                label,
-                status: "running".to_string(),
-                turn: 0,
-                live: true,
-            });
+            track_subagent_started(&mut state.live_subagents, id, name, detail)
         }
         TurnEvent::SubagentFinished {
             id,
             name,
             status,
             detail,
-        } => {
-            let label = match detail {
-                Some(detail) if !detail.is_empty() => format!("{name} · {detail}"),
-                _ => name.clone(),
-            };
-            let matched = match id.as_deref() {
-                Some(id) => state
-                    .live_subagents
-                    .iter_mut()
-                    .rev()
-                    .find(|entry| entry.status == "running" && entry.id.as_deref() == Some(id)),
-                None => state
-                    .live_subagents
-                    .iter_mut()
-                    .rev()
-                    .find(|entry| entry.status == "running" && entry.label.starts_with(&name)),
-            };
-            match matched {
-                Some(entry) => {
-                    entry.status = status;
-                    entry.label = label;
-                }
-                None => state.live_subagents.push(AgentEntry {
-                    id,
-                    label,
-                    status,
-                    turn: 0,
-                    live: true,
-                }),
-            }
-        }
+        } => track_subagent_finished(&mut state.live_subagents, id, name, status, detail),
         TurnEvent::RateLimits { provider, info } => {
             if let Ok(guard) = state.store.lock() {
                 let _ = guard.save_rate_limits(provider, &info);
@@ -3219,6 +3296,44 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
         | TurnEvent::TurnFailed { .. } => {
             state.live_subagents.clear();
         }
+    }
+}
+
+/// Tracks live turn state for an open tab that is not active. Threads without a
+/// tab, such as orchestration workers and multi children, keep their existing
+/// event handling and do not grow this map.
+fn apply_background_turn_event(state: &mut TuiState, thread_id: &str, event: TurnEvent) {
+    if !state.open_tabs.iter().any(|tab| tab.id() == thread_id) {
+        return;
+    }
+    let run = state
+        .background_runs
+        .entry(thread_id.to_string())
+        .or_default();
+    match event {
+        TurnEvent::TextDelta { text } => push_text_delta(&mut run.streaming_text, &text),
+        TurnEvent::ToolStarted { id, tool, detail } => {
+            track_tool_started(&mut run.tool_lines, id, tool, detail)
+        }
+        TurnEvent::ToolCompleted {
+            id,
+            tool,
+            detail,
+            exit_code,
+        } => track_tool_completed(&mut run.tool_lines, id, tool, detail, exit_code),
+        TurnEvent::SubagentStarted { id, name, detail } => {
+            track_subagent_started(&mut run.live_subagents, id, name, detail)
+        }
+        TurnEvent::SubagentFinished {
+            id,
+            name,
+            status,
+            detail,
+        } => track_subagent_finished(&mut run.live_subagents, id, name, status, detail),
+        TurnEvent::TurnCompleted { .. }
+        | TurnEvent::TurnInterrupted { .. }
+        | TurnEvent::TurnFailed { .. } => run.live_subagents.clear(),
+        _ => {}
     }
 }
 
@@ -3324,7 +3439,7 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
             }
         }
         event if thread_id == state.thread.id => apply_turn_event(state, event),
-        _ => {}
+        event => apply_background_turn_event(state, &thread_id, event),
     }
 }
 
@@ -3341,6 +3456,7 @@ fn remember_open_thread(state: &mut TuiState, thread: &ThreadRow) {
 fn forget_open_tab(state: &mut TuiState, thread_id: &str) {
     state.open_tabs.retain(|tab| tab.id() != thread_id);
     state.thread_drafts.remove(thread_id);
+    state.background_runs.remove(thread_id);
 }
 
 fn switch_open_tab(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, index: usize) {
@@ -3361,6 +3477,7 @@ fn switch_open_tab(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, index: 
 
 fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread: ThreadRow) {
     state.stash_composer();
+    state.save_run_state();
     remember_open_thread(state, &thread);
     state.permission_mode = thread.permission_mode;
     state.goal = thread.goal.clone();
@@ -3380,6 +3497,7 @@ fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.scroll_offset = 0;
     drop(guard);
     state.restore_composer();
+    state.restore_run_state();
     state.notice = Some(format!("opened {}", thread.title));
     hydrate_plans(state, &thread.id);
 }
@@ -5450,6 +5568,7 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
         return;
     };
     state.stash_composer();
+    state.save_run_state();
     remember_open_thread(state, &thread);
     state.permission_mode = thread.permission_mode;
     state.goal = thread.goal.clone();
@@ -5482,6 +5601,7 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     });
     state.overlay = Overlay::None;
     state.restore_composer();
+    state.restore_run_state();
 }
 
 fn open_command_palette(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
@@ -5618,8 +5738,7 @@ fn handle_key(
                     state.notice = Some("answer the pending request before switching tabs".into());
                     return;
                 }
-                if state.running
-                    || state.orchestration_pending
+                if state.orchestration_pending
                     || state.multi.is_some()
                     || state.review.is_some()
                     || state.orchestration_report.is_some()
@@ -8284,6 +8403,7 @@ fn begin_issue_task(
     };
     let title = format!("#{} {}", plan.issue.number, plan.issue.title);
     state.stash_composer();
+    state.save_run_state();
     state.thread = {
         let guard = store.lock().unwrap();
         guard.draft_thread(NewThread {
@@ -8309,6 +8429,7 @@ fn begin_issue_task(
     state.overlay = Overlay::None;
     state.banner_cache.borrow_mut().take();
     state.restore_composer();
+    state.restore_run_state();
     state.set_input(plan.issue.prompt());
     let thread = state.thread.clone();
     remember_open_thread(state, &thread);
@@ -10926,6 +11047,7 @@ fn handle_command(
                 args.join(" ")
             };
             state.stash_composer();
+            state.save_run_state();
             state.thread = {
                 let guard = store.lock().unwrap();
                 guard.draft_thread(NewThread {
@@ -10949,6 +11071,7 @@ fn handle_command(
             state.shell_output = None;
             state.scroll_offset = 0;
             state.restore_composer();
+            state.restore_run_state();
             let thread = state.thread.clone();
             remember_open_thread(state, &thread);
             state.notice = Some("new thread, unsaved until you send a message".into());
@@ -17930,7 +18053,16 @@ fn draw_tabs(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     let width = area.width as usize;
     for (index, tab) in state.open_tabs.iter().take(9).enumerate() {
         let title = crate::sanitize::sanitize_terminal_text(tab.title());
-        let label = format!(" {}:{} ", index + 1, truncate_chars(&title, 18));
+        let running = if tab.id() == state.thread.id {
+            state.running
+        } else {
+            state
+                .background_runs
+                .get(tab.id())
+                .is_some_and(|run| run.running)
+        };
+        let marker = if running { " *" } else { "" };
+        let label = format!(" {}:{}{} ", index + 1, truncate_chars(&title, 18), marker);
         let length = label.chars().count();
         if !spans.is_empty() && used + length + 1 > width {
             break;
@@ -18248,6 +18380,50 @@ impl TuiState {
         self.set_input(text);
     }
 
+    /// Moves the active thread's live turn buffers aside before another thread
+    /// becomes active. An idle tab with no live rows leaves no map entry.
+    fn save_run_state(&mut self) {
+        let run = ThreadRunState {
+            running: self.running,
+            queued_provider: self.queued_provider,
+            streaming_text: std::mem::take(&mut self.streaming_text),
+            tool_lines: std::mem::take(&mut self.tool_lines),
+            live_subagents: std::mem::take(&mut self.live_subagents),
+        };
+        if run.running
+            || run.queued_provider.is_some()
+            || !run.streaming_text.is_empty()
+            || !run.tool_lines.is_empty()
+            || !run.live_subagents.is_empty()
+        {
+            self.background_runs.insert(self.thread.id.clone(), run);
+        } else {
+            self.background_runs.remove(&self.thread.id);
+        }
+        self.running = false;
+        self.queued_provider = None;
+    }
+
+    /// Restores the live turn buffers for the thread that just became active.
+    fn restore_run_state(&mut self) {
+        match self.background_runs.remove(&self.thread.id) {
+            Some(run) => {
+                self.running = run.running;
+                self.queued_provider = run.queued_provider;
+                self.streaming_text = run.streaming_text;
+                self.tool_lines = run.tool_lines;
+                self.live_subagents = run.live_subagents;
+            }
+            None => {
+                self.running = false;
+                self.queued_provider = None;
+                self.streaming_text.clear();
+                self.tool_lines.clear();
+                self.live_subagents.clear();
+            }
+        }
+    }
+
     fn set_input(&mut self, text: String) {
         self.input_cursor = text.chars().count();
         self.input = text;
@@ -18530,6 +18706,7 @@ mod tests {
             ),
             thread,
             open_tabs,
+            background_runs: std::collections::HashMap::new(),
             side_chat_of: None,
             adapter_lifecycles: std::collections::HashMap::new(),
             history,
@@ -33914,9 +34091,17 @@ exit 1
             .unwrap();
         open_thread_by_id(&mut state, &store, &second.id);
         open_thread_by_id(&mut state, &store, &first);
+        state.background_runs.insert(
+            second.id.clone(),
+            ThreadRunState {
+                running: true,
+                ..Default::default()
+            },
+        );
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         apply_archive_command(&mut state, &store, &sender, true, Some(&second.id));
         assert_eq!(state.open_tabs.len(), 1);
+        assert!(!state.background_runs.contains_key(&second.id));
         assert_eq!(state.open_tabs[0].id(), first);
         assert_eq!(state.thread.id, first);
     }
@@ -34004,40 +34189,59 @@ exit 1
         assert_eq!(state.input, "draft two");
     }
 
+    fn two_thread_state(
+        home: &std::path::Path,
+        store: &Arc<Mutex<BatonStore>>,
+    ) -> (TuiState, String, String) {
+        let mut state = test_state(home, store, Vec::new());
+        let first = state.thread.id.clone();
+        let second = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "second".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: state.thread.current_provider,
+                current_model: None,
+            })
+            .unwrap();
+        open_thread_by_id(&mut state, store, &second.id);
+        open_thread_by_id(&mut state, store, &first);
+        (state, first, second.id)
+    }
+
     #[test]
-    fn alt_number_is_blocked_while_a_turn_runs() {
+    fn a_background_turn_keeps_streaming_in_its_tab() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
-        let mut state = test_state(home.path(), &store, Vec::new());
-        let first = state.thread.id.clone();
+        let (mut state, first, second) = two_thread_state(home.path(), &store);
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
-        handle_command(&mut state, &store, &sender, "/new second");
-        let second = state.thread.id.clone();
-        handle_key(
+        apply_engine_event(
             &mut state,
             &store,
+            EngineEvent::TurnStarted {
+                thread_id: first.clone(),
+            },
             &sender,
-            modified_key(KeyCode::Char('1'), KeyModifiers::ALT),
         );
-        assert_eq!(state.thread.id, first);
-        state.running = true;
-        handle_key(
+        apply_turn_event_for_thread(
             &mut state,
-            &store,
-            &sender,
-            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+            first.clone(),
+            TurnEvent::TextDelta {
+                text: "alpha".into(),
+            },
         );
-        assert_eq!(state.thread.id, first);
-        assert!(
-            state
-                .notice
-                .as_deref()
-                .unwrap_or("")
-                .contains("before switching tabs"),
-            "{:?}",
-            state.notice
+        apply_turn_event_for_thread(
+            &mut state,
+            first.clone(),
+            TurnEvent::ToolStarted {
+                id: Some("tool-1".into()),
+                tool: "exec".into(),
+                detail: Some("cargo test".into()),
+            },
         );
-        state.running = false;
+        assert!(state.running);
+
         handle_key(
             &mut state,
             &store,
@@ -34045,6 +34249,163 @@ exit 1
             modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
         );
         assert_eq!(state.thread.id, second);
+        assert!(!state.running);
+        let run = state.background_runs.get(&first).unwrap();
+        assert!(run.running);
+        assert_eq!(run.streaming_text, "alpha");
+        assert_eq!(run.tool_lines.len(), 1);
+
+        apply_turn_event_for_thread(
+            &mut state,
+            first.clone(),
+            TurnEvent::TextDelta {
+                text: " omega".into(),
+            },
+        );
+        assert_eq!(
+            state.background_runs.get(&first).unwrap().streaming_text,
+            "alpha omega"
+        );
+        let text = buffer_lines(&render_state(&state, 120, 30)).join("\n");
+        assert!(text.contains("1:test *"), "{text}");
+        assert!(text.contains("2:second"), "{text}");
+
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('1'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, first);
+        assert!(state.running);
+        assert_eq!(state.streaming_text, "alpha omega");
+        assert_eq!(state.tool_lines.len(), 1);
+    }
+
+    #[test]
+    fn a_background_turn_finish_clears_its_run_state() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, first, second) = two_thread_state(home.path(), &store);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnStarted {
+                thread_id: first.clone(),
+            },
+            &sender,
+        );
+        apply_turn_event_for_thread(
+            &mut state,
+            first.clone(),
+            TurnEvent::TextDelta {
+                text: "partial".into(),
+            },
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        assert!(state.background_runs.get(&first).unwrap().running);
+
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: first.clone(),
+                ok: true,
+                error: None,
+                phase: TurnPhase::Completed,
+            },
+            &sender,
+        );
+        let run = state.background_runs.get(&first).unwrap();
+        assert!(!run.running);
+        assert!(run.streaming_text.is_empty());
+        assert!(run.tool_lines.is_empty());
+        assert_eq!(state.thread.id, second);
+        assert!(!state.running);
+
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('1'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, first);
+        assert!(!state.running);
+        assert!(state.streaming_text.is_empty());
+    }
+
+    #[test]
+    fn a_background_failure_reports_in_the_notice() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, first, _second) = two_thread_state(home.path(), &store);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnStarted {
+                thread_id: first.clone(),
+            },
+            &sender,
+        );
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        apply_engine_event(
+            &mut state,
+            &store,
+            EngineEvent::TurnFinished {
+                thread_id: first.clone(),
+                ok: false,
+                error: Some("boom".into()),
+                phase: TurnPhase::Failed,
+            },
+            &sender,
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("background turn in test failed: boom"),
+            "{:?}",
+            state.notice
+        );
+        assert!(!state.background_runs.get(&first).unwrap().running);
+    }
+
+    #[test]
+    fn a_worker_turn_does_not_create_a_background_tab() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let worker = store
+            .lock()
+            .unwrap()
+            .create_thread(NewThread {
+                title: "worker".into(),
+                cwd: state.thread.cwd.clone(),
+                current_provider: state.thread.current_provider,
+                current_model: None,
+            })
+            .unwrap();
+        apply_turn_event_for_thread(
+            &mut state,
+            worker.id,
+            TurnEvent::TextDelta {
+                text: "worker output".into(),
+            },
+        );
+        assert!(state.background_runs.is_empty());
     }
 
     #[test]

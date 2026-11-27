@@ -190,6 +190,19 @@ pub fn discover(cwd: &Path, env: &MemoryEnvironment) -> MemoryListing {
             "User rule",
         ));
     }
+    for dir in ancestor_instruction_dirs(cwd) {
+        for path in [dir.join("CLAUDE.md"), dir.join(".claude").join("CLAUDE.md")] {
+            if path.is_file() {
+                claude_rows.push(memory_file_row(
+                    "Parent instructions",
+                    path,
+                    env,
+                    "Claude reads this at",
+                    "Missing · enter creates",
+                ));
+            }
+        }
+    }
     claude_rows.push(memory_file_row(
         "Project instructions",
         root.join("CLAUDE.md"),
@@ -802,6 +815,35 @@ fn working_root(cwd: &Path) -> PathBuf {
     std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf())
 }
 
+/// Directories between the project identity root and `cwd`, outermost first.
+/// `cwd` itself is excluded because the project rows already cover it. A path
+/// outside a repository has no bounded parent chain, so it returns nothing
+/// instead of walking to the filesystem root.
+fn ancestor_instruction_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let Some(anchor) = crate::worktree::project_identity_root(&cwd) else {
+        return Vec::new();
+    };
+    let anchor = std::fs::canonicalize(&anchor).unwrap_or(anchor);
+    if cwd == anchor || !cwd.starts_with(&anchor) {
+        return Vec::new();
+    }
+    let mut dirs = Vec::new();
+    let mut current = cwd.parent();
+    while let Some(dir) = current {
+        if !dir.starts_with(&anchor) {
+            break;
+        }
+        dirs.push(dir.to_path_buf());
+        if dir == anchor {
+            break;
+        }
+        current = dir.parent();
+    }
+    dirs.reverse();
+    dirs
+}
+
 fn display_path(path: &Path, home: &Path) -> String {
     let rendered = path.to_string_lossy();
     if let Ok(relative) = path.strip_prefix(home) {
@@ -1021,6 +1063,53 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn discovery_lists_existing_ancestor_claude_files_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+        std::fs::write(repo.join("CLAUDE.md"), "root").unwrap();
+        std::fs::write(repo.join("src/CLAUDE.md"), "src").unwrap();
+        std::fs::write(repo.join("src/deep/CLAUDE.md"), "deep").unwrap();
+
+        let env = environment(temp.path());
+        let listing = discover(&repo.join("src/deep"), &env);
+        let parents = listing
+            .rows()
+            .into_iter()
+            .filter(|(_, row)| row.label == "Parent instructions")
+            .map(|(_, row)| row.action.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            parents,
+            vec![
+                MemoryAction::OpenFile {
+                    path: std::fs::canonicalize(repo.join("CLAUDE.md")).unwrap(),
+                },
+                MemoryAction::OpenFile {
+                    path: std::fs::canonicalize(repo.join("src/CLAUDE.md")).unwrap(),
+                },
+            ],
+            "{parents:?}"
+        );
+        let deep = std::fs::canonicalize(repo.join("src/deep/CLAUDE.md")).unwrap();
+        assert!(
+            listing.rows().into_iter().any(|(_, row)| {
+                row.label == "Project instructions"
+                    && row.action == MemoryAction::OpenFile { path: deep.clone() }
+            }),
+            "{:?}",
+            listing.rows()
+        );
+    }
+
     #[test]
     fn discovery_skips_rule_symlinks_outside_the_rule_root() {
         use std::os::unix::fs::symlink;

@@ -1,4 +1,4 @@
-use baton::{activity, adapters, checkpoints, claim, cli, config, doctor, exec_events, files, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, serve, status, store, tasks, tui, types, usage, worktree};
+use baton::{activity, adapters, checkpoints, claim, cli, config, doctor, exec_events, files, grants, grep, inbox, mcp, orchestrate, paths, process, provider_runtime, resume, roles, runtime, sanitize, scanner, serve, status, store, tasks, tui, types, usage, worktree};
 
 use anyhow::Result;
 use clap::{CommandFactory, Parser};
@@ -709,6 +709,7 @@ fn main_result(started: Instant) -> Result<()> {
         ),
         cli::Commands::Serve { stdio, socket } => run_serve(&home, stdio, socket.as_deref()),
         cli::Commands::Host { command } => run_host(&home, command),
+        cli::Commands::Grant { command } => run_grant(&home, command),
         cli::Commands::Runs { command } => run_runs(command),
         cli::Commands::Mcp => {
             let store = open_store(None)?;
@@ -2833,6 +2834,93 @@ fn settle_run(run_id: &str, status: cli::RunStatus, force: bool, json: bool) -> 
             "closed {} open task(s) and settled {} open turn(s)",
             settlement.tasks, settlement.turns
         );
+    }
+    Ok(())
+}
+
+fn run_grant(home: &Path, command: cli::GrantCommand) -> Result<()> {
+    match command {
+        cli::GrantCommand::List { json } => list_grants(json),
+        cli::GrantCommand::Revoke { grant_id, json } => revoke_grant(home, &grant_id, json),
+    }
+}
+
+fn grant_json(grant: &store::GrantSummary) -> serde_json::Value {
+    serde_json::json!({
+        "grant_id": grant.grant_id,
+        "state": grants::state(grant),
+        "scopes": grant.scopes,
+        "permission_ceiling": grant.permission_ceiling,
+        "project_allowlist": grant.project_allowlist,
+        "issued_at": grant.issued_at,
+        "expires_at": grant.expires_at,
+        "revoked_at": grant.revoked_at,
+        "label": grant.label,
+    })
+}
+
+fn list_grants(json: bool) -> Result<()> {
+    let path = paths::baton_db_path();
+    let grants = if path.exists() {
+        let store = BatonStore::open_read_only(&path)?;
+        grants::list(&store)?
+    } else {
+        Vec::new()
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": status::SCHEMA_VERSION,
+                "grants": grants.iter().map(grant_json).collect::<Vec<_>>(),
+            }))?
+        );
+        return Ok(());
+    }
+    if grants.is_empty() {
+        println!("no grants yet");
+        return Ok(());
+    }
+    println!(
+        "{:<36} {:<8} {:<18} {:<24} {:<26} {}",
+        "ID", "STATE", "CEILING", "SCOPES", "EXPIRES", "LABEL"
+    );
+    for grant in &grants {
+        let label = grant
+            .label
+            .as_deref()
+            .map(sanitize::sanitize_single_line)
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<36} {:<8} {:<18} {:<24} {:<26} {}",
+            grant.grant_id,
+            grants::state(grant),
+            grant.permission_ceiling,
+            grant.scopes.join(","),
+            grant.expires_at,
+            label
+        );
+    }
+    Ok(())
+}
+
+fn revoke_grant(home: &Path, grant_id: &str, json: bool) -> Result<()> {
+    let store = open_store(None)?;
+    if !grants::revoke(&store, home, grant_id)? {
+        anyhow::bail!("no grant matches {grant_id}");
+    }
+    let short = &grant_id[..8.min(grant_id.len())];
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "schema_version": status::SCHEMA_VERSION,
+                "grant_id": grant_id,
+                "revoked": true,
+            }))?
+        );
+    } else {
+        println!("revoked {short}");
     }
     Ok(())
 }

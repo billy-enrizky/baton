@@ -210,6 +210,16 @@ pub fn verify(store: &BatonStore, grant_id: &str, secret: &str) -> Result<GrantS
     Ok(row.summary())
 }
 
+pub fn state(summary: &GrantSummary) -> &'static str {
+    if summary.revoked_at.is_some() {
+        "revoked"
+    } else if expired(&summary.expires_at) {
+        "expired"
+    } else {
+        "live"
+    }
+}
+
 pub fn list(store: &BatonStore) -> Result<Vec<GrantSummary>> {
     Ok(store
         .list_grant_rows()?

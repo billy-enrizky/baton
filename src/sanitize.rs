@@ -35,6 +35,15 @@ pub fn sanitize_terminal_text(input: &str) -> Cow<'_, str> {
     )
 }
 
+/// Replaces terminal controls and line breaks so text stays in one table
+/// cell or one notice line.
+pub fn sanitize_single_line(input: &str) -> String {
+    sanitize_terminal_text(input)
+        .chars()
+        .map(|ch| if ch == '\n' || ch == '\t' { ' ' } else { ch })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -44,6 +53,12 @@ mod tests {
         let text = "hello world";
         assert!(matches!(sanitize_terminal_text(text), Cow::Borrowed(_)));
         assert_eq!(sanitize_terminal_text(text), text);
+    }
+
+    #[test]
+    fn single_line_text_replaces_line_breaks_and_controls() {
+        assert_eq!(sanitize_single_line("a\nb\tc"), "a b c");
+        assert_eq!(sanitize_single_line("a\u{1b}[31mred"), "a\u{fffd}[31mred");
     }
 
     #[test]

@@ -757,6 +757,8 @@ fn main_result(started: Instant) -> Result<()> {
             http,
             token_file,
             trusted_overlay,
+            tls_cert,
+            tls_key,
             read_only,
             allow_tool,
         } => {
@@ -778,7 +780,13 @@ fn main_result(started: Instant) -> Result<()> {
                 Some(addr) => {
                     let token_file =
                         token_file.ok_or_else(|| anyhow::anyhow!("--http needs --token-file"))?;
-                    mcp::run_http(server, &addr, &token_file, trusted_overlay)
+                    mcp::run_http(
+                        server,
+                        &addr,
+                        &token_file,
+                        trusted_overlay,
+                        tls_cert.as_deref().zip(tls_key.as_deref()),
+                    )
                 }
                 None => mcp::run_stdio(server),
             }

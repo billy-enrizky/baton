@@ -143,7 +143,7 @@ baton update
 
 ## MCP
 
-`baton mcp` serves the local store over MCP stdio, or over HTTP with `--http <addr> --token-file <path>`.
+`baton mcp` serves the local store over MCP stdio, or over HTTP with `--http <addr> --token-file <path>`. The token file must be a regular file with mode 0600 and a 32 to 512 character value. Loopback is the default; a non-loopback bind needs `--trusted-overlay` and is plain HTTP with a static token. `POST /mcp` serves JSON-RPC and `GET /health` returns readiness.
 
 ```json
 {

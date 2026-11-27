@@ -5093,8 +5093,19 @@ fn create_git_merge(
 ) {
     match crate::git_workflow::merge(&plan) {
         Ok(()) => {
+            let note = git_audit_note(record_git_action(
+                store,
+                state,
+                crate::audit::AuditAction::GitMerge,
+                serde_json::json!({
+                    "number": plan.number,
+                    "method": plan.method.as_str(),
+                    "branch": plan.branch,
+                    "head_oid": plan.head_oid,
+                }),
+            ));
             state.notice = Some(git_line(&format!(
-                "merged pull request #{} ({} method) · {}",
+                "merged pull request #{} ({} method) · {}{note}",
                 plan.number,
                 plan.method.as_str(),
                 plan.url
@@ -5136,6 +5147,16 @@ fn create_git_review(
 ) {
     match crate::git_workflow::review(&plan) {
         Ok(()) => {
+            let note = git_audit_note(record_git_action(
+                store,
+                state,
+                crate::audit::AuditAction::GitReview,
+                serde_json::json!({
+                    "number": plan.number,
+                    "action": plan.action.as_str(),
+                    "branch": plan.branch,
+                }),
+            ));
             let notice = match plan.action {
                 crate::git_workflow::PrReviewAction::Approve => {
                     format!("approved pull request #{}", plan.number)
@@ -5147,7 +5168,7 @@ fn create_git_review(
                     format!("commented on pull request #{}", plan.number)
                 }
             };
-            state.notice = Some(git_line(&format!("{notice} · {}", plan.url)));
+            state.notice = Some(git_line(&format!("{notice} · {}{note}", plan.url)));
             state.overlay = Overlay::None;
         }
         Err(error) => {
@@ -5171,12 +5192,24 @@ fn create_git_pr(
     }
     match crate::git_workflow::create_pr(&plan) {
         Ok(outcome) => {
+            let note = git_audit_note(record_git_action(
+                store,
+                state,
+                crate::audit::AuditAction::GitPr,
+                serde_json::json!({
+                    "url": &outcome.url,
+                    "number": outcome.number,
+                    "branch": &plan.branch,
+                    "base": &plan.base,
+                    "commits": plan.commit_count,
+                }),
+            ));
             let number = outcome
                 .number
                 .map(|number| format!(" #{number}"))
                 .unwrap_or_default();
             state.notice = Some(git_line(&format!(
-                "opened pull request{number} · {}",
+                "opened pull request{number} · {}{note}",
                 outcome.url
             )));
             state.overlay = Overlay::None;
@@ -5202,8 +5235,18 @@ fn commit_git_plan(
     }
     match crate::git_workflow::commit(&plan) {
         Ok(outcome) => {
+            let note = git_audit_note(record_git_action(
+                store,
+                state,
+                crate::audit::AuditAction::GitCommit,
+                serde_json::json!({
+                    "sha": &outcome.sha,
+                    "files": outcome.files,
+                    "mode": plan.mode.label(),
+                }),
+            ));
             state.notice = Some(git_line(&format!(
-                "committed {} · {} file(s) · {}",
+                "committed {} · {} file(s) · {}{note}",
                 outcome.sha, outcome.files, outcome.message
             )));
             state.overlay = Overlay::None;
@@ -5281,13 +5324,27 @@ fn push_git_plan(
     }
     match crate::git_workflow::push(&plan) {
         Ok(outcome) => {
+            let note = git_audit_note(record_git_action(
+                store,
+                state,
+                crate::audit::AuditAction::GitPush,
+                serde_json::json!({
+                    "remote": &outcome.remote,
+                    "remote_branch": &outcome.remote_branch,
+                    "branch": &plan.branch,
+                    "upstream": outcome.upstream,
+                    "ahead": plan.ahead,
+                    "behind": plan.behind,
+                    "head": &plan.head,
+                }),
+            ));
             let upstream = if outcome.upstream {
                 String::new()
             } else {
                 " · upstream unchanged".to_string()
             };
             state.notice = Some(git_line(&format!(
-                "pushed {} to {}/{}{upstream}",
+                "pushed {} to {}/{}{upstream}{note}",
                 plan.branch, outcome.remote, outcome.remote_branch
             )));
             state.overlay = Overlay::None;
@@ -16752,6 +16809,34 @@ fn record_question_answers(
     Ok(())
 }
 
+/// Appends a git action row after the command succeeded. The action already
+/// happened, so a failed append can only be reported, never undone.
+fn record_git_action(
+    store: &Arc<Mutex<BatonStore>>,
+    state: &TuiState,
+    action: crate::audit::AuditAction,
+    payload: serde_json::Value,
+) -> anyhow::Result<()> {
+    let event = crate::audit::event(
+        crate::audit::TUI_ACTOR,
+        &crate::claim::installation_id(&state.home).unwrap_or_else(|| "unclaimed".into()),
+        Some(&state.thread.id),
+        action,
+        crate::audit::GIT_SCOPE,
+        crate::audit::HOST_SESSION_CONFIRMATION,
+        &payload,
+    )?;
+    store.lock().unwrap().append_audit_event(&event)?;
+    Ok(())
+}
+
+fn git_audit_note(result: anyhow::Result<()>) -> String {
+    match result {
+        Ok(()) => String::new(),
+        Err(error) => format!(" · not recorded: {error}"),
+    }
+}
+
 fn approval_decision_name(decision: &ApprovalDecision) -> String {
     match decision {
         ApprovalDecision::Accept => "accept".to_string(),
@@ -20506,6 +20591,115 @@ mod tests {
             approval_decision_name(&ApprovalDecision::Choose("opt-reject".into())),
             "choose:opt-reject"
         );
+    }
+
+    fn init_audit_repo(path: &std::path::Path) {
+        let run = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init", "--quiet"]);
+        run(&["config", "user.name", "Baton Test"]);
+        run(&["config", "user.email", "baton@example.test"]);
+    }
+
+    #[test]
+    fn git_action_rows_name_the_action_and_the_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let state = test_state(home.path(), &store, Vec::new());
+        record_git_action(
+            &store,
+            &state,
+            crate::audit::AuditAction::GitPush,
+            serde_json::json!({"remote": "origin", "branch": "main"}),
+        )
+        .unwrap();
+        let events = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].action, "git.push");
+        assert_eq!(events[0].actor, crate::audit::TUI_ACTOR);
+        assert_eq!(events[0].scope, crate::audit::GIT_SCOPE);
+        assert_eq!(
+            events[0].thread_id.as_deref(),
+            Some(state.thread.id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_commit_is_recorded_after_it_lands() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_audit_repo(repo.path());
+        std::fs::write(repo.path().join("file.txt"), "one\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        let plan = crate::git_workflow::plan_commit(
+            repo.path(),
+            crate::git_workflow::CommitMode::All,
+            Some("audit commit"),
+        )
+        .unwrap();
+
+        commit_git_plan(&mut state, &store, plan);
+        assert!(
+            state.notice.as_deref().unwrap_or("").contains("committed"),
+            "{:?}",
+            state.notice
+        );
+        let events = store.lock().unwrap().list_audit_events(10).unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert_eq!(events[0].action, "git.commit");
+        assert_eq!(events[0].scope, crate::audit::GIT_SCOPE);
+        assert_eq!(
+            events[0].thread_id.as_deref(),
+            Some(state.thread.id.as_str())
+        );
+    }
+
+    #[test]
+    fn a_commit_that_cannot_be_recorded_still_lands_and_says_so() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        init_audit_repo(repo.path());
+        std::fs::write(repo.path().join("file.txt"), "one\n").unwrap();
+        let db = home.path().join("baton.sqlite");
+        let writable = Arc::new(Mutex::new(BatonStore::open(&db).unwrap()));
+        let mut state = test_state(home.path(), &writable, Vec::new());
+        state.thread.cwd = repo.path().to_string_lossy().to_string();
+        let read_only = Arc::new(Mutex::new(BatonStore::open_read_only(&db).unwrap()));
+        let plan = crate::git_workflow::plan_commit(
+            repo.path(),
+            crate::git_workflow::CommitMode::All,
+            Some("audit commit"),
+        )
+        .unwrap();
+
+        commit_git_plan(&mut state, &read_only, plan);
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("committed"), "{notice}");
+        assert!(notice.contains("not recorded"), "{notice}");
+        let log = std::process::Command::new("git")
+            .args(["log", "-1", "--format=%s"])
+            .current_dir(repo.path())
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "audit commit");
+        assert!(writable
+            .lock()
+            .unwrap()
+            .list_audit_events(10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

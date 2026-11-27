@@ -18,6 +18,7 @@ pub const HOST_SESSION_CONFIRMATION: &str = "host_session";
 pub const ADMIN_SCOPE: &str = "admin";
 pub const OPERATE_SCOPE: &str = "operate";
 pub const APPROVE_SCOPE: &str = "approve";
+pub const GIT_SCOPE: &str = "git";
 pub const DURABLE_RETENTION: &str = "durable";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,6 +29,11 @@ pub enum AuditAction {
     TurnSubmit,
     ApprovalDecide,
     QuestionAnswer,
+    GitCommit,
+    GitPush,
+    GitPr,
+    GitReview,
+    GitMerge,
     QueueClear,
     ThreadFork,
 }
@@ -41,6 +47,11 @@ impl AuditAction {
             AuditAction::TurnSubmit => "turn.submit",
             AuditAction::ApprovalDecide => "approval.decide",
             AuditAction::QuestionAnswer => "question.answer",
+            AuditAction::GitCommit => "git.commit",
+            AuditAction::GitPush => "git.push",
+            AuditAction::GitPr => "git.pr",
+            AuditAction::GitReview => "git.review",
+            AuditAction::GitMerge => "git.merge",
             AuditAction::QueueClear => "queue.clear",
             AuditAction::ThreadFork => "thread.fork",
         }
@@ -120,6 +131,8 @@ mod tests {
         assert_eq!(AuditAction::TurnSubmit.as_str(), "turn.submit");
         assert_eq!(AuditAction::ApprovalDecide.as_str(), "approval.decide");
         assert_eq!(AuditAction::QuestionAnswer.as_str(), "question.answer");
+        assert_eq!(AuditAction::GitCommit.as_str(), "git.commit");
+        assert_eq!(AuditAction::GitMerge.as_str(), "git.merge");
         assert_eq!(AuditAction::QueueClear.as_str(), "queue.clear");
         assert_eq!(AuditAction::ThreadFork.as_str(), "thread.fork");
     }

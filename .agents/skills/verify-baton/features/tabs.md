@@ -49,7 +49,7 @@ Non-goals:
 - `/pane` opens a picker of open tabs other than the active one. The selected tab fills a second pane.
 - The secondary pane has a bordered header with its tab position, title, and running marker. It renders the thread's banner-free transcript tail (the last 50 messages), live tool rows, and live streaming text, plus any queued-provider or thinking row.
 - Alt+W swaps the active and secondary threads. `/pane focus` does the same from the command line.
-- A wide transcript area places the panes side by side at 50/50; a narrow one stacks them (secondary above primary) at 45/55. If neither dimension can fit a split, only the primary renders and the pane state is kept.
+- A wide transcript area places the panes side by side; a narrow one stacks them with the secondary above the primary. The primary keeps `secondary_split` percent of the area, 50 by default and clamped to 20 through 80. Alt+[ and Alt+] move it by five, and `/pane wider`, `/pane narrower`, and `/pane reset` do the same from the command line. If neither dimension can fit a split, only the primary renders and the pane state is kept.
 - `/pane close` closes the second pane. Archiving the secondary thread closes it. Presenting the secondary tab through Alt+1 through Alt+9 or `/open` swaps the pair instead of showing one thread twice.
 - A background finish for the secondary thread reloads its stored transcript so the pane's tail includes the completed reply.
 
@@ -63,7 +63,7 @@ Every path that replaces `state.thread` calls `remember_open_thread` with the sa
 
 `apply_background_turn_event` handles deltas, tool rows, and subagent rows for an open tab that is not active. `EngineEvent::TurnQueued`, `TurnStarted`, and `TurnFinished` update the same entry for a non-active thread. A thread with no tab, such as an orchestration worker or a `/multi` child, does not grow the map.
 
-`TuiState` holds `secondary_tab` and `secondary_history`. `set_secondary_pane` loads the chosen thread's messages; `focus_secondary_pane` opens that thread and lets `open_thread_by_id` swap the previous active into the secondary slot. `switch_open_tab` routes a switch to the secondary tab through the same swap. `draw` splits the transcript area only when the pane is open and the space can hold two readable regions; `draw_secondary_pane` renders the tail and live state.
+`TuiState` holds `secondary_tab`, `secondary_split`, and `secondary_history`. `set_secondary_pane` loads the chosen thread's messages; `focus_secondary_pane` opens that thread and lets `open_thread_by_id` swap the previous active into the secondary slot. `switch_open_tab` routes a switch to the secondary tab through the same swap. `draw` splits the transcript area only when the pane is open and the space can hold two readable regions; `draw_secondary_pane` renders the tail and live state.
 
 The key handler reads Alt plus a digit before overlay handling. It checks the pending request and surface guards first, then switches; the running flag is no longer a guard. `draw` adds a one-row strip above the transcript only when at least two tabs are open, and offsets every later chunk by that row. The strip reads the active `running` flag for the active tab and the stored entry for every other tab.
 

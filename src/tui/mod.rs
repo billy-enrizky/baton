@@ -1069,6 +1069,9 @@ pub struct TuiState {
     open_tabs: Vec<OpenThreadTab>,
     background_runs: std::collections::HashMap<String, ThreadRunState>,
     secondary_tab: Option<String>,
+    /// Percentage of the transcript area the primary pane keeps when the
+    /// secondary pane is open. Clamped to 20 through 80.
+    secondary_split: u16,
     secondary_history: Vec<MessageRow>,
     side_chat_of: Option<String>,
     adapter_lifecycles: std::collections::HashMap<ProviderId, AdapterLifecycle>,
@@ -1244,6 +1247,7 @@ pub fn run_tui(
         open_tabs,
         background_runs: std::collections::HashMap::new(),
         secondary_tab: None,
+        secondary_split: 50,
         secondary_history: Vec::new(),
         side_chat_of,
         adapter_lifecycles,
@@ -3627,6 +3631,23 @@ fn set_secondary_pane(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thre
     state.notice = Some(format!("secondary pane: {title}"));
 }
 
+fn adjust_secondary_split(state: &mut TuiState, delta: i16) {
+    if state.secondary_tab.is_none() {
+        state.notice = Some("open a second pane first with /pane".into());
+        return;
+    }
+    let next = (state.secondary_split as i16 + delta).clamp(20, 80) as u16;
+    if next == state.secondary_split {
+        state.notice = Some(format!(
+            "split stays at {}% primary; use /pane wider or /pane narrower",
+            state.secondary_split
+        ));
+        return;
+    }
+    state.secondary_split = next;
+    state.notice = Some(format!("split {next}% primary"));
+}
+
 fn close_secondary_pane(state: &mut TuiState) {
     if state.secondary_tab.take().is_some() {
         state.secondary_history.clear();
@@ -4171,7 +4192,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/files", _) => Some("files [--ignored] [query] [:<line>]"),
         ("/grep", _) => Some("grep [--case|--case-sensitive] [--word] [--regex] <query>"),
         ("/pin", "move") => Some("pin move <id> up or down"),
-        ("/pane", _) => Some("pane [open <tab>|close|focus]"),
+        ("/pane", _) => Some("pane [open <tab>|close|focus|wider|narrower|reset]"),
         ("/snooze", _) => Some("snooze [1h|4h|tomorrow|week|off]"),
         ("/schedule", _) => Some(
             "schedule [list|add|pause <id>|resume <id>|remove <id>]",
@@ -4282,6 +4303,19 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                 "focus",
                 "move focus to the second pane",
             );
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "wider",
+                "give the primary pane more room",
+            );
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "narrower",
+                "give the secondary pane more room",
+            );
+            push_suggestion(&mut suggestions, command, "reset", "split the panes evenly");
             for tab in &state.open_tabs {
                 if tab.id() == state.thread.id {
                     continue;
@@ -6270,6 +6304,14 @@ fn handle_key(
                     return;
                 }
                 focus_secondary_pane(state, store);
+                return;
+            }
+            if character == '[' {
+                adjust_secondary_split(state, -5);
+                return;
+            }
+            if character == ']' {
+                adjust_secondary_split(state, 5);
                 return;
             }
             if let Some(digit) = character.to_digit(10) {
@@ -12226,6 +12268,12 @@ fn handle_command(
         "/pane" => match (args.first().map(String::as_str), args.len()) {
             (None, _) => open_pane_picker(state),
             (Some("close"), 1) => close_secondary_pane(state),
+            (Some("wider"), 1) => adjust_secondary_split(state, 5),
+            (Some("narrower"), 1) => adjust_secondary_split(state, -5),
+            (Some("reset"), 1) => {
+                state.secondary_split = 50;
+                state.notice = Some("split 50% primary".into());
+            }
             (Some("focus"), 1) => {
                 if let Some(notice) = pane_switch_blocked_notice(state) {
                     state.notice = Some(notice.into());
@@ -12245,7 +12293,7 @@ fn handle_command(
                     None => state.notice = Some(format!("no open tab matches \"{prefix}\"")),
                 }
             }
-            _ => state.notice = Some("pane [open <tab>|close|focus]".into()),
+            _ => state.notice = Some("pane [open <tab>|close|focus|wider|narrower|reset]".into()),
         },
         "/threads" => {
             let include_archived = match (args.first().map(String::as_str), args.len()) {
@@ -13817,14 +13865,22 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     let transcript_area = chunks[1];
     let pane_split = state.secondary_tab.is_some()
         && (transcript_area.width >= 100 || transcript_area.height >= 24);
+    let primary_percent = state.secondary_split.clamp(20, 80);
+    let secondary_percent = 100 - primary_percent;
     if pane_split && transcript_area.width >= 100 {
-        let panes = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(transcript_area);
+        let panes = Layout::horizontal([
+            Constraint::Percentage(primary_percent),
+            Constraint::Percentage(secondary_percent),
+        ])
+        .split(transcript_area);
         draw_transcript(frame, state, panes[0], spinner_frame);
         draw_secondary_pane(frame, state, panes[1], spinner_frame);
     } else if pane_split {
-        let panes = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
-            .split(transcript_area);
+        let panes = Layout::vertical([
+            Constraint::Percentage(secondary_percent),
+            Constraint::Percentage(primary_percent),
+        ])
+        .split(transcript_area);
         draw_secondary_pane(frame, state, panes[0], spinner_frame);
         draw_transcript(frame, state, panes[1], spinner_frame);
     } else {
@@ -19791,6 +19847,7 @@ mod tests {
             open_tabs,
             background_runs: std::collections::HashMap::new(),
             secondary_tab: None,
+            secondary_split: 50,
             secondary_history: Vec::new(),
             side_chat_of: None,
             adapter_lifecycles: std::collections::HashMap::new(),
@@ -35616,6 +35673,93 @@ exit 1
         handle_command(&mut state, &store, &sender, "/pane close");
         assert_eq!(state.secondary_tab, None);
         assert!(state.secondary_history.is_empty());
+    }
+
+    #[test]
+    fn pane_split_adjusts_clamps_and_resets() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, _first, second) = two_thread_state(home.path(), &store);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(state.secondary_split, 50);
+
+        handle_command(&mut state, &store, &sender, "/pane wider");
+        assert_eq!(state.secondary_split, 50);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("open a second pane"));
+
+        handle_command(&mut state, &store, &sender, &format!("/pane open {second}"));
+        handle_command(&mut state, &store, &sender, "/pane wider");
+        assert_eq!(state.secondary_split, 55);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("55% primary"));
+        handle_command(&mut state, &store, &sender, "/pane narrower");
+        assert_eq!(state.secondary_split, 50);
+        handle_command(&mut state, &store, &sender, "/pane reset");
+        assert_eq!(state.secondary_split, 50);
+
+        for _ in 0..20 {
+            handle_command(&mut state, &store, &sender, "/pane narrower");
+        }
+        assert_eq!(state.secondary_split, 20);
+        assert!(state
+            .notice
+            .as_deref()
+            .unwrap_or("")
+            .contains("split stays at 20% primary"));
+        for _ in 0..20 {
+            handle_command(&mut state, &store, &sender, "/pane wider");
+        }
+        assert_eq!(state.secondary_split, 80);
+
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('['), KeyModifiers::ALT),
+        );
+        assert_eq!(state.secondary_split, 75);
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char(']'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.secondary_split, 80);
+    }
+
+    #[test]
+    fn pane_split_moves_the_secondary_boundary() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, _first, second) = two_thread_state(home.path(), &store);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, &format!("/pane open {second}"));
+
+        state.secondary_split = 70;
+        let wide = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        let wide_column = wide
+            .lines()
+            .find_map(|line| line.find(" pane "))
+            .expect("the secondary pane title");
+
+        state.secondary_split = 30;
+        let narrow = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        let narrow_column = narrow
+            .lines()
+            .find_map(|line| line.find(" pane "))
+            .expect("the secondary pane title");
+
+        assert!(
+            wide_column > narrow_column + 20,
+            "wide {wide_column} narrow {narrow_column}"
+        );
     }
 
     #[test]

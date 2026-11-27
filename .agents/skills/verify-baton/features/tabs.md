@@ -15,12 +15,13 @@ Goals:
 - Keep an unsaved draft in its tab so switching away and back does not lose it.
 - Keep composer text with the thread it was typed in.
 - Keep a live turn running when its tab is not active, with its stream and tool rows preserved.
+- Show one secondary pane for another open tab, with a focus swap between the two panes.
 
 Non-goals:
 
 - Skipping the handoff preview for a background queued follow-up. When the current harness has not covered the thread's prior messages, the message stays queued for a manual send.
 - Running a tab switch under an orchestration, `/multi`, review, activity, report, picker, or pending request surface.
-- A secondary pane, split view, or draggable layout.
+- More than one secondary pane, nested splits, drag resize, or per-pane tab groups.
 - Reordering, renaming, or closing tabs by mouse.
 - A `/tabs` picker. Navigation is keyboard-first in this slice.
 
@@ -45,6 +46,12 @@ Non-goals:
 - A tab whose working directory differs from the previous tab reloads that directory's prompt history, custom commands, and banner. `/new`, `/task`, `/open`, `/threads`, and every tab switch use the same refresh.
 - Permission mode, session mode, goal, and an orchestration-derived title refresh the active tab's stored row.
 - The strip is only drawn on the normal transcript surface. Full-screen report, multi, review, and activity surfaces keep their existing layouts.
+- `/pane` opens a picker of open tabs other than the active one. The selected tab fills a second pane.
+- The secondary pane has a bordered header with its tab position, title, and running marker. It renders the thread's banner-free transcript tail (the last 50 messages), live tool rows, and live streaming text, plus any queued-provider or thinking row.
+- Alt+W swaps the active and secondary threads. `/pane focus` does the same from the command line.
+- A wide transcript area places the panes side by side at 50/50; a narrow one stacks them (secondary above primary) at 45/55. If neither dimension can fit a split, only the primary renders and the pane state is kept.
+- `/pane close` closes the second pane. Archiving the secondary thread closes it. Presenting the secondary tab through Alt+1 through Alt+9 or `/open` swaps the pair instead of showing one thread twice.
+- A background finish for the secondary thread reloads its stored transcript so the pane's tail includes the completed reply.
 
 ## Approach
 
@@ -55,6 +62,8 @@ Every path that replaces `state.thread` calls `remember_open_thread` with the sa
 `TuiState` also holds `background_runs: HashMap<String, ThreadRunState>`. `save_run_state` moves the active running flag, queued provider, streaming text, tool rows, and live subagent rows into that map; `restore_run_state` moves the target thread's entry back, or clears the active buffers when there is none. `load_thread_state` and `open_thread_by_id` save before the swap and restore after it, next to the composer save and restore.
 
 `apply_background_turn_event` handles deltas, tool rows, and subagent rows for an open tab that is not active. `EngineEvent::TurnQueued`, `TurnStarted`, and `TurnFinished` update the same entry for a non-active thread. A thread with no tab, such as an orchestration worker or a `/multi` child, does not grow the map.
+
+`TuiState` holds `secondary_tab` and `secondary_history`. `set_secondary_pane` loads the chosen thread's messages; `focus_secondary_pane` opens that thread and lets `open_thread_by_id` swap the previous active into the secondary slot. `switch_open_tab` routes a switch to the secondary tab through the same swap. `draw` splits the transcript area only when the pane is open and the space can hold two readable regions; `draw_secondary_pane` renders the tail and live state.
 
 The key handler reads Alt plus a digit before overlay handling. It checks the pending request and surface guards first, then switches; the running flag is no longer a guard. `draw` adds a one-row strip above the transcript only when at least two tabs are open, and offsets every later chunk by that row. The strip reads the active `running` flag for the active tab and the stored entry for every other tab.
 
@@ -81,6 +90,11 @@ The key handler reads Alt plus a digit before overlay handling. It checks the pe
 | A background finish leaves a tab stuck running | The non-active `TurnFinished` branch clears the stored running flag and live buffers even when another tab is active. |
 | A worker thread grows the background map | Only a thread with an open tab is tracked; `a_worker_turn_does_not_create_a_background_tab` proves it. |
 | A background queued message is sent without a handoff preview | `background_handoff_pending` checks the thread's messages against its native session coverage and keeps the queue when a preview is needed. The `background-queue-state-machine` gate rejects a handoff auto-start. |
+| Both panes show the same thread | `set_secondary_pane` rejects the active thread, `open_thread_by_id` swaps when the target is the secondary, and `switch_open_tab` swaps through `focus_secondary_pane`. The `pane-focus-state-machine` gate rejects equal panes. |
+| Presenting the secondary keeps the pair unchanged | `open_thread_by_id` moves the previous active into the secondary slot. The gate's `present` mutant rejects a stale pair. |
+| An archived thread stays in the pane | `forget_open_tab` clears the secondary slot. The gate's `archive` mutant rejects a closed secondary. |
+| The pane shows a stale transcript after a background finish | The non-active `TurnFinished` branch reloads `secondary_history` when the finished thread is the secondary. |
+| The pane squeezes the primary on a small terminal | The split requires 100 columns or 24 rows; otherwise only the primary renders and the pane state is kept. |
 | A failed background turn starts the queue | The advance runs only in the `ok` branch. The gate's `failure` mutant rejects a failure auto-start. |
 | A rejected background submit loses the message or leaves a stuck marker | The non-active `TurnRejected` branch clears the run state, re-queues the message unless it was a retry, and names the tab and reason in the notice. |
 | Switching under a picker or report leaves stale content | The key handler refuses while any picker or full-screen surface is open. |
@@ -121,9 +135,20 @@ The background turn probe starts a fake Codex turn that streams `alpha `, waits,
 - `a_background_finish_keeps_the_queue_for_a_handoff`
 - `a_background_rejection_queues_the_message_again`
 - `a_worker_turn_does_not_create_a_background_tab`
+- `pane_command_opens_and_closes`
+- `focusing_the_secondary_pane_swaps_both`
+- `switching_to_the_secondary_tab_swaps_the_pane`
+- `archiving_the_secondary_pane_closes_it`
+- `pane_picker_lists_other_open_tabs`
+- `pane_picker_needs_another_open_tab`
+- `secondary_pane_renders_the_other_transcript`
 - `tabs_probe.py`
 - `background_turn_probe.py`
+- `pane_probe.py`
+- `pane-focus-state-machine` gate
 
 ## Limits
 
+- The secondary pane is read-only and there is only one of it. Alt+W is the way to type into the other thread.
 - A background finish does not ring the terminal bell. The `*` marker is the signal.
+- Nested splits, drag resize, per-pane tab groups, and pane layouts per worktree remain out of scope.

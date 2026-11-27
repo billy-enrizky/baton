@@ -168,6 +168,7 @@ const SLASH_COMMANDS: &[(&str, &str)] = &[
         "start a GitHub issue in a new worktree; /task <number> or no argument to pick",
     ),
     ("/threads", "list threads in this directory; /threads all includes archived"),
+    ("/pane", "show another open tab in a second pane"),
     ("/pin", "pin, unpin, or move a pinned thread"),
     (
         "/snooze",
@@ -369,6 +370,7 @@ struct RetryChoice {
 enum ThreadPickerAction {
     Open,
     Pin,
+    Pane,
 }
 
 #[derive(Clone, Debug)]
@@ -1050,6 +1052,8 @@ pub struct TuiState {
     thread: ThreadRow,
     open_tabs: Vec<OpenThreadTab>,
     background_runs: std::collections::HashMap<String, ThreadRunState>,
+    secondary_tab: Option<String>,
+    secondary_history: Vec<MessageRow>,
     side_chat_of: Option<String>,
     adapter_lifecycles: std::collections::HashMap<ProviderId, AdapterLifecycle>,
     history: Vec<MessageRow>,
@@ -1223,6 +1227,8 @@ pub fn run_tui(
         thread,
         open_tabs,
         background_runs: std::collections::HashMap::new(),
+        secondary_tab: None,
+        secondary_history: Vec::new(),
         side_chat_of,
         adapter_lifecycles,
         history,
@@ -1981,6 +1987,13 @@ fn apply_engine_event(
                     run.streaming_text.clear();
                     run.tool_lines.clear();
                     run.live_subagents.clear();
+                    if state.secondary_tab.as_deref() == Some(thread_id.as_str()) {
+                        state.secondary_history = store
+                            .lock()
+                            .unwrap()
+                            .list_messages(&thread_id)
+                            .unwrap_or_default();
+                    }
                     if ok {
                         background_queue_advance(
                             state,
@@ -3573,6 +3586,92 @@ fn forget_open_tab(state: &mut TuiState, thread_id: &str) {
     state.open_tabs.retain(|tab| tab.id() != thread_id);
     state.thread_drafts.remove(thread_id);
     state.background_runs.remove(thread_id);
+    if state.secondary_tab.as_deref() == Some(thread_id) {
+        state.secondary_tab = None;
+        state.secondary_history.clear();
+    }
+}
+
+fn set_secondary_pane(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread_id: &str) {
+    if thread_id == state.thread.id {
+        state.notice = Some("that tab is already the active pane".into());
+        return;
+    }
+    let Some(tab) = state.open_tabs.iter().find(|tab| tab.id() == thread_id) else {
+        state.notice = Some("that thread is not open in a tab".into());
+        return;
+    };
+    let title = tab.title().to_string();
+    state.secondary_tab = Some(thread_id.to_string());
+    state.secondary_history = store
+        .lock()
+        .unwrap()
+        .list_messages(thread_id)
+        .unwrap_or_default();
+    state.notice = Some(format!("secondary pane: {title}"));
+}
+
+fn close_secondary_pane(state: &mut TuiState) {
+    if state.secondary_tab.take().is_some() {
+        state.secondary_history.clear();
+        state.notice = Some("secondary pane closed".into());
+    } else {
+        state.notice = Some("no secondary pane".into());
+    }
+}
+
+fn focus_secondary_pane(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
+    let Some(secondary) = state.secondary_tab.clone() else {
+        state.notice = Some("no secondary pane".into());
+        return;
+    };
+    if secondary == state.thread.id {
+        state.notice = Some("that pane is already active".into());
+        return;
+    }
+    if !state.open_tabs.iter().any(|tab| tab.id() == secondary) {
+        state.secondary_tab = None;
+        state.secondary_history.clear();
+        state.notice = Some("secondary pane closed".into());
+        return;
+    }
+    open_thread_by_id(state, store, &secondary);
+    if state.thread.id == secondary {
+        state.notice = Some(format!("focused pane: {}", state.thread.title));
+    }
+}
+
+fn open_pane_picker(state: &mut TuiState) {
+    let threads: Vec<ThreadChoice> = state
+        .open_tabs
+        .iter()
+        .filter(|tab| tab.id() != state.thread.id)
+        .map(|tab| ThreadChoice {
+            full_id: tab.id().to_string(),
+            title: tab.title().to_string(),
+            status: if state
+                .background_runs
+                .get(tab.id())
+                .is_some_and(|run| run.running)
+            {
+                "running".to_string()
+            } else {
+                "idle".to_string()
+            },
+            pinned: false,
+            snoozed_until: None,
+            archived: false,
+        })
+        .collect();
+    if threads.is_empty() {
+        state.notice = Some("open another thread to fill the second pane".into());
+        return;
+    }
+    state.overlay = Overlay::ThreadPicker {
+        selected: 0,
+        threads,
+        action: ThreadPickerAction::Pane,
+    };
 }
 
 fn switch_open_tab(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, index: usize) {
@@ -3581,6 +3680,10 @@ fn switch_open_tab(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, index: 
         return;
     };
     if tab.id() == state.thread.id {
+        return;
+    }
+    if state.secondary_tab.as_deref() == Some(tab.id()) {
+        focus_secondary_pane(state, store);
         return;
     }
     let stored = store.lock().unwrap().get_thread(tab.id()).ok().flatten();
@@ -4014,6 +4117,8 @@ fn is_complete_command(input: &str) -> bool {
             ProviderId::parse(value).is_some()
         }
         (Some("/git"), Some("review" | "merge"), None) => true,
+        (Some("/pane"), Some("close" | "focus"), None) => true,
+        (Some("/pane"), Some("open"), Some(_)) => true,
         _ => false,
     }
 }
@@ -4050,6 +4155,7 @@ fn command_usage(input: &str) -> Option<&'static str> {
         ("/files", _) => Some("files [--ignored] [query] [:<line>]"),
         ("/grep", _) => Some("grep [--case|--case-sensitive] [--word] [--regex] <query>"),
         ("/pin", "move") => Some("pin move <id> up or down"),
+        ("/pane", _) => Some("pane [open <tab>|close|focus]"),
         ("/snooze", _) => Some("snooze [1h|4h|tomorrow|week|off]"),
         ("/changes", _) => Some("changes [turn]"),
         ("/limits", _) => Some("limits"),
@@ -4125,6 +4231,26 @@ fn argument_suggestions(state: &TuiState, command: &str) -> Vec<CommandSuggestio
                         format!("switch to {provider}/{model}"),
                     );
                 }
+            }
+        }
+        "/pane" => {
+            push_suggestion(&mut suggestions, command, "close", "close the second pane");
+            push_suggestion(
+                &mut suggestions,
+                command,
+                "focus",
+                "move focus to the second pane",
+            );
+            for tab in &state.open_tabs {
+                if tab.id() == state.thread.id {
+                    continue;
+                }
+                push_suggestion(
+                    &mut suggestions,
+                    command,
+                    &format!("open {}", tab.id()),
+                    format!("show {} in the second pane", tab.title()),
+                );
             }
         }
         "/model" => {
@@ -5670,6 +5796,7 @@ fn push_git_plan(
 }
 
 fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread_id: &str) {
+    let previous = state.thread.id.clone();
     let found = {
         let guard = store.lock().unwrap();
         guard.get_thread(thread_id).ok().flatten().or_else(|| {
@@ -5684,6 +5811,7 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
         state.notice = Some(format!("no thread matches \"{thread_id}\""));
         return;
     };
+    let swaps_pane = state.secondary_tab.as_deref() == Some(thread.id.as_str());
     state.stash_composer();
     state.save_run_state();
     remember_open_thread(state, &thread);
@@ -5721,6 +5849,14 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.restore_composer();
     state.restore_run_state();
     refresh_cwd_state(state, store, &thread.cwd);
+    if swaps_pane && previous != state.thread.id {
+        state.secondary_tab = Some(previous.clone());
+        state.secondary_history = store
+            .lock()
+            .unwrap()
+            .list_messages(&previous)
+            .unwrap_or_default();
+    }
 }
 
 fn open_command_palette(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
@@ -5815,6 +5951,22 @@ fn palette_filter_indices(items: &[PaletteItem], query: &str) -> Vec<usize> {
         .collect()
 }
 
+fn pane_switch_blocked_notice(state: &TuiState) -> Option<&'static str> {
+    if !state.approvals.is_empty() || !state.questions.is_empty() {
+        Some("answer the pending request before switching tabs")
+    } else if state.orchestration_pending
+        || state.multi.is_some()
+        || state.review.is_some()
+        || state.orchestration_report.is_some()
+        || state.activity.is_some()
+        || !matches!(state.overlay, Overlay::None)
+    {
+        Some("close or finish the current view before switching tabs")
+    } else {
+        None
+    }
+}
+
 fn handle_key(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -5849,23 +6001,20 @@ fn handle_key(
 
     if key.modifiers.contains(KeyModifiers::ALT) {
         if let KeyCode::Char(character) = key.code {
+            if character == 'w' {
+                if let Some(notice) = pane_switch_blocked_notice(state) {
+                    state.notice = Some(notice.into());
+                    return;
+                }
+                focus_secondary_pane(state, store);
+                return;
+            }
             if let Some(digit) = character.to_digit(10) {
                 if digit == 0 {
                     return;
                 }
-                if !state.approvals.is_empty() || !state.questions.is_empty() {
-                    state.notice = Some("answer the pending request before switching tabs".into());
-                    return;
-                }
-                if state.orchestration_pending
-                    || state.multi.is_some()
-                    || state.review.is_some()
-                    || state.orchestration_report.is_some()
-                    || state.activity.is_some()
-                    || !matches!(state.overlay, Overlay::None)
-                {
-                    state.notice =
-                        Some("close or finish the current view before switching tabs".into());
+                if let Some(notice) = pane_switch_blocked_notice(state) {
+                    state.notice = Some(notice.into());
                     return;
                 }
                 switch_open_tab(state, store, digit as usize - 1);
@@ -7617,6 +7766,9 @@ fn handle_key(
                                 action,
                             };
                         }
+                    } else if action == ThreadPickerAction::Pane {
+                        set_secondary_pane(state, store, &id);
+                        state.overlay = Overlay::None;
                     } else {
                         open_thread_by_id(state, store, &id);
                     }
@@ -11633,6 +11785,30 @@ fn handle_command(
                 "worktree fork {short_fork} · run {short_run} · next turn commits here"
             ));
         }
+        "/pane" => match (args.first().map(String::as_str), args.len()) {
+            (None, _) => open_pane_picker(state),
+            (Some("close"), 1) => close_secondary_pane(state),
+            (Some("focus"), 1) => {
+                if let Some(notice) = pane_switch_blocked_notice(state) {
+                    state.notice = Some(notice.into());
+                } else {
+                    focus_secondary_pane(state, store);
+                }
+            }
+            (Some("open"), 2) => {
+                let prefix = args[1].as_str();
+                let found = state
+                    .open_tabs
+                    .iter()
+                    .find(|tab| tab.id().starts_with(prefix))
+                    .map(|tab| tab.id().to_string());
+                match found {
+                    Some(id) => set_secondary_pane(state, store, &id),
+                    None => state.notice = Some(format!("no open tab matches \"{prefix}\"")),
+                }
+            }
+            _ => state.notice = Some("pane [open <tab>|close|focus]".into()),
+        },
         "/threads" => {
             let include_archived = match (args.first().map(String::as_str), args.len()) {
                 (None, _) => false,
@@ -13171,7 +13347,22 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
     .split(area);
 
     draw_tabs(frame, chunks[0], state);
-    draw_transcript(frame, state, chunks[1], spinner_frame);
+    let transcript_area = chunks[1];
+    let pane_split = state.secondary_tab.is_some()
+        && (transcript_area.width >= 100 || transcript_area.height >= 24);
+    if pane_split && transcript_area.width >= 100 {
+        let panes = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(transcript_area);
+        draw_transcript(frame, state, panes[0], spinner_frame);
+        draw_secondary_pane(frame, state, panes[1], spinner_frame);
+    } else if pane_split {
+        let panes = Layout::vertical([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .split(transcript_area);
+        draw_secondary_pane(frame, state, panes[0], spinner_frame);
+        draw_transcript(frame, state, panes[1], spinner_frame);
+    } else {
+        draw_transcript(frame, state, transcript_area, spinner_frame);
+    }
     if let Some(approval) = state.approvals.last() {
         draw_approval(frame, chunks[2], state, approval);
     } else if let Some(question) = state.questions.last() {
@@ -15857,6 +16048,7 @@ fn draw_thread_picker(
     let heading = match action {
         ThreadPickerAction::Open => "threads · enter open · esc close",
         ThreadPickerAction::Pin => "pin · ctrl+↑/↓ move · enter toggle · esc close",
+        ThreadPickerAction::Pane => "pane · enter show · esc close",
     };
     let mut lines: Vec<Line> = vec![Line::styled(heading, Style::default().fg(COLORS.muted))];
     let visible = 8;
@@ -16762,6 +16954,31 @@ fn draw_checkpoint_picker(
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+fn wrap_transcript_text(text: &str, width: usize) -> Vec<String> {
+    let text = crate::sanitize::sanitize_terminal_text(text);
+    text.split('\n')
+        .flat_map(|line| {
+            if line.is_empty() {
+                vec![String::new()]
+            } else {
+                let mut wrapped = Vec::new();
+                let mut current = String::new();
+                for ch in line.chars() {
+                    if current.chars().count() >= width.saturating_sub(2) {
+                        wrapped.push(current.clone());
+                        current.clear();
+                    }
+                    current.push(ch);
+                }
+                if !current.is_empty() || wrapped.is_empty() {
+                    wrapped.push(current);
+                }
+                wrapped
+            }
+        })
+        .collect()
+}
+
 fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spinner_frame: usize) {
     if let Some(shell) = &state.shell_output {
         hide_transcript_view(state);
@@ -16847,30 +17064,7 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
 
     // Pre-wrap all text at the actual terminal width so line counts are exact
     let width = area.width as usize;
-    let wrap = |text: &str| -> Vec<String> {
-        let text = crate::sanitize::sanitize_terminal_text(text);
-        text.split('\n')
-            .flat_map(|line| {
-                if line.is_empty() {
-                    vec![String::new()]
-                } else {
-                    let mut wrapped = Vec::new();
-                    let mut current = String::new();
-                    for ch in line.chars() {
-                        if current.chars().count() >= width.saturating_sub(2) {
-                            wrapped.push(current.clone());
-                            current.clear();
-                        }
-                        current.push(ch);
-                    }
-                    if !current.is_empty() || wrapped.is_empty() {
-                        wrapped.push(current);
-                    }
-                    wrapped
-                }
-            })
-            .collect()
-    };
+    let wrap = |text: &str| -> Vec<String> { wrap_transcript_text(text, width) };
 
     // Build all terminal lines (each element = exactly 1 rendered row).
     // The banner scrolls with the conversation, like Codex and Claude Code.
@@ -18222,6 +18416,164 @@ fn draw_tabs(frame: &mut ratatui::Frame, area: Rect, state: &TuiState) {
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+fn draw_secondary_pane(
+    frame: &mut ratatui::Frame,
+    state: &TuiState,
+    area: Rect,
+    spinner_frame: usize,
+) {
+    let Some(id) = state.secondary_tab.as_deref() else {
+        return;
+    };
+    let Some((index, tab)) = state
+        .open_tabs
+        .iter()
+        .enumerate()
+        .find(|(_, tab)| tab.id() == id)
+    else {
+        return;
+    };
+    let run = state.background_runs.get(id);
+    let running = run.is_some_and(|run| run.running);
+    let title = crate::sanitize::sanitize_terminal_text(tab.title());
+    let marker = if running { " *" } else { "" };
+    let header = Line::styled(
+        format!(
+            " pane {}{}{} ",
+            index + 1,
+            truncate_chars(&title, 24),
+            marker
+        ),
+        Style::default()
+            .fg(if running { COLORS.accent } else { COLORS.muted })
+            .add_modifier(Modifier::BOLD),
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border))
+        .title(header);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let width = inner.width as usize;
+    let wrap = |text: &str| -> Vec<String> { wrap_transcript_text(text, width) };
+    let provider = tab.thread.current_provider;
+    let model = tab.thread.current_model.as_deref().unwrap_or("default");
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::styled(
+        format!("{provider}/{model} · {}", tab.thread.cwd),
+        Style::default().fg(COLORS.muted),
+    ));
+    let skip = state.secondary_history.len().saturating_sub(50);
+    for message in state.secondary_history.iter().skip(skip) {
+        match message.role.as_str() {
+            "tool" => {
+                let style = if message.text.starts_with("✗") {
+                    COLORS.error
+                } else if message.text.starts_with("✓") {
+                    COLORS.success
+                } else {
+                    COLORS.muted
+                };
+                for line in wrap(&message.text) {
+                    lines.push(Line::styled(line, Style::default().fg(style)));
+                }
+            }
+            "orchestration" => {
+                for line in wrap(&message.text) {
+                    lines.push(Line::styled(line, Style::default().fg(COLORS.muted)));
+                }
+                lines.push(Line::raw(" "));
+            }
+            "diff" => {
+                let rendered = state
+                    .diff_cache
+                    .borrow_mut()
+                    .preview(&message.text, width.saturating_sub(2));
+                lines.extend(rendered.iter().cloned());
+                lines.push(Line::raw(" "));
+            }
+            "user" => {
+                for line in wrap(&message.text) {
+                    lines.push(Line::styled(
+                        line,
+                        Style::default().fg(COLORS.text).bg(COLORS.user_bg),
+                    ));
+                }
+                lines.push(Line::raw(" "));
+            }
+            _ => {
+                lines.push(Line::styled(
+                    format!(
+                        "{} · {}",
+                        message.provider.as_deref().unwrap_or("?"),
+                        message.model.as_deref().unwrap_or("?")
+                    ),
+                    Style::default().fg(COLORS.muted),
+                ));
+                let sanitized = crate::sanitize::sanitize_terminal_text(&message.text);
+                let rendered = state
+                    .markdown_cache
+                    .borrow_mut()
+                    .render(&sanitized, width.saturating_sub(2));
+                lines.extend(rendered.iter().cloned());
+                lines.push(Line::raw(" "));
+            }
+        }
+    }
+    if let Some(run) = run {
+        let spinner = SPINNER_FRAMES[spinner_frame];
+        if run.running && run.tool_lines.is_empty() && run.streaming_text.is_empty() {
+            if let Some(provider) = run.queued_provider {
+                lines.push(Line::styled(
+                    format!("· Queued for {provider}"),
+                    Style::default().fg(COLORS.muted),
+                ));
+            } else {
+                lines.push(Line::styled(
+                    format!("{spinner} Thinking"),
+                    Style::default().fg(COLORS.accent),
+                ));
+            }
+        }
+        for tool_line in &run.tool_lines {
+            let line = match tool_line.status {
+                ToolStatus::Running => Line::styled(
+                    format!("{spinner} {}", tool_line.label),
+                    Style::default().fg(COLORS.accent),
+                ),
+                ToolStatus::Done => Line::styled(
+                    format!("✓ {}", tool_line.label),
+                    Style::default().fg(COLORS.success),
+                ),
+                ToolStatus::Failed => Line::styled(
+                    format!("✗ {}", tool_line.label),
+                    Style::default().fg(COLORS.error),
+                ),
+            };
+            lines.push(line);
+        }
+        if !run.streaming_text.is_empty() {
+            lines.extend(markdown::render(
+                &run.streaming_text,
+                width.saturating_sub(2),
+            ));
+        }
+    }
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            "no messages yet",
+            Style::default().fg(COLORS.muted),
+        ));
+    }
+    let body = inner.height as usize;
+    let start = lines.len().saturating_sub(body);
+    let tail: Vec<Line> = lines.into_iter().skip(start).collect();
+    frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), inner);
+}
+
 fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
     let left = if state.esc_primed {
         Line::styled(
@@ -18839,6 +19191,8 @@ mod tests {
             thread,
             open_tabs,
             background_runs: std::collections::HashMap::new(),
+            secondary_tab: None,
+            secondary_history: Vec::new(),
             side_chat_of: None,
             adapter_lifecycles: std::collections::HashMap::new(),
             history,
@@ -34285,6 +34639,134 @@ exit 1
         assert_eq!(state.thread.id, first_id);
         assert_eq!(state.prompt_history, vec!["first prompt".to_string()]);
         assert!(state.custom_commands.is_empty());
+    }
+
+    #[test]
+    fn pane_command_opens_and_closes() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, _first, second) = two_thread_state(home.path(), &store);
+        store
+            .lock()
+            .unwrap()
+            .add_message(&second, 1, "user", None, None, "pane history")
+            .unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, &format!("/pane open {second}"));
+        assert_eq!(state.secondary_tab.as_deref(), Some(second.as_str()));
+        assert_eq!(state.secondary_history.len(), 1);
+        handle_command(&mut state, &store, &sender, "/pane close");
+        assert_eq!(state.secondary_tab, None);
+        assert!(state.secondary_history.is_empty());
+    }
+
+    #[test]
+    fn focusing_the_secondary_pane_swaps_both() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, first, second) = two_thread_state(home.path(), &store);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, &format!("/pane open {second}"));
+        assert_eq!(state.secondary_tab.as_deref(), Some(second.as_str()));
+        handle_command(&mut state, &store, &sender, "/pane focus");
+        assert_eq!(state.thread.id, second);
+        assert_eq!(state.secondary_tab.as_deref(), Some(first.as_str()));
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("focused pane:"),
+            "{:?}",
+            state.notice
+        );
+    }
+
+    #[test]
+    fn switching_to_the_secondary_tab_swaps_the_pane() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, first, second) = two_thread_state(home.path(), &store);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, &format!("/pane open {second}"));
+        handle_key(
+            &mut state,
+            &store,
+            &sender,
+            modified_key(KeyCode::Char('2'), KeyModifiers::ALT),
+        );
+        assert_eq!(state.thread.id, second);
+        assert_eq!(state.secondary_tab.as_deref(), Some(first.as_str()));
+    }
+
+    #[test]
+    fn archiving_the_secondary_pane_closes_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, _first, second) = two_thread_state(home.path(), &store);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, &format!("/pane open {second}"));
+        apply_archive_command(&mut state, &store, &sender, true, Some(&second));
+        assert_eq!(state.secondary_tab, None);
+        assert!(state.secondary_history.is_empty());
+    }
+
+    #[test]
+    fn pane_picker_needs_another_open_tab() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/pane");
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("open another thread"),
+            "{:?}",
+            state.notice
+        );
+        assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn pane_picker_lists_other_open_tabs() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, _first, second) = two_thread_state(home.path(), &store);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/pane");
+        match &state.overlay {
+            Overlay::ThreadPicker {
+                threads, action, ..
+            } => {
+                assert_eq!(*action, ThreadPickerAction::Pane);
+                assert_eq!(threads.len(), 1);
+                assert_eq!(threads[0].full_id, second);
+            }
+            other => panic!(
+                "expected a pane picker, got {:?}",
+                std::mem::discriminant(other)
+            ),
+        }
+    }
+
+    #[test]
+    fn secondary_pane_renders_the_other_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let (mut state, _first, second) = two_thread_state(home.path(), &store);
+        store
+            .lock()
+            .unwrap()
+            .add_message(&second, 1, "user", None, None, "pane-only text")
+            .unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, &format!("/pane open {second}"));
+        let text = buffer_lines(&render_state(&state, 120, 40)).join("\n");
+        assert!(text.contains("pane 2"), "{text}");
+        assert!(text.contains("pane-only text"), "{text}");
     }
 
     #[test]

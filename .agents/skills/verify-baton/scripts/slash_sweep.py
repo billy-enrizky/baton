@@ -53,6 +53,7 @@ COMMANDS = [
     ("/skills", ["skills (2)", "claude-demo", "codex-demo"]),
     ("/memory", ["Memory ·", "Auto-memory"]),
     ("/threads", ["threads ·", "New thread"]),
+    ("/pane", ["pane · enter show", "New thread"]),
     ("/pin", ["pin ·", "New thread"]),
     ("/inbox", ["inbox empty"]),
     ("/questions", ["no open worker questions"]),

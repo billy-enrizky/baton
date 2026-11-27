@@ -14,6 +14,8 @@ A thread can be snoozed or archived. A snooze hides it from `/inbox` until a wak
 
 Every thread you open stays in a tab strip above the transcript. The strip appears once a second tab is open, marks the active thread, and answers to Alt+1 through Alt+9. A running turn keeps running when you switch away: its tab carries a `*` marker, streams in the background, and shows the result when you return. A queued follow-up starts on its own when that turn finishes, unless the harness changed and a handoff preview is required. Each tab also keeps its own composer draft, prompt history, and working-directory custom commands. A switch is refused while a pending request, a picker, or a full-screen view owns the surface.
 
+`/pane` shows a second open thread beside the active one. The second pane is read-only and follows that thread's live stream; Alt+W swaps the two panes so the composer follows whichever thread you want to drive.
+
 Two thread variants change how Baton treats the conversation.
 
 - A side chat is a fork marked as belonging to its source thread. `/btw` opens one and leaves the source untouched; `/merge-back` copies the new messages back as one redacted context message.

@@ -123,6 +123,11 @@ pub enum Commands {
         socket: Option<String>,
     },
     /// Connect to a paired host and print its status
+    #[command(group(
+        clap::ArgGroup::new("mutation")
+            .args(["submit", "respond"])
+            .multiple(true)
+    ))]
     Attach {
         /// Pairing URL from the host terminal pair command
         #[arg(long, value_name = "URL")]
@@ -148,8 +153,25 @@ pub enum Commands {
         /// Submit one prompt to the thread over the socket
         #[arg(long, value_name = "TEXT", requires = "thread")]
         submit: Option<String>,
-        /// Reuse a key so a retried submit returns the original result
-        #[arg(long, value_name = "KEY", requires = "submit")]
+        /// List pending approvals from the host
+        #[arg(
+            long,
+            conflicts_with_all = ["submit", "messages", "follow", "respond", "after"]
+        )]
+        approvals: bool,
+        /// Answer one pending approval request
+        #[arg(
+            long,
+            value_name = "REQUEST",
+            requires = "choice",
+            conflicts_with_all = ["submit", "messages", "follow", "approvals", "after"]
+        )]
+        respond: Option<String>,
+        /// Choice id for --respond
+        #[arg(long, value_name = "CHOICE", requires = "respond")]
+        choice: Option<String>,
+        /// Reuse a key so a retried submit or respond returns the original result
+        #[arg(long, value_name = "KEY", requires = "mutation")]
         idempotency_key: Option<String>,
     },
     /// Inspect or change host ownership of the local store
@@ -937,6 +959,9 @@ mod tests {
                 limit: 50,
                 follow: false,
                 submit: None,
+                approvals: false,
+                respond: None,
+                choice: None,
                 idempotency_key: None,
             }) => assert!(url.starts_with("baton://local#")),
             _ => panic!("expected attach"),
@@ -993,7 +1018,58 @@ mod tests {
             }
             _ => panic!("expected a submit"),
         }
-        let key_without_submit = Cli::try_parse_from([
+        let cli = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--approvals",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Attach {
+                approvals: true,
+                respond: None,
+                ..
+            }) => {}
+            _ => panic!("expected approvals"),
+        }
+        let cli = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--respond",
+            "req-1",
+            "--choice",
+            "accept",
+            "--idempotency-key",
+            "answer-1",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Attach {
+                respond: Some(request),
+                choice: Some(choice),
+                idempotency_key: Some(key),
+                ..
+            }) => {
+                assert_eq!(request, "req-1");
+                assert_eq!(choice, "accept");
+                assert_eq!(key, "answer-1");
+            }
+            _ => panic!("expected a respond"),
+        }
+        let missing_choice = Cli::try_parse_from([
+            "baton",
+            "attach",
+            "--url",
+            "baton://local#grant=00000000-0000-4000-8000-000000000000&secret=secret",
+            "--respond",
+            "req-1",
+        ]);
+        assert!(missing_choice.is_err(), "--respond needs --choice");
+        let key_without_mutation = Cli::try_parse_from([
             "baton",
             "attach",
             "--url",
@@ -1004,8 +1080,8 @@ mod tests {
             "remote-1",
         ]);
         assert!(
-            key_without_submit.is_err(),
-            "--idempotency-key needs --submit"
+            key_without_mutation.is_err(),
+            "--idempotency-key needs --submit or --respond"
         );
         let conflict = Cli::try_parse_from([
             "baton",

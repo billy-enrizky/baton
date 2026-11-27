@@ -723,6 +723,9 @@ fn main_result(started: Instant) -> Result<()> {
             limit,
             follow,
             submit,
+            approvals,
+            respond,
+            choice,
             idempotency_key,
         } => run_attach(
             &home,
@@ -734,6 +737,9 @@ fn main_result(started: Instant) -> Result<()> {
             limit,
             follow,
             submit,
+            approvals,
+            respond,
+            choice,
             idempotency_key,
         ),
         cli::Commands::Host { command } => run_host(&home, command),
@@ -2931,6 +2937,9 @@ fn run_attach(
     limit: usize,
     follow: bool,
     submit: Option<String>,
+    approvals: bool,
+    respond: Option<String>,
+    choice: Option<String>,
     idempotency_key: Option<String>,
 ) -> Result<()> {
     let Some(url) = url else {
@@ -2947,6 +2956,58 @@ fn run_attach(
     if !(1..=200).contains(&limit) {
         anyhow::bail!("--limit must be between 1 and 200");
     }
+    if idempotency_key.is_some() && submit.is_none() && respond.is_none() {
+        anyhow::bail!("--idempotency-key needs --submit or --respond");
+    }
+    if approvals {
+        let pending =
+            attach::query_approvals(home, &credential, thread.as_deref(), attach::ATTACH_TIMEOUT)?;
+        if json {
+            println!("{}", serde_json::to_string_pretty(&pending.json())?);
+        } else {
+            print!("{}", pending.text());
+        }
+        return Ok(());
+    }
+    if let Some(request) = respond {
+        if messages || follow || after != 0 {
+            anyhow::bail!("--respond cannot be combined with --messages, --follow, or --after");
+        }
+        let choice = choice.ok_or_else(|| anyhow::anyhow!("--respond needs --choice"))?;
+        let key = idempotency_key
+            .as_deref()
+            .filter(|key| !key.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let answer = attach::respond(
+            home,
+            &credential,
+            &request,
+            &choice,
+            &key,
+            attach::ATTACH_TIMEOUT,
+        )?;
+        if let Some(thread) = thread.as_deref() {
+            if answer.thread_id != thread {
+                anyhow::bail!(
+                    "host answered approval for thread {}, not {thread}",
+                    answer.thread_id
+                );
+            }
+        }
+        if json {
+            println!("{}", serde_json::to_string_pretty(&answer.json())?);
+        } else {
+            println!(
+                "answered {} · request {} · {}{}",
+                sanitize::sanitize_single_line(&answer.thread_id),
+                sanitize::sanitize_single_line(&answer.request_id),
+                sanitize::sanitize_single_line(&answer.decision),
+                if answer.replayed { " · replayed" } else { "" }
+            );
+        }
+        return Ok(());
+    }
     let Some(thread) = thread else {
         if messages || follow || after != 0 || submit.is_some() {
             anyhow::bail!("--thread is needed for --messages, --after, --follow, or --submit");
@@ -2960,7 +3021,9 @@ fn run_attach(
             anyhow::bail!("--submit cannot be combined with --messages, --follow, or --after");
         }
         let key = idempotency_key
+            .as_deref()
             .filter(|key| !key.trim().is_empty())
+            .map(str::to_string)
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
         let accepted = attach::submit(
             home,

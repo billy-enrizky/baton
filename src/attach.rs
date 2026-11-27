@@ -17,6 +17,8 @@ const PAIRING_PREFIX: &str = "baton://local#";
 const STATUS_REQUEST_ID: u64 = 1;
 const MESSAGES_REQUEST_ID: u64 = 2;
 const SUBMIT_REQUEST_ID: u64 = 3;
+const APPROVALS_REQUEST_ID: u64 = 4;
+const RESPOND_REQUEST_ID: u64 = 5;
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct PairingCredential {
@@ -117,6 +119,186 @@ impl AttachSubmit {
             "schema_version": crate::status::SCHEMA_VERSION,
             "thread_id": self.thread_id,
             "accepted": self.accepted,
+            "replayed": self.replayed,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteApprovalChoice {
+    pub id: String,
+    pub label: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteApproval {
+    pub request_id: String,
+    pub thread_id: String,
+    pub kind: String,
+    pub summary: String,
+    pub choices: Vec<RemoteApprovalChoice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachApprovals {
+    pub approvals: Vec<RemoteApproval>,
+}
+
+impl AttachApprovals {
+    pub fn from_response(value: &Value) -> Result<AttachApprovals> {
+        let result = value
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("host response has no result object"))?;
+        let raw = result
+            .get("approvals")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow::anyhow!("host response has no approvals array"))?;
+        let mut approvals = Vec::with_capacity(raw.len());
+        for approval in raw {
+            let object = approval
+                .as_object()
+                .ok_or_else(|| anyhow::anyhow!("host response has a malformed approval"))?;
+            let text = |field: &str| {
+                object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow::anyhow!("host approval has no {field}"))
+            };
+            let choices = object
+                .get("choices")
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow::anyhow!("host approval has no choices array"))?
+                .iter()
+                .map(|choice| {
+                    let choice = choice
+                        .as_object()
+                        .ok_or_else(|| anyhow::anyhow!("host approval has a malformed choice"))?;
+                    let field = |name: &str| {
+                        choice
+                            .get(name)
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow::anyhow!("host choice has no {name}"))
+                    };
+                    Ok(RemoteApprovalChoice {
+                        id: field("id")?.to_string(),
+                        label: field("label")?.to_string(),
+                        kind: field("kind")?.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            approvals.push(RemoteApproval {
+                request_id: text("request_id")?.to_string(),
+                thread_id: text("thread_id")?.to_string(),
+                kind: text("kind")?.to_string(),
+                summary: text("summary")?.to_string(),
+                choices,
+            });
+        }
+        Ok(AttachApprovals { approvals })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "schema_version": crate::status::SCHEMA_VERSION,
+            "approvals": self.approvals.iter().map(|approval| json!({
+                "request_id": approval.request_id,
+                "thread_id": approval.thread_id,
+                "kind": approval.kind,
+                "summary": approval.summary,
+                "choices": approval.choices.iter().map(|choice| json!({
+                    "id": choice.id,
+                    "label": choice.label,
+                    "kind": choice.kind,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
+        })
+    }
+
+    pub fn text(&self) -> String {
+        if self.approvals.is_empty() {
+            return "no pending approvals\n".to_string();
+        }
+        let mut out = format!("{} pending approval(s)\n", self.approvals.len());
+        for approval in &self.approvals {
+            out.push_str(&format!(
+                "  {}  {}  {}\n",
+                crate::sanitize::sanitize_single_line(&approval.request_id),
+                crate::sanitize::sanitize_single_line(&approval.thread_id),
+                crate::sanitize::sanitize_single_line(&approval.kind),
+            ));
+            out.push_str(&format!(
+                "    {}\n",
+                crate::sanitize::sanitize_single_line(&approval.summary)
+            ));
+            let choices = approval
+                .choices
+                .iter()
+                .map(|choice| {
+                    format!(
+                        "{} ({})",
+                        crate::sanitize::sanitize_single_line(&choice.id),
+                        crate::sanitize::sanitize_single_line(&choice.label)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push_str(&format!("    choices: {choices}\n"));
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachAnswer {
+    pub request_id: String,
+    pub thread_id: String,
+    pub choice: String,
+    pub decision: String,
+    pub replayed: bool,
+}
+
+impl AttachAnswer {
+    pub fn from_response(value: &Value) -> Result<AttachAnswer> {
+        let result = value
+            .get("result")
+            .and_then(Value::as_object)
+            .ok_or_else(|| anyhow::anyhow!("host response has no result object"))?;
+        let field = |name: &str| {
+            result
+                .get(name)
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("host response has no {name}"))
+        };
+        let answered = result
+            .get("answered")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| anyhow::anyhow!("host response has no answered flag"))?;
+        if !answered {
+            anyhow::bail!("host did not answer the approval");
+        }
+        Ok(AttachAnswer {
+            request_id: field("request_id")?,
+            thread_id: field("thread_id")?,
+            choice: field("choice")?,
+            decision: field("decision")?,
+            replayed: result
+                .get("replayed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    }
+
+    pub fn json(&self) -> Value {
+        json!({
+            "schema_version": crate::status::SCHEMA_VERSION,
+            "request_id": self.request_id,
+            "thread_id": self.thread_id,
+            "choice": self.choice,
+            "decision": self.decision,
+            "answered": true,
             "replayed": self.replayed,
         })
     }
@@ -376,6 +558,52 @@ pub fn submit(
 }
 
 #[cfg(unix)]
+pub fn query_approvals(
+    home: &Path,
+    credential: &PairingCredential,
+    thread: Option<&str>,
+    timeout: Duration,
+) -> Result<AttachApprovals> {
+    let args = match thread {
+        Some(thread) => json!({ "thread": thread }),
+        None => json!({}),
+    };
+    let response = request(
+        home,
+        credential,
+        "approvals",
+        args,
+        APPROVALS_REQUEST_ID,
+        timeout,
+    )?;
+    AttachApprovals::from_response(&response)
+}
+
+#[cfg(unix)]
+pub fn respond(
+    home: &Path,
+    credential: &PairingCredential,
+    request_id: &str,
+    choice: &str,
+    idempotency_key: &str,
+    timeout: Duration,
+) -> Result<AttachAnswer> {
+    let response = request(
+        home,
+        credential,
+        "respond",
+        json!({
+            "request": request_id,
+            "choice": choice,
+            "idempotency_key": idempotency_key,
+        }),
+        RESPOND_REQUEST_ID,
+        timeout,
+    )?;
+    AttachAnswer::from_response(&response)
+}
+
+#[cfg(unix)]
 pub fn query_messages(
     home: &Path,
     credential: &PairingCredential,
@@ -413,6 +641,28 @@ pub fn submit(
     _idempotency_key: &str,
     _timeout: Duration,
 ) -> Result<AttachSubmit> {
+    anyhow::bail!("attach is supported only on Unix")
+}
+
+#[cfg(not(unix))]
+pub fn query_approvals(
+    _home: &Path,
+    _credential: &PairingCredential,
+    _thread: Option<&str>,
+    _timeout: Duration,
+) -> Result<AttachApprovals> {
+    anyhow::bail!("attach is supported only on Unix")
+}
+
+#[cfg(not(unix))]
+pub fn respond(
+    _home: &Path,
+    _credential: &PairingCredential,
+    _request_id: &str,
+    _choice: &str,
+    _idempotency_key: &str,
+    _timeout: Duration,
+) -> Result<AttachAnswer> {
     anyhow::bail!("attach is supported only on Unix")
 }
 
@@ -471,6 +721,62 @@ mod tests {
 
     fn url(secret: &str) -> String {
         format!("baton://local#grant=00000000-0000-4000-8000-000000000000&secret={secret}")
+    }
+
+    #[test]
+    fn approvals_response_is_typed_and_text_is_sanitized() {
+        let response = json!({
+            "v": crate::serve::PROTOCOL_VERSION,
+            "kind": "response",
+            "id": APPROVALS_REQUEST_ID,
+            "ok": true,
+            "result": {
+                "approvals": [{
+                    "request_id": "req-1",
+                    "thread_id": "thread",
+                    "kind": "command",
+                    "summary": "run\u{1b}[31m tests\nnow",
+                    "choices": [
+                        {"id":"accept","label":"Allow once","kind":"allow_once"},
+                        {"id":"deny","label":"Deny","kind":"reject_once"}
+                    ]
+                }]
+            }
+        });
+        let approvals = AttachApprovals::from_response(&response).unwrap();
+        assert_eq!(approvals.approvals.len(), 1);
+        assert_eq!(approvals.approvals[0].request_id, "req-1");
+        assert_eq!(approvals.approvals[0].choices[0].id, "accept");
+        let text = approvals.text();
+        assert!(text.contains("req-1"), "{text}");
+        assert!(!text.contains('\u{1b}'), "{text}");
+        assert!(!text.contains("tests\nnow"), "{text}");
+        assert_eq!(approvals.json()["approvals"][0]["kind"], "command");
+    }
+
+    #[test]
+    fn answer_response_is_typed_and_requires_answered() {
+        let response = json!({
+            "v": crate::serve::PROTOCOL_VERSION,
+            "kind": "response",
+            "id": RESPOND_REQUEST_ID,
+            "ok": true,
+            "result": {
+                "request_id": "req-1",
+                "thread_id": "thread",
+                "choice": "accept",
+                "decision": "accept",
+                "answered": true,
+                "replayed": false
+            }
+        });
+        let answer = AttachAnswer::from_response(&response).unwrap();
+        assert_eq!(answer.request_id, "req-1");
+        assert_eq!(answer.decision, "accept");
+        assert!(!answer.replayed);
+        let mut refused = response.clone();
+        refused["result"]["answered"] = json!(false);
+        assert!(AttachAnswer::from_response(&refused).is_err());
     }
 
     #[test]

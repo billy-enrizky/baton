@@ -320,6 +320,19 @@ pub struct ApprovalChoice {
     pub kind: String,
 }
 
+impl ApprovalChoice {
+    /// The provider decision this choice represents. Custom ACP options keep
+    /// their own id so the adapter can map it back to its protocol.
+    pub fn decision(&self) -> ApprovalDecision {
+        match self.id.as_str() {
+            "accept" => ApprovalDecision::Accept,
+            "accept_always" => ApprovalDecision::AcceptAlways,
+            "deny" => ApprovalDecision::Deny,
+            _ => ApprovalDecision::Choose(self.id.clone()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct QuestionOption {
     pub label: String,
@@ -430,6 +443,18 @@ pub enum ApprovalDecision {
     Choose(String),
 }
 
+impl ApprovalDecision {
+    /// Stable wire and audit spelling shared by the TUI and the remote host.
+    pub fn as_str(&self) -> String {
+        match self {
+            ApprovalDecision::Accept => "accept".to_string(),
+            ApprovalDecision::AcceptAlways => "accept_always".to_string(),
+            ApprovalDecision::Deny => "deny".to_string(),
+            ApprovalDecision::Choose(option) => format!("choose:{option}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize)]
 pub struct TurnUsage {
     pub input_tokens: i64,
@@ -458,6 +483,32 @@ mod tests {
         assert!(!PermissionMode::Default.within_ceiling(PermissionMode::Plan));
         assert!(PermissionMode::Plan.within_ceiling(PermissionMode::Plan));
         assert!(!PermissionMode::BypassPermissions.within_ceiling(PermissionMode::AcceptEdits));
+    }
+
+    #[test]
+    fn approval_choices_map_to_decisions_and_names() {
+        let choice = |id: &str| ApprovalChoice {
+            id: id.into(),
+            label: id.into(),
+            kind: "allow_once".into(),
+        };
+        assert_eq!(choice("accept").decision(), ApprovalDecision::Accept);
+        assert_eq!(
+            choice("accept_always").decision(),
+            ApprovalDecision::AcceptAlways
+        );
+        assert_eq!(choice("deny").decision(), ApprovalDecision::Deny);
+        assert_eq!(
+            choice("opt-allow").decision(),
+            ApprovalDecision::Choose("opt-allow".into())
+        );
+        assert_eq!(ApprovalDecision::Accept.as_str(), "accept");
+        assert_eq!(ApprovalDecision::AcceptAlways.as_str(), "accept_always");
+        assert_eq!(ApprovalDecision::Deny.as_str(), "deny");
+        assert_eq!(
+            ApprovalDecision::Choose("opt-allow".into()).as_str(),
+            "choose:opt-allow"
+        );
     }
 
     #[test]

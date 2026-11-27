@@ -2,6 +2,10 @@
 
 Status on 2026-11-26: the first 100 successful PR runs record p50 62.0 seconds, p95 97.0 seconds, and max 150 seconds. The latest merged code PR and main push both took 71 seconds, with Test at 54 and 52 seconds, so the current code path still misses the one-minute target. The last 50 record p50 59.0 seconds, p95 69.0 seconds, and max 83 seconds. The 100-run window spans earlier CI designs, so the next 100 runs after `ba82720` are the current-design acceptance window. The latest 2026-11-25 eight-run sample is 56, 58, 59, 63, 64, 64, 75, and 76 seconds with a 64-second median, so the current design is close to the one-minute target but has not met it at p50. A free ARM runner was rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate; the x64 Test job stays in place.
 
+## 2026-11-27 upload-artifact Node 24 pin
+
+The CI and release workflows moved `actions/upload-artifact` from v4.6.2 to v7.0.2 at `cf430e030ddbb5b0abf93d22962f4752f3646cd9`. This was a `ci-repair` change. Local `actionlint`, `ci/selftest.sh`, `ci/check-ci.sh --base <main workflow> --allow-change`, and a full `cargo test --locked` passed. PR #391 run [46033595598](https://github.com/billy-enrizky/baton/actions/runs/46033595598) passed Changes, Test, Build, and Check; Selection guard failed only with `CI013 workflow commands, needs, if, timeout, or runner changed without --allow-change: test`, and Verify failed as a consequence. The owner merged with the documented override. Main push [46035169201](https://github.com/billy-enrizky/baton/actions/runs/46035169201) then succeeded in 84 seconds with Test 67, Build 44, Check 42, Selection guard 13, Changes 3, and Verify 5. The run log has no Node.js 20 action deprecation line. This is maintenance evidence, not a new percentile sample.
+
 ## 2026-11-26 latest runs
 
 | Run | Event | Whole run | Test job | Note |

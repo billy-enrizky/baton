@@ -614,7 +614,7 @@ Install and update copy the whole skill directory through a staging directory. S
 }
 ```
 
-`baton serve` claims the local store for one host process, runs provider and turn recovery, and listens on `BATON_HOME/serve.sock` with mode 0600 until SIGINT or SIGTERM. `--stdio` serves the spawner pipe instead, and `--socket <path>` overrides the path. Every socket request except `ping` must carry a live grant id and secret with the `read` scope, and the peer uid must match the host. On shutdown it stops recorded provider children with a verified command and start identity, cancels the turns, tasks, and runs it owns with the `host shut down` reason, reports the worktrees it leaves in place, settles turns and runs whose owner process stopped, then releases the claim. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and the `baton host takeover --pid <pid>` hint. The TUI opens read-only, shows the same ownership line, and refuses to send a prompt or change the store.
+`baton serve` claims the local store for one host process, runs provider and turn recovery, and listens on `BATON_HOME/serve.sock` with mode 0600 until SIGINT or SIGTERM. `--stdio` serves the spawner pipe instead, and `--socket <path>` overrides the path. Every socket request except `ping` must carry a live grant id and secret with the `read` scope, and the peer uid must match the host. `baton grant list` shows grants without their secrets, and `baton grant revoke <id>` deletes the client secret and refuses every later request. On shutdown it stops recorded provider children with a verified command and start identity, cancels the turns, tasks, and runs it owns with the `host shut down` reason, reports the worktrees it leaves in place, settles turns and runs whose owner process stopped, then releases the claim. A second host is refused with exit code 3 and the owning process. While a host is live, CLI and MCP clients exit 4 and name the owning pid and the `baton host takeover --pid <pid>` hint. The TUI opens read-only, shows the same ownership line, and refuses to send a prompt or change the store.
 
 With `--stdio`, the host accepts one newline-delimited JSON request per line. Responses carry the same `id`, and stdout carries no diagnostics:
 
@@ -719,6 +719,8 @@ baton files [query...] [--ignored] [--json]
 baton open <path[:line]> [--print]
 baton grep <query> [--case-sensitive] [--word] [--regex] [--json]
 baton memories [add|remove|clear] [-C path] [--json]
+baton grant list [--json]
+baton grant revoke <id> [--json]
 baton checkpoints <thread-id>
 baton queue [-t id] [--clear] [--json]
 baton auth [provider] [subscription|api]

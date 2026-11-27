@@ -127,6 +127,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: HostCommand,
     },
+    /// List or revoke pairing grants
+    Grant {
+        #[command(subcommand)]
+        command: GrantCommand,
+    },
     /// Serve the local thread store over MCP stdio for coding agents
     Mcp,
     /// Inspect every turn's tool calls, diff, and usage
@@ -442,6 +447,24 @@ pub fn login_command(provider: ProviderId) -> Option<Vec<&'static str>> {
 }
 
 #[derive(Subcommand, Clone)]
+pub enum GrantCommand {
+    /// List grants without their secrets
+    List {
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+    /// Revoke a grant and delete its client secret
+    Revoke {
+        /// Grant id
+        grant_id: String,
+        /// Emit a JSON object instead of lines
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand, Clone)]
 pub enum RunCommand {
     /// Settle a running orchestration with an explicit final status
     Settle {
@@ -718,6 +741,35 @@ mod tests {
                 assert!(!json);
             }
             _ => panic!("expected the exec command"),
+        }
+    }
+
+    #[test]
+    fn grant_list_and_revoke_parse() {
+        let cli = Cli::try_parse_from(["baton", "grant", "list", "--json"]).unwrap();
+        match cli.command {
+            Some(Commands::Grant {
+                command: GrantCommand::List { json: true },
+            }) => {}
+            _ => panic!("expected grant list"),
+        }
+        let cli = Cli::try_parse_from([
+            "baton",
+            "grant",
+            "revoke",
+            "00000000-0000-4000-8000-000000000000",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Grant {
+                command:
+                    GrantCommand::Revoke {
+                        grant_id,
+                        json: true,
+                    },
+            }) => assert_eq!(grant_id, "00000000-0000-4000-8000-000000000000"),
+            _ => panic!("expected grant revoke"),
         }
     }
 

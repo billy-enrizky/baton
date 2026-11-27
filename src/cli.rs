@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 use crate::types::ProviderId;
 
@@ -222,8 +223,18 @@ pub enum Commands {
         #[command(subcommand)]
         command: AuditCommand,
     },
-    /// Serve the local thread store over MCP stdio for coding agents
-    Mcp,
+    /// Serve the local thread store over MCP stdio or HTTP for coding agents
+    Mcp {
+        /// Listen for MCP HTTP requests on this host:port
+        #[arg(long, value_name = "ADDR", requires = "token_file")]
+        http: Option<String>,
+        /// File containing the bearer token (mode 0600)
+        #[arg(long, value_name = "PATH", requires = "http")]
+        token_file: Option<PathBuf>,
+        /// Allow a non-loopback HTTP bind on a trusted overlay
+        #[arg(long, requires = "http")]
+        trusted_overlay: bool,
+    },
     /// Inspect every turn's tool calls, diff, and usage
     Activity {
         /// Emit JSON
@@ -939,6 +950,37 @@ mod tests {
             }) => {}
             _ => panic!("expected audit list"),
         }
+    }
+
+    #[test]
+    fn mcp_http_requires_a_token_file() {
+        let cli = Cli::try_parse_from([
+            "baton",
+            "mcp",
+            "--http",
+            "127.0.0.1:8787",
+            "--token-file",
+            "/tmp/baton-mcp-token",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Commands::Mcp {
+                http: Some(addr),
+                token_file: Some(path),
+                trusted_overlay: false,
+            }) => {
+                assert_eq!(addr, "127.0.0.1:8787");
+                assert_eq!(path, PathBuf::from("/tmp/baton-mcp-token"));
+            }
+            _ => panic!("expected MCP HTTP"),
+        }
+        let missing = Cli::try_parse_from(["baton", "mcp", "--http", "127.0.0.1:8787"]);
+        assert!(missing.is_err(), "--http needs --token-file");
+        let overlay_without_http = Cli::try_parse_from(["baton", "mcp", "--trusted-overlay"]);
+        assert!(
+            overlay_without_http.is_err(),
+            "--trusted-overlay needs --http"
+        );
     }
 
     #[test]

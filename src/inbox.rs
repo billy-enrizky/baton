@@ -207,6 +207,30 @@ mod tests {
     }
 
     #[test]
+    fn an_indefinite_snooze_stays_hidden_until_cleared() {
+        let store = BatonStore::memory().unwrap();
+        let failed = thread(&store, "failed work");
+        fail_turn(&store, &failed.id, 1);
+        let now = Utc::now();
+        store
+            .set_thread_snoozed_at(
+                &failed.id,
+                &(now + chrono::Duration::seconds(1)).to_rfc3339(),
+                crate::snooze::INDEFINITE_UNTIL,
+            )
+            .unwrap();
+        let far_future = chrono::DateTime::parse_from_rfc3339("9998-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert!(
+            items_at(&store, far_future).unwrap().is_empty(),
+            "an indefinite snooze does not expire"
+        );
+        store.clear_thread_snooze(&failed.id).unwrap();
+        assert_eq!(items_at(&store, far_future).unwrap().len(), 1);
+    }
+
+    #[test]
     fn archived_threads_stay_out_of_the_inbox() {
         let store = BatonStore::memory().unwrap();
         let failed = thread(&store, "failed work");

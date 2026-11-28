@@ -6,7 +6,23 @@
 //! hidden past its timer.
 
 use anyhow::{anyhow, Result};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc};
+
+pub const INDEFINITE_UNTIL: &str = "9999-12-31T23:59:59.000Z";
+
+fn indefinite_time() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339(INDEFINITE_UNTIL)
+        .expect("the indefinite snooze timestamp is valid")
+        .with_timezone(&Utc)
+}
+
+pub fn is_indefinite_time(until: DateTime<Utc>) -> bool {
+    until.date_naive().year() >= 9999
+}
+
+pub fn is_indefinite(value: &str) -> bool {
+    parse_timestamp(value).is_some_and(is_indefinite_time)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnoozePreset {
@@ -14,13 +30,15 @@ pub enum SnoozePreset {
     FourHours,
     Tomorrow,
     Week,
+    Indefinite,
 }
 
-pub const PRESETS: [SnoozePreset; 4] = [
+pub const PRESETS: [SnoozePreset; 5] = [
     SnoozePreset::OneHour,
     SnoozePreset::FourHours,
     SnoozePreset::Tomorrow,
     SnoozePreset::Week,
+    SnoozePreset::Indefinite,
 ];
 
 impl SnoozePreset {
@@ -30,6 +48,7 @@ impl SnoozePreset {
             "4h" => Some(Self::FourHours),
             "tomorrow" | "1d" => Some(Self::Tomorrow),
             "week" | "7d" => Some(Self::Week),
+            "forever" | "indefinite" | "indefinitely" => Some(Self::Indefinite),
             _ => None,
         }
     }
@@ -40,6 +59,7 @@ impl SnoozePreset {
             Self::FourHours => "4h",
             Self::Tomorrow => "tomorrow",
             Self::Week => "week",
+            Self::Indefinite => "forever",
         }
     }
 
@@ -49,6 +69,7 @@ impl SnoozePreset {
             Self::FourHours => "in 4 hours",
             Self::Tomorrow => "tomorrow",
             Self::Week => "next week",
+            Self::Indefinite => "until woken",
         }
     }
 
@@ -58,13 +79,14 @@ impl SnoozePreset {
             Self::FourHours => now + Duration::hours(4),
             Self::Tomorrow => now + Duration::days(1),
             Self::Week => now + Duration::days(7),
+            Self::Indefinite => indefinite_time(),
         }
     }
 }
 
 pub fn parse_preset(value: &str) -> Result<SnoozePreset> {
     SnoozePreset::parse(value).ok_or_else(|| {
-        anyhow!("unknown snooze preset \"{value}\"; use 1h, 4h, tomorrow, week, or off")
+        anyhow!("unknown snooze preset \"{value}\"; use 1h, 4h, tomorrow, week, forever, or off")
     })
 }
 
@@ -83,6 +105,9 @@ pub fn parse_timestamp(value: &str) -> Option<DateTime<Utc>> {
 /// `14:32`, or `Nov 27 09:00` when the wake is not today. Local time, because
 /// the person reading it is the one who will come back to the thread.
 pub fn wake_label(until: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    if is_indefinite_time(until) {
+        return "until woken".to_string();
+    }
     let local = until.with_timezone(&chrono::Local);
     let local_now = now.with_timezone(&chrono::Local);
     if local.date_naive() == local_now.date_naive() {
@@ -115,6 +140,7 @@ mod tests {
             at("2026-11-27T12:00:00Z")
         );
         assert_eq!(SnoozePreset::Week.until(now), at("2026-12-03T12:00:00Z"));
+        assert_eq!(SnoozePreset::Indefinite.until(now), at(INDEFINITE_UNTIL));
     }
 
     #[test]
@@ -123,8 +149,14 @@ mod tests {
             assert_eq!(SnoozePreset::parse(preset.as_str()), Some(preset));
         }
         assert_eq!(SnoozePreset::parse("hour"), Some(SnoozePreset::OneHour));
+        assert_eq!(
+            SnoozePreset::parse("indefinitely"),
+            Some(SnoozePreset::Indefinite)
+        );
         assert!(SnoozePreset::parse("3h").is_none());
-        assert!(parse_preset("3h").unwrap_err().to_string().contains("off"));
+        let error = parse_preset("3h").unwrap_err().to_string();
+        assert!(error.contains("forever"), "{error}");
+        assert!(error.contains("off"), "{error}");
     }
 
     #[test]
@@ -146,5 +178,17 @@ mod tests {
         assert!(later.contains(':'), "{later}");
         let next_week = wake_label(at("2026-12-03T12:00:00Z"), now);
         assert!(next_week.contains("Dec"), "{next_week}");
+        assert_eq!(wake_label(at(INDEFINITE_UNTIL), now), "until woken");
+    }
+
+    #[test]
+    fn the_indefinite_sentinel_is_recognized_and_stays_active() {
+        let now = at("2026-11-26T12:00:00Z");
+        assert!(is_indefinite(INDEFINITE_UNTIL));
+        assert!(!is_indefinite("2026-11-26T13:00:00Z"));
+        assert_eq!(
+            active_until(Some(INDEFINITE_UNTIL), now),
+            Some(at(INDEFINITE_UNTIL))
+        );
     }
 }

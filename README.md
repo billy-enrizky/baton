@@ -416,7 +416,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | Command | What it does |
 |---|---|
 | `/threads`, `/open`, `/pin`, `/inbox` | List, open, pin, or triage threads; `/threads all` includes archived threads |
-| `/snooze` | Hide this thread from `/inbox` for an hour, four hours, a day, a week, or clear the snooze with `off`; a new failure or question after the snooze wakes it early |
+| `/snooze` | Hide this thread from `/inbox` for an hour, four hours, a day, a week, or until you wake it with `forever`; clear any snooze with `off`; a new failure or question after the snooze wakes it early |
 | `/snippets` | List, add, or remove prompt commands under `.baton/commands` or `--global` under `~/.baton/commands`; a template expands `{{args}}` and `{{cwd}}`, a project command shadows a user command with the same name, and a template that starts with `!` runs as a shell command |
 | `/schedule` | Open the schedule view; `p` pauses or resumes the selected row, `d` removes it after a second press, and Enter opens its thread. `/schedule add` starts a thread, cron, and prompt form; a blank thread uses the current one |
 | `/archive`, `/unarchive` | Hide a thread from the default lists and `/inbox`, or restore it; a running turn blocks the archive |

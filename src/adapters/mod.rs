@@ -261,7 +261,14 @@ pub enum TurnEvent {
         provider: crate::types::ProviderId,
         plan_id: String,
     },
-    Usage { usage: TurnUsage },
+    Usage {
+        usage: TurnUsage,
+    },
+    /// The model-reported context window, when the harness names one. A
+    /// harness that never reports one leaves every percentage unknown.
+    ContextWindow {
+        tokens: i64,
+    },
     /// A provider-reported rate-limit snapshot. Providers that do not report
     /// one leave the harness in an explicit unknown state.
     RateLimits {

@@ -135,6 +135,24 @@ impl ClaudeAdapter {
     }
 }
 
+/// Claude reports one window per model in `modelUsage`. A result that names
+/// different windows is ambiguous, so it reports none instead of guessing.
+fn context_window_from_model_usage(value: Option<&Value>) -> Option<i64> {
+    let usage = value?.as_object()?;
+    let mut windows = usage.values().filter_map(|entry| {
+        entry
+            .get("contextWindow")
+            .and_then(Value::as_i64)
+            .filter(|tokens| *tokens > 0)
+    });
+    let first = windows.next()?;
+    if windows.all(|tokens| tokens == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
 fn parse_usage(usage: &Value) -> TurnUsage {
     TurnUsage {
         input_tokens: usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
@@ -653,6 +671,10 @@ impl BatonAdapter for ClaudeAdapter {
                             ..Default::default()
                         });
                     }
+                    if let Some(tokens) = context_window_from_model_usage(message.get("modelUsage"))
+                    {
+                        let _ = emit.send(TurnEvent::ContextWindow { tokens });
+                    }
                     if message.get("is_error").and_then(Value::as_bool) == Some(true) {
                         result = Err(anyhow::anyhow!(if final_text.is_empty() {
                             "claude turn ended with an error".to_string()
@@ -714,6 +736,32 @@ impl BatonAdapter for ClaudeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_window_requires_one_agreed_value() {
+        let one = serde_json::json!({
+            "claude-opus-5-5[1m]": { "contextWindow": 1000000 }
+        });
+        assert_eq!(context_window_from_model_usage(Some(&one)), Some(1_000_000));
+        let agreeing = serde_json::json!({
+            "a": { "contextWindow": 200000 },
+            "b": { "contextWindow": 200000 }
+        });
+        assert_eq!(
+            context_window_from_model_usage(Some(&agreeing)),
+            Some(200_000)
+        );
+        let mixed = serde_json::json!({
+            "a": { "contextWindow": 200000 },
+            "b": { "contextWindow": 1000000 }
+        });
+        assert_eq!(context_window_from_model_usage(Some(&mixed)), None);
+        assert_eq!(context_window_from_model_usage(None), None);
+        assert_eq!(
+            context_window_from_model_usage(Some(&serde_json::json!({ "a": {} }))),
+            None
+        );
+    }
 
     #[test]
     fn command_args_request_partial_stream_messages() {

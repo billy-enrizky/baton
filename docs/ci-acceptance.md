@@ -4,7 +4,7 @@ Status on 2026-11-26: the first 100 successful PR runs record p50 62.0 seconds, 
 
 ## 2026-11-28 test profile without debuginfo
 
-`[profile.test] debug` moved from `1` to `0`. Run [46130099763](https://github.com/billy-enrizky/baton/actions/runs/46130099763) shows why the test profile is the lever: the Test step spent 26.07 seconds in cargo before the first test started, the log contains no `Compiling` line, and the 18 test binaries then took 12.78 seconds. That means the restored target tree is revalidated and replayed rather than rebuilt from scratch, so both artifact bytes and any real rebuild sit inside the 26.07 seconds.
+`[profile.test] debug` moved from `1` to `0`. Run [46130099763](https://github.com/billy-enrizky/baton/actions/runs/46130099763) shows why the test profile is the lever: the Test step spent 26.07 seconds in cargo before the first test started, the log shows exactly one `Compiling baton v0.4.3` line, and the 18 test binaries then took 12.78 seconds. Every dependency came from the restored cache, so the 26.07 seconds is Baton's own 18 test units, which is exactly what this profile controls.
 
 Method: two isolated `CARGO_TARGET_DIR` trees per variant, `CARGO_INCREMENTAL=0`, `cargo test --locked --no-run`, interleaved pairs. "Warm" removes only the `baton` package artifacts with `cargo clean -p baton` and keeps every dependency artifact, which is the steady state after a cache restore. "Cold" means an empty target directory; in CI the cold case is the one-time seed after the `Cargo.toml` hash changes.
 
@@ -20,7 +20,7 @@ The four-job column decides, because four build jobs match a standard runner. At
 
 What the change gives up: a temporary `tests/panic_probe.rs` was compiled under `debug = 0`. A failing `assert_eq!` still printed the test name, `panicked at tests/panic_probe.rs:5:5`, and both values. With `RUST_BACKTRACE=1` the frames kept their symbols and lost only the `at ./tests/panic_probe.rs:5:5` lines. The probe was deleted before the commit and is not in the tree.
 
-Cold seed: the `Cargo.toml` hash is part of the cache key, so the first run after this change is a cold seed. Its numbers are recorded separately and are not part of the warm sample.
+Cold seed: the `Cargo.toml` hash is part of the cache key, so the first run after this change cannot restore a usable test cache. PR #427 run [46134284130](https://github.com/billy-enrizky/baton/actions/runs/46134284130) recorded it: whole run 86 seconds, Test 69 seconds, Test step 53 seconds, 38.78 seconds of cargo with the dependency tree built from source, and 13.15 seconds of tests. The profile label moved from `[unoptimized + debuginfo]` to `[unoptimized]`, which proves the setting reached CI. Those numbers are the seed and are not a warm sample. The first pull request after the seed records the warm comparison, and this change is reverted if that run does not improve.
 
 Local verification: 1,246 tests, format debt 534, Clippy debt 60, all 55 formal gates, the CI admission model, the 22-page docs export, doc links, parity paths, and the CI self-tests.
 
@@ -37,7 +37,7 @@ The CI and release workflows moved `actions/upload-artifact` from v4.6.2 to v7.0
 | [45814071824](https://github.com/billy-enrizky/baton/actions/runs/45814071824) | pull request #330 | 73 seconds | 58 seconds | Skill install/update; all selected gates green |
 | [45814391195](https://github.com/billy-enrizky/baton/actions/runs/45814391195) | push `main` | 69 seconds | 49 seconds | Skill install/update; all selected gates green |
 
-The current gap is 9 to 13 seconds above target on whole-run time, with 17.5 seconds of test-profile compile and 10 seconds of Cargo cache restore inside a 54 to 58 second Test job. Two attempts to move that work were rejected in the table below. Run 46130099763 measured the same shape in a 62-second Test job: 26.07 seconds of cargo time before the first test, 12.78 seconds of test execution, and 7 seconds of Cargo cache restore.
+The current gap is 9 to 13 seconds above target on whole-run time, with 17.5 seconds of test-profile compile and 10 seconds of Cargo cache restore inside a 54 to 58 second Test job. Two attempts to move that work were rejected in the table below. Run 46130099763 measured the same shape in a 62-second Test job: 26.07 seconds of cargo time with a single `Compiling baton v0.4.3` line, 12.78 seconds of test execution, and 7 seconds of Cargo cache restore.
 
 ## 2026-11-25 latest runs
 

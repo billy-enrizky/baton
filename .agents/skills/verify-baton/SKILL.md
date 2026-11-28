@@ -5,7 +5,7 @@ description: "Drive baton's Rust CLI, TUI, and MCP stdio server through isolated
 
 # Verify baton
 
-Baton is a terminal app, so the proof is a terminal transcript, not a unit test alone. This skill builds the debug binary once, starts each drive in its own PTY with a temporary `BATON_HOME` and working directory, captures a full screen after forcing a redraw, and preserves the evidence. It also runs the 57-case slash sweep, the hermetic MCP probe, and the installed-binary check after a release.
+Baton is a terminal app, so the proof is a terminal transcript, not a unit test alone. This skill builds the debug binary once, starts each drive in its own PTY with a temporary `BATON_HOME` and working directory, captures a full screen after forcing a redraw, and preserves the evidence. It also runs the slash sweep, the hermetic MCP probe, and the installed-binary check after a release.
 
 ## Launch
 
@@ -97,11 +97,13 @@ Use the focused probe for the workflow you changed. Each one prints one JSON sum
 | Codex plan and `/plan` overlay | `scripts/plan_probe.py` | zero, fake Codex app-server |
 | MCP stdio handshake and read-only tools | `scripts/mcp_probe.py` | zero, seeds an empty thread with `baton new` |
 | Command palette | `scripts/palette_probe.py` | zero |
-| Usage scope and grouping picker | 57-case slash sweep | zero |
+| Usage scope and grouping picker | `scripts/slash_sweep.py` | zero |
 | One-shot shell command | `scripts/tui_probe.py --command '!printf shell-probe'` | zero |
 | Single slash command or status frame | `scripts/tui_probe.py` | zero |
 | Slash argument choices and completion | `scripts/slash_probe.py` | zero |
-| All 57 sweep cases across the registered slash commands and argument variants | `scripts/slash_sweep.py` | zero |
+| Every registered slash command and argument variant | `scripts/slash_sweep.py` | zero |
+
+The slash sweep prints its own case count in `summary.json`, so this map never repeats the number and cannot go stale when a case is added; `ci/selftest.sh` rejects a restated count. The latest recorded run on 2026-11-28 at commit `0aff17c` used binary `54b429ab57aa154a8a2ab96eae3d781d43701a8f4499dac8f47a45a0dbf3adc3` and wrote evidence to `local_docs/verification/evidence/slash-sweep-1795861488`.
 | All advertised harnesses with ICA or an explicit account block | `scripts/harness_matrix_probe.py` | four small ICA turns; the live Claude turn is opt-in and Cursor is capability-only |
 
 Every probe accepts `--binary` (default `~/.cargo/bin/baton`) and `--evidence-dir`. To run it against a change before merge, pass `--binary target/debug/baton`.

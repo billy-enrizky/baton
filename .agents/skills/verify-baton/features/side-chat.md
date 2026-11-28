@@ -16,7 +16,7 @@ Run one turn, then type `/btw why does this work?` or a bare `/btw`.
 - `btw_opens_a_marked_side_chat_and_prefills_the_prompt`
 - `merge_back_moves_the_delta_and_redacts_keys`
 - `merge_back_requires_a_side_chat_and_a_delta`
-- The 57-case slash sweep runs `/btw` and requires the side-chat notice.
+- The slash sweep runs `/btw` and requires the side-chat notice.
 
 ## Gotchas
 - The side chat shares the source working tree, like `/fork`. It is not an isolated worktree; use `/worktree` for that.

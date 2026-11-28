@@ -375,6 +375,32 @@ if [[ "$(cat "$timings_out")" != "$expected_timings" ]]; then
   exit 1
 fi
 
+reject_restated_sweep_counts() {
+  # The slash sweep prints its own case count, so a number copied into a map of
+  # current coverage goes stale when a case is added. Historical release proofs
+  # keep their numbers because they describe what ran then.
+  local file
+  for file in "$@"; do
+    grep -nE '[0-9]+[ -](case|cases|command|commands|sweep)' "$file" 2>/dev/null
+  done
+}
+
+sweep_fixture=$(mktemp -d)
+printf 'The 57-case slash sweep covers it.\n' >"$sweep_fixture/map.md"
+if ! reject_restated_sweep_counts "$sweep_fixture/map.md" >/dev/null; then
+  echo "the proof-map guard missed a restated sweep count" >&2
+  exit 1
+fi
+current_maps=(
+  "$repo_root/.agents/skills/verify-baton/SKILL.md"
+  "$repo_root/.agents/skills/verify-baton/features/README.md"
+)
+if reject_restated_sweep_counts "${current_maps[@]}" >/dev/null; then
+  echo "a current proof map restates a generated sweep count" >&2
+  reject_restated_sweep_counts "${current_maps[@]}" >&2
+  exit 1
+fi
+
 bash "$root/installer-selftest.sh" "$repo_root"
 
 echo "ci selftest passed"

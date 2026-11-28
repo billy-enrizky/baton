@@ -26,6 +26,7 @@ A harness is the coding agent CLI that performs a turn. Baton does not bundle a 
 - Permission modes for the harnesses that accept them.
 - A model picker built from the harness's own model list, cached in `~/.baton/model-cache/`.
 - An approval and question overlay, so a request from the harness appears as rows you can answer with the arrow keys.
+- Read-only ACP file access for the ACP harnesses: relative paths resolve against the thread working directory, symlinks and `..` paths cannot escape it, and Baton does not advertise file writes.
 
 ## What Baton does not add
 

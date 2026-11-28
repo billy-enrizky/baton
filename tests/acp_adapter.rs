@@ -120,6 +120,158 @@ async fn fake_acp_agent(read: tokio::io::DuplexStream, mut write: tokio::io::Dup
     }
 }
 
+async fn fake_acp_agent_reads_client_file(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+    request_path: String,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    let mut client_fs = Value::Null;
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let id = frame.get("id").cloned();
+        match method.as_str() {
+            "initialize" => {
+                client_fs = frame
+                    .pointer("/params/clientCapabilities/fs")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": 2,
+                            "authMethods": []
+                        }
+                    }),
+                )
+                .await;
+            }
+            "session/new" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": { "sessionId": "acp-session-1" }
+                    }),
+                )
+                .await;
+            }
+            "session/set_mode" | "session/set_config_option" | "session/set_model" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                )
+                .await;
+            }
+            "session/prompt" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "acp-session-1",
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": {
+                                    "type": "text",
+                                    "text": format!(
+                                        "cap:read={},write={}",
+                                        client_fs.get("readTextFile").and_then(Value::as_bool).unwrap_or(false),
+                                        client_fs.get("writeTextFile").and_then(Value::as_bool).unwrap_or(true)
+                                    )
+                                }
+                            }
+                        }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": "client-file-read",
+                        "method": "fs/read_text_file",
+                        "params": {
+                            "sessionId": "acp-session-1",
+                            "path": request_path,
+                            "line": 2,
+                            "limit": 2
+                        }
+                    }),
+                )
+                .await;
+                let mut response_line = String::new();
+                lines.read_line(&mut response_line).await.unwrap();
+                let response: Value = serde_json::from_str(response_line.trim()).unwrap();
+                let text = response
+                    .get("result")
+                    .and_then(|result| result.get("content"))
+                    .and_then(Value::as_str)
+                    .map(|content| format!("file:{content}"))
+                    .or_else(|| {
+                        response
+                            .get("error")
+                            .and_then(|error| error.get("message"))
+                            .and_then(Value::as_str)
+                            .map(|message| format!("error:{message}"))
+                    })
+                    .unwrap_or_else(|| "missing response".to_string());
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "acp-session-1",
+                            "update": {
+                                "sessionUpdate": "agent_message_chunk",
+                                "content": { "type": "text", "text": text }
+                            }
+                        }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "acp-session-1",
+                            "update": { "sessionUpdate": "state_update", "state": "idle", "stopReason": "end_turn" }
+                        }
+                    }),
+                )
+                .await;
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "stopReason": "end_turn" } }),
+                )
+                .await;
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn fake_acp_agent_exits_with_question(
     read: tokio::io::DuplexStream,
     mut write: tokio::io::DuplexStream,
@@ -549,6 +701,53 @@ async fn acp_adapter_runs_a_full_turn_with_streaming() {
             baton::adapters::TurnEvent::TurnCompleted { final_text, .. } if final_text == "hello acp"
         )),
         "streamed ACP text is kept as the final answer"
+    );
+    adapter.dispose().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acp_client_file_reads_use_relative_cwd_and_advertise_read_only() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("notes.txt"), "one\ntwo\nthree\nfour").unwrap();
+    let spawner = Arc::new(
+        move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            tokio::spawn(fake_acp_agent_reads_client_file(
+                server_read,
+                server_write,
+                "notes.txt".to_string(),
+            ));
+            Ok(halves)
+        },
+    );
+    let mut adapter = AcpAdapter::new(ProviderId::Antigravity, spawner);
+    let input = baton::adapters::TurnStartInput {
+        turn: 1,
+        thread_id: "thread".into(),
+        cwd: workspace.path().to_string_lossy().to_string(),
+        model: "model".into(),
+        effort: None,
+        prompt: "read the notes".into(),
+        permission_mode: PermissionMode::Default,
+        auth_env: vec![],
+    };
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        adapter.start_turn(input, None, event_sender),
+    )
+    .await
+    .expect("the client file read completes")
+    .expect("the turn completes");
+    let events: Vec<TurnEvent> = event_receiver.try_iter().collect();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TurnEvent::TurnCompleted { final_text, .. }
+                if final_text.contains("cap:read=true,write=false")
+                    && final_text.contains("file:two\nthree")
+        )),
+        "the client file response and capability reach the turn: {events:?}"
     );
     adapter.dispose().await.unwrap();
 }

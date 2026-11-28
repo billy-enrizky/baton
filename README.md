@@ -159,7 +159,7 @@ In this documentation, a harness is a command-line coding agent. The supported h
 | OpenCode | The open-source coding agent |
 | Antigravity | Google's Antigravity agent |
 
-Baton starts the harness, sends the prompt, reads its structured events, and records the turn. The harness still uses its own subscription or API key.
+Baton starts the harness, sends the prompt, reads its structured events, and records the turn. The harness still uses its own subscription or API key. Cursor, Grok, and Antigravity speak ACP; Baton gives them read-only file access inside the thread working directory and does not advertise file writes.
 
 ### 1.4 What Baton is not
 

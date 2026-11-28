@@ -12,6 +12,7 @@
 - `--tls-cert` and `--tls-key` serve HTTPS; the key must be mode 0600, and TLS conflicts with `--trusted-overlay`
 - An HTTP `initialize` returns an `Mcp-Session-Id`; later POSTs must send it, and `DELETE /mcp` ends it
 - A missing session id is 400, an unknown or ended id is 404, and at most 1,024 sessions stay live
+- A session expires after 30 minutes without a request; activity refreshes it, and expired sessions no longer block capacity
 - On Unix, SIGHUP reloads the token file; a valid replacement takes effect and an invalid one keeps the current token
 - Unknown tools return a tool result with `isError: true` and `unknown baton tool <name>`
 

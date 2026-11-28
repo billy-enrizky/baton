@@ -247,6 +247,7 @@ pub fn discover(cwd: &Path, env: &MemoryEnvironment) -> MemoryListing {
     }
 
     let mut codex_rows = Vec::new();
+    let fallbacks = codex_fallback_filenames(env, &mut warnings);
     let user_override = env.codex_home.join("AGENTS.override.md");
     let has_user_override = user_override.is_file();
     if has_user_override {
@@ -282,7 +283,8 @@ pub fn discover(cwd: &Path, env: &MemoryEnvironment) -> MemoryListing {
             ));
         }
         let agents = dir.join("AGENTS.md");
-        if agents.is_file() {
+        let has_agents = agents.is_file();
+        if has_agents {
             codex_rows.push(memory_file_row(
                 "Parent instructions",
                 agents,
@@ -294,6 +296,23 @@ pub fn discover(cwd: &Path, env: &MemoryEnvironment) -> MemoryListing {
                 },
                 "Missing · enter creates",
             ));
+        }
+        let has_base = has_override || has_agents;
+        for name in &fallbacks {
+            let path = dir.join(name);
+            if path.is_file() {
+                codex_rows.push(memory_file_row(
+                    "Parent fallback",
+                    path,
+                    env,
+                    if has_base {
+                        "Codex fallback; AGENTS.md wins at"
+                    } else {
+                        "Codex fallback filename at"
+                    },
+                    "Missing · enter creates",
+                ));
+            }
         }
     }
     let project_override = root.join("AGENTS.override.md");
@@ -319,8 +338,8 @@ pub fn discover(cwd: &Path, env: &MemoryEnvironment) -> MemoryListing {
         "Missing · enter creates",
     ));
     let has_project_base = has_project_override || root.join("AGENTS.md").is_file();
-    for name in codex_fallback_filenames(env, &mut warnings) {
-        let path = root.join(&name);
+    for name in &fallbacks {
+        let path = root.join(name);
         if path.is_file() {
             codex_rows.push(memory_file_row(
                 "Project fallback",
@@ -1257,6 +1276,58 @@ mod tests {
                     path: std::fs::canonicalize(repo.join("src/deep/AGENTS.md")).unwrap(),
                 }
         }));
+    }
+
+    #[test]
+    fn discovery_lists_ancestor_codex_fallbacks_from_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+        let env = environment(temp.path());
+        std::fs::create_dir_all(&env.codex_home).unwrap();
+        std::fs::write(
+            env.codex_home.join("config.toml"),
+            "project_doc_fallback_filenames = [\"TEAM.md\"]\n",
+        )
+        .unwrap();
+        std::fs::write(repo.join("TEAM.md"), "root team").unwrap();
+        std::fs::write(repo.join("src/AGENTS.md"), "src agents").unwrap();
+        std::fs::write(repo.join("src/TEAM.md"), "src team").unwrap();
+        std::fs::write(repo.join("src/deep/AGENTS.md"), "deep agents").unwrap();
+
+        let listing = discover(&repo.join("src/deep"), &env);
+        let parents = listing
+            .rows()
+            .into_iter()
+            .filter(|(section, row)| section.title == "Codex" && row.label == "Parent fallback")
+            .map(|(_, row)| (row.action.clone(), row.detail.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(parents.len(), 2, "{parents:?}");
+        assert_eq!(
+            parents[0].0,
+            MemoryAction::OpenFile {
+                path: std::fs::canonicalize(repo.join("TEAM.md")).unwrap()
+            }
+        );
+        assert!(
+            parents[0].1.contains("fallback filename"),
+            "{}",
+            parents[0].1
+        );
+        assert_eq!(
+            parents[1].0,
+            MemoryAction::OpenFile {
+                path: std::fs::canonicalize(repo.join("src/TEAM.md")).unwrap()
+            }
+        );
+        assert!(parents[1].1.contains("AGENTS.md wins"), "{}", parents[1].1);
     }
 
     #[test]

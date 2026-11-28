@@ -26,7 +26,7 @@ COMMANDS = [
     # command is in the help text; this screen checks that a recently added
     # command reaches the rendered surface, which clips on a short terminal.
     ("/help all", ["/auth", "/task"]),
-    ("/status", ["thread:", "adapters:"]),
+    ("/status", ["thread:", "permissions:", "adapters:"]),
     ("/usage", ["usage ·", "This thread", "All threads"]),
     ("/plan", ["no plan available"]),
     ("/context", ["context:"]),

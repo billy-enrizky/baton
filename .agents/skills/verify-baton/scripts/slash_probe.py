@@ -992,6 +992,8 @@ def main() -> int:
         os.write(master, b"/status\r")
         pump(master, 1.0, transcript)
         after_failure = screen_text(transcript, args.width, args.height)
+        if "permissions:" not in after_failure:
+            missing.append("/status permissions line")
         if "adapters:" not in after_failure:
             missing.append("TUI accepted input after editor failure")
         (evidence / "files-open-failure-screen.txt").write_text(

@@ -5,9 +5,9 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Feature | Surface | Proof |
 |---|---|---|
 | Doctor | CLI | `baton doctor` next action, six providers, readiness, database count |
-| TUI status | TUI | `/status` shows thread, phase, queue, adapter lifecycle, and the cached rate-limit plan with window percentages and a `/limits` refresh hint |
+| TUI status | TUI | `/status` shows thread, effective permissions with the selected mode and provider default, phase, queue, adapter lifecycle, and the cached rate-limit plan with window percentages and a `/limits` refresh hint |
 | Queued follow-ups | TUI | `/queue` opens the queue; Enter sends, `e` edits, `d` deletes, `c` twice clears, and Ctrl+Up/Ctrl+Down reorder; every action persists through the store |
-| Slash choices | TUI | typing a command argument lists valid choices or its syntax, filters them, and completes with Tab or Enter; `slash_sweep.py` runs 57 cases across 51 of the 52 registered commands plus argument variants, and `slash_probe.py` covers the remaining `/quit` path |
+| Slash choices | TUI | typing a command argument lists valid choices or its syntax, filters them, and completes with Tab or Enter; `slash_sweep.py` runs 63 cases across the registered commands plus argument variants, and `slash_probe.py` covers `/quit` and the cross-command journeys |
 | Settings | TUI | `/settings` writes global default mode and bell choices, shows the selected category's options, and labels harness rows read-only |
 | Auth billing | TUI | `/auth` lists every harness with subscription and API rows, marks the current mode, names the key variable or `missing`, applies a keyed choice, and keeps the picker open on a missing key or malformed config |
 | Login | TUI | `/login` lists every harness with the command it runs, suspends the TUI, runs the harness login, then resumes and reports the result |

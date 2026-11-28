@@ -427,7 +427,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/grep` | Search project contents, insert `path:line`, or open the match |
 | `/find` | Search the conversation |
 | `/activity`, `/commands`, `/agents` | Inspect turns, tool calls, and subagent calls |
-| `/usage`, `/context`, `/status`, `/turns`, `/limits` | Inspect usage with a scope and grouping picker, plus context (including percent of the model-reported window, or an explicit unknown), status, turn history, and live or stored rate-limit windows; the composer warns at 80 percent with `/compact`, and the window plus the latest usage persist with their model across restarts |
+| `/usage`, `/context`, `/status`, `/turns`, `/limits` | Inspect usage with a scope and grouping picker, plus context (including percent of the model-reported window, or an explicit unknown), status, turn history, and live or stored rate-limit windows; the composer warns at 80 percent with `/compact`, the window plus the latest usage persist with their model across restarts, with Claude reporting a window from its result frame and ACP harnesses reporting used tokens and size from `usage_update` |
 | `/memory` | Open Claude and Codex instruction files, project memory, any parent `CLAUDE.md` or `AGENTS.md` between the repository root and the working directory, and Codex fallback filenames from `config.toml` at the working directory and its parents |
 
 `/files` and `/grep` use `rg` when it is installed and fall back to `git ls-files` and `git grep` inside a repository. Ctrl+O opens the selected file in `VISUAL` or `EDITOR`.

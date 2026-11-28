@@ -6,6 +6,7 @@
 - The model is a config family selected with `session/set_config_option` (`configId: "model"`), not `session/set_model`
 - `apiKeyEnv` names the variable baton reads; the child receives `GEMINI_API_KEY`
 - `apiBaseUrl` maps to `GOOGLE_GEMINI_BASE_URL`; it is the endpoint root, not the OpenAI `/v1` base
+- ACP `usage_update` frames report `used` tokens and a positive `size`; Baton maps them to the context used and window, so `/context` and the 80 percent composer warning work for this harness
 
 ## How to get to it
 ```sh
@@ -20,6 +21,10 @@ CODEX_ICA_API_KEY=... .agents/skills/verify-baton/scripts/antigravity_probe.py \
 ```
 
 The probe writes a throwaway config with `mode: "api"`, `apiKeyEnv: "CODEX_ICA_API_KEY"`, the ICA root URL, and `gemini-3.7-flash`, runs one turn, and passes only when the reply is `AGY_OK`, the phase is completed, the error is null, exit is 0, and `baton ps --json` is empty. It spends one small Gemini turn.
+
+## Proof
+- `adapters::acp::tests::acp_usage_updates_report_used_and_context_size`
+- `tui::tests::an_acp_context_used_event_updates_the_cached_usage`
 
 ## Gotchas
 - The base URL is the host root. `agy` appends `/v1beta/models/...`; adding `/v1` returns HTTP 404.

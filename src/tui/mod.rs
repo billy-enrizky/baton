@@ -12090,6 +12090,12 @@ fn handle_command(
         },
         "/skills" => {
             let cwd = std::path::PathBuf::from(&state.thread.cwd);
+            // A crash between install renames leaves the project without its
+            // skill, so opening the picker is the first moment the user would
+            // notice. Repair before the listing is read.
+            let repaired = crate::skills::reconcile_project_skills(&cwd)
+                .ok()
+                .filter(|outcome| !outcome.is_empty());
             let skills: Vec<SkillChoice> = sync::scan_skills_in(&cwd)
                 .into_iter()
                 .map(|skill| SkillChoice {
@@ -12101,14 +12107,25 @@ fn handle_command(
                 })
                 .collect();
             if skills.is_empty() {
-                state.notice = Some(
-                    "no skills found in the configured Claude or Codex skill directories".into(),
-                );
+                state.notice = Some(match &repaired {
+                    Some(outcome) => format!(
+                        "no skills found in the configured Claude or Codex skill directories; repaired {} interrupted skill operation(s)",
+                        outcome.repaired()
+                    ),
+                    None => "no skills found in the configured Claude or Codex skill directories"
+                        .into(),
+                });
             } else {
                 state.overlay = Overlay::SkillsPicker {
                     selected: 0,
                     skills,
                 };
+                if let Some(outcome) = &repaired {
+                    state.notice = Some(format!(
+                        "repaired {} interrupted skill operation(s)",
+                        outcome.repaired()
+                    ));
+                }
             }
         }
         "/switch" => {
@@ -39772,5 +39789,41 @@ exit 1
             .unwrap_or("")
             .contains("cannot load roles"));
         assert!(matches!(state.overlay, Overlay::None));
+    }
+
+    #[test]
+    fn skills_command_repairs_a_crashed_swap_before_listing() {
+        let home = tempfile::tempdir().unwrap();
+        let skills = home.path().join(".claude").join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let backup = skills.join(".baton-backup-0123456789abcdef0123456789abcdef-demo");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("SKILL.md"), "---\nname: demo\n---\n").unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+
+        handle_command(&mut state, &store, &engine_command_sender, "/skills");
+
+        let Overlay::SkillsPicker {
+            skills: choices, ..
+        } = &state.overlay
+        else {
+            panic!("expected the skills picker");
+        };
+        assert!(
+            choices.iter().any(|choice| choice.name == "demo"),
+            "the restored skill is missing: {choices:?}"
+        );
+        assert!(
+            state
+                .notice
+                .as_deref()
+                .unwrap_or("")
+                .contains("repaired 1 interrupted skill operation"),
+            "notice: {:?}",
+            state.notice
+        );
+        assert!(!backup.exists());
     }
 }

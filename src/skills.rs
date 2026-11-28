@@ -6,6 +6,11 @@ const DEFAULT_MAX_FILES: usize = 2048;
 const DEFAULT_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_TREE_DEPTH: usize = 32;
 
+const STAGING_PREFIX: &str = ".baton-staging-";
+const BACKUP_PREFIX: &str = ".baton-backup-";
+const TRASH_PREFIX: &str = ".baton-trash-";
+const TRANSIENT_ID_LEN: usize = 32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillInstallMode {
     Install,
@@ -66,6 +71,22 @@ pub fn is_safe_skill_name(name: &str) -> bool {
 
 pub fn is_reserved_skill_name(name: &str) -> bool {
     name.eq_ignore_ascii_case("memories")
+}
+
+/// A transient directory carries the skill name after its one-time id, so a
+/// later run can tell which project skill an interrupted install belonged to.
+fn transient_path(root: &Path, prefix: &str, name: &str) -> PathBuf {
+    root.join(format!("{prefix}{}-{name}", uuid::Uuid::new_v4().simple()))
+}
+
+fn transient_skill_name<'a>(entry: &'a str, prefix: &str) -> Option<&'a str> {
+    let rest = entry.strip_prefix(prefix)?;
+    let (id, tail) = rest.split_at_checked(TRANSIENT_ID_LEN)?;
+    if !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let name = tail.strip_prefix('-')?;
+    (is_safe_skill_name(name) && !is_reserved_skill_name(name)).then_some(name)
 }
 
 pub fn install_skill(
@@ -134,6 +155,7 @@ fn install_skill_with_limits(
     let root = cwd.join(harness_dir).join("skills");
     reject_symlinked_destination(&cwd.join(harness_dir))?;
     reject_symlinked_destination(&root)?;
+    reconcile_project_skills(cwd)?;
     let destination = root.join(name);
     let destination_meta = match fs::symlink_metadata(&destination) {
         Ok(meta) => Some(meta),
@@ -159,7 +181,7 @@ fn install_skill_with_limits(
 
     fs::create_dir_all(&root)
         .with_context(|| format!("cannot create skill root {}", root.display()))?;
-    let staging = root.join(format!(".baton-staging-{}", uuid::Uuid::new_v4().simple()));
+    let staging = transient_path(&root, STAGING_PREFIX, name);
     let mut progress = CopyProgress { files: 0, bytes: 0 };
     if let Err(error) = copy_tree(source, &staging, limits, &mut progress, 0) {
         remove_owned_tree(&staging);
@@ -183,7 +205,7 @@ fn install_skill_with_limits(
         });
     }
 
-    let backup = root.join(format!(".baton-backup-{}", uuid::Uuid::new_v4().simple()));
+    let backup = transient_path(&root, BACKUP_PREFIX, name);
     fs::rename(&destination, &backup).with_context(|| {
         format!(
             "cannot move the existing project skill {} out of the way",
@@ -238,6 +260,7 @@ pub fn remove_skill(cwd: &Path, harness: &str, name: &str) -> Result<SkillRemove
     let root = cwd.join(harness_dir).join("skills");
     reject_symlinked_destination(&cwd.join(harness_dir))?;
     reject_symlinked_destination(&root)?;
+    reconcile_project_skills(cwd)?;
     let destination = root.join(name);
     let destination_meta = match fs::symlink_metadata(&destination) {
         Ok(meta) => meta,
@@ -255,7 +278,7 @@ pub fn remove_skill(cwd: &Path, harness: &str, name: &str) -> Result<SkillRemove
         bail!("project skill has no SKILL.md");
     }
 
-    let trash = root.join(format!(".baton-trash-{}", uuid::Uuid::new_v4().simple()));
+    let trash = transient_path(&root, TRASH_PREFIX, name);
     fs::rename(&destination, &trash).with_context(|| {
         format!(
             "cannot stage project skill {} for removal",
@@ -342,6 +365,96 @@ fn copy_tree(
 
 fn remove_owned_tree(path: &Path) {
     let _ = fs::remove_dir_all(path);
+}
+
+/// What a reconcile repaired, so a caller can report it.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct SkillReconcile {
+    pub restored: Vec<PathBuf>,
+    pub removed: Vec<PathBuf>,
+}
+
+impl SkillReconcile {
+    pub fn is_empty(&self) -> bool {
+        self.restored.is_empty() && self.removed.is_empty()
+    }
+
+    pub fn repaired(&self) -> usize {
+        self.restored.len() + self.removed.len()
+    }
+}
+
+/// Repairs the project skill roots after an interrupted install, update, or
+/// removal. Only directories that carry a transient prefix and a valid skill
+/// name are touched, so an unrecognised entry is left exactly as it is.
+pub fn reconcile_project_skills(cwd: &Path) -> Result<SkillReconcile> {
+    let mut outcome = SkillReconcile::default();
+    for harness_dir in [".claude", ".codex"] {
+        reconcile_skill_root(&cwd.join(harness_dir).join("skills"), &mut outcome)?;
+    }
+    Ok(outcome)
+}
+
+fn reconcile_skill_root(root: &Path, outcome: &mut SkillReconcile) -> Result<()> {
+    let meta = match fs::symlink_metadata(root) {
+        Ok(meta) => meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect skill root {}", root.display()))
+        }
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Ok(());
+    }
+    let entries =
+        fs::read_dir(root).with_context(|| format!("cannot read skill root {}", root.display()))?;
+    for entry in entries {
+        let entry = entry.with_context(|| format!("cannot read skill root {}", root.display()))?;
+        let Ok(entry_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        let path = entry.path();
+        if transient_skill_name(&entry_name, STAGING_PREFIX).is_some() {
+            // A staged copy only becomes a skill through a rename, so it holds
+            // nothing the project refers to.
+            remove_owned_tree(&path);
+            outcome.removed.push(path);
+            continue;
+        }
+        if transient_skill_name(&entry_name, TRASH_PREFIX).is_some() {
+            // Removal was the requested end state, so finishing it is the repair.
+            remove_owned_tree(&path);
+            outcome.removed.push(path);
+            continue;
+        }
+        let Some(name) = transient_skill_name(&entry_name, BACKUP_PREFIX) else {
+            continue;
+        };
+        let destination = root.join(name);
+        match fs::symlink_metadata(&destination) {
+            // The swap happened; only the backup cleanup was interrupted.
+            Ok(_) => {
+                remove_owned_tree(&path);
+                outcome.removed.push(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::rename(&path, &destination).with_context(|| {
+                    format!(
+                        "cannot restore project skill {} from {}",
+                        destination.display(),
+                        path.display()
+                    )
+                })?;
+                outcome.restored.push(destination);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("cannot inspect {}", destination.display()))
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -631,5 +744,179 @@ mod tests {
             "{error}"
         );
         assert!(project.join("SKILL.md").is_file());
+    }
+
+    const TRANSIENT_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn transient(root: &Path, prefix: &str, name: &str) -> PathBuf {
+        let path = root.join(format!("{prefix}{TRANSIENT_ID}-{name}"));
+        fs::create_dir_all(&path).unwrap();
+        fs::write(path.join("SKILL.md"), "staged\n").unwrap();
+        path
+    }
+
+    #[test]
+    fn transient_names_carry_the_skill_name() {
+        let path = transient_path(Path::new("/tmp/root"), BACKUP_PREFIX, "demo");
+        let entry = path.file_name().unwrap().to_str().unwrap();
+        assert!(entry.starts_with(BACKUP_PREFIX));
+        assert_eq!(transient_skill_name(entry, BACKUP_PREFIX), Some("demo"));
+        assert_eq!(transient_skill_name(entry, STAGING_PREFIX), None);
+        assert_eq!(transient_skill_name(entry, TRASH_PREFIX), None);
+    }
+
+    #[test]
+    fn reconcile_removes_a_staged_copy_from_an_interrupted_install() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let skills = cwd.join(".codex/skills");
+        fs::create_dir_all(&skills).unwrap();
+        let staging = transient(&skills, STAGING_PREFIX, "demo");
+
+        let outcome = reconcile_project_skills(&cwd).unwrap();
+
+        assert_eq!(outcome.removed, vec![staging.clone()]);
+        assert!(outcome.restored.is_empty());
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn reconcile_restores_the_backup_when_the_swap_never_happened() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let skills = cwd.join(".claude/skills");
+        fs::create_dir_all(&skills).unwrap();
+        let backup = transient(&skills, BACKUP_PREFIX, "demo");
+        let destination = skills.join("demo");
+
+        let outcome = reconcile_project_skills(&cwd).unwrap();
+
+        assert_eq!(outcome.restored, vec![destination.clone()]);
+        assert_eq!(
+            fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            "staged\n"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn reconcile_drops_the_backup_when_the_swap_completed() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let skills = cwd.join(".claude/skills");
+        fs::create_dir_all(&skills).unwrap();
+        let destination = skill(&skills, "demo", "new\n");
+        let backup = transient(&skills, BACKUP_PREFIX, "demo");
+
+        let outcome = reconcile_project_skills(&cwd).unwrap();
+
+        assert!(outcome.restored.is_empty());
+        assert_eq!(outcome.removed, vec![backup.clone()]);
+        assert!(!backup.exists());
+        assert_eq!(
+            fs::read_to_string(destination.join("SKILL.md")).unwrap(),
+            "new\n"
+        );
+    }
+
+    #[test]
+    fn reconcile_finishes_an_interrupted_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let skills = cwd.join(".codex/skills");
+        fs::create_dir_all(&skills).unwrap();
+        let trash = transient(&skills, TRASH_PREFIX, "demo");
+
+        let outcome = reconcile_project_skills(&cwd).unwrap();
+
+        assert_eq!(outcome.removed, vec![trash.clone()]);
+        assert!(!trash.exists());
+        assert!(!skills.join("demo").exists());
+    }
+
+    #[test]
+    fn reconcile_leaves_an_unrecognised_transient_directory_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let skills = cwd.join(".claude/skills");
+        fs::create_dir_all(&skills).unwrap();
+        let legacy = skills.join(".baton-backup-legacy");
+        let short = skills.join(".baton-staging-0123456789abcdef");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::create_dir_all(&short).unwrap();
+
+        let outcome = reconcile_project_skills(&cwd).unwrap();
+
+        assert!(outcome.is_empty());
+        assert!(legacy.exists());
+        assert!(short.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reconcile_skips_a_symlinked_skill_root() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let real = root.path().join("real-skills");
+        fs::create_dir_all(&real).unwrap();
+        let trash = transient(&real, TRASH_PREFIX, "demo");
+        fs::create_dir_all(cwd.join(".claude")).unwrap();
+        symlink(&real, cwd.join(".claude/skills")).unwrap();
+
+        let outcome = reconcile_project_skills(&cwd).unwrap();
+
+        assert!(outcome.is_empty());
+        assert!(trash.exists());
+    }
+
+    #[test]
+    fn update_repairs_a_crashed_swap_before_installing() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let global = root.path().join("global");
+        fs::create_dir_all(&cwd).unwrap();
+        let skills = cwd.join(".claude/skills");
+        fs::create_dir_all(&skills).unwrap();
+        transient(&skills, BACKUP_PREFIX, "demo");
+        let source = skill(&global, "demo", "version two\n");
+
+        let outcome = install_skill(&cwd, &source, "claude", SkillInstallMode::Update).unwrap();
+
+        assert!(matches!(
+            outcome,
+            SkillInstallOutcome::Installed { updated: true, .. }
+        ));
+        assert_eq!(
+            fs::read_to_string(skills.join("demo/SKILL.md")).unwrap(),
+            "version two\n"
+        );
+        assert!(transient_entries(&skills).is_empty());
+    }
+
+    #[test]
+    fn remove_repairs_a_crashed_removal_before_running() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        let skills = cwd.join(".codex/skills");
+        fs::create_dir_all(&skills).unwrap();
+        let trash = transient(&skills, TRASH_PREFIX, "demo");
+
+        let outcome = remove_skill(&cwd, "codex", "demo").unwrap();
+
+        assert_eq!(
+            outcome,
+            SkillRemoveOutcome::NotInstalled(skills.join("demo"))
+        );
+        assert!(!trash.exists());
+    }
+
+    fn transient_entries(root: &Path) -> Vec<String> {
+        fs::read_dir(root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .filter(|name| name.starts_with(".baton-"))
+            .collect()
     }
 }

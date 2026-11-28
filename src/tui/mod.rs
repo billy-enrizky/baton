@@ -17,7 +17,9 @@ use crate::adapters::{standard_approval_choices, AdapterLifecycle, TurnEvent};
 use crate::checkpoints::{
     diff_checkpoint_against_worktree, restore_thread_checkpoint, RestoreConsent,
 };
-use crate::config::{describe_auth, load_config_file_strict, resolve_config, save_config_file};
+use crate::config::{
+    describe_auth, load_config_file_strict, resolve_config, resolve_config_in, save_config_file,
+};
 use crate::handoff::git_branch_label;
 use crate::inbox::{self, InboxItem};
 use crate::orchestrate::{self, IntegrateReport, OrchestrationProgress, RunReport, ShipReport};
@@ -9653,6 +9655,11 @@ fn effective_permission_mode(
     }
 }
 
+fn permission_status_summary(selected: PermissionMode, provider_default: PermissionMode) -> String {
+    let effective = effective_permission_mode(selected, provider_default);
+    format!("{effective} · selected {selected} · provider default {provider_default}")
+}
+
 fn send_queued_item(
     state: &mut TuiState,
     store: &Arc<Mutex<BatonStore>>,
@@ -11497,8 +11504,18 @@ fn handle_command(
                 .unwrap_or_default();
             let turn_count = turns.len();
             let latest = turns.into_iter().last();
+            let resolved = resolve_config_in(
+                &state.home,
+                std::path::Path::new(&state.thread.cwd),
+                Some(&state.memory_environment.config_dir),
+                Some(&state.memory_environment.codex_home),
+                None,
+            );
+            let provider_default = resolved
+                .for_provider(state.thread.current_provider)
+                .permission_mode;
             let mut text = format!(
-                "thread: {} {}\nprovider: {}/{}\neffort: {}\nsession: {}\nmode: {}\n{}",
+                "thread: {} {}\nprovider: {}/{}\neffort: {}\nsession: {}\npermissions: {}\n{}",
                 &state.thread.id[..8.min(state.thread.id.len())],
                 state.thread.title,
                 state.thread.current_provider,
@@ -11509,7 +11526,7 @@ fn handle_command(
                     .as_deref()
                     .unwrap_or("default"),
                 state.thread.session_mode,
-                state.permission_mode,
+                permission_status_summary(state.permission_mode, provider_default),
                 rate_limit_outline(state)
             );
             match &state.goal {
@@ -26970,6 +26987,18 @@ mod tests {
     }
 
     #[test]
+    fn permission_status_names_effective_selected_and_provider_default() {
+        assert_eq!(
+            permission_status_summary(PermissionMode::Default, PermissionMode::AcceptEdits),
+            "acceptEdits · selected default · provider default acceptEdits"
+        );
+        assert_eq!(
+            permission_status_summary(PermissionMode::Plan, PermissionMode::BypassPermissions),
+            "plan · selected plan · provider default bypassPermissions"
+        );
+    }
+
+    #[test]
     fn status_command_summarizes_phase_goal_and_queue() {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
@@ -27000,7 +27029,7 @@ mod tests {
         );
         let notice = state.notice.clone().unwrap_or_default();
         assert!(notice.contains("provider: claude"));
-        assert!(notice.contains("mode: plan"));
+        assert!(notice.contains("permissions: plan · selected plan · provider default default"));
         assert!(notice.contains("limits: no snapshot for claude; /limits refreshes"));
         assert!(notice.contains("goal: ship (paused)"));
         assert!(notice.contains("turns: 1"));

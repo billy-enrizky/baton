@@ -3,7 +3,7 @@
 ## Sub-features
 - Thread id and title
 - Provider and model
-- Permission mode
+- Effective permissions, the selected permission mode, and the provider default
 - Goal and paused state
 - Turn count and latest phase
 - Queue count
@@ -19,6 +19,7 @@ Start `baton` and type `/status`, or run the PTY helper with `--command /status`
   --binary target/debug/baton \
   --command /status \
   --expect "thread:" \
+  --expect "permissions:" \
   --expect "adapters:" \
   --expect "codex=" \
   --evidence-dir local_docs/verification/evidence

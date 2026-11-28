@@ -55,10 +55,11 @@ The inbox merges threads from every project that need a person: a failed turn, a
 ```text
 /snooze 1h
 /snooze tomorrow
+/snooze forever
 /snooze off
 ```
 
-A snoozed thread leaves the inbox and returns when a failure or worker state happens after the snooze was set, or when the wake time passes. `/threads` marks a snoozed thread with its wake time.
+A snoozed thread leaves the inbox and returns when a failure or worker state happens after the snooze was set, or when the wake time passes. `/snooze forever` keeps it hidden until you run `/snooze off`. `/threads` marks a snoozed thread with its wake time, or `snoozed until woken` for an indefinite snooze.
 
 To put a thread away for longer, run `/archive`. It leaves the default thread list and the inbox.
 

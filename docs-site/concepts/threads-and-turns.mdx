@@ -10,7 +10,7 @@ A thread is a durable conversation. A turn is one prompt and everything the harn
 
 A thread has an id, a title, a working directory, a harness, a model, a session mode, and a transcript. It survives a restart. A thread belongs to one directory, and `/threads` lists the threads for the current directory.
 
-A thread can be snoozed or archived. A snooze hides it from `/inbox` until a wake time. An archive hides it from every default list and from `/inbox`. Both are reversible: `/snooze off` and `/unarchive`. Opening an archived thread from `/threads all` restores it, and a running turn blocks an archive.
+A thread can be snoozed or archived. A snooze hides it from `/inbox` until a wake time, or until you wake it with `/snooze forever`. An archive hides it from every default list and from `/inbox`. Both are reversible: `/snooze off` and `/unarchive`. Opening an archived thread from `/threads all` restores it, and a running turn blocks an archive.
 
 Every thread you open stays in a tab strip above the transcript. The strip appears once a second tab is open, marks the active thread, and answers to Alt+1 through Alt+9. A running turn keeps running when you switch away: its tab carries a `*` marker, streams in the background, and shows the result when you return. A queued follow-up starts on its own when that turn finishes, unless the harness changed and a handoff preview is required. Each tab also keeps its own composer draft, prompt history, and working-directory custom commands. A switch is refused while a pending request, a picker, or a full-screen view owns the surface.
 

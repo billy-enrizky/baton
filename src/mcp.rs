@@ -4,10 +4,11 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
 use crate::config::resolve_config;
@@ -883,6 +884,9 @@ const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
 const MAX_HTTP_SESSION_ID_BYTES: usize = 128;
 const MAX_HTTP_SESSIONS: usize = 1024;
+const MCP_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+type HttpSessions = Arc<Mutex<HashMap<String, Instant>>>;
 
 const MAX_SECRET_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -998,7 +1002,7 @@ pub fn run_http(
         let scheme = if encrypted { "https" } else { "http" };
         eprintln!("baton: MCP HTTP listening on {scheme}://{local}");
         let server = Arc::new(Mutex::new(server));
-        let sessions = Arc::new(Mutex::new(HashSet::new()));
+        let sessions: HttpSessions = Arc::new(Mutex::new(HashMap::new()));
         #[cfg(unix)]
         let mut reload =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -1061,7 +1065,7 @@ async fn serve_http_connection<S>(
     stream: S,
     server: Arc<Mutex<McpServer>>,
     token: Arc<String>,
-    sessions: Arc<Mutex<HashSet<String>>>,
+    sessions: HttpSessions,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1248,10 +1252,8 @@ where
             )
             .await;
         };
-        let removed = sessions
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MCP session lock poisoned"))?
-            .remove(session);
+        let removed =
+            remove_live_session(&sessions, session, Instant::now, MCP_SESSION_IDLE_TIMEOUT)?;
         if !removed {
             return write_http_response(
                 &mut write,
@@ -1326,11 +1328,8 @@ where
             )
             .await;
         };
-        let known = sessions
-            .lock()
-            .map_err(|_| anyhow::anyhow!("MCP session lock poisoned"))?
-            .contains(session);
-        if !known {
+        let live = session_is_live(&sessions, session, Instant::now, MCP_SESSION_IDLE_TIMEOUT)?;
+        if !live {
             return write_http_response(
                 &mut write,
                 "404 Not Found",
@@ -1350,7 +1349,12 @@ where
         Some(response) => {
             let session = if is_initialize && response.get("error").is_none() {
                 let session = uuid::Uuid::new_v4().to_string();
-                if !insert_http_session(&sessions, &session)? {
+                if !insert_http_session(
+                    &sessions,
+                    &session,
+                    Instant::now,
+                    MCP_SESSION_IDLE_TIMEOUT,
+                )? {
                     return write_http_response(
                         &mut write,
                         "503 Service Unavailable",
@@ -1384,14 +1388,60 @@ fn valid_http_session_id(session: &str) -> bool {
         && session.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
 }
 
-fn insert_http_session(sessions: &Mutex<HashSet<String>>, session: &str) -> Result<bool> {
+fn session_is_live(
+    sessions: &Mutex<HashMap<String, Instant>>,
+    session: &str,
+    clock: impl FnOnce() -> Instant,
+    timeout: Duration,
+) -> Result<bool> {
     let mut sessions = sessions
         .lock()
         .map_err(|_| anyhow::anyhow!("MCP session lock poisoned"))?;
+    let now = clock();
+    match sessions.get(session).copied() {
+        Some(last_used) if now.saturating_duration_since(last_used) < timeout => {
+            sessions.insert(session.to_string(), now);
+            Ok(true)
+        }
+        Some(_) => {
+            sessions.remove(session);
+            Ok(false)
+        }
+        None => Ok(false),
+    }
+}
+
+fn remove_live_session(
+    sessions: &Mutex<HashMap<String, Instant>>,
+    session: &str,
+    clock: impl FnOnce() -> Instant,
+    timeout: Duration,
+) -> Result<bool> {
+    let mut sessions = sessions
+        .lock()
+        .map_err(|_| anyhow::anyhow!("MCP session lock poisoned"))?;
+    let now = clock();
+    match sessions.remove(session) {
+        Some(last_used) => Ok(now.saturating_duration_since(last_used) < timeout),
+        None => Ok(false),
+    }
+}
+
+fn insert_http_session(
+    sessions: &Mutex<HashMap<String, Instant>>,
+    session: &str,
+    clock: impl FnOnce() -> Instant,
+    timeout: Duration,
+) -> Result<bool> {
+    let mut sessions = sessions
+        .lock()
+        .map_err(|_| anyhow::anyhow!("MCP session lock poisoned"))?;
+    let now = clock();
+    sessions.retain(|_, last_used| now.saturating_duration_since(*last_used) < timeout);
     if sessions.len() >= MAX_HTTP_SESSIONS {
         return Ok(false);
     }
-    sessions.insert(session.to_string());
+    sessions.insert(session.to_string(), now);
     Ok(true)
 }
 
@@ -1666,7 +1716,7 @@ mod tests {
                 stream,
                 server,
                 Arc::new(expected_token),
-                Arc::new(Mutex::new(HashSet::new())),
+                Arc::new(Mutex::new(HashMap::new())),
             )
             .await
             .unwrap();
@@ -1723,7 +1773,7 @@ mod tests {
     async fn http_request(
         server: Arc<Mutex<McpServer>>,
         token: &str,
-        sessions: Arc<Mutex<HashSet<String>>>,
+        sessions: HttpSessions,
         request: &str,
     ) -> String {
         let (mut client, server_side) = tokio::io::duplex(16 * 1024);
@@ -1760,7 +1810,7 @@ mod tests {
     #[tokio::test]
     async fn http_requires_a_bearer_and_answers_initialize() {
         let server = Arc::new(Mutex::new(server()));
-        let sessions = Arc::new(Mutex::new(HashSet::new()));
+        let sessions: HttpSessions = Arc::new(Mutex::new(HashMap::new()));
         let token = "a".repeat(64);
         let initialize = json!({
             "jsonrpc": "2.0",
@@ -1834,7 +1884,7 @@ mod tests {
     #[tokio::test]
     async fn http_session_ids_guard_requests_and_can_be_deleted() {
         let server = Arc::new(Mutex::new(server()));
-        let sessions = Arc::new(Mutex::new(HashSet::new()));
+        let sessions: HttpSessions = Arc::new(Mutex::new(HashMap::new()));
         let token = "a".repeat(64);
         let auth = format!("Bearer {token}");
         let initialize = json!({
@@ -1925,12 +1975,146 @@ mod tests {
         assert!(expired.starts_with("HTTP/1.1 404"), "{expired}");
     }
 
+    #[test]
+    fn http_sessions_expire_after_idle_and_activity_refreshes_them() {
+        let timeout = Duration::from_secs(60);
+        let sessions = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        assert!(insert_http_session(&sessions, "session", || now, timeout).unwrap());
+        assert!(session_is_live(
+            &sessions,
+            "session",
+            || now + Duration::from_secs(30),
+            timeout
+        )
+        .unwrap());
+        assert!(session_is_live(
+            &sessions,
+            "session",
+            || now + Duration::from_secs(89),
+            timeout
+        )
+        .unwrap());
+        assert!(!session_is_live(
+            &sessions,
+            "session",
+            || now + Duration::from_secs(149),
+            timeout
+        )
+        .unwrap());
+        assert!(!sessions.lock().unwrap().contains_key("session"));
+    }
+
+    #[test]
+    fn session_clock_is_sampled_after_the_lock() {
+        let timeout = Duration::from_secs(60);
+        let sessions = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        assert!(insert_http_session(&sessions, "session", || now, timeout).unwrap());
+        let live = session_is_live(
+            &sessions,
+            "session",
+            || {
+                assert!(
+                    sessions.try_lock().is_err(),
+                    "the clock must sample after the session lock"
+                );
+                now + Duration::from_secs(1)
+            },
+            timeout,
+        )
+        .unwrap();
+        assert!(live);
+    }
+
+    #[test]
+    fn an_expired_session_reclaims_capacity() {
+        let timeout = Duration::from_secs(60);
+        let sessions = Mutex::new(HashMap::new());
+        let now = Instant::now();
+        let expired = now.checked_sub(timeout + Duration::from_secs(1)).unwrap();
+        for index in 0..MAX_HTTP_SESSIONS {
+            sessions
+                .lock()
+                .unwrap()
+                .insert(format!("expired-{index}"), expired);
+        }
+        assert!(insert_http_session(&sessions, "fresh", || now, timeout).unwrap());
+        let sessions = sessions.lock().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert!(sessions.contains_key("fresh"));
+    }
+
+    #[tokio::test]
+    async fn http_rejects_an_expired_session() {
+        let server = Arc::new(Mutex::new(server()));
+        let sessions: HttpSessions = Arc::new(Mutex::new(HashMap::new()));
+        let token = "a".repeat(64);
+        let auth = format!("Bearer {token}");
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}
+        })
+        .to_string();
+        let accepted = http_request(
+            server.clone(),
+            &token,
+            sessions.clone(),
+            &http_post(Some(&auth), &initialize, None),
+        )
+        .await;
+        let session = http_session(&accepted).expect("initialize returns a session id");
+        let expire = |sessions: &HttpSessions, session: &str| {
+            let mut sessions = sessions.lock().unwrap();
+            let expired = Instant::now()
+                .checked_sub(MCP_SESSION_IDLE_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+            sessions.insert(session.to_string(), expired);
+        };
+        expire(&sessions, &session);
+        let delete = format!(
+            "DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: {auth}\r\nMcp-Session-Id: {session}\r\n\r\n"
+        );
+        let expired_delete = http_request(server.clone(), &token, sessions.clone(), &delete).await;
+        assert!(
+            expired_delete.starts_with("HTTP/1.1 404"),
+            "{expired_delete}"
+        );
+        assert!(!sessions.lock().unwrap().contains_key(&session));
+
+        let accepted = http_request(
+            server.clone(),
+            &token,
+            sessions.clone(),
+            &http_post(Some(&auth), &initialize, None),
+        )
+        .await;
+        let session = http_session(&accepted).expect("initialize returns a new session id");
+        expire(&sessions, &session);
+        let list =
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string();
+        let expired = http_request(
+            server,
+            &token,
+            sessions,
+            &http_post(Some(&auth), &list, Some(&session)),
+        )
+        .await;
+        assert!(expired.starts_with("HTTP/1.1 404"), "{expired}");
+    }
+
     #[tokio::test]
     async fn http_refuses_a_new_session_at_capacity() {
         let server = Arc::new(Mutex::new(server()));
-        let sessions = Arc::new(Mutex::new(HashSet::new()));
+        let sessions: HttpSessions = Arc::new(Mutex::new(HashMap::new()));
+        let now = Instant::now();
         for index in 0..MAX_HTTP_SESSIONS {
-            sessions.lock().unwrap().insert(format!("session-{index}"));
+            sessions
+                .lock()
+                .unwrap()
+                .insert(format!("session-{index}"), now);
         }
         let token = "a".repeat(64);
         let initialize = json!({

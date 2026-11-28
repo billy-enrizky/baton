@@ -1076,6 +1076,9 @@ pub struct TuiState {
     /// The last model-reported context window for each thread. Session-only:
     /// a harness that never reports one leaves the percentage unknown.
     context_windows: std::collections::HashMap<String, i64>,
+    /// The latest request's input plus cache tokens for each thread, so the
+    /// composer can warn before a turn reaches the reported window.
+    context_used: std::collections::HashMap<String, i64>,
     /// Percentage of the transcript area the primary pane keeps when the
     /// secondary pane is open. Clamped to 20 through 80.
     secondary_split: u16,
@@ -1255,6 +1258,7 @@ pub fn run_tui(
         background_runs: std::collections::HashMap::new(),
         secondary_tab: None,
         context_windows: std::collections::HashMap::new(),
+        context_used: std::collections::HashMap::new(),
         secondary_split: 50,
         secondary_history: Vec::new(),
         side_chat_of,
@@ -3598,6 +3602,12 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
         }
         TurnEvent::ContextWindow { tokens } => {
             state.context_windows.insert(thread_id, tokens);
+        }
+        TurnEvent::Usage { usage } => {
+            state.context_used.insert(
+                thread_id,
+                usage.input_tokens + usage.cache_read_tokens + usage.cache_creation_tokens,
+            );
         }
         event if thread_id == state.thread.id => apply_turn_event(state, event),
         event => apply_background_turn_event(state, &thread_id, event),
@@ -11739,11 +11749,17 @@ fn handle_command(
                 format_usage_line(&sum_usage(&usage_rows))
             };
             let window = state.context_windows.get(&state.thread.id).copied();
-            let latest_context = usage_rows.last().map(|row| {
-                row.usage.input_tokens
-                    + row.usage.cache_read_tokens
-                    + row.usage.cache_creation_tokens
-            });
+            let latest_context = state
+                .context_used
+                .get(&state.thread.id)
+                .copied()
+                .or_else(|| {
+                    usage_rows.last().map(|row| {
+                        row.usage.input_tokens
+                            + row.usage.cache_read_tokens
+                            + row.usage.cache_creation_tokens
+                    })
+                });
             let window_line = match (latest_context, window) {
                 (Some(tokens), Some(window)) if window > 0 => format!(
                     "context window: {} used of {} ({:.1}%)",
@@ -14639,6 +14655,7 @@ fn set_current_model(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, model
         Ok(()) => {
             state.thread.current_model = Some(model.clone());
             state.context_windows.remove(&state.thread.id);
+            state.context_used.remove(&state.thread.id);
             state.overlay = Overlay::None;
             state.notice = Some(format!("model set to {model}"));
         }
@@ -14686,6 +14703,7 @@ fn perform_switch(
             state.thread.current_provider = provider;
             state.thread.current_model = model.clone();
             state.context_windows.remove(&state.thread.id);
+            state.context_used.remove(&state.thread.id);
             if !provider.supports_effort() {
                 state.thread.reasoning_effort = None;
             }
@@ -19113,6 +19131,23 @@ fn draw_code_confirm(frame: &mut ratatui::Frame, area: Rect, turn: i64) {
 
 /// One line that explains what Enter will do right now. Shown only when the
 /// answer is not the default submit, so the composer stays quiet when idle.
+const CONTEXT_WARN_PERCENT: f64 = 80.0;
+
+fn context_warning(state: &TuiState) -> Option<String> {
+    let window = *state.context_windows.get(&state.thread.id)?;
+    if window <= 0 {
+        return None;
+    }
+    let used = *state.context_used.get(&state.thread.id)?;
+    let percent = used as f64 / window as f64 * 100.0;
+    if percent < CONTEXT_WARN_PERCENT {
+        return None;
+    }
+    Some(format!(
+        "{percent:.0}% of the context window used · /compact frees context"
+    ))
+}
+
 fn composer_hint(state: &TuiState) -> Option<String> {
     let command = state.input.split_whitespace().next().unwrap_or_default();
     if state.running {
@@ -19155,7 +19190,7 @@ fn composer_hint(state: &TuiState) -> Option<String> {
         };
         Some(format!("/{usage} · {suffix}"))
     } else {
-        None
+        context_warning(state)
     }
 }
 
@@ -20162,6 +20197,7 @@ mod tests {
             background_runs: std::collections::HashMap::new(),
             secondary_tab: None,
             context_windows: std::collections::HashMap::new(),
+            context_used: std::collections::HashMap::new(),
             secondary_split: 50,
             secondary_history: Vec::new(),
             side_chat_of: None,
@@ -27890,8 +27926,81 @@ mod tests {
         let mut state = test_state(home.path(), &store, Vec::new());
         let thread_id = state.thread.id.clone();
         state.context_windows.insert(thread_id.clone(), 200_000);
+        state.context_used.insert(thread_id.clone(), 100_000);
         set_current_model(&mut state, &store, "claude-opus-5-5".to_string());
         assert!(!state.context_windows.contains_key(&thread_id));
+        assert!(!state.context_used.contains_key(&thread_id));
+    }
+
+    #[test]
+    fn composer_warns_when_context_is_near_the_window() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        assert_eq!(composer_hint(&state), None);
+
+        state.context_windows.insert(thread_id.clone(), 100_000);
+        state.context_used.insert(thread_id.clone(), 50_000);
+        assert_eq!(composer_hint(&state), None);
+
+        state.context_used.insert(thread_id.clone(), 85_000);
+        let hint = composer_hint(&state).expect("a high context hint");
+        assert!(hint.contains("85% of the context window used"), "{hint}");
+        assert!(hint.contains("/compact"), "{hint}");
+
+        state.context_windows.remove(&thread_id);
+        assert_eq!(composer_hint(&state), None);
+    }
+
+    #[test]
+    fn usage_events_track_the_latest_context_tokens() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::Usage {
+                usage: crate::types::TurnUsage {
+                    input_tokens: 10,
+                    output_tokens: 1,
+                    cache_read_tokens: 20,
+                    cache_creation_tokens: 30,
+                    cost_usd: None,
+                },
+            },
+        );
+        assert_eq!(state.context_used.get(&thread_id), Some(&60));
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::Usage {
+                usage: crate::types::TurnUsage {
+                    input_tokens: 5,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cost_usd: None,
+                },
+            },
+        );
+        assert_eq!(state.context_used.get(&thread_id), Some(&5));
+    }
+
+    #[test]
+    fn context_command_uses_the_cached_latest_tokens() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        state.context_windows.insert(thread_id.clone(), 100_000);
+        state.context_used.insert(thread_id, 85_000);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/context");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("85.0k used of 100.0k (85.0%)"), "{notice}");
     }
 
     #[test]

@@ -37,7 +37,7 @@ Type `/` to see the commands. Typing a command and a space always answers: it li
 | `/merge-back` | Append the side chat's new messages to its source |
 | `/files`, `/grep`, `/find` | Find a file, search the project, or search the conversation |
 | `/activity`, `/commands`, `/agents` | Inspect turns, tool calls, and subagent calls |
-| `/usage`, `/context`, `/status`, `/turns`, `/limits` | Inspect usage, context (including percent of the model-reported window, or an explicit unknown), status, turn history, and live or stored rate-limit windows |
+| `/usage`, `/context`, `/status`, `/turns`, `/limits` | Inspect usage, context (including percent of the model-reported window, or an explicit unknown), status, turn history, and live or stored rate-limit windows; the composer warns at 80 percent with `/compact` |
 | `/memory` | Open instruction files and project memory, including parent `CLAUDE.md` and `AGENTS.md` files between the repository root and the working directory and Codex fallback filenames from `config.toml` at the working directory and its parents |
 | `/snippets` | List, add, or remove prompt commands; `/snippets add [--global] <name> <template>` writes a project or user `.baton/commands/<name>.md`, a project command shadows a user command with the same name, and a template that starts with `!` runs as a shell command |
 

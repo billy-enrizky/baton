@@ -342,7 +342,7 @@ Common
   /retry                      retry a failed or unverified turn
   /quit                       exit
 
-/help all  every command · shift+enter newline · up/down history · ctrl+t expand/collapse long diffs";
+/help all  every command · shift+enter newline · up/down history · ctrl+t expand/collapse long diffs · alt+d close diff pane";
 
 #[derive(Debug, Clone)]
 struct RunChoice {
@@ -1085,6 +1085,10 @@ pub struct TuiState {
     /// secondary pane is open. Clamped to 20 through 80.
     secondary_split: u16,
     secondary_history: Vec<MessageRow>,
+    secondary_diff: Option<String>,
+    secondary_diff_scroll: std::cell::Cell<usize>,
+    secondary_diff_scroll_max: std::cell::Cell<usize>,
+    diff_pane_visible: std::cell::Cell<bool>,
     side_chat_of: Option<String>,
     adapter_lifecycles: std::collections::HashMap<ProviderId, AdapterLifecycle>,
     history: Vec<MessageRow>,
@@ -1263,6 +1267,10 @@ pub fn run_tui(
         context_used: std::collections::HashMap::new(),
         secondary_split: 50,
         secondary_history: Vec::new(),
+        secondary_diff: None,
+        secondary_diff_scroll: std::cell::Cell::new(0),
+        secondary_diff_scroll_max: std::cell::Cell::new(0),
+        diff_pane_visible: std::cell::Cell::new(false),
         side_chat_of,
         adapter_lifecycles,
         history,
@@ -1964,7 +1972,7 @@ fn apply_engine_event(
             state.streaming_text.clear();
             state.tool_lines.clear();
             state.notice = None;
-            state.diff_output = None;
+            clear_diff_views(state);
             state.shell_output = None;
         }
         EngineEvent::TurnFinished {
@@ -3711,6 +3719,38 @@ fn close_secondary_pane(state: &mut TuiState) {
     }
 }
 
+fn show_diff_view(state: &mut TuiState, diff: String) {
+    let fallback = {
+        let truncated = diff.lines().count() > 200;
+        let mut text = diff.lines().take(200).collect::<Vec<_>>().join("\n");
+        if truncated {
+            text.push_str("\n[...truncated]");
+        }
+        text
+    };
+    state.secondary_diff = Some(diff);
+    state.diff_output = Some(fallback);
+    state.secondary_diff_scroll.set(0);
+    state.secondary_diff_scroll_max.set(0);
+}
+
+fn clear_diff_views(state: &mut TuiState) {
+    state.diff_output = None;
+    state.secondary_diff = None;
+    state.secondary_diff_scroll.set(0);
+    state.secondary_diff_scroll_max.set(0);
+    state.diff_pane_visible.set(false);
+}
+
+fn toggle_secondary_diff(state: &mut TuiState) {
+    if state.secondary_diff.is_some() || state.diff_output.is_some() {
+        clear_diff_views(state);
+        state.notice = Some("diff pane closed".into());
+    } else {
+        state.notice = Some("run /diff <turn> first".into());
+    }
+}
+
 fn focus_secondary_pane(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>) {
     let Some(secondary) = state.secondary_tab.clone() else {
         state.notice = Some("no secondary pane".into());
@@ -3858,7 +3898,7 @@ fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.history = guard.list_messages(&thread.id).unwrap_or_default();
     state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
     state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
-    state.diff_output = None;
+    clear_diff_views(state);
     state.shell_output = None;
     state.scroll_offset = 0;
     drop(guard);
@@ -6463,7 +6503,7 @@ fn open_thread_by_id(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.history = guard.list_messages(&thread.id).unwrap_or_default();
     state.queued_messages = guard.list_queued_messages(&thread.id).unwrap_or_default();
     state.branch_label = git_branch_label(std::path::Path::new(&thread.cwd));
-    state.diff_output = None;
+    clear_diff_views(state);
     state.shell_output = None;
     state.scroll_offset = 0;
     state.notice = Some(if unarchived {
@@ -6635,6 +6675,10 @@ fn handle_key(
                     return;
                 }
                 focus_secondary_pane(state, store);
+                return;
+            }
+            if character == 'd' {
+                toggle_secondary_diff(state);
                 return;
             }
             if character == '[' {
@@ -9056,14 +9100,7 @@ fn handle_key(
                             &cwd,
                             &checkpoint.git_ref,
                         ) {
-                            Ok(diff) => {
-                                let lines: Vec<&str> = diff.lines().take(200).collect();
-                                let mut text = lines.join("\n");
-                                if diff.lines().count() > 200 {
-                                    text.push_str("\n[...truncated]");
-                                }
-                                state.diff_output = Some(text);
-                            }
+                            Ok(diff) => show_diff_view(state, diff),
                             Err(error) => state.notice = Some(format!("diff failed: {error}")),
                         }
                     }
@@ -9505,7 +9542,7 @@ fn begin_issue_task(
     state.thread.goal = None;
     state.thread.goal_paused = false;
     state.branch_label = None;
-    state.diff_output = None;
+    clear_diff_views(state);
     state.shell_output = None;
     state.scroll_offset = 0;
     state.overlay = Overlay::None;
@@ -9698,7 +9735,7 @@ fn run_shell_command(state: &mut TuiState, command: String) {
     state.shell_request = request;
     state.shell_running = true;
     state.shell_output = None;
-    state.diff_output = None;
+    clear_diff_views(state);
     state.notice = Some(format!("running !{command}"));
     let sender = state.shell_sender.clone();
     let cwd = std::path::PathBuf::from(&state.thread.cwd);
@@ -10491,6 +10528,32 @@ fn handle_composer_key(
     key: KeyEvent,
 ) {
     ensure_file_reference_index(state);
+    if state.secondary_diff.is_some() && state.diff_pane_visible.get() {
+        let max = state.secondary_diff_scroll_max.get();
+        match key.code {
+            KeyCode::PageUp => {
+                state.secondary_diff_scroll.set(
+                    state
+                        .secondary_diff_scroll
+                        .get()
+                        .saturating_sub(10)
+                        .min(max),
+                );
+                return;
+            }
+            KeyCode::PageDown => {
+                state.secondary_diff_scroll.set(
+                    state
+                        .secondary_diff_scroll
+                        .get()
+                        .saturating_add(10)
+                        .min(max),
+                );
+                return;
+            }
+            _ => {}
+        }
+    }
     let suggestions = suggestions_for(state);
     let clamped = state
         .suggestion_index
@@ -11201,7 +11264,7 @@ fn handle_command(
             }
         }
         "/clear" => {
-            state.diff_output = None;
+            clear_diff_views(state);
             state.shell_output = None;
             state.orchestration_report = None;
             state.orchestration_scroll = 0;
@@ -12234,7 +12297,7 @@ fn handle_command(
             state.thread.goal = None;
             state.thread.goal_paused = false;
             state.branch_label = None;
-            state.diff_output = None;
+            clear_diff_views(state);
             state.shell_output = None;
             state.scroll_offset = 0;
             state.restore_composer();
@@ -13168,14 +13231,7 @@ fn handle_command(
                 Ok(diff)
             })();
             match result {
-                Ok(diff) => {
-                    let lines: Vec<&str> = diff.lines().take(200).collect();
-                    let mut text = lines.join("\n");
-                    if diff.lines().count() > 200 {
-                        text.push_str("\n[...truncated]");
-                    }
-                    state.diff_output = Some(text);
-                }
+                Ok(diff) => show_diff_view(state, diff),
                 Err(error) => state.notice = Some(format!("{error}")),
             }
         }
@@ -14281,8 +14337,12 @@ fn draw(frame: &mut ratatui::Frame, state: &TuiState, spinner_frame: usize) {
 
     draw_tabs(frame, chunks[0], state);
     let transcript_area = chunks[1];
-    let pane_split = state.secondary_tab.is_some()
-        && (transcript_area.width >= 100 || transcript_area.height >= 24);
+    let has_secondary_pane = state.secondary_tab.is_some() || state.secondary_diff.is_some();
+    let pane_split =
+        has_secondary_pane && (transcript_area.width >= 100 || transcript_area.height >= 24);
+    state
+        .diff_pane_visible
+        .set(pane_split && state.secondary_diff.is_some());
     let primary_percent = state.secondary_split.clamp(20, 80);
     let secondary_percent = 100 - primary_percent;
     if pane_split && transcript_area.width >= 100 {
@@ -18135,7 +18195,11 @@ fn draw_transcript(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, spi
         frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
         return;
     }
-    if let Some(diff) = &state.diff_output {
+    if let Some(diff) = state
+        .diff_output
+        .as_ref()
+        .filter(|_| !state.diff_pane_visible.get())
+    {
         hide_transcript_view(state);
         let rendered = state
             .diff_cache
@@ -19571,6 +19635,10 @@ fn draw_secondary_pane(
     area: Rect,
     spinner_frame: usize,
 ) {
+    if let Some(diff) = &state.secondary_diff {
+        draw_secondary_diff(frame, state, area, diff);
+        return;
+    }
     let Some(id) = state.secondary_tab.as_deref() else {
         return;
     };
@@ -19721,6 +19789,34 @@ fn draw_secondary_pane(
     let start = lines.len().saturating_sub(body);
     let tail: Vec<Line> = lines.into_iter().skip(start).collect();
     frame.render_widget(Paragraph::new(tail).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_secondary_diff(frame: &mut ratatui::Frame, state: &TuiState, area: Rect, diff: &str) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(COLORS.border))
+        .title(Line::styled(
+            " diff · PgUp/PgDn scroll · alt+d close ",
+            Style::default().fg(COLORS.muted),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+    let rendered = state
+        .diff_cache
+        .borrow_mut()
+        .render(diff, inner.width as usize);
+    let max = rendered.len().saturating_sub(inner.height as usize);
+    state.secondary_diff_scroll_max.set(max);
+    let scroll = state.secondary_diff_scroll.get().min(max);
+    state.secondary_diff_scroll.set(scroll);
+    let scroll = u16::try_from(scroll).unwrap_or(u16::MAX);
+    frame.render_widget(
+        Paragraph::new(rendered.as_ref().as_slice()).scroll((scroll, 0)),
+        inner,
+    );
 }
 
 fn draw_status(frame: &mut ratatui::Frame, state: &TuiState, area: Rect) {
@@ -20178,6 +20274,82 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_diff_view_uses_the_secondary_pane_and_page_keys_scroll_it() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let body = (1..=80)
+            .map(|line| format!("+line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let diff =
+            format!("diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,80 +1,80 @@\n{body}");
+        show_diff_view(&mut state, diff);
+        let screen = buffer_lines(&render_state(&state, 140, 40)).join("\n");
+        assert!(state.diff_pane_visible.get());
+        assert!(screen.contains("diff · PgUp/PgDn scroll · alt+d close"));
+        assert!(screen.contains("+line 1"), "{screen}");
+        assert!(!screen.contains("+line 70"), "{screen}");
+
+        let (engine_sender, _engine_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let max = state.secondary_diff_scroll_max.get();
+        state.secondary_diff_scroll.set(max.saturating_sub(5));
+        handle_composer_key(&mut state, &store, &engine_sender, key(KeyCode::PageDown));
+        assert_eq!(state.secondary_diff_scroll.get(), max);
+        let screen = buffer_lines(&render_state(&state, 140, 40)).join("\n");
+        assert!(screen.contains("+line 80"), "{screen}");
+    }
+
+    #[test]
+    fn a_narrow_terminal_falls_back_to_the_full_screen_diff() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let body = (1..=300)
+            .map(|line| format!("+line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let diff = format!(
+            "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,300 +1,300 @@\n{body}"
+        );
+        show_diff_view(&mut state, diff);
+        let screen = buffer_lines(&render_state(&state, 80, 20)).join("\n");
+        assert!(!state.diff_pane_visible.get());
+        assert!(screen.contains("diff · /clear to close"), "{screen}");
+        assert!(!screen.contains("PgUp/PgDn scroll"), "{screen}");
+    }
+
+    #[test]
+    fn alt_d_closes_the_diff_pane_from_the_keyboard() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        show_diff_view(&mut state, "+one\n+two".to_string());
+        let (engine_sender, _engine_receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_key(
+            &mut state,
+            &store,
+            &engine_sender,
+            modified_key(KeyCode::Char('d'), KeyModifiers::ALT),
+        );
+        assert!(state.secondary_diff.is_none());
+        assert!(state.diff_output.is_none());
+    }
+
+    #[test]
+    fn toggling_the_diff_pane_clears_both_layouts() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        show_diff_view(&mut state, "+one\n+two".to_string());
+        assert!(state.secondary_diff.is_some());
+        toggle_secondary_diff(&mut state);
+        assert!(state.secondary_diff.is_none());
+        assert!(state.diff_output.is_none());
+        assert_eq!(state.secondary_diff_scroll.get(), 0);
+    }
+
+    #[test]
     fn basic_fallbacks_cover_every_palette_role() {
         let roles = COLORS.roles();
         let mut seen = std::collections::BTreeSet::new();
@@ -20345,6 +20517,10 @@ mod tests {
             context_used: std::collections::HashMap::new(),
             secondary_split: 50,
             secondary_history: Vec::new(),
+            secondary_diff: None,
+            secondary_diff_scroll: std::cell::Cell::new(0),
+            secondary_diff_scroll_max: std::cell::Cell::new(0),
+            diff_pane_visible: std::cell::Cell::new(false),
             side_chat_of: None,
             adapter_lifecycles: std::collections::HashMap::new(),
             history,

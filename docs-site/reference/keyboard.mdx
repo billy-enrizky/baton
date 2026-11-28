@@ -38,11 +38,12 @@ The tab strip appears above the transcript once a second thread is open. A runni
 | Alt+W | Swap focus between the active pane and the secondary pane |
 | Alt+[ | Give the secondary pane more room |
 | Alt+] | Give the primary pane more room |
+| Alt+D | Close the diff pane |
 | `/pane` | Pick an open tab for the secondary pane |
 | `/pane close` | Close the secondary pane |
 | `/pane wider`, `/pane narrower`, `/pane reset` | Resize the split, or return it to even |
 
-The secondary pane is read-only. It shows the other thread's transcript tail and any live tool or stream rows. Alt+W makes it the active pane so you can type into it. Alt+[ and Alt+] resize the split between 20 and 80 percent. A wide terminal places the panes side by side; a narrow one stacks them.
+The secondary pane is read-only. It shows the other thread's transcript tail and any live tool or stream rows. Alt+W makes it the active pane so you can type into it. Alt+[ and Alt+] resize the split between 20 and 80 percent. A wide terminal places the panes side by side; a narrow one stacks them. `/diff` uses this pane for the checkpoint diff when there is room; PageUp and PageDown scroll it, and Alt+D or `/clear` closes it. A narrow terminal falls back to the full-screen diff.
 
 ## Steer and queue
 

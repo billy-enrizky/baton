@@ -27,22 +27,32 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
-def request(context: ssl.SSLContext, port: int, token: str, method: str, params=None):
+def request(
+    context: ssl.SSLContext,
+    port: int,
+    token: str,
+    method: str | None,
+    params=None,
+    session: str | None = None,
+    http_method: str = "POST",
+):
     connection = http.client.HTTPSConnection("127.0.0.1", port, context=context, timeout=10)
-    frame = {"jsonrpc": "2.0", "id": 1, "method": method}
-    if params is not None:
-        frame["params"] = params
-    body = json.dumps(frame).encode()
-    connection.request(
-        "POST",
-        "/mcp",
-        body,
-        {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
+    headers = {"Authorization": f"Bearer {token}"}
+    body = None
+    if http_method == "POST":
+        frame = {"jsonrpc": "2.0", "id": 1, "method": method}
+        if params is not None:
+            frame["params"] = params
+        body = json.dumps(frame).encode()
+        headers["Content-Type"] = "application/json"
+    if session is not None:
+        headers["Mcp-Session-Id"] = session
+    connection.request(http_method, "/mcp", body, headers)
     response = connection.getresponse()
     data = response.read()
+    response_headers = {name.lower(): value for name, value in response.getheaders()}
     connection.close()
-    return response.status, json.loads(data)
+    return response.status, json.loads(data) if data else {}, response_headers
 
 
 def run(binary: str, evidence: Path) -> dict:
@@ -130,17 +140,26 @@ def run(binary: str, evidence: Path) -> dict:
                     if time.time() >= deadline:
                         raise RuntimeError("HTTPS server did not become ready")
                     time.sleep(0.05)
-            initialize_status, initialized = request(
+            initialize_status, initialized, initialize_headers = request(
                 context, port, token, "initialize", {"protocolVersion": "2025-06-18"}
             )
-            tools_status, tools = request(context, port, token, "tools/list")
-            status_status, status = request(
-                context, port, token, "tools/call", {"name": "baton_status", "arguments": {}}
+            session = initialize_headers.get("mcp-session-id")
+            tools_status, tools, _ = request(
+                context, port, token, "tools/list", session=session
+            )
+            status_status, status, _ = request(
+                context,
+                port,
+                token,
+                "tools/call",
+                {"name": "baton_status", "arguments": {}},
+                session=session,
             )
             tools_names = [tool["name"] for tool in tools["result"]["tools"]]
             result = {
                 "health": health,
                 "initialize_status": initialize_status,
+                "session_present": bool(session),
                 "protocol_version": initialized["result"]["protocolVersion"],
                 "tools_status": tools_status,
                 "tool_count": len(tools_names),
@@ -153,9 +172,14 @@ def run(binary: str, evidence: Path) -> dict:
                 "status_error": status["result"].get("isError"),
                 "status_provider": json.loads(status["result"]["content"][0]["text"])["provider"],
             }
+            delete_status, _, _ = request(
+                context, port, token, None, session=session, http_method="DELETE"
+            )
+            result["delete_status"] = delete_status
             passed = (
                 health[0] == 200
                 and result["initialize_status"] == 200
+                and result["session_present"]
                 and result["protocol_version"] == "2025-06-18"
                 and result["tools_status"] == 200
                 and result["tool_count"] == 15
@@ -163,6 +187,7 @@ def run(binary: str, evidence: Path) -> dict:
                 and result["status_status"] == 200
                 and not result["status_error"]
                 and result["status_provider"] == "codex"
+                and result["delete_status"] == 204
             )
         finally:
             process.send_signal(signal.SIGINT)

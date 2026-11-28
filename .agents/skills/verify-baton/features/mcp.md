@@ -10,6 +10,8 @@
 - `--read-only` hides `baton_fork` and refuses queue clearing; queue listing and every other read tool stay available
 - Repeatable `--allow-tool` exposes only the named tools and refuses every other name with `-32003`
 - `--tls-cert` and `--tls-key` serve HTTPS; the key must be mode 0600, and TLS conflicts with `--trusted-overlay`
+- An HTTP `initialize` returns an `Mcp-Session-Id`; later POSTs must send it, and `DELETE /mcp` ends it
+- A missing session id is 400, an unknown or ended id is 404, and at most 1,024 sessions stay live
 - On Unix, SIGHUP reloads the token file; a valid replacement takes effect and an invalid one keeps the current token
 - Unknown tools return a tool result with `isError: true` and `unknown baton tool <name>`
 
@@ -43,6 +45,8 @@ error, stderr is empty, and the server exits 0.
 - A read-only server returns JSON-RPC error `-32003` for a mutating tool. It does
   not write an audit row or change the queue.
 - `mcp_https_probe.py` needs `openssl` and proves a real HTTPS handshake. It
-  connects to `127.0.0.1` with the generated certificate as the root.
+  connects to `127.0.0.1` with the generated certificate as the root, then
+  initializes, lists and calls tools with the returned session, and deletes it.
 - `mcp_token_reload_probe.py` proves SIGHUP reload, old-token rejection, new-token
-  acceptance, and the invalid-file fallback on a real HTTP process.
+  acceptance, the invalid-file fallback, and a live session on each accepted
+  token on a real HTTP process.

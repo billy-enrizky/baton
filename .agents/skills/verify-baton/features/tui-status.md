@@ -8,6 +8,7 @@
 - Turn count and latest phase
 - Queue count
 - Adapter lifecycle states
+- Cached rate-limit plan, primary and secondary window percentages, credits, and a `/limits` refresh hint
 
 ## How to get to it (user POV)
 Start `baton` and type `/status`, or run the PTY helper with `--command /status`.
@@ -27,3 +28,4 @@ Start `baton` and type `/status`, or run the PTY helper with `--command /status`
 - The notice wraps at the terminal width. Assert short substrings, not a whole line.
 - A fresh temporary home has no history and no running turns, so the phase is `none`.
 - Adapter states are live handles. A fresh TUI should show `unloaded` for adapters that have not run.
+- `/status` reads the stored snapshot and never starts a provider read. The line says `cached; /limits refreshes`; run `/limits` for a live refresh and reset times.

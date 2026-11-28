@@ -5004,6 +5004,35 @@ fn move_pinned_thread(
     Some(())
 }
 
+fn rate_limit_outline(state: &TuiState) -> String {
+    let provider = state.thread.current_provider;
+    let Some(info) = state.rate_limits.get(&provider) else {
+        return format!("limits: no snapshot for {provider}; /limits refreshes");
+    };
+    let mut parts = vec![info
+        .plan_type
+        .as_deref()
+        .unwrap_or("unknown plan")
+        .to_string()];
+    for (label, window) in [
+        ("primary", info.primary.as_ref()),
+        ("secondary", info.secondary.as_ref()),
+    ] {
+        if let Some(window) = window {
+            parts.push(format!("{label} {}% used", window.used_percent));
+        }
+    }
+    if info.credits_unlimited {
+        parts.push("credits unlimited".into());
+    } else if let Some(balance) = info.credits_balance.as_deref() {
+        parts.push(format!("credits {balance}"));
+    }
+    format!(
+        "limits: {provider} · {} · cached; /limits refreshes",
+        parts.join(" · ")
+    )
+}
+
 fn rate_limit_lines(state: &TuiState) -> Vec<String> {
     let now = chrono::Utc::now();
     let mut ordered = vec![state.thread.current_provider];
@@ -11456,7 +11485,7 @@ fn handle_command(
             let turn_count = turns.len();
             let latest = turns.into_iter().last();
             let mut text = format!(
-                "thread: {} {}\nprovider: {}/{}\neffort: {}\nsession: {}\nmode: {}",
+                "thread: {} {}\nprovider: {}/{}\neffort: {}\nsession: {}\nmode: {}\n{}",
                 &state.thread.id[..8.min(state.thread.id.len())],
                 state.thread.title,
                 state.thread.current_provider,
@@ -11467,7 +11496,8 @@ fn handle_command(
                     .as_deref()
                     .unwrap_or("default"),
                 state.thread.session_mode,
-                state.permission_mode
+                state.permission_mode,
+                rate_limit_outline(state)
             );
             match &state.goal {
                 Some(goal) => {
@@ -26853,7 +26883,7 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
         let mut state = test_state(home.path(), &store, Vec::new());
-        let (engine_command_sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (engine_command_sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         state.apply_permission_mode(&store, PermissionMode::Plan);
         state.set_goal_state(&store, Some("ship".into()), true);
         enqueue_message(&mut state, &store, "later".into());
@@ -26873,9 +26903,14 @@ mod tests {
                 .unwrap();
         }
         handle_command(&mut state, &store, &engine_command_sender, "/status");
+        assert!(
+            receiver.try_recv().is_err(),
+            "/status must not start a provider read"
+        );
         let notice = state.notice.clone().unwrap_or_default();
         assert!(notice.contains("provider: claude"));
         assert!(notice.contains("mode: plan"));
+        assert!(notice.contains("limits: no snapshot for claude; /limits refreshes"));
         assert!(notice.contains("goal: ship (paused)"));
         assert!(notice.contains("turns: 1"));
         assert!(notice.contains("turn: 1 failed"));
@@ -26884,6 +26919,16 @@ mod tests {
         assert!(
             notice.contains("adapters: codex=turn-running(thread-1)"),
             "adapter lifecycle missing from status: {notice}"
+        );
+
+        state
+            .rate_limits
+            .insert(state.thread.current_provider, codex_rate_limits());
+        handle_command(&mut state, &store, &engine_command_sender, "/status");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(
+            notice.contains("limits: claude · plus · primary 12% used · secondary 48% used · credits 12.50 · cached; /limits refreshes"),
+            "cached rate-limit plan missing from status: {notice}"
         );
     }
 

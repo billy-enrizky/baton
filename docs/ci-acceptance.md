@@ -2,6 +2,28 @@
 
 Status on 2026-11-26: the first 100 successful PR runs record p50 62.0 seconds, p95 97.0 seconds, and max 150 seconds. The latest merged code PR and main push both took 71 seconds, with Test at 54 and 52 seconds, so the current code path still misses the one-minute target. The last 50 record p50 59.0 seconds, p95 69.0 seconds, and max 83 seconds. The 100-run window spans earlier CI designs, so the next 100 runs after `ba82720` are the current-design acceptance window. The latest 2026-11-25 eight-run sample is 56, 58, 59, 63, 64, 64, 75, and 76 seconds with a 64-second median, so the current design is close to the one-minute target but has not met it at p50. A free ARM runner was rejected as a replacement because it would remove x64 runtime tests from the pre-merge gate; the x64 Test job stays in place.
 
+## 2026-11-28 test profile without debuginfo
+
+`[profile.test] debug` moved from `1` to `0`. Run [46130099763](https://github.com/billy-enrizky/baton/actions/runs/46130099763) shows why the test profile is the lever: the Test step spent 26.07 seconds in cargo before the first test started, the log contains no `Compiling` line, and the 18 test binaries then took 12.78 seconds. That means the restored target tree is revalidated and replayed rather than rebuilt from scratch, so both artifact bytes and any real rebuild sit inside the 26.07 seconds.
+
+Method: two isolated `CARGO_TARGET_DIR` trees per variant, `CARGO_INCREMENTAL=0`, `cargo test --locked --no-run`, interleaved pairs. "Warm" removes only the `baton` package artifacts with `cargo clean -p baton` and keeps every dependency artifact, which is the steady state after a cache restore. "Cold" means an empty target directory; in CI the cold case is the one-time seed after the `Cargo.toml` hash changes.
+
+| Variant | Cold, 18 jobs | Warm, 18 jobs (n=3) | Warm, 4 jobs (n=4) | Target dir | 18 test binaries |
+|---|---|---|---|---|---|
+| `debug = 1` | 19.65 s | 9.06, 9.44, 9.18 (mean 9.23) | 10.13, 10.42, 10.49, 10.44 (mean 10.37) | 1,075,824 KiB | 148,537,160 B |
+| `debug = "line-tables-only"` | not run | not run | 10.28, 10.32, 10.40, 10.28 (mean 10.32) | 1,066,900 KiB | 148,182,488 B |
+| `debug = 0` | 20.22 s | 9.19, 8.62, 8.59 (mean 8.80) | 9.50, 9.50, 9.83, 9.44 (mean 9.57) | 705,580 KiB | 132,235,152 B |
+
+The four-job column decides, because four build jobs match a standard runner. At 18 jobs the same comparison narrowed to 9.23 against 8.80 seconds, because a wide machine hides the CPU difference behind the serial link tail. Every four-job pair favoured `debug = 0` and the two ranges do not overlap. User time fell from 28.19 to 25.37 seconds, the target directory fell 34.4 percent, and the binaries fell 11.0 percent. The single cold sample per variant differs by 0.57 seconds the other way, which is one-sample noise and is not used as evidence.
+
+`debug = "line-tables-only"` was measured before acceptance and rejected: 10.32 seconds is inside the `debug = 1` range and the artifacts are within one percent, so it pays the cache-key change for nothing.
+
+What the change gives up: a temporary `tests/panic_probe.rs` was compiled under `debug = 0`. A failing `assert_eq!` still printed the test name, `panicked at tests/panic_probe.rs:5:5`, and both values. With `RUST_BACKTRACE=1` the frames kept their symbols and lost only the `at ./tests/panic_probe.rs:5:5` lines. The probe was deleted before the commit and is not in the tree.
+
+Cold seed: the `Cargo.toml` hash is part of the cache key, so the first run after this change is a cold seed. Its numbers are recorded separately and are not part of the warm sample.
+
+Local verification: 1,246 tests, format debt 534, Clippy debt 60, all 55 formal gates, the CI admission model, the 22-page docs export, doc links, parity paths, and the CI self-tests.
+
 ## 2026-11-27 upload-artifact Node 24 pin
 
 The CI and release workflows moved `actions/upload-artifact` from v4.6.2 to v7.0.2 at `cf430e030ddbb5b0abf93d22962f4752f3646cd9`. This was a `ci-repair` change. Local `actionlint`, `ci/selftest.sh`, `ci/check-ci.sh --base <main workflow> --allow-change`, and a full `cargo test --locked` passed. PR #391 run [46033595598](https://github.com/billy-enrizky/baton/actions/runs/46033595598) passed Changes, Test, Build, and Check; Selection guard failed only with `CI013 workflow commands, needs, if, timeout, or runner changed without --allow-change: test`, and Verify failed as a consequence. The owner merged with the documented override. Main push [46035169201](https://github.com/billy-enrizky/baton/actions/runs/46035169201) then succeeded in 84 seconds with Test 67, Build 44, Check 42, Selection guard 13, Changes 3, and Verify 5. The run log has no Node.js 20 action deprecation line. This is maintenance evidence, not a new percentile sample.
@@ -15,7 +37,7 @@ The CI and release workflows moved `actions/upload-artifact` from v4.6.2 to v7.0
 | [45814071824](https://github.com/billy-enrizky/baton/actions/runs/45814071824) | pull request #330 | 73 seconds | 58 seconds | Skill install/update; all selected gates green |
 | [45814391195](https://github.com/billy-enrizky/baton/actions/runs/45814391195) | push `main` | 69 seconds | 49 seconds | Skill install/update; all selected gates green |
 
-The current gap is 9 to 13 seconds above target on whole-run time, with 17.5 seconds of test-profile compile and 10 seconds of Cargo cache restore inside a 54 to 58 second Test job. Two attempts to move that work were rejected in the table below.
+The current gap is 9 to 13 seconds above target on whole-run time, with 17.5 seconds of test-profile compile and 10 seconds of Cargo cache restore inside a 54 to 58 second Test job. Two attempts to move that work were rejected in the table below. Run 46130099763 measured the same shape in a 62-second Test job: 26.07 seconds of cargo time before the first test, 12.78 seconds of test execution, and 7 seconds of Cargo cache restore.
 
 ## 2026-11-25 latest runs
 

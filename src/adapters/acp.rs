@@ -2,6 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
@@ -25,7 +26,10 @@ struct AcpRuntime {
     notifications: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
     current_emit: AsyncMutex<Option<TurnEventSender>>,
     active_session: AsyncMutex<Option<String>>,
+    session_cwd: AsyncMutex<Option<PathBuf>>,
 }
+
+const ACP_CLIENT_FILE_MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 pub type HalvesSpawner = Arc<dyn Fn(&[(String, String)]) -> Result<TransportHalves> + Send + Sync>;
 
@@ -138,12 +142,11 @@ fn register_pending(
     Ok(())
 }
 
-async fn handle_server_request(
-    runtime: &Arc<AcpRuntime>,
-    id: Value,
-    method: &str,
-    params: Value,
-) {
+async fn handle_server_request(runtime: &Arc<AcpRuntime>, id: Value, method: &str, params: Value) {
+    if method == "fs/read_text_file" {
+        handle_client_file_read(runtime, id, &params).await;
+        return;
+    }
     if matches!(method, "x.ai/ask_user_question" | "_x.ai/ask_user_question") {
         handle_xai_question(runtime, id, &params).await;
         return;
@@ -208,6 +211,153 @@ async fn handle_server_request(
             let _ = writer.write_line(&serialized).await;
         }
     });
+}
+
+async fn handle_client_file_read(runtime: &Arc<AcpRuntime>, id: Value, params: &Value) {
+    let path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let requested_session = params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let line = params.get("line").and_then(Value::as_u64);
+    let limit = params.get("limit").and_then(Value::as_u64);
+    let Some(path) = path else {
+        write_client_file_response(
+            runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32602, "message": "fs/read_text_file requires a path" }
+            }),
+        )
+        .await;
+        return;
+    };
+    if let Some(requested_session) = requested_session {
+        let active_session = runtime.active_session.lock().await.clone();
+        if active_session.as_deref() != Some(requested_session.as_str()) {
+            write_client_file_response(
+                runtime,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32602, "message": "fs/read_text_file names an inactive session" }
+                }),
+            )
+            .await;
+            return;
+        }
+    }
+    let Some(cwd) = runtime.session_cwd.lock().await.clone() else {
+        write_client_file_response(
+            runtime,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32602, "message": "no ACP session workspace is active" }
+            }),
+        )
+        .await;
+        return;
+    };
+    let response = match read_acp_client_text_file(&cwd, &path, line, limit).await {
+        Ok(content) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": { "content": content }
+        }),
+        Err((code, message)) => json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message }
+        }),
+    };
+    write_client_file_response(runtime, response).await;
+}
+
+async fn write_client_file_response(runtime: &Arc<AcpRuntime>, response: Value) {
+    if let Ok(serialized) = serde_json::to_string(&response) {
+        let mut writer = runtime.writer.lock().await;
+        let _ = writer.write_line(&serialized).await;
+    }
+}
+
+async fn read_acp_client_text_file(
+    root: &Path,
+    requested: &str,
+    line: Option<u64>,
+    limit: Option<u64>,
+) -> std::result::Result<String, (i32, String)> {
+    if requested.trim().is_empty() {
+        return Err((-32602, "fs/read_text_file path is empty".to_string()));
+    }
+    let root = tokio::fs::canonicalize(root).await.map_err(|error| {
+        (
+            -32603,
+            format!("cannot resolve the ACP session workspace: {error}"),
+        )
+    })?;
+    let requested_path = Path::new(requested);
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        root.join(requested_path)
+    };
+    let real = tokio::fs::canonicalize(&candidate).await.map_err(|_| {
+        (
+            -32002,
+            format!("File '{requested}' was not found in the session workspace."),
+        )
+    })?;
+    if !real.starts_with(&root) {
+        return Err((
+            -32602,
+            format!("Path '{requested}' is outside the session workspace."),
+        ));
+    }
+    let metadata = tokio::fs::metadata(&real)
+        .await
+        .map_err(|error| (-32603, format!("cannot inspect '{requested}': {error}")))?;
+    if !metadata.is_file() || metadata.len() > ACP_CLIENT_FILE_MAX_BYTES {
+        return Err((
+            -32602,
+            format!("File '{requested}' is not a readable text file under 8 MiB."),
+        ));
+    }
+    let bytes = tokio::fs::read(&real)
+        .await
+        .map_err(|error| (-32603, format!("cannot read '{requested}': {error}")))?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        (
+            -32602,
+            format!("File '{requested}' is not a UTF-8 text file."),
+        )
+    })?;
+    if text.contains('\0') {
+        return Err((-32602, format!("File '{requested}' contains binary data.")));
+    }
+    Ok(slice_client_file_text(&text, line, limit))
+}
+
+fn slice_client_file_text(text: &str, line: Option<u64>, limit: Option<u64>) -> String {
+    if line.is_none() && limit.is_none() {
+        return text.to_string();
+    }
+    let lines: Vec<&str> = text.split('\n').collect();
+    let first = line.unwrap_or(1).max(1);
+    let start = usize::try_from(first.saturating_sub(1))
+        .unwrap_or(usize::MAX)
+        .min(lines.len());
+    let end = match limit {
+        Some(limit) => start
+            .saturating_add(usize::try_from(limit).unwrap_or(usize::MAX))
+            .min(lines.len()),
+        None => lines.len(),
+    };
+    lines[start..end].join("\n")
 }
 
 fn xai_question_params(params: &Value) -> &Value {
@@ -828,6 +978,7 @@ impl AcpAdapter {
                 notifications: notification_sender,
                 current_emit: AsyncMutex::new(None),
                 active_session: AsyncMutex::new(None),
+                session_cwd: AsyncMutex::new(None),
             });
             spawn_reader(runtime.clone());
             *slot = Some(runtime.clone());
@@ -874,7 +1025,7 @@ impl AcpAdapter {
         let params = json!({
             "protocolVersion": 2,
             "clientCapabilities": {
-                "fs": { "readTextFile": true, "writeTextFile": true },
+                "fs": { "readTextFile": true, "writeTextFile": false },
                 "terminal": false
             },
             "clientInfo": { "name": "baton", "version": env!("CARGO_PKG_VERSION") }
@@ -977,6 +1128,7 @@ impl BatonAdapter for AcpAdapter {
         let _turn_guard = AdapterTurnGuard::new(self.lifecycle.clone());
         self.lifecycle.starting("model-list");
         let runtime = self.ensure_runtime(&input.auth_env).await?;
+        *runtime.session_cwd.lock().await = Some(PathBuf::from(&input.cwd));
         self.ensure_initialized(&runtime, &input.auth_env).await?;
         let created = self
             .request(
@@ -1000,12 +1152,14 @@ impl BatonAdapter for AcpAdapter {
             anyhow::bail!("{} does not support reasoning effort; use codex or claude", self.provider);
         }
         let runtime = self.ensure_runtime(&input.auth_env).await?;
+        *runtime.session_cwd.lock().await = Some(PathBuf::from(&input.cwd));
         self.ensure_initialized(&runtime, &input.auth_env).await?;
         self.lifecycle.turn_running(&input.thread_id);
         let _emit_scope = EmitScope::set(&runtime, emit.clone()).await;
 
         let session_id = match session {
             Some(session) => {
+                *runtime.active_session.lock().await = Some(session.native_session_id.clone());
                 let params = json!({ "sessionId": session.native_session_id, "cwd": input.cwd, "mcpServers": [] });
                 if self.request(&runtime, "session/resume", params.clone()).await.is_err() {
                     self.request(&runtime, "session/load", params).await?;
@@ -1159,8 +1313,8 @@ mod tests {
     use super::{
         antigravity_model_family, antigravity_question_prompts, antigravity_question_response,
         approval_decision_or_cancel, handle_session_update, permission_choices,
-        pick_permission_option, question_answers_or_cancel, xai_question_prompts,
-        xai_question_response, TurnEvent,
+        pick_permission_option, question_answers_or_cancel, read_acp_client_text_file,
+        xai_question_prompts, xai_question_response, TurnEvent, ACP_CLIENT_FILE_MAX_BYTES,
     };
     use crate::types::{ApprovalDecision, QuestionAnswer, QuestionPrompt};
     use serde_json::json;
@@ -1253,6 +1407,97 @@ mod tests {
             }]
         );
         drop((approval_exit, question_exit));
+    }
+
+    #[tokio::test]
+    async fn client_file_reads_resolve_relative_paths_and_line_limits() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("..notes.txt"), "one\ntwo\nthree\nfour").unwrap();
+        assert_eq!(
+            read_acp_client_text_file(root.path(), "..notes.txt", Some(2), Some(2))
+                .await
+                .unwrap(),
+            "two\nthree"
+        );
+        assert_eq!(
+            read_acp_client_text_file(root.path(), "..notes.txt", None, None)
+                .await
+                .unwrap(),
+            "one\ntwo\nthree\nfour"
+        );
+        assert_eq!(
+            read_acp_client_text_file(root.path(), "..notes.txt", None, Some(1))
+                .await
+                .unwrap(),
+            "one"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_file_reads_reject_paths_outside_the_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        let error = read_acp_client_text_file(root.path(), secret.to_str().unwrap(), None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, -32602);
+        assert!(
+            error.1.contains("outside the session workspace"),
+            "{error:?}"
+        );
+        let missing = read_acp_client_text_file(root.path(), "missing.txt", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(missing.0, -32002);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_file_reads_resolve_symlinks_before_containment() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        std::os::unix::fs::symlink(&secret, root.path().join("link.txt")).unwrap();
+        let error = read_acp_client_text_file(root.path(), "link.txt", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.0, -32602);
+        assert!(
+            error.1.contains("outside the session workspace"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_file_reads_reject_binary_and_non_utf8_files() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("nul.txt"), b"a\0b").unwrap();
+        let nul = read_acp_client_text_file(root.path(), "nul.txt", None, None)
+            .await
+            .unwrap_err();
+        assert!(nul.1.contains("binary data"), "{nul:?}");
+        std::fs::write(root.path().join("bytes.txt"), [0xff, 0xfe]).unwrap();
+        let bytes = read_acp_client_text_file(root.path(), "bytes.txt", None, None)
+            .await
+            .unwrap_err();
+        assert!(bytes.1.contains("UTF-8"), "{bytes:?}");
+    }
+
+    #[tokio::test]
+    async fn client_file_reads_reject_files_over_the_size_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("large.txt");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(ACP_CLIENT_FILE_MAX_BYTES + 1)
+            .unwrap();
+        let error = read_acp_client_text_file(root.path(), "large.txt", None, None)
+            .await
+            .unwrap_err();
+        assert!(error.1.contains("under 8 MiB"), "{error:?}");
     }
 
     #[test]

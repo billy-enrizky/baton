@@ -7,6 +7,7 @@
 - `apiKeyEnv` names the variable baton reads; the child receives `GEMINI_API_KEY`
 - `apiBaseUrl` maps to `GOOGLE_GEMINI_BASE_URL`; it is the endpoint root, not the OpenAI `/v1` base
 - ACP `usage_update` frames report `used` tokens and a positive `size`; Baton maps them to the context used and window, so `/context` and the 80 percent composer warning work for this harness
+- ACP `fs/read_text_file` is advertised read-only: relative paths resolve against the active session workspace, canonical paths must stay inside it, and reads are bounded to 8 MiB of UTF-8 text with optional line and limit
 - An `agy` exit fails the active turn, rejects pending client requests immediately, cancels an open question, and forces a fresh runtime on the next turn
 
 ## How to get to it
@@ -28,6 +29,12 @@ The probe writes a throwaway config with `mode: "api"`, `apiKeyEnv: "CODEX_ICA_A
 - `tui::tests::an_acp_context_used_event_updates_the_cached_usage`
 - `tests/acp_adapter.rs::an_acp_agent_exit_fails_the_turn_and_restarts_cleanly`
 - `adapters::acp::tests::an_exited_runtime_cancels_pending_interactions`
+- `adapters::acp::tests::client_file_reads_resolve_relative_paths_and_line_limits`
+- `adapters::acp::tests::client_file_reads_reject_paths_outside_the_workspace`
+- `adapters::acp::tests::client_file_reads_resolve_symlinks_before_containment`
+- `adapters::acp::tests::client_file_reads_reject_binary_and_non_utf8_files`
+- `adapters::acp::tests::client_file_reads_reject_files_over_the_size_limit`
+- `tests/acp_adapter.rs::acp_client_file_reads_use_relative_cwd_and_advertise_read_only`
 
 ## Gotchas
 - The base URL is the host root. `agy` appends `/v1beta/models/...`; adding `/v1` returns HTTP 404.

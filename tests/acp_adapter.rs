@@ -1,7 +1,8 @@
-use baton::adapters::{duplex_halves, BatonAdapter, ModelListInput, TransportHalves};
 use baton::adapters::acp::AcpAdapter;
+use baton::adapters::{duplex_halves, BatonAdapter, ModelListInput, TransportHalves, TurnEvent};
 use baton::types::{ApprovalDecision, PermissionMode, ProviderId, QuestionAnswer};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -119,6 +120,74 @@ async fn fake_acp_agent(read: tokio::io::DuplexStream, mut write: tokio::io::Dup
     }
 }
 
+async fn fake_acp_agent_exits_with_question(
+    read: tokio::io::DuplexStream,
+    mut write: tokio::io::DuplexStream,
+) {
+    let mut lines = BufReader::new(read);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if lines.read_line(&mut line).await.unwrap_or(0) == 0 {
+            break;
+        }
+        let frame: Value = match serde_json::from_str(line.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let method = frame.get("method").and_then(Value::as_str).unwrap_or("");
+        let id = frame.get("id").cloned();
+        match method {
+            "initialize" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": 2 } }),
+                )
+                .await;
+            }
+            "session/new" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": { "sessionId": "acp-exit" } }),
+                )
+                .await;
+            }
+            "session/set_model" | "session/set_config_option" => {
+                send(
+                    &mut write,
+                    json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                )
+                .await;
+            }
+            "session/prompt" => {
+                send(
+                    &mut write,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": 900,
+                        "method": "session/request_permission",
+                        "params": {
+                            "sessionId": "acp-exit",
+                            "toolCall": {
+                                "toolCallId": "interaction_exit_1",
+                                "kind": "other",
+                                "title": "Pick an exit option",
+                                "status": "pending"
+                            },
+                            "options": [
+                                { "optionId": "one", "name": "One", "kind": "allow_once" }
+                            ]
+                        }
+                    }),
+                )
+                .await;
+                return;
+            }
+            _ => {}
+        }
+    }
+}
+
 async fn fake_acp_session_error(read: tokio::io::DuplexStream, mut write: tokio::io::DuplexStream) {
     let mut lines = BufReader::new(read);
     let mut line = String::new();
@@ -219,6 +288,69 @@ async fn fake_acp_plan(
             _ => {}
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_acp_agent_exit_fails_the_turn_and_restarts_cleanly() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let spawner_attempts = attempts.clone();
+    let spawner = Arc::new(
+        move |_auth_env: &[(String, String)]| -> anyhow::Result<TransportHalves> {
+            let attempt = spawner_attempts.fetch_add(1, Ordering::SeqCst);
+            let (halves, server_read, server_write) = duplex_halves(64 * 1024);
+            if attempt == 0 {
+                tokio::spawn(fake_acp_agent_exits_with_question(
+                    server_read,
+                    server_write,
+                ));
+            } else {
+                tokio::spawn(fake_acp_agent(server_read, server_write));
+            }
+            Ok(halves)
+        },
+    );
+    let mut adapter = AcpAdapter::new(ProviderId::Antigravity, spawner);
+    let input = || baton::adapters::TurnStartInput {
+        turn: 1,
+        thread_id: "thread".into(),
+        cwd: "/work".into(),
+        model: "model".into(),
+        effort: None,
+        prompt: "hello".into(),
+        permission_mode: PermissionMode::Default,
+        auth_env: vec![],
+    };
+    let (event_sender, event_receiver) = std::sync::mpsc::channel();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        adapter.start_turn(input(), None, event_sender),
+    )
+    .await
+    .expect("an agent exit returns instead of hanging");
+    assert!(result.is_err(), "the runtime exit fails the turn");
+    let events: Vec<TurnEvent> = event_receiver.try_iter().collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::QuestionRequest { .. })),
+        "the open question was reported: {events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, TurnEvent::TurnFailed { .. })),
+        "the turn failed after the runtime exit: {events:?}"
+    );
+
+    let (restart_sender, _restart_receiver) = std::sync::mpsc::channel();
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        adapter.start_turn(input(), None, restart_sender),
+    )
+    .await
+    .expect("the adapter restarts after an exit")
+    .expect("the next turn completes");
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

@@ -19,6 +19,7 @@ Run a turn that asks for permission. The overlay appears above the composer with
 `TurnEvent::ApprovalRequest` carries `choices`. `ApprovalState` stores them and the selected index. `decision_for_choice` maps the standard ids `accept`, `accept_always`, and `deny` back to the existing `ApprovalDecision` variants, and sends `ApprovalDecision::Choose(option_id)` for a provider-specific id. ACP builds the rows from `optionId`, `name`, and `kind` in `permission_choices`, and `pick_permission_option` accepts a `Choose` id only when it is one of the offered options; an unknown id becomes a cancelled permission response. The other adapters publish the standard choices and deny a `Choose` they do not understand.
 
 ## Gotchas
+- An ACP agent exit cancels the open approval and fails the turn. The terminal event removes only that thread's pending approval; another thread's request stays. Proof: `an_exited_runtime_cancels_pending_interactions` and `a_terminal_event_clears_only_its_thread_pending_interactions`.
 - ACP accepts only an option id, so a free-text custom answer is not part of this protocol.
 - Do not classify every ACP permission request as an approval. The `interaction_` prefix is Antigravity's user-input marker.
 - The overlay shows eight rows at a time and keeps the selected row in the window.

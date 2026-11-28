@@ -11,8 +11,8 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Settings | TUI | `/settings` writes global default mode and bell choices, shows the selected category's options, and labels harness rows read-only |
 | Auth billing | TUI | `/auth` lists every harness with subscription and API rows, marks the current mode, names the key variable or `missing`, applies a keyed choice, and keeps the picker open on a missing key or malformed config |
 | Login | TUI | `/login` lists every harness with the command it runs, suspends the TUI, runs the harness login, then resumes and reports the result |
-| Approval choices | TUI | an approval lists the provider's own choices, arrows and Enter send the selected id, y/a/n keep the standard shortcuts, and a child request names the child thread |
-| Provider questions | TUI | Codex `requestUserInput` and Grok `x.ai/ask_user_question` walk each question, answer an option or a custom Other text, mask secret input, and batch the native answers map |
+| Approval choices | TUI | an approval lists the provider's own choices, arrows and Enter send the selected id, y/a/n keep the standard shortcuts, a child request names the child thread, and an agent exit cancels the open request |
+| Provider questions | TUI | Codex `requestUserInput` and Grok `x.ai/ask_user_question` walk each question, answer an option or a custom Other text, mask secret input, batch the native answers map, and cancel when the agent exits |
 | Worker questions list | TUI | `/questions` lists open worker questions and opens the worker thread to answer |
 | Roles | TUI and CLI | `/roles` shows the four resolved role rows and detail; `baton roles --json` also returns effort, prompt source/path, and parsed hook declarations |
 | Skills | TUI | `/skills` lists Claude and Codex skills, marks project and global copies, scrolls past eight rows, inserts the source-specific invocation on Enter, installs a global copy on `i`, updates the project copy on `u`, and removes a project copy on `d` after confirmation |

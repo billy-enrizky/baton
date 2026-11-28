@@ -7,6 +7,7 @@
 - `apiKeyEnv` names the variable baton reads; the child receives `GEMINI_API_KEY`
 - `apiBaseUrl` maps to `GOOGLE_GEMINI_BASE_URL`; it is the endpoint root, not the OpenAI `/v1` base
 - ACP `usage_update` frames report `used` tokens and a positive `size`; Baton maps them to the context used and window, so `/context` and the 80 percent composer warning work for this harness
+- An `agy` exit fails the active turn, rejects pending client requests immediately, cancels an open question, and forces a fresh runtime on the next turn
 
 ## How to get to it
 ```sh
@@ -25,6 +26,8 @@ The probe writes a throwaway config with `mode: "api"`, `apiKeyEnv: "CODEX_ICA_A
 ## Proof
 - `adapters::acp::tests::acp_usage_updates_report_used_and_context_size`
 - `tui::tests::an_acp_context_used_event_updates_the_cached_usage`
+- `tests/acp_adapter.rs::an_acp_agent_exit_fails_the_turn_and_restarts_cleanly`
+- `adapters::acp::tests::an_exited_runtime_cancels_pending_interactions`
 
 ## Gotchas
 - The base URL is the host root. `agy` appends `/v1beta/models/...`; adding `/v1` returns HTTP 404.

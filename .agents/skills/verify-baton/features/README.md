@@ -45,6 +45,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Rate limits | TUI | `/limits` asks Codex for a live snapshot, then shows the primary and secondary windows with used percent, window length, reset time, plan, and credits; each other harness shows an explicit unknown line, and a failed read names its reason |
 | Changes view | TUI | `/changes` opens every diff in the thread in one scrollable view, with `turn N` headings, `[` and `]` jumps, `/changes <turn>` filtering, and a clear empty state |
 | Diff expansion | TUI | a diff longer than twelve rows collapses with `… N more lines · ctrl+t expand`; a multi-file diff keeps every path and its counts, spilling to `… N more files` only when paths alone fill the rows; Ctrl+T expands every long diff inline and swaps the hint to `ctrl+t collapse`; short diffs are unchanged; `scripts/diff_expand_probe.py` proves the collapse, expand, and recollapse in the real TUI against a two-file turn-written diff |
+| Diff pane | TUI | `/diff` opens the checkpoint diff beside the conversation on a wide terminal, PageUp and PageDown scroll it, Alt+D or `/clear` closes it, and a narrow terminal keeps the full-screen fallback |
 | Review | TUI | `/review` shows the turn diff, `/` finds text or a path, saves a line note, and leaves it unsent |
 | TUI native rewind | TUI | `/rewind --native` truncates the provider and store history and prefills the message |
 | Retry | TUI | `/retry` lists failed or unverified turns and submits the chosen prompt as a new turn |

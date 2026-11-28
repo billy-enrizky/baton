@@ -389,6 +389,8 @@ Alt+1 through Alt+9 switch to the tab in that position. Alt+0 does nothing. The 
 
 `/pane` opens a picker for the second pane. Alt+W swaps the active and secondary threads, Alt+[ and Alt+] resize the split, and `/pane close` closes the second pane. The second pane is read-only; its header names the tab, and its body shows the transcript tail plus any live tool or stream rows for that thread.
 
+On a wide terminal, `/diff` opens the checkpoint diff in the secondary pane so the conversation stays visible. PageUp and PageDown scroll the diff, and Alt+D closes it. `/clear` closes it too. A narrow terminal keeps the full-screen diff fallback.
+
 ## 7. Slash commands
 
 ### 7.1 How commands behave
@@ -440,7 +442,7 @@ Type `/` to see commands. Typing a command followed by a space always answers: i
 | `/review` | Review the latest turn diff, search it with `/`, and keep line notes |
 | `/changes` | Every diff in this thread in one scrollable view; `/changes <turn>` filters one turn |
 | `/plan` | Show the plan the current harness reported, with status and priority |
-| `/diff` | Diff a checkpoint against the working tree |
+| `/diff` | Diff a checkpoint against the working tree; on a wide terminal the diff opens in the scrollable secondary pane |
 | `/rewind` | Restore a turn and optionally the code; `--native` uses a Codex or OpenCode native rollback |
 | `/retry` | Retry a failed or unverified turn on the same harness |
 | `/queue` | Inspect, send, edit, delete, reorder, or clear queued follow-ups |

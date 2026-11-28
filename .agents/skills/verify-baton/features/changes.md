@@ -22,5 +22,5 @@ The tests seed two diffs, render `/changes`, assert both blocks, filter with `/c
 
 ## Gotchas
 
-- The view is read-only. Use `/review` for line notes and `/diff` for a checkpoint against the working tree.
+- The view is read-only. Use `/review` for line notes and `/diff` for a checkpoint against the working tree. `/diff` has its own secondary-pane path on a wide terminal; this view covers the every-diff report.
 - A very long thread renders every diff in one pass, bounded by the diff cache and the terminal width.

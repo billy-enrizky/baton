@@ -944,6 +944,7 @@ fn ensure_thread_columns(db: &Connection) -> Result<()> {
     ensure_column(db, "threads", "snoozed_until", "TEXT")?;
     ensure_column(db, "threads", "archived_at", "TEXT")?;
     ensure_column(db, "threads", "context_window", "INTEGER")?;
+    ensure_column(db, "threads", "context_used", "INTEGER")?;
     ensure_column(db, "threads", "context_model", "TEXT")?;
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS threads_pin_order_idx ON threads(pin_order_key DESC) WHERE pin_order_key IS NOT NULL;
@@ -1733,36 +1734,39 @@ impl BatonStore {
         Ok(changed == 1)
     }
 
-    /// Stores the model-reported context window with the model it belongs to,
-    /// so a later model change cannot reuse a stale percentage.
-    pub fn set_thread_context_window(
+    /// Stores the model-reported context window and the latest request's
+    /// tokens with the model they belong to, so a later model change cannot
+    /// reuse a stale percentage.
+    pub fn set_thread_context(
         &self,
         id: &str,
         window: Option<i64>,
+        used: Option<i64>,
         model: Option<&str>,
     ) -> Result<()> {
         self.write_execute(
-            "UPDATE threads SET context_window = ?, context_model = ? WHERE id = ?",
-            params![window, model, id],
+            "UPDATE threads SET context_window = ?, context_used = ?, context_model = ? WHERE id = ?",
+            params![window, used, model, id],
         )?;
         Ok(())
     }
 
-    pub fn thread_context_window(&self, id: &str) -> Result<Option<(i64, Option<String>)>> {
+    pub fn thread_context(&self, id: &str) -> Result<(Option<i64>, Option<i64>, Option<String>)> {
         let row = self
             .db
             .query_row(
-                "SELECT context_window, context_model FROM threads WHERE id = ?1",
+                "SELECT context_window, context_used, context_model FROM threads WHERE id = ?1",
                 params![id],
                 |row| {
                     Ok((
                         row.get::<_, Option<i64>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
                     ))
                 },
             )
             .optional()?;
-        Ok(row.and_then(|(window, model)| window.map(|window| (window, model))))
+        Ok(row.unwrap_or((None, None, None)))
     }
 
     pub fn remove_schedule(&self, id: &str) -> Result<bool> {
@@ -4945,18 +4949,33 @@ mod tests {
                 current_model: Some("claude-opus-5-5".into()),
             })
             .unwrap();
-        assert_eq!(store.thread_context_window(&thread.id).unwrap(), None);
-        store
-            .set_thread_context_window(&thread.id, Some(200_000), Some("claude-opus-5-5"))
-            .unwrap();
         assert_eq!(
-            store.thread_context_window(&thread.id).unwrap(),
-            Some((200_000, Some("claude-opus-5-5".to_string())))
+            store.thread_context(&thread.id).unwrap(),
+            (None, None, None)
         );
         store
-            .set_thread_context_window(&thread.id, None, None)
+            .set_thread_context(
+                &thread.id,
+                Some(200_000),
+                Some(85_000),
+                Some("claude-opus-5-5"),
+            )
             .unwrap();
-        assert_eq!(store.thread_context_window(&thread.id).unwrap(), None);
+        assert_eq!(
+            store.thread_context(&thread.id).unwrap(),
+            (
+                Some(200_000),
+                Some(85_000),
+                Some("claude-opus-5-5".to_string())
+            )
+        );
+        store
+            .set_thread_context(&thread.id, None, None, None)
+            .unwrap();
+        assert_eq!(
+            store.thread_context(&thread.id).unwrap(),
+            (None, None, None)
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
@@ -881,6 +881,8 @@ fn tool_descriptors(access: McpAccess) -> Vec<Value> {
 
 const MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAX_HTTP_BODY_BYTES: usize = 1024 * 1024;
+const MAX_HTTP_SESSION_ID_BYTES: usize = 128;
+const MAX_HTTP_SESSIONS: usize = 1024;
 
 const MAX_SECRET_FILE_BYTES: u64 = 1024 * 1024;
 
@@ -996,6 +998,7 @@ pub fn run_http(
         let scheme = if encrypted { "https" } else { "http" };
         eprintln!("baton: MCP HTTP listening on {scheme}://{local}");
         let server = Arc::new(Mutex::new(server));
+        let sessions = Arc::new(Mutex::new(HashSet::new()));
         #[cfg(unix)]
         let mut reload =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
@@ -1031,14 +1034,17 @@ pub fn run_http(
                             .clone(),
                     );
                     let tls_acceptor = tls_acceptor.clone();
+                    let sessions = sessions.clone();
                     tokio::spawn(async move {
                         let result = match tls_acceptor {
                             Some(acceptor) => match acceptor.accept(stream).await {
-                                Ok(stream) => serve_http_connection(stream, server, token).await,
+                                Ok(stream) => {
+                                    serve_http_connection(stream, server, token, sessions).await
+                                }
                                 Err(error) => Err(anyhow::Error::new(error)
                                     .context("MCP TLS handshake")),
                             },
-                            None => serve_http_connection(stream, server, token).await,
+                            None => serve_http_connection(stream, server, token, sessions).await,
                         };
                         if let Err(error) = result {
                             eprintln!("baton: MCP HTTP connection: {error}");
@@ -1055,6 +1061,7 @@ async fn serve_http_connection<S>(
     stream: S,
     server: Arc<Mutex<McpServer>>,
     token: Arc<String>,
+    sessions: Arc<Mutex<HashSet<String>>>,
 ) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -1097,6 +1104,7 @@ where
 
     let mut content_length = None;
     let mut authorization = None;
+    let mut mcp_session = None;
     let mut expect_continue = false;
     let mut header_bytes = 0usize;
     loop {
@@ -1154,6 +1162,7 @@ where
                 content_length = Some(length);
             }
             "authorization" => authorization = Some(value.trim().to_string()),
+            "mcp-session-id" => mcp_session = Some(value.trim().to_string()),
             "expect" => expect_continue = value.trim().eq_ignore_ascii_case("100-continue"),
             _ => {}
         }
@@ -1179,12 +1188,14 @@ where
         )
         .await;
     }
-    if method != "POST" {
+    if method != "POST" && method != "DELETE" {
         return write_http_response(
             &mut write,
             "405 Method Not Allowed",
             "application/json",
-            json!({"error": "use POST /mcp"}).to_string().as_bytes(),
+            json!({"error": "use POST or DELETE /mcp"})
+                .to_string()
+                .as_bytes(),
         )
         .await;
     }
@@ -1210,6 +1221,49 @@ where
         write.write_all(body.as_bytes()).await?;
         write.flush().await?;
         return Ok(());
+    }
+
+    if let Some(session) = mcp_session.as_deref() {
+        if !valid_http_session_id(session) {
+            return write_http_response(
+                &mut write,
+                "400 Bad Request",
+                "application/json",
+                json!({"error": "invalid Mcp-Session-Id"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await;
+        }
+    }
+    if method == "DELETE" {
+        let Some(session) = mcp_session.as_deref() else {
+            return write_http_response(
+                &mut write,
+                "400 Bad Request",
+                "application/json",
+                json!({"error": "Mcp-Session-Id is required"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await;
+        };
+        let removed = sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MCP session lock poisoned"))?
+            .remove(session);
+        if !removed {
+            return write_http_response(
+                &mut write,
+                "404 Not Found",
+                "application/json",
+                json!({"error": "unknown Mcp-Session-Id"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await;
+        }
+        return write_http_response(&mut write, "204 No Content", "application/json", b"").await;
     }
 
     let Some(content_length) = content_length else {
@@ -1259,22 +1313,86 @@ where
             .await
         }
     };
+    let is_initialize = frame.get("method").and_then(Value::as_str) == Some("initialize");
+    if !is_initialize {
+        let Some(session) = mcp_session.as_deref() else {
+            return write_http_response(
+                &mut write,
+                "400 Bad Request",
+                "application/json",
+                json!({"error": "Mcp-Session-Id is required"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await;
+        };
+        let known = sessions
+            .lock()
+            .map_err(|_| anyhow::anyhow!("MCP session lock poisoned"))?
+            .contains(session);
+        if !known {
+            return write_http_response(
+                &mut write,
+                "404 Not Found",
+                "application/json",
+                json!({"error": "unknown Mcp-Session-Id"})
+                    .to_string()
+                    .as_bytes(),
+            )
+            .await;
+        }
+    }
     let response = server
         .lock()
         .map_err(|_| anyhow::anyhow!("MCP server lock poisoned"))?
         .handle(frame);
     match response {
         Some(response) => {
-            write_http_response(
+            let session = if is_initialize && response.get("error").is_none() {
+                let session = uuid::Uuid::new_v4().to_string();
+                if !insert_http_session(&sessions, &session)? {
+                    return write_http_response(
+                        &mut write,
+                        "503 Service Unavailable",
+                        "application/json",
+                        json!({"error": "too many MCP sessions"})
+                            .to_string()
+                            .as_bytes(),
+                    )
+                    .await;
+                }
+                Some(session)
+            } else {
+                None
+            };
+            write_http_response_with_session(
                 &mut write,
                 "200 OK",
                 "application/json",
                 serde_json::to_string(&response)?.as_bytes(),
+                session.as_deref(),
             )
             .await
         }
         None => write_http_response(&mut write, "202 Accepted", "application/json", b"").await,
     }
+}
+
+fn valid_http_session_id(session: &str) -> bool {
+    !session.is_empty()
+        && session.len() <= MAX_HTTP_SESSION_ID_BYTES
+        && session.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
+
+fn insert_http_session(sessions: &Mutex<HashSet<String>>, session: &str) -> Result<bool> {
+    let mut sessions = sessions
+        .lock()
+        .map_err(|_| anyhow::anyhow!("MCP session lock poisoned"))?;
+    if sessions.len() >= MAX_HTTP_SESSIONS {
+        return Ok(false);
+    }
+    sessions.insert(session.to_string());
+    Ok(true)
 }
 
 async fn write_http_response<W>(
@@ -1286,8 +1404,24 @@ async fn write_http_response<W>(
 where
     W: AsyncWrite + Unpin,
 {
+    write_http_response_with_session(write, status, content_type, body, None).await
+}
+
+async fn write_http_response_with_session<W>(
+    write: &mut W,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+    session: Option<&str>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let session_header = session
+        .map(|session| format!("Mcp-Session-Id: {session}\r\n"))
+        .unwrap_or_default();
     let header = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\n{session_header}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     write.write_all(header.as_bytes()).await?;
@@ -1528,9 +1662,14 @@ mod tests {
         let server_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let stream = acceptor.accept(stream).await.unwrap();
-            serve_http_connection(stream, server, Arc::new(expected_token))
-                .await
-                .unwrap();
+            serve_http_connection(
+                stream,
+                server,
+                Arc::new(expected_token),
+                Arc::new(Mutex::new(HashSet::new())),
+            )
+            .await
+            .unwrap();
         });
 
         let root = native_tls::Certificate::from_pem(cert_pem.as_bytes()).unwrap();
@@ -1549,7 +1688,7 @@ mod tests {
         })
         .to_string();
         stream
-            .write_all(http_post(Some(&auth), &initialize).as_bytes())
+            .write_all(http_post(Some(&auth), &initialize, None).as_bytes())
             .await
             .unwrap();
         let mut response = Vec::new();
@@ -1581,10 +1720,15 @@ mod tests {
         assert_eq!(*current.read().unwrap(), token);
     }
 
-    async fn http_request(server: Arc<Mutex<McpServer>>, token: &str, request: &str) -> String {
+    async fn http_request(
+        server: Arc<Mutex<McpServer>>,
+        token: &str,
+        sessions: Arc<Mutex<HashSet<String>>>,
+        request: &str,
+    ) -> String {
         let (mut client, server_side) = tokio::io::duplex(16 * 1024);
         let token = Arc::new(token.to_string());
-        let handle = tokio::spawn(serve_http_connection(server_side, server, token));
+        let handle = tokio::spawn(serve_http_connection(server_side, server, token, sessions));
         client.write_all(request.as_bytes()).await.unwrap();
         let mut response = Vec::new();
         client.read_to_end(&mut response).await.unwrap();
@@ -1592,19 +1736,31 @@ mod tests {
         String::from_utf8_lossy(&response).to_string()
     }
 
-    fn http_post(auth: Option<&str>, body: &str) -> String {
+    fn http_post(auth: Option<&str>, body: &str, session: Option<&str>) -> String {
         let auth = auth
             .map(|value| format!("Authorization: {value}\r\n"))
             .unwrap_or_default();
+        let session = session
+            .map(|value| format!("Mcp-Session-Id: {value}\r\n"))
+            .unwrap_or_default();
         format!(
-            "POST /mcp HTTP/1.1\r\nHost: localhost\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\n{auth}{session}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
         )
+    }
+
+    fn http_session(response: &str) -> Option<String> {
+        response.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("mcp-session-id")
+                .then(|| value.trim().to_string())
+        })
     }
 
     #[tokio::test]
     async fn http_requires_a_bearer_and_answers_initialize() {
         let server = Arc::new(Mutex::new(server()));
+        let sessions = Arc::new(Mutex::new(HashSet::new()));
         let token = "a".repeat(64);
         let initialize = json!({
             "jsonrpc": "2.0",
@@ -1617,7 +1773,8 @@ mod tests {
         let unauthorized = http_request(
             server.clone(),
             &token,
-            &http_post(Some("Bearer wrong"), &initialize),
+            sessions.clone(),
+            &http_post(Some("Bearer wrong"), &initialize, None),
         )
         .await;
         assert!(unauthorized.starts_with("HTTP/1.1 401"), "{unauthorized}");
@@ -1625,12 +1782,14 @@ mod tests {
         let accepted = http_request(
             server.clone(),
             &token,
-            &http_post(Some(&format!("Bearer {token}")), &initialize),
+            sessions.clone(),
+            &http_post(Some(&format!("Bearer {token}")), &initialize, None),
         )
         .await;
         assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
         assert!(accepted.contains("\"serverInfo\""), "{accepted}");
         assert!(accepted.contains("2025-06-18"), "{accepted}");
+        let session = http_session(&accepted).expect("initialize returns a session id");
 
         let notification = json!({
             "jsonrpc": "2.0",
@@ -1641,7 +1800,12 @@ mod tests {
         let accepted = http_request(
             server.clone(),
             &token,
-            &http_post(Some(&format!("Bearer {token}")), &notification),
+            sessions.clone(),
+            &http_post(
+                Some(&format!("Bearer {token}")),
+                &notification,
+                Some(&session),
+            ),
         )
         .await;
         assert!(accepted.starts_with("HTTP/1.1 202"), "{accepted}");
@@ -1649,6 +1813,7 @@ mod tests {
         let health = http_request(
             server.clone(),
             &token,
+            sessions.clone(),
             "GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n",
         )
         .await;
@@ -1658,11 +1823,133 @@ mod tests {
         let malformed = http_request(
             server,
             &token,
-            &http_post(Some(&format!("Bearer {token}")), "{"),
+            sessions,
+            &http_post(Some(&format!("Bearer {token}")), "{", None),
         )
         .await;
         assert!(malformed.starts_with("HTTP/1.1 400"), "{malformed}");
         assert!(malformed.contains("-32700"), "{malformed}");
+    }
+
+    #[tokio::test]
+    async fn http_session_ids_guard_requests_and_can_be_deleted() {
+        let server = Arc::new(Mutex::new(server()));
+        let sessions = Arc::new(Mutex::new(HashSet::new()));
+        let token = "a".repeat(64);
+        let auth = format!("Bearer {token}");
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}
+        })
+        .to_string();
+        let accepted = http_request(
+            server.clone(),
+            &token,
+            sessions.clone(),
+            &http_post(Some(&auth), &initialize, None),
+        )
+        .await;
+        assert!(accepted.starts_with("HTTP/1.1 200"), "{accepted}");
+        let session = http_session(&accepted).expect("initialize returns a session id");
+
+        let list =
+            json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}).to_string();
+        let missing = http_request(
+            server.clone(),
+            &token,
+            sessions.clone(),
+            &http_post(Some(&auth), &list, None),
+        )
+        .await;
+        assert!(missing.starts_with("HTTP/1.1 400"), "{missing}");
+        assert!(missing.contains("Mcp-Session-Id"), "{missing}");
+
+        let listed = http_request(
+            server.clone(),
+            &token,
+            sessions.clone(),
+            &http_post(Some(&auth), &list, Some(&session)),
+        )
+        .await;
+        assert!(listed.starts_with("HTTP/1.1 200"), "{listed}");
+        assert!(listed.contains("\"tools\""), "{listed}");
+
+        let unknown = http_request(
+            server.clone(),
+            &token,
+            sessions.clone(),
+            &http_post(
+                Some(&auth),
+                &list,
+                Some("00000000-0000-4000-8000-000000000000"),
+            ),
+        )
+        .await;
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+
+        let invalid = http_request(
+            server.clone(),
+            &token,
+            sessions.clone(),
+            &http_post(Some(&auth), &list, Some("contains a space")),
+        )
+        .await;
+        assert!(invalid.starts_with("HTTP/1.1 400"), "{invalid}");
+        assert!(invalid.contains("invalid Mcp-Session-Id"), "{invalid}");
+
+        let too_long = "x".repeat(MAX_HTTP_SESSION_ID_BYTES + 1);
+        let oversized = http_request(
+            server.clone(),
+            &token,
+            sessions.clone(),
+            &http_post(Some(&auth), &list, Some(&too_long)),
+        )
+        .await;
+        assert!(oversized.starts_with("HTTP/1.1 400"), "{oversized}");
+
+        let delete = format!(
+            "DELETE /mcp HTTP/1.1\r\nHost: localhost\r\nAuthorization: {auth}\r\nMcp-Session-Id: {session}\r\n\r\n"
+        );
+        let deleted = http_request(server.clone(), &token, sessions.clone(), &delete).await;
+        assert!(deleted.starts_with("HTTP/1.1 204"), "{deleted}");
+
+        let expired = http_request(
+            server,
+            &token,
+            sessions,
+            &http_post(Some(&auth), &list, Some(&session)),
+        )
+        .await;
+        assert!(expired.starts_with("HTTP/1.1 404"), "{expired}");
+    }
+
+    #[tokio::test]
+    async fn http_refuses_a_new_session_at_capacity() {
+        let server = Arc::new(Mutex::new(server()));
+        let sessions = Arc::new(Mutex::new(HashSet::new()));
+        for index in 0..MAX_HTTP_SESSIONS {
+            sessions.lock().unwrap().insert(format!("session-{index}"));
+        }
+        let token = "a".repeat(64);
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18"}
+        })
+        .to_string();
+        let full = http_request(
+            server,
+            &token,
+            sessions.clone(),
+            &http_post(Some(&format!("Bearer {token}")), &initialize, None),
+        )
+        .await;
+        assert!(full.starts_with("HTTP/1.1 503"), "{full}");
+        assert!(http_session(&full).is_none(), "{full}");
+        assert_eq!(sessions.lock().unwrap().len(), MAX_HTTP_SESSIONS);
     }
 
     #[test]

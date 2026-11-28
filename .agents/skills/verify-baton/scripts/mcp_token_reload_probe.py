@@ -27,25 +27,24 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
-def post(port: int, token: str, method: str, params=None):
+def post(port: int, token: str, method: str, params=None, session=None):
     connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     frame = {"jsonrpc": "2.0", "id": 1, "method": method}
     if params is not None:
         frame["params"] = params
-    connection.request(
-        "POST",
-        "/mcp",
-        json.dumps(frame).encode(),
-        {"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    if session is not None:
+        headers["Mcp-Session-Id"] = session
+    connection.request("POST", "/mcp", json.dumps(frame).encode(), headers)
     response = connection.getresponse()
     data = response.read()
+    response_headers = {name.lower(): value for name, value in response.getheaders()}
     connection.close()
     try:
         body = json.loads(data)
     except ValueError:
         body = {}
-    return response.status, body
+    return response.status, body, response_headers
 
 
 def wait_health(port: int) -> None:
@@ -106,38 +105,60 @@ def run(binary: str, evidence: Path) -> dict:
         threading.Thread(target=read_stderr, daemon=True).start()
         try:
             wait_health(port)
-            first_status, first_init = post(
+            first_status, first_init, first_headers = post(
                 port, first, "initialize", {"protocolVersion": "2025-06-18"}
+            )
+            first_session = first_headers.get("mcp-session-id")
+            first_tools_status, first_tools, _ = post(
+                port, first, "tools/list", session=first_session
             )
             token_path.write_text(second + "\n")
             process.send_signal(signal.SIGHUP)
             wait_line(lines, "reloaded the MCP bearer token")
-            old_status, _ = post(port, first, "initialize", {"protocolVersion": "2025-06-18"})
-            new_status, new_init = post(
+            old_status, _, _ = post(
+                port, first, "initialize", {"protocolVersion": "2025-06-18"}
+            )
+            new_status, new_init, new_headers = post(
                 port, second, "initialize", {"protocolVersion": "2025-06-18"}
+            )
+            new_session = new_headers.get("mcp-session-id")
+            new_tools_status, new_tools, _ = post(
+                port, second, "tools/list", session=new_session
             )
             token_path.write_text("short\n")
             process.send_signal(signal.SIGHUP)
             wait_line(lines, "MCP token reload failed")
-            kept_status, _ = post(
+            kept_status, _, _ = post(
                 port, second, "initialize", {"protocolVersion": "2025-06-18"}
             )
             result = {
                 "first_status": first_status,
+                "first_session_present": bool(first_session),
                 "first_protocol": first_init.get("result", {}).get("protocolVersion"),
+                "first_tools_status": first_tools_status,
+                "first_tool_count": len(first_tools.get("result", {}).get("tools", [])),
                 "old_status_after_reload": old_status,
                 "new_status_after_reload": new_status,
+                "new_session_present": bool(new_session),
                 "new_protocol": new_init.get("result", {}).get("protocolVersion"),
+                "new_tools_status": new_tools_status,
+                "new_tool_count": len(new_tools.get("result", {}).get("tools", [])),
                 "kept_status_after_invalid_reload": kept_status,
                 "stderr_has_reload": any("reloaded the MCP bearer token" in line for line in lines),
                 "stderr_has_failure": any("MCP token reload failed" in line for line in lines),
             }
             passed = (
                 result["first_status"] == 200
+                and result["first_session_present"]
                 and result["first_protocol"] == "2025-06-18"
+                and result["first_tools_status"] == 200
+                and result["first_tool_count"] == 15
                 and result["old_status_after_reload"] == 401
                 and result["new_status_after_reload"] == 200
+                and result["new_session_present"]
                 and result["new_protocol"] == "2025-06-18"
+                and result["new_tools_status"] == 200
+                and result["new_tool_count"] == 15
                 and result["kept_status_after_invalid_reload"] == 200
                 and result["stderr_has_reload"]
                 and result["stderr_has_failure"]

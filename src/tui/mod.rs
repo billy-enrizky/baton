@@ -1073,6 +1073,9 @@ pub struct TuiState {
     open_tabs: Vec<OpenThreadTab>,
     background_runs: std::collections::HashMap<String, ThreadRunState>,
     secondary_tab: Option<String>,
+    /// The last model-reported context window for each thread. Session-only:
+    /// a harness that never reports one leaves the percentage unknown.
+    context_windows: std::collections::HashMap<String, i64>,
     /// Percentage of the transcript area the primary pane keeps when the
     /// secondary pane is open. Clamped to 20 through 80.
     secondary_split: u16,
@@ -1251,6 +1254,7 @@ pub fn run_tui(
         open_tabs,
         background_runs: std::collections::HashMap::new(),
         secondary_tab: None,
+        context_windows: std::collections::HashMap::new(),
         secondary_split: 50,
         secondary_history: Vec::new(),
         side_chat_of,
@@ -3350,7 +3354,8 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
         }
         TurnEvent::ProviderTurnId { .. }
         | TurnEvent::ProviderSession { .. }
-        | TurnEvent::Usage { .. } => {}
+        | TurnEvent::Usage { .. }
+        | TurnEvent::ContextWindow { .. } => {}
         // Approval requests need their thread id, so the run loop routes them
         // through apply_turn_event_for_thread before calling this function.
         TurnEvent::ApprovalRequest { .. } => {}
@@ -3590,6 +3595,9 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
                 });
                 state.ring_attention();
             }
+        }
+        TurnEvent::ContextWindow { tokens } => {
+            state.context_windows.insert(thread_id, tokens);
         }
         event if thread_id == state.thread.id => apply_turn_event(state, event),
         event => apply_background_turn_event(state, &thread_id, event),
@@ -11730,8 +11738,31 @@ fn handle_command(
             } else {
                 format_usage_line(&sum_usage(&usage_rows))
             };
+            let window = state.context_windows.get(&state.thread.id).copied();
+            let latest_context = usage_rows.last().map(|row| {
+                row.usage.input_tokens
+                    + row.usage.cache_read_tokens
+                    + row.usage.cache_creation_tokens
+            });
+            let window_line = match (latest_context, window) {
+                (Some(tokens), Some(window)) if window > 0 => format!(
+                    "context window: {} used of {} ({:.1}%)",
+                    crate::usage::format_token_count(tokens),
+                    crate::usage::format_token_count(window),
+                    tokens as f64 / window as f64 * 100.0
+                ),
+                (Some(tokens), _) => format!(
+                    "context window: {} used, window unknown (this harness has not reported one)",
+                    crate::usage::format_token_count(tokens)
+                ),
+                (None, Some(window)) => format!(
+                    "context window: no turn usage yet, window {}",
+                    crate::usage::format_token_count(window)
+                ),
+                (None, None) => "context window: unknown".to_string(),
+            };
             state.notice = Some(format!(
-                "context: {} messages, {:.1}k chars history, {:.1}k chars streaming\ntokens: {usage_line}",
+                "context: {} messages, {:.1}k chars history, {:.1}k chars streaming\ntokens: {usage_line}\n{window_line}",
                 messages.len(),
                 total_chars as f64 / 1000.0,
                 streaming_chars as f64 / 1000.0
@@ -14607,6 +14638,7 @@ fn set_current_model(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, model
     match result {
         Ok(()) => {
             state.thread.current_model = Some(model.clone());
+            state.context_windows.remove(&state.thread.id);
             state.overlay = Overlay::None;
             state.notice = Some(format!("model set to {model}"));
         }
@@ -14653,6 +14685,7 @@ fn perform_switch(
         Ok(()) => {
             state.thread.current_provider = provider;
             state.thread.current_model = model.clone();
+            state.context_windows.remove(&state.thread.id);
             if !provider.supports_effort() {
                 state.thread.reasoning_effort = None;
             }
@@ -20128,6 +20161,7 @@ mod tests {
             open_tabs,
             background_runs: std::collections::HashMap::new(),
             secondary_tab: None,
+            context_windows: std::collections::HashMap::new(),
             secondary_split: 50,
             secondary_history: Vec::new(),
             side_chat_of: None,
@@ -27784,6 +27818,80 @@ mod tests {
             receiver.try_recv().is_err(),
             "a shell snippet is not submitted to the engine"
         );
+    }
+
+    #[test]
+    fn context_command_shows_the_model_reported_window() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        store
+            .lock()
+            .unwrap()
+            .add_usage(
+                &thread_id,
+                1,
+                ProviderId::Claude,
+                Some("m"),
+                &crate::types::TurnUsage {
+                    input_tokens: 10_000,
+                    output_tokens: 100,
+                    cache_read_tokens: 50_000,
+                    cache_creation_tokens: 40_000,
+                    cost_usd: None,
+                },
+            )
+            .unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id,
+            TurnEvent::ContextWindow { tokens: 200_000 },
+        );
+        handle_command(&mut state, &store, &sender, "/context");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("100.0k used of 200.0k (50.0%)"), "{notice}");
+    }
+
+    #[test]
+    fn context_command_marks_an_unreported_window_unknown() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        store
+            .lock()
+            .unwrap()
+            .add_usage(
+                &thread_id,
+                1,
+                ProviderId::Claude,
+                Some("m"),
+                &crate::types::TurnUsage {
+                    input_tokens: 1_000,
+                    output_tokens: 10,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    cost_usd: None,
+                },
+            )
+            .unwrap();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        handle_command(&mut state, &store, &sender, "/context");
+        let notice = state.notice.clone().unwrap_or_default();
+        assert!(notice.contains("1.0k used, window unknown"), "{notice}");
+    }
+
+    #[test]
+    fn changing_the_model_clears_the_reported_window() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        state.context_windows.insert(thread_id.clone(), 200_000);
+        set_current_model(&mut state, &store, "claude-opus-5-5".to_string());
+        assert!(!state.context_windows.contains_key(&thread_id));
     }
 
     #[test]

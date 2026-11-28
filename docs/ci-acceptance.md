@@ -23,6 +23,8 @@ What the change gives up: a temporary `tests/panic_probe.rs` was compiled under 
 Cold seed: the `Cargo.toml` hash is part of the cache key, so the first run after this change cannot restore a usable test cache. PR #427 run [46134284130](https://github.com/billy-enrizky/baton/actions/runs/46134284130) recorded it: whole run 86 seconds, Test 69 seconds, Test step 53 seconds, 38.78 seconds of cargo with the dependency tree built from source, and 13.15 seconds of tests. The profile label moved from `[unoptimized + debuginfo]` to `[unoptimized]`, which proves the setting reached CI. Those numbers are the seed and are not a warm sample. The first pull request after the seed records the warm comparison, and this change is reverted if that run does not improve.
 
 Local verification: 1,246 tests, format debt 534, Clippy debt 60, all 55 formal gates, the CI admission model, the 22-page docs export, doc links, parity paths, and the CI self-tests.
+Warm comparison after the seed: PR #428 run [46136129699](https://github.com/billy-enrizky/baton/actions/runs/46136129699) restored the seeded cache and recompiled only `baton`, reaching `Finished` in 25.39 seconds against 26.07 seconds for the profile that kept line tables, with 15.42 seconds of tests, a 42-second Test step, a 66-second Test job, and an 81-second run. The controlled local A/B predicted 7.7 percent on exactly that stage; CI delivered 2.6 percent on one sample each, and the Test job moved the other way inside a 55 to 111 second spread, so this pair does not decide the profile. A second warm sample on the same cache key is recorded before the profile is kept or reverted.
+
 
 ## 2026-11-27 upload-artifact Node 24 pin
 

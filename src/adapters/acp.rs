@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
@@ -20,6 +20,8 @@ struct AcpRuntime {
     reader: AsyncMutex<Box<dyn LineReader>>,
     writer: AsyncMutex<Box<dyn LineWriter>>,
     pending: Mutex<HashMap<u32, oneshot::Sender<Result<Value, String>>>>,
+    alive: AtomicBool,
+    exit: tokio::sync::watch::Sender<bool>,
     notifications: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
     current_emit: AsyncMutex<Option<TurnEventSender>>,
     active_session: AsyncMutex<Option<String>>,
@@ -110,7 +112,30 @@ fn spawn_reader(runtime: Arc<AcpRuntime>) {
                 }
             }
         }
+        fail_runtime(&runtime, "acp connection closed");
     });
+}
+
+fn fail_runtime(runtime: &Arc<AcpRuntime>, message: &str) {
+    runtime.alive.store(false, Ordering::Release);
+    runtime.exit.send_replace(true);
+    let pending = std::mem::take(&mut *runtime.pending.lock().unwrap());
+    for sender in pending.into_values() {
+        let _ = sender.send(Err(message.to_string()));
+    }
+}
+
+fn register_pending(
+    runtime: &AcpRuntime,
+    id: u32,
+    sender: oneshot::Sender<Result<Value, String>>,
+) -> Result<()> {
+    let mut pending = runtime.pending.lock().unwrap();
+    if !runtime.alive.load(Ordering::Acquire) {
+        anyhow::bail!("acp connection closed");
+    }
+    pending.insert(id, sender);
+    Ok(())
 }
 
 async fn handle_server_request(
@@ -168,8 +193,11 @@ async fn handle_server_request(
         }
     }
     let runtime = runtime.clone();
+    let exit = runtime.exit.subscribe();
     tokio::spawn(async move {
-        let option_id = pick_permission_option(&options, receiver.await.ok());
+        let option_id = approval_decision_or_cancel(receiver, exit)
+            .await
+            .and_then(|decision| pick_permission_option(&options, Some(decision)));
         let outcome = match option_id {
             Some(option_id) => json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
             None => json!({ "outcome": { "outcome": "cancelled" } }),
@@ -443,10 +471,37 @@ async fn handle_question_request<F>(
         }
     }
     let runtime = runtime.clone();
+    let exit = runtime.exit.subscribe();
     tokio::spawn(async move {
-        let answers = receiver.await.unwrap_or_default();
+        let answers = question_answers_or_cancel(receiver, exit).await;
         send_acp_result(&runtime, id, response(&questions, &answers)).await;
     });
+}
+
+async fn approval_decision_or_cancel(
+    receiver: oneshot::Receiver<ApprovalDecision>,
+    mut exit: tokio::sync::watch::Receiver<bool>,
+) -> Option<ApprovalDecision> {
+    if *exit.borrow() {
+        return None;
+    }
+    tokio::select! {
+        decision = receiver => decision.ok(),
+        _ = exit.changed() => None,
+    }
+}
+
+async fn question_answers_or_cancel(
+    receiver: oneshot::Receiver<Vec<QuestionAnswer>>,
+    mut exit: tokio::sync::watch::Receiver<bool>,
+) -> Vec<QuestionAnswer> {
+    if *exit.borrow() {
+        return Vec::new();
+    }
+    tokio::select! {
+        answers = receiver => answers.unwrap_or_default(),
+        _ = exit.changed() => Vec::new(),
+    }
 }
 
 async fn send_acp_result(runtime: &Arc<AcpRuntime>, id: Value, result: Value) {
@@ -751,9 +806,13 @@ impl AcpAdapter {
 
     async fn ensure_runtime(&mut self, auth_env: &[(String, String)]) -> Result<Arc<AcpRuntime>> {
         let signature = auth_signature(auth_env);
-        let need_spawn = self.auth_signature.lock().unwrap().as_deref() != Some(signature.as_str());
-        if need_spawn {
-            let mut slot = self.runtime.lock().await;
+        let signature_changed =
+            self.auth_signature.lock().unwrap().as_deref() != Some(signature.as_str());
+        let mut slot = self.runtime.lock().await;
+        let runtime_dead = slot
+            .as_ref()
+            .is_some_and(|runtime| !runtime.alive.load(Ordering::Acquire));
+        if signature_changed || runtime_dead {
             if let Some(runtime) = slot.as_ref() {
                 let mut writer = runtime.writer.lock().await;
                 let _ = writer.shutdown().await;
@@ -764,6 +823,8 @@ impl AcpAdapter {
                 reader: AsyncMutex::new(reader),
                 writer: AsyncMutex::new(writer),
                 pending: Mutex::new(HashMap::new()),
+                alive: AtomicBool::new(true),
+                exit: tokio::sync::watch::channel(false).0,
                 notifications: notification_sender,
                 current_emit: AsyncMutex::new(None),
                 active_session: AsyncMutex::new(None),
@@ -773,14 +834,14 @@ impl AcpAdapter {
             self.notification_receiver = Some(notification_receiver);
             *self.auth_signature.lock().unwrap() = Some(signature);
         }
-        Ok(self.runtime.lock().await.clone().expect("acp runtime spawned"))
+        Ok(slot.as_ref().cloned().expect("acp runtime spawned"))
     }
 
     async fn request(&self, runtime: &Arc<AcpRuntime>, method: &str, params: Value) -> Result<Value> {
         acp_debug(&format!("request {method}"));
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, receiver) = oneshot::channel();
-        runtime.pending.lock().unwrap().insert(id, sender);
+        register_pending(runtime, id, sender)?;
         let frame = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         {
             let mut writer = runtime.writer.lock().await;
@@ -796,6 +857,7 @@ impl AcpAdapter {
                 anyhow::bail!("acp error: {error}")
             }
             _ => {
+                runtime.pending.lock().unwrap().remove(&id);
                 acp_debug(&format!("response {method} timeout"));
                 anyhow::bail!("acp request timed out: {method}")
             }
@@ -972,7 +1034,7 @@ impl BatonAdapter for AcpAdapter {
         });
         let prompt_id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (sender, mut prompt_receiver) = oneshot::channel();
-        runtime.pending.lock().unwrap().insert(prompt_id, sender);
+        register_pending(&runtime, prompt_id, sender)?;
         let frame = json!({ "jsonrpc": "2.0", "id": prompt_id, "method": "session/prompt", "params": prompt_params });
         {
             let mut writer = runtime.writer.lock().await;
@@ -1058,6 +1120,7 @@ impl BatonAdapter for AcpAdapter {
                 }
             }
         };
+        runtime.pending.lock().unwrap().remove(&prompt_id);
         self.notification_receiver = Some(receiver);
         *runtime.current_emit.lock().await = None;
         *runtime.active_session.lock().await = None;
@@ -1095,7 +1158,8 @@ impl BatonAdapter for AcpAdapter {
 mod tests {
     use super::{
         antigravity_model_family, antigravity_question_prompts, antigravity_question_response,
-        handle_session_update, permission_choices, pick_permission_option, xai_question_prompts,
+        approval_decision_or_cancel, handle_session_update, permission_choices,
+        pick_permission_option, question_answers_or_cancel, xai_question_prompts,
         xai_question_response, TurnEvent,
     };
     use crate::types::{ApprovalDecision, QuestionAnswer, QuestionPrompt};
@@ -1138,6 +1202,57 @@ mod tests {
                 .any(|event| matches!(event, TurnEvent::ContextWindow { .. })),
             "a zero size is unknown: {events:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn an_exited_runtime_cancels_pending_interactions() {
+        let (approval_sender, approval_receiver) =
+            tokio::sync::oneshot::channel::<ApprovalDecision>();
+        let (question_sender, question_receiver) =
+            tokio::sync::oneshot::channel::<Vec<QuestionAnswer>>();
+        let (approval_exit, approval_exit_rx) = tokio::sync::watch::channel(false);
+        let (_question_exit, question_exit_rx) = tokio::sync::watch::channel(true);
+        drop(approval_sender);
+        approval_exit.send_replace(true);
+        assert_eq!(
+            approval_decision_or_cancel(approval_receiver, approval_exit_rx).await,
+            None
+        );
+        drop(question_sender);
+        assert!(
+            question_answers_or_cancel(question_receiver, question_exit_rx)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_runtime_keeps_a_pending_interaction_until_it_is_answered() {
+        let (approval_sender, approval_receiver) =
+            tokio::sync::oneshot::channel::<ApprovalDecision>();
+        let (approval_exit, approval_exit_rx) = tokio::sync::watch::channel(false);
+        let (question_sender, question_receiver) =
+            tokio::sync::oneshot::channel::<Vec<QuestionAnswer>>();
+        let (question_exit, question_exit_rx) = tokio::sync::watch::channel(false);
+        approval_sender.send(ApprovalDecision::Accept).unwrap();
+        question_sender
+            .send(vec![QuestionAnswer {
+                id: "pick".into(),
+                answers: vec!["One".into()],
+            }])
+            .unwrap();
+        assert_eq!(
+            approval_decision_or_cancel(approval_receiver, approval_exit_rx).await,
+            Some(ApprovalDecision::Accept)
+        );
+        assert_eq!(
+            question_answers_or_cancel(question_receiver, question_exit_rx).await,
+            vec![QuestionAnswer {
+                id: "pick".into(),
+                answers: vec!["One".into()],
+            }]
+        );
+        drop((approval_exit, question_exit));
     }
 
     #[test]

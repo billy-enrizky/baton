@@ -3503,6 +3503,19 @@ fn apply_background_turn_event(state: &mut TuiState, thread_id: &str, event: Tur
 }
 
 fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: TurnEvent) {
+    if matches!(
+        &event,
+        TurnEvent::TurnCompleted { .. }
+            | TurnEvent::TurnInterrupted { .. }
+            | TurnEvent::TurnFailed { .. }
+    ) {
+        state
+            .approvals
+            .retain(|approval| approval.thread_id != thread_id);
+        state
+            .questions
+            .retain(|question| question.thread_id != thread_id);
+    }
     if let Some(child) = state.multi.as_mut().and_then(|multi| {
         multi
             .children
@@ -22563,6 +22576,84 @@ mod tests {
             events[0].payload_digest, events[1].payload_digest,
             "the digest covers the decision"
         );
+    }
+
+    #[test]
+    fn a_terminal_event_clears_only_its_thread_pending_interactions() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let active = state.thread.id.clone();
+        let other = "other-thread".to_string();
+        let (approval_active, _) = tokio::sync::oneshot::channel();
+        let (approval_other, _) = tokio::sync::oneshot::channel();
+        let (question_active, _) = tokio::sync::oneshot::channel();
+        let (question_other, _) = tokio::sync::oneshot::channel();
+        state.approvals.push(ApprovalState {
+            thread_id: active.clone(),
+            id: "approval-active".into(),
+            kind: "permissions".into(),
+            summary: "run active".into(),
+            choices: Vec::new(),
+            selected: 0,
+            respond: approval_active,
+        });
+        state.approvals.push(ApprovalState {
+            thread_id: other.clone(),
+            id: "approval-other".into(),
+            kind: "permissions".into(),
+            summary: "run other".into(),
+            choices: Vec::new(),
+            selected: 0,
+            respond: approval_other,
+        });
+        let prompt = || QuestionPrompt {
+            id: "pick".into(),
+            header: "Question".into(),
+            question: "Pick one".into(),
+            options: vec![QuestionOption {
+                label: "One".into(),
+                description: String::new(),
+            }],
+            allow_custom: false,
+            multi_select: false,
+            secret: false,
+        };
+        state.questions.push(QuestionState {
+            thread_id: active.clone(),
+            id: "question-active".into(),
+            questions: vec![prompt()],
+            index: 0,
+            selected: 0,
+            toggled: Vec::new(),
+            custom: None,
+            answers: Vec::new(),
+            respond: question_active,
+        });
+        state.questions.push(QuestionState {
+            thread_id: other.clone(),
+            id: "question-other".into(),
+            questions: vec![prompt()],
+            index: 0,
+            selected: 0,
+            toggled: Vec::new(),
+            custom: None,
+            answers: Vec::new(),
+            respond: question_other,
+        });
+
+        apply_turn_event_for_thread(
+            &mut state,
+            active,
+            TurnEvent::TurnFailed {
+                error: "agent exited".into(),
+            },
+        );
+
+        assert_eq!(state.approvals.len(), 1);
+        assert_eq!(state.approvals[0].thread_id, other);
+        assert_eq!(state.questions.len(), 1);
+        assert_eq!(state.questions[0].thread_id, other);
     }
 
     #[test]

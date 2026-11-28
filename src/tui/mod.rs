@@ -1354,7 +1354,7 @@ pub fn run_tui(
     };
     let visible_thread = state.thread.id.clone();
     let initial_thread = state.thread.clone();
-    restore_context_window(&mut state, &store, &initial_thread);
+    restore_context(&mut state, &store, &initial_thread);
     hydrate_plans(&mut state, &visible_thread);
 
     let mut startup_notes = Vec::new();
@@ -3604,28 +3604,23 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
         }
         TurnEvent::ContextWindow { tokens } => {
             state.context_windows.insert(thread_id.clone(), tokens);
-            let model = if thread_id == state.thread.id {
-                state.thread.current_model.clone()
-            } else {
-                state
-                    .open_tabs
-                    .iter()
-                    .find(|tab| tab.id() == thread_id)
-                    .and_then(|tab| tab.thread.current_model.clone())
-            };
-            if let Err(error) = state.store.lock().unwrap().set_thread_context_window(
-                &thread_id,
-                Some(tokens),
-                model.as_deref(),
-            ) {
-                state.notice = Some(format!("context window not saved: {error}"));
-            }
+            persist_thread_context(state, &thread_id);
         }
         TurnEvent::Usage { usage } => {
             state.context_used.insert(
                 thread_id,
                 usage.input_tokens + usage.cache_read_tokens + usage.cache_creation_tokens,
             );
+        }
+        event @ (TurnEvent::TurnCompleted { .. }
+        | TurnEvent::TurnFailed { .. }
+        | TurnEvent::TurnInterrupted { .. }) => {
+            persist_thread_context(state, &thread_id);
+            if thread_id == state.thread.id {
+                apply_turn_event(state, event);
+            } else {
+                apply_background_turn_event(state, &thread_id, event);
+            }
         }
         event if thread_id == state.thread.id => apply_turn_event(state, event),
         event => apply_background_turn_event(state, &thread_id, event),
@@ -3771,23 +3766,57 @@ fn switch_open_tab(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, index: 
     }
 }
 
-fn restore_context_window(
-    state: &mut TuiState,
-    store: &Arc<Mutex<BatonStore>>,
-    thread: &ThreadRow,
-) {
-    let stored = store
+fn persist_thread_context(state: &mut TuiState, thread_id: &str) {
+    let window = state.context_windows.get(thread_id).copied();
+    let used = state.context_used.get(thread_id).copied();
+    if window.is_none() && used.is_none() {
+        return;
+    }
+    let model = if thread_id == state.thread.id {
+        state.thread.current_model.clone()
+    } else {
+        state
+            .open_tabs
+            .iter()
+            .find(|tab| tab.id() == thread_id)
+            .and_then(|tab| tab.thread.current_model.clone())
+    };
+    if let Err(error) =
+        state
+            .store
+            .lock()
+            .unwrap()
+            .set_thread_context(thread_id, window, used, model.as_deref())
+    {
+        state.notice = Some(format!("context not saved: {error}"));
+    }
+}
+
+fn restore_context(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, thread: &ThreadRow) {
+    let (window, used, model) = store
         .lock()
         .unwrap()
-        .thread_context_window(&thread.id)
-        .ok()
-        .flatten();
-    match stored {
-        Some((window, model)) if model == thread.current_model => {
+        .thread_context(&thread.id)
+        .unwrap_or((None, None, None));
+    if model != thread.current_model {
+        state.context_windows.remove(&thread.id);
+        state.context_used.remove(&thread.id);
+        return;
+    }
+    match window {
+        Some(window) => {
             state.context_windows.insert(thread.id.clone(), window);
         }
-        _ => {
+        None => {
             state.context_windows.remove(&thread.id);
+        }
+    }
+    match used {
+        Some(used) => {
+            state.context_used.insert(thread.id.clone(), used);
+        }
+        None => {
+            state.context_used.remove(&thread.id);
         }
     }
 }
@@ -3800,7 +3829,7 @@ fn load_thread_state(state: &mut TuiState, store: &Arc<Mutex<BatonStore>>, threa
     state.goal = thread.goal.clone();
     state.goal_paused = thread.goal_paused;
     state.thread = thread.clone();
-    restore_context_window(state, store, &thread);
+    restore_context(state, store, &thread);
     let guard = store.lock().unwrap();
     state.side_chat_of = guard
         .side_chat_source(&thread.id)
@@ -28055,12 +28084,8 @@ mod tests {
             TurnEvent::ContextWindow { tokens: 200_000 },
         );
         assert_eq!(
-            store
-                .lock()
-                .unwrap()
-                .thread_context_window(&thread_id)
-                .unwrap(),
-            Some((200_000, None))
+            store.lock().unwrap().thread_context(&thread_id).unwrap(),
+            (Some(200_000), None, None)
         );
     }
 
@@ -28073,18 +28098,49 @@ mod tests {
         store
             .lock()
             .unwrap()
-            .set_thread_context_window(&thread.id, Some(200_000), thread.current_model.as_deref())
+            .set_thread_context(
+                &thread.id,
+                Some(200_000),
+                Some(85_000),
+                thread.current_model.as_deref(),
+            )
             .unwrap();
-        restore_context_window(&mut state, &store, &thread);
+        restore_context(&mut state, &store, &thread);
         assert_eq!(state.context_windows.get(&thread.id), Some(&200_000));
+        assert_eq!(state.context_used.get(&thread.id), Some(&85_000));
 
         store
             .lock()
             .unwrap()
-            .set_thread_context_window(&thread.id, Some(100_000), Some("other-model"))
+            .set_thread_context(&thread.id, Some(100_000), Some(1), Some("other-model"))
             .unwrap();
-        restore_context_window(&mut state, &store, &thread);
+        restore_context(&mut state, &store, &thread);
         assert!(!state.context_windows.contains_key(&thread.id));
+        assert!(!state.context_used.contains_key(&thread.id));
+    }
+
+    #[test]
+    fn a_turn_end_persists_the_cached_context() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        state.context_windows.insert(thread_id.clone(), 200_000);
+        state.context_used.insert(thread_id.clone(), 85_000);
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::TurnCompleted {
+                final_text: String::new(),
+                usage: None,
+                native_session_id: None,
+                rollout_path: None,
+            },
+        );
+        assert_eq!(
+            store.lock().unwrap().thread_context(&thread_id).unwrap(),
+            (Some(200_000), Some(85_000), None)
+        );
     }
 
     #[test]

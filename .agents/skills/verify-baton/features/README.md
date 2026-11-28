@@ -5,7 +5,7 @@ Use these files with `../SKILL.md`. Each journey is written for an agent that ha
 | Feature | Surface | Proof |
 |---|---|---|
 | Doctor | CLI | `baton doctor` next action, six providers, readiness, database count |
-| TUI status | TUI | `/status` shows thread, phase, queue, and adapter lifecycle |
+| TUI status | TUI | `/status` shows thread, phase, queue, adapter lifecycle, and the cached rate-limit plan with window percentages and a `/limits` refresh hint |
 | Queued follow-ups | TUI | `/queue` opens the queue; Enter sends, `e` edits, `d` deletes, `c` twice clears, and Ctrl+Up/Ctrl+Down reorder; every action persists through the store |
 | Slash choices | TUI | typing a command argument lists valid choices or its syntax, filters them, and completes with Tab or Enter; `slash_sweep.py` runs 57 cases across 51 of the 52 registered commands plus argument variants, and `slash_probe.py` covers the remaining `/quit` path |
 | Settings | TUI | `/settings` writes global default mode and bell choices, shows the selected category's options, and labels harness rows read-only |

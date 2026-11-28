@@ -318,6 +318,23 @@ pub fn discover(cwd: &Path, env: &MemoryEnvironment) -> MemoryListing {
         },
         "Missing · enter creates",
     ));
+    let has_project_base = has_project_override || root.join("AGENTS.md").is_file();
+    for name in codex_fallback_filenames(env, &mut warnings) {
+        let path = root.join(&name);
+        if path.is_file() {
+            codex_rows.push(memory_file_row(
+                "Project fallback",
+                path,
+                env,
+                if has_project_base {
+                    "Codex fallback; AGENTS.md wins at"
+                } else {
+                    "Codex fallback filename at"
+                },
+                "Missing · enter creates",
+            ));
+        }
+    }
     let mut auto_rows = vec![MemoryRow {
         label: "Auto-memory".to_string(),
         detail: auto_memory_detail(&auto_memory),
@@ -847,6 +864,59 @@ fn working_root(cwd: &Path) -> PathBuf {
 /// `cwd` itself is excluded because the project rows already cover it. A path
 /// outside a repository has no bounded parent chain, so it returns nothing
 /// instead of walking to the filesystem root.
+/// Extra filenames Codex tries after `AGENTS.override.md` and `AGENTS.md` at
+/// each level. The list is read from the Codex config, validated the way Codex
+/// validates it, and capped so one config cannot flood the picker.
+fn codex_fallback_filenames(env: &MemoryEnvironment, warnings: &mut Vec<String>) -> Vec<String> {
+    const MAX_CODEX_FALLBACKS: usize = 20;
+    let path = env.codex_home.join("config.toml");
+    let contents = match std::fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            warnings.push(format!("cannot read {}: {error}", path.display()));
+            return Vec::new();
+        }
+    };
+    let table = match toml::from_str::<toml::Table>(&contents) {
+        Ok(table) => table,
+        Err(error) => {
+            warnings.push(format!("cannot parse {}: {error}", path.display()));
+            return Vec::new();
+        }
+    };
+    let Some(values) = table
+        .get("project_doc_fallback_filenames")
+        .and_then(toml::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for value in values {
+        let Some(name) = value.as_str().map(str::trim) else {
+            continue;
+        };
+        if name.is_empty() || matches!(name, "." | "..") || name.contains(['/', '\0']) {
+            continue;
+        }
+        #[cfg(windows)]
+        if name.contains(['\\', ':']) {
+            continue;
+        }
+        if name == "AGENTS.md" || name == "AGENTS.override.md" {
+            continue;
+        }
+        if names.iter().any(|existing| existing == name) {
+            continue;
+        }
+        names.push(name.to_string());
+        if names.len() >= MAX_CODEX_FALLBACKS {
+            break;
+        }
+    }
+    names
+}
+
 fn ancestor_instruction_dirs(cwd: &Path) -> Vec<PathBuf> {
     let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
     let Some(anchor) = crate::worktree::project_identity_root(&cwd) else {
@@ -1187,6 +1257,70 @@ mod tests {
                     path: std::fs::canonicalize(repo.join("src/deep/AGENTS.md")).unwrap(),
                 }
         }));
+    }
+
+    #[test]
+    fn discovery_lists_codex_fallback_filenames_from_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let env = environment(temp.path());
+        std::fs::create_dir_all(&env.codex_home).unwrap();
+        std::fs::write(
+            env.codex_home.join("config.toml"),
+            "project_doc_fallback_filenames = [\"TEAM.md\", \"../escape.md\", \"AGENTS.md\", \"TEAM.md\", \" \"]\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("TEAM.md"), "team").unwrap();
+        std::fs::write(project.join("AGENTS.md"), "agents").unwrap();
+
+        let listing = discover(&project, &env);
+        let fallbacks = listing
+            .rows()
+            .into_iter()
+            .filter(|(section, row)| section.title == "Codex" && row.label == "Project fallback")
+            .collect::<Vec<_>>();
+        assert_eq!(fallbacks.len(), 1, "{fallbacks:?}");
+        assert_eq!(
+            fallbacks[0].1.action,
+            MemoryAction::OpenFile {
+                path: std::fs::canonicalize(project.join("TEAM.md")).unwrap()
+            }
+        );
+        assert!(
+            fallbacks[0].1.detail.contains("AGENTS.md wins"),
+            "{}",
+            fallbacks[0].1.detail
+        );
+    }
+
+    #[test]
+    fn a_malformed_codex_config_adds_a_warning_and_no_fallbacks() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let env = environment(temp.path());
+        std::fs::create_dir_all(&env.codex_home).unwrap();
+        std::fs::write(env.codex_home.join("config.toml"), "not = [toml").unwrap();
+        std::fs::write(project.join("TEAM.md"), "team").unwrap();
+
+        let listing = discover(&project, &env);
+        assert!(
+            !listing
+                .rows()
+                .into_iter()
+                .any(|(_, row)| row.label == "Project fallback"),
+            "{:?}",
+            listing.rows()
+        );
+        assert!(
+            listing
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("cannot parse")),
+            "{:?}",
+            listing.warnings
+        );
     }
 
     #[test]

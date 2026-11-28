@@ -151,6 +151,7 @@ pub fn discover(cwd: &Path, env: &MemoryEnvironment) -> MemoryListing {
     } else {
         memory_root.clone()
     };
+    let ancestors = ancestor_instruction_dirs(cwd);
     let mut warnings = Vec::new();
     let (user, user_error) = read_settings(
         &env.config_dir.join("settings.json"),
@@ -190,7 +191,7 @@ pub fn discover(cwd: &Path, env: &MemoryEnvironment) -> MemoryListing {
             "User rule",
         ));
     }
-    for dir in ancestor_instruction_dirs(cwd) {
+    for dir in &ancestors {
         for path in [dir.join("CLAUDE.md"), dir.join(".claude").join("CLAUDE.md")] {
             if path.is_file() {
                 claude_rows.push(memory_file_row(
@@ -268,6 +269,33 @@ pub fn discover(cwd: &Path, env: &MemoryEnvironment) -> MemoryListing {
         },
         "Missing · enter creates",
     ));
+    for dir in &ancestors {
+        let override_path = dir.join("AGENTS.override.md");
+        let has_override = override_path.is_file();
+        if has_override {
+            codex_rows.push(memory_file_row(
+                "Parent override",
+                override_path,
+                env,
+                "Codex override at",
+                "Missing · enter creates",
+            ));
+        }
+        let agents = dir.join("AGENTS.md");
+        if agents.is_file() {
+            codex_rows.push(memory_file_row(
+                "Parent instructions",
+                agents,
+                env,
+                if has_override {
+                    "Codex fallback; override wins at"
+                } else {
+                    "Codex reads this at"
+                },
+                "Missing · enter creates",
+            ));
+        }
+    }
     let project_override = root.join("AGENTS.override.md");
     let has_project_override = project_override.is_file();
     if has_project_override {
@@ -1108,6 +1136,57 @@ mod tests {
             "{:?}",
             listing.rows()
         );
+    }
+
+    #[test]
+    fn discovery_lists_existing_ancestor_codex_files_in_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(repo.join("src/deep")).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(status.success(), "git init failed");
+        std::fs::write(repo.join("AGENTS.override.md"), "root override").unwrap();
+        std::fs::write(repo.join("AGENTS.md"), "root agents").unwrap();
+        std::fs::write(repo.join("src/AGENTS.md"), "src agents").unwrap();
+        std::fs::write(repo.join("src/deep/AGENTS.md"), "deep agents").unwrap();
+
+        let env = environment(temp.path());
+        let listing = discover(&repo.join("src/deep"), &env);
+        let parents = listing
+            .rows()
+            .into_iter()
+            .filter(|(section, row)| {
+                section.title == "Codex"
+                    && (row.label == "Parent override" || row.label == "Parent instructions")
+            })
+            .map(|(_, row)| (row.label.clone(), row.action.clone(), row.detail.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(parents.len(), 3, "{parents:?}");
+        let root_override = std::fs::canonicalize(repo.join("AGENTS.override.md")).unwrap();
+        let root_agents = std::fs::canonicalize(repo.join("AGENTS.md")).unwrap();
+        let src_agents = std::fs::canonicalize(repo.join("src/AGENTS.md")).unwrap();
+        assert_eq!(parents[0].0, "Parent override");
+        assert_eq!(
+            parents[0].1,
+            MemoryAction::OpenFile {
+                path: root_override
+            }
+        );
+        assert_eq!(parents[1].0, "Parent instructions");
+        assert_eq!(parents[1].1, MemoryAction::OpenFile { path: root_agents });
+        assert!(parents[1].2.contains("fallback"), "{:?}", parents[1]);
+        assert_eq!(parents[2].1, MemoryAction::OpenFile { path: src_agents });
+        assert!(!parents.iter().any(|(_, action, _)| {
+            action
+                == &MemoryAction::OpenFile {
+                    path: std::fs::canonicalize(repo.join("src/deep/AGENTS.md")).unwrap(),
+                }
+        }));
     }
 
     #[test]

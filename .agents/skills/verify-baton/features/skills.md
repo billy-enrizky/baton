@@ -27,7 +27,7 @@ A terminal user can see installed Claude Code and Codex skills, but Baton only l
 
 `src/tui/mod.rs` maps those rows into `Overlay::SkillsPicker`, including the source path and whether the copy is project or global. `insert_skill` validates the name, inserts `$name ` at a token boundary, closes the picker, and reports the source. It adds a warning when the source differs from the current harness or when the thread is in orchestrate mode. `i` and `u` call `src/skills.rs::install_skill`, and `d` opens a confirmation before `src/skills.rs::remove_skill`.
 
-`src/skills.rs` owns the install, update, and removal boundary. It validates the skill directory and name, refuses a project source and symlinked destination roots, copies the tree into a hidden staging directory with a file and byte cap, then renames it into place. Update first renames the existing directory to a hidden backup, swaps in the staging directory, and restores the backup if the swap fails. Removal renames the project copy to a hidden trash name, deletes it, and restores it if deletion fails. Internal `.baton-staging-*`, `.baton-backup-*`, and `.baton-trash-*` directories are hidden from discovery.
+`src/skills.rs` owns the install, update, and removal boundary. It validates the skill directory and name, refuses a project source and symlinked destination roots, copies the tree into a hidden staging directory with a file and byte cap, then renames it into place. Update first renames the existing directory to a hidden backup, swaps in the staging directory, and restores the backup if the swap fails. Removal renames the project copy to a hidden trash name, deletes it, and restores it if deletion fails. Internal `.baton-staging-*`, `.baton-backup-*`, and `.baton-trash-*` directories are hidden from discovery. Each transient name also carries the skill name after a 32-character id, so `reconcile_project_skills` can tell which project skill an interrupted run belonged to and repair it.
 
 `src/skill_dispatch.rs::prompt_for_provider_from_in` runs after the handoff or goal wrapper is built. For Claude, it finds the last known `$name` mention using the project and global scan for the turn's working directory, moves it to the start as `/name`, and keeps the rest of the payload as arguments. Other providers keep the prompt unchanged. The stored message remains the original `$name` text.
 
@@ -42,6 +42,8 @@ A terminal user can see installed Claude Code and Codex skills, but Baton only l
 - `u` replaces the project copy from the same harness's global source and reports `updated $name in <path>`. It refuses when the project copy is absent and asks for `i`. Selecting a project row uses the exact harness global source, not a cross-harness duplicate.
 - `d` opens a confirmation for a project row. `y` removes the project copy, `n` returns to the picker, and Esc returns to the picker. A global row is refused with a message to edit its source directory. The confirmation names the relative destination, and success reports `removed $name from <path>`.
 - The copier refuses a missing project directory, a source symlink, a symlink or non-directory in `.claude`, `.codex`, or `skills`, a source without `SKILL.md`, a project source, more than 2,048 files, more than 32 MiB, a tree deeper than 32 directories, and any non-regular file in the tree.
+- Install, update, removal, and opening `/skills` reconcile first. A staged copy is deleted because only a rename can publish it, a trash copy finishes the removal the user asked for, a backup beside a live destination is dropped because the swap finished, and a backup with no destination restores the previous copy. A transient name without the id-and-name shape is left untouched, and a symlinked skill root is skipped rather than followed.
+- Opening `/skills` after a repair reports `repaired N interrupted skill operation(s)`. The repair runs before the listing, so a skill that a crash left missing reappears in the same picker.
 - Install never overwrites an existing project skill. Update replaces the project directory, so files removed from the global source are removed from the project copy. A failed swap restores the previous project copy. Removal stages the project directory before deletion, restores it on failure, and never touches the global source.
 - The validator requires at least one ASCII letter, permits ASCII letters, digits, `:`, `_`, and `-`, and rejects `memories` because `$memories` is a Baton memory token. A rejected name leaves the picker open.
 - The notice adds `switch to <source> before sending` when the row source differs from the current harness, and `/orchestrate off before sending` in orchestrate mode. It does not silently claim the current harness will use a different harness's skill.
@@ -61,7 +63,7 @@ Enter
 
 The first Enter opens the picker. Down selects the next source row. The second Enter inserts `$name ` into the composer. If the notice says `/orchestrate off before sending`, switch the thread to one harness before submitting. For a Claude skill, Baton converts the final provider payload from `$name` to `/name`.
 
-To install a global skill into the project, open `/skills`, select the global row, and press `i`. To update that project copy later, change the global skill, reopen `/skills`, select the project row, and press `u`. To remove the project copy, open `/skills`, select the project row, press `d`, and confirm with `y`. The global copy stays in place.
+To install a global skill into the project, open `/skills`, select the global row, and press `i`. To update that project copy later, change the global skill, reopen `/skills`, select the project row, and press `u`. To remove the project copy, open `/skills`, select the project row, press `d`, and confirm with `y`. The global copy stays in place. If Baton was interrupted part way through any of those steps, the next install, update, removal, or `/skills` open repairs the leftover directory before doing anything else.
 
 ## Driving it with the verification harness
 
@@ -88,6 +90,7 @@ cargo test --locked --lib sync::tests::skill_description -- --nocapture
 cargo test --locked --lib tui::tests::skills_command_lists_project_skills -- --nocapture
 cargo test --locked --lib tui::tests::skills_picker_shows_sanitized_descriptions -- --nocapture
 cargo test --locked --lib skills::tests -- --nocapture
+cargo test --locked --lib tui::tests::skills_command_repairs_a_crashed_swap_before_listing -- --nocapture
 cargo test --locked --lib skills_picker_installs_and_updates_a_project_copy -- --nocapture
 cargo test --locked --lib skills_picker_explains_a_refused_install_or_update -- --nocapture
 cargo test --locked --lib skills_picker_removes_a_project_copy_after_confirmation -- --nocapture

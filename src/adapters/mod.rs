@@ -269,6 +269,11 @@ pub enum TurnEvent {
     ContextWindow {
         tokens: i64,
     },
+    /// The latest request's context tokens when a harness reports its own
+    /// used total instead of a usage breakdown.
+    ContextUsed {
+        tokens: i64,
+    },
     /// A provider-reported rate-limit snapshot. Providers that do not report
     /// one leave the harness in an explicit unknown state.
     RateLimits {

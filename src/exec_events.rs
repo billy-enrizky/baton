@@ -174,6 +174,10 @@ pub fn turn_event_json(thread_id: &str, event: &TurnEvent) -> Value {
             "type": "context_window",
             "tokens": tokens,
         }),
+        TurnEvent::ContextUsed { tokens } => json!({
+            "type": "context_used",
+            "tokens": tokens,
+        }),
         TurnEvent::TurnCompleted {
             final_text,
             usage,

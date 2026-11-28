@@ -636,6 +636,22 @@ fn handle_session_update(
                 }
             }
         }
+        "usage_update" => {
+            if let Some(used) = update
+                .get("used")
+                .and_then(Value::as_i64)
+                .filter(|used| *used >= 0)
+            {
+                let _ = emit.send(TurnEvent::ContextUsed { tokens: used });
+            }
+            if let Some(size) = update
+                .get("size")
+                .and_then(Value::as_i64)
+                .filter(|size| *size > 0)
+            {
+                let _ = emit.send(TurnEvent::ContextWindow { tokens: size });
+            }
+        }
         "plan" => {
             let _ = emit.send(TurnEvent::PlanUpdated {
                 provider,
@@ -1079,10 +1095,50 @@ impl BatonAdapter for AcpAdapter {
 mod tests {
     use super::{
         antigravity_model_family, antigravity_question_prompts, antigravity_question_response,
-        permission_choices, pick_permission_option, xai_question_prompts, xai_question_response,
+        handle_session_update, permission_choices, pick_permission_option, xai_question_prompts,
+        xai_question_response, TurnEvent,
     };
     use crate::types::{ApprovalDecision, QuestionAnswer, QuestionPrompt};
     use serde_json::json;
+
+    #[test]
+    fn acp_usage_updates_report_used_and_context_size() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut text = String::new();
+        handle_session_update(
+            &json!({ "sessionUpdate": "usage_update", "used": 42000, "size": 1000000 }),
+            crate::types::ProviderId::Antigravity,
+            &sender,
+            &mut text,
+        );
+        let events: Vec<TurnEvent> = receiver.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::ContextUsed { tokens: 42000 })),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::ContextWindow { tokens: 1000000 })),
+            "{events:?}"
+        );
+
+        handle_session_update(
+            &json!({ "sessionUpdate": "usage_update", "used": 5, "size": 0 }),
+            crate::types::ProviderId::Antigravity,
+            &sender,
+            &mut text,
+        );
+        let events: Vec<TurnEvent> = receiver.try_iter().collect();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, TurnEvent::ContextWindow { .. })),
+            "a zero size is unknown: {events:?}"
+        );
+    }
 
     #[test]
     fn antigravity_model_families_strip_thinking_suffixes() {

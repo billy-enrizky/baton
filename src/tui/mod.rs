@@ -3361,7 +3361,8 @@ fn apply_turn_event(state: &mut TuiState, event: TurnEvent) {
         TurnEvent::ProviderTurnId { .. }
         | TurnEvent::ProviderSession { .. }
         | TurnEvent::Usage { .. }
-        | TurnEvent::ContextWindow { .. } => {}
+        | TurnEvent::ContextWindow { .. }
+        | TurnEvent::ContextUsed { .. } => {}
         // Approval requests need their thread id, so the run loop routes them
         // through apply_turn_event_for_thread before calling this function.
         TurnEvent::ApprovalRequest { .. } => {}
@@ -3605,6 +3606,9 @@ fn apply_turn_event_for_thread(state: &mut TuiState, thread_id: String, event: T
         TurnEvent::ContextWindow { tokens } => {
             state.context_windows.insert(thread_id.clone(), tokens);
             persist_thread_context(state, &thread_id);
+        }
+        TurnEvent::ContextUsed { tokens } => {
+            state.context_used.insert(thread_id, tokens);
         }
         TurnEvent::Usage { usage } => {
             state.context_used.insert(
@@ -28141,6 +28145,27 @@ mod tests {
             store.lock().unwrap().thread_context(&thread_id).unwrap(),
             (Some(200_000), Some(85_000), None)
         );
+    }
+
+    #[test]
+    fn an_acp_context_used_event_updates_the_cached_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(Mutex::new(BatonStore::memory().unwrap()));
+        let mut state = test_state(home.path(), &store, Vec::new());
+        let thread_id = state.thread.id.clone();
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::ContextUsed { tokens: 85_000 },
+        );
+        assert_eq!(state.context_used.get(&thread_id), Some(&85_000));
+        apply_turn_event_for_thread(
+            &mut state,
+            thread_id.clone(),
+            TurnEvent::ContextWindow { tokens: 100_000 },
+        );
+        let hint = composer_hint(&state).expect("the context warning");
+        assert!(hint.contains("85% of the context window used"), "{hint}");
     }
 
     #[test]

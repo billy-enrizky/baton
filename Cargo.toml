@@ -40,6 +40,8 @@ tempfile = "3"
 [profile.release]
 lto = true
 
-# Keep line tables for backtraces without paying for full test debuginfo.
+# CI rebuilds the test profile more often than it needs stack-frame line
+# numbers. Panic messages still carry the source location; raise this to 1
+# when a test needs a readable backtrace.
 [profile.test]
-debug = 1
+debug = 0

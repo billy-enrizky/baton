@@ -943,6 +943,8 @@ fn ensure_thread_columns(db: &Connection) -> Result<()> {
     ensure_column(db, "threads", "snoozed_at", "TEXT")?;
     ensure_column(db, "threads", "snoozed_until", "TEXT")?;
     ensure_column(db, "threads", "archived_at", "TEXT")?;
+    ensure_column(db, "threads", "context_window", "INTEGER")?;
+    ensure_column(db, "threads", "context_model", "TEXT")?;
     db.execute_batch(
         "CREATE INDEX IF NOT EXISTS threads_pin_order_idx ON threads(pin_order_key DESC) WHERE pin_order_key IS NOT NULL;
          CREATE INDEX IF NOT EXISTS threads_pin_backfill_idx ON threads(updated_at) WHERE pinned = 1 AND (pin_order_key IS NULL OR pin_order_key = '');",
@@ -1729,6 +1731,38 @@ impl BatonStore {
         )?;
         tx.commit()?;
         Ok(changed == 1)
+    }
+
+    /// Stores the model-reported context window with the model it belongs to,
+    /// so a later model change cannot reuse a stale percentage.
+    pub fn set_thread_context_window(
+        &self,
+        id: &str,
+        window: Option<i64>,
+        model: Option<&str>,
+    ) -> Result<()> {
+        self.write_execute(
+            "UPDATE threads SET context_window = ?, context_model = ? WHERE id = ?",
+            params![window, model, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn thread_context_window(&self, id: &str) -> Result<Option<(i64, Option<String>)>> {
+        let row = self
+            .db
+            .query_row(
+                "SELECT context_window, context_model FROM threads WHERE id = ?1",
+                params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.and_then(|(window, model)| window.map(|window| (window, model))))
     }
 
     pub fn remove_schedule(&self, id: &str) -> Result<bool> {
@@ -4898,6 +4932,31 @@ mod tests {
             revoked_at: None,
             label: None,
         }
+    }
+
+    #[test]
+    fn a_thread_context_window_round_trips_with_its_model() {
+        let store = BatonStore::memory().unwrap();
+        let thread = store
+            .create_thread(NewThread {
+                title: "context".into(),
+                cwd: "/tmp".into(),
+                current_provider: ProviderId::Claude,
+                current_model: Some("claude-opus-5-5".into()),
+            })
+            .unwrap();
+        assert_eq!(store.thread_context_window(&thread.id).unwrap(), None);
+        store
+            .set_thread_context_window(&thread.id, Some(200_000), Some("claude-opus-5-5"))
+            .unwrap();
+        assert_eq!(
+            store.thread_context_window(&thread.id).unwrap(),
+            Some((200_000, Some("claude-opus-5-5".to_string())))
+        );
+        store
+            .set_thread_context_window(&thread.id, None, None)
+            .unwrap();
+        assert_eq!(store.thread_context_window(&thread.id).unwrap(), None);
     }
 
     #[test]
